@@ -61,13 +61,26 @@ class LCMEngine(ContextEngine):
         # Wire tool handlers
         lcm_tools.set_engine(self)
 
-        # State required by ContextEngine ABC
+        # State required by ContextEngine ABC and run_agent.py compatibility
+        self.model = ""
+        self.base_url = ""
+        self.api_key = ""
+        self.provider = ""
         self.context_length = 0
         self.threshold_tokens = 0
+        self.threshold_percent = self._config.context_threshold
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.compression_count = 0
+        # run_agent.py reads these for preflight checks
+        self.protect_first_n = 3
+        self.protect_last_n = self._config.fresh_tail_count
+        # run_agent.py reads these for context probing
+        self._context_probed = False
+        self._context_probe_persistable = False
+        self.quiet_mode = False
+        self.summary_model = self._config.summary_model
 
     @property
     def name(self) -> str:
@@ -195,6 +208,8 @@ class LCMEngine(ContextEngine):
     def on_session_reset(self) -> None:
         super().on_session_reset()
         self._last_compacted_store_id = 0
+        self._context_probed = False
+        self._context_probe_persistable = False
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND]
