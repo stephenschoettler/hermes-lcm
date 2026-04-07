@@ -62,8 +62,8 @@ Environment variables (all optional):
 ```
 Fresh Tail (protected)          Summary DAG
 ┌─────────────────────┐        ┌──────────┐
-│ Recent N messages    │       │ D2 node  │ ← condensation of D1
-│ (always in context)  │       │          │
+│ Recent N messages   │        │ D2 node  │ ← condensation of D1
+│ (always in context) │        │          │
 └─────────────────────┘        ├──────────┤
                                │ D1 node  │ ← condensation of D0
                                │ D1 node  │
