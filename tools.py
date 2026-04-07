@@ -18,10 +18,35 @@ def set_engine(engine: "LCMEngine") -> None:
     _engine = engine
 
 
+def _try_ingest_from_state_db():
+    """Opportunistically ingest messages from Hermes state.db into the LCM store.
+
+    Pulls from completed sessions in state.db. Current in-progress messages
+    won't be there yet — those are ingested when compress() is called.
+    """
+    if _engine is None or not _engine._session_id:
+        return
+    try:
+        from hermes_state import SessionDB
+        from pathlib import Path
+        if _engine._hermes_home:
+            db_path = Path(_engine._hermes_home) / "state.db"
+            db = SessionDB(db_path=db_path)
+        else:
+            db = SessionDB()
+        # Try current session and also parent sessions (lineage)
+        conversation = db.get_messages_as_conversation(_engine._session_id)
+        if conversation:
+            _engine._ingest_messages(conversation)
+    except Exception as e:
+        logger.debug("Ingest from state.db failed: %s", e)
+
+
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     """Search across the full DAG and raw messages."""
     if _engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
+    _try_ingest_from_state_db()
 
     query = args.get("query", "").strip()
     if not query:

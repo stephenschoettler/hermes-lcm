@@ -99,6 +99,17 @@ class LCMEngine(ContextEngine):
             return False
         return tokens >= self.threshold_tokens
 
+    def should_compress_preflight(self, messages):
+        """Pre-flight check — also ingests messages into the store."""
+        if self._session_id and messages:
+            try:
+                self._ingest_messages(messages)
+            except Exception as e:
+                logger.debug("Ingest during preflight: %s", e)
+        from .tokens import count_messages_tokens
+        rough = count_messages_tokens(messages)
+        return rough >= self.threshold_tokens
+
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None) -> List[Dict[str, Any]]:
         """Main compaction entry point.
