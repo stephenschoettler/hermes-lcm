@@ -31,7 +31,7 @@ into anything that was compacted.
  │  System Prompt     │            ┌──────────┐
  │  (with LCM note)   │            │ D2 node  │ ← weeks
  ├────────────────────┤            ├──────────┤
- │  DAG Summaries     │ ◄──────── │ D1 node  │ ← hours
+ │  DAG Summaries     │ ─────────  │ D1 node  │ ← hours
  │  (highest depth)   │            │ D1 node  │
  ├────────────────────┤            ├──────────┤
  │  Fresh Tail        │            │ D0 node  │ ← minutes
