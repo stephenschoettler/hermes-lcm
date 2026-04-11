@@ -109,11 +109,11 @@ Environment variables (all optional):
 | `LCM_FRESH_TAIL_COUNT` | `64` | Recent messages protected from compaction |
 | `LCM_LEAF_CHUNK_TOKENS` | `20000` | Token threshold for leaf compaction |
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window triggering compaction |
-| `LCM_INCREMENTAL_MAX_DEPTH` | `1` | Max condensation depth (0=leaf only, -1=unlimited) |
+| `LCM_INCREMENTAL_MAX_DEPTH` | `1` | Max condensation depth (`0` = disabled, `-1` = unlimited) |
 | `LCM_CONDENSATION_FANIN` | `4` | Same-depth nodes needed to trigger condensation |
 | `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
-| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after `/new` |
+| `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after `/new` (`-1` = all, `0` = none, `2` = keep d2+) |
 
 ## Agent Tools
 

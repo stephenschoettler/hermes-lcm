@@ -150,6 +150,180 @@ class TestEngineCompress:
             esc._call_llm_for_summary = original_fn
 
 
+class TestPostCompactionIngestion:
+    """Regression tests for issue #1 — messages must be persisted after
+    compaction even though the active context is shorter than the store."""
+
+    def _make_long_conversation(self, n_turns=20):
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(n_turns):
+            messages.append({"role": "user", "content": f"Question {i}: " + "x" * 200})
+            messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
+        return messages
+
+    def _mock_summarize(self, prompt, max_tokens, model=""):
+        return "Mock summary of conversation.\nExpand for details about: earlier turns"
+
+    def test_ingest_after_compaction(self, engine):
+        """New messages after compress() must still be persisted."""
+        import hermes_lcm.escalation as esc
+        original_fn = esc._call_llm_for_summary
+        esc._call_llm_for_summary = self._mock_summarize
+        try:
+            messages = self._make_long_conversation(20)
+            compressed = engine.compress(messages)
+            count_after_compress = engine._store.get_session_count("test-session")
+            assert count_after_compress == len(messages)  # all originals stored
+
+            # Simulate new turns appended to compressed context
+            compressed.append({"role": "user", "content": "Brand new question"})
+            compressed.append({"role": "assistant", "content": "Brand new answer"})
+
+            engine._ingest_messages(compressed)
+            count_after_new = engine._store.get_session_count("test-session")
+            assert count_after_new == count_after_compress + 2
+        finally:
+            esc._call_llm_for_summary = original_fn
+
+    def test_ingest_cursor_reset_on_session_reset(self, engine):
+        """on_session_reset() must reset the ingest cursor."""
+        engine._ingest_cursor = 42
+        engine.on_session_reset()
+        assert engine._ingest_cursor == 0
+
+    def test_multiple_compactions(self, engine):
+        """Messages stay persisted across multiple compress() cycles."""
+        import hermes_lcm.escalation as esc
+        original_fn = esc._call_llm_for_summary
+        esc._call_llm_for_summary = self._mock_summarize
+        try:
+            # First compaction
+            messages = self._make_long_conversation(20)
+            compressed = engine.compress(messages)
+            count1 = engine._store.get_session_count("test-session")
+
+            # Add new turns and compact again
+            for i in range(15):
+                compressed.append({"role": "user", "content": f"Round2 Q{i}: " + "z" * 200})
+                compressed.append({"role": "assistant", "content": f"Round2 A{i}: " + "w" * 200})
+
+            compressed2 = engine.compress(compressed)
+            count2 = engine._store.get_session_count("test-session")
+            # Should have original messages + 30 new ones
+            assert count2 == count1 + 30
+
+            # Add more after second compaction
+            compressed2.append({"role": "user", "content": "Final question"})
+            engine._ingest_messages(compressed2)
+            count3 = engine._store.get_session_count("test-session")
+            assert count3 == count2 + 1
+        finally:
+            esc._call_llm_for_summary = original_fn
+
+
+class TestSessionRetainDepth:
+    """Tests for issue #2a — new_session_retain_depth wiring."""
+
+    def test_retain_depth_zero_deletes_all(self, engine):
+        """retain_depth=0 should delete all DAG nodes on reset."""
+        engine._config.new_session_retain_depth = 0
+        from hermes_lcm.dag import SummaryNode
+        import time
+        for d in range(3):
+            engine._dag.add_node(SummaryNode(
+                session_id="test-session", depth=d,
+                summary=f"d{d} summary", token_count=100,
+                source_token_count=500, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            ))
+        assert len(engine._dag.get_session_nodes("test-session")) == 3
+        engine.on_session_reset()
+        assert len(engine._dag.get_session_nodes("test-session")) == 0
+
+    def test_retain_depth_keeps_high_nodes(self, engine):
+        """retain_depth=2 should keep d2+ and delete d0, d1."""
+        engine._config.new_session_retain_depth = 2
+        from hermes_lcm.dag import SummaryNode
+        import time
+        for d in range(4):
+            engine._dag.add_node(SummaryNode(
+                session_id="test-session", depth=d,
+                summary=f"d{d} summary", token_count=100,
+                source_token_count=500, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            ))
+        engine.on_session_reset()
+        remaining = engine._dag.get_session_nodes("test-session")
+        assert len(remaining) == 2
+        assert all(n.depth >= 2 for n in remaining)
+
+    def test_retain_depth_minus_one_keeps_all(self, engine):
+        """retain_depth=-1 should keep all nodes."""
+        engine._config.new_session_retain_depth = -1
+        from hermes_lcm.dag import SummaryNode
+        import time
+        for d in range(3):
+            engine._dag.add_node(SummaryNode(
+                session_id="test-session", depth=d,
+                summary=f"d{d} summary", token_count=100,
+                source_token_count=500, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            ))
+        engine.on_session_reset()
+        assert len(engine._dag.get_session_nodes("test-session")) == 3
+
+
+class TestUnlimitedCondensationDepth:
+    """Tests for issue #2b — max_depth=-1 should be truly unlimited."""
+
+    def test_unlimited_depth_condenses_beyond_ten(self, engine):
+        """With max_depth=-1, condensation should not be capped at depth 10."""
+        engine._config.incremental_max_depth = -1
+        engine._config.condensation_fanin = 2
+        from hermes_lcm.dag import SummaryNode
+        import time
+
+        # Create nodes at depth 11 — old code would skip these
+        for i in range(3):
+            engine._dag.add_node(SummaryNode(
+                session_id="test-session", depth=11,
+                summary=f"Deep node {i}", token_count=100,
+                source_token_count=200, source_ids=[],
+                source_type="nodes", created_at=time.time(),
+            ))
+
+        import hermes_lcm.escalation as esc
+        original_fn = esc._call_llm_for_summary
+
+        def mock_summarize(prompt, max_tokens, model=""):
+            return "Condensed.\nExpand for details about: deep nodes"
+
+        esc._call_llm_for_summary = mock_summarize
+        try:
+            engine._maybe_condense()
+            # Should have created a d12 node
+            d12 = engine._dag.get_session_nodes("test-session", depth=12)
+            assert len(d12) >= 1
+        finally:
+            esc._call_llm_for_summary = original_fn
+
+
+class TestConfigCleanup:
+    """Tests for issue #2c — removed config options."""
+
+    def test_no_expansion_model(self):
+        config = LCMConfig()
+        assert not hasattr(config, "expansion_model")
+
+    def test_no_summary_timeout(self):
+        config = LCMConfig()
+        assert not hasattr(config, "summary_timeout_ms")
+
+    def test_no_delegation_timeout(self):
+        config = LCMConfig()
+        assert not hasattr(config, "delegation_timeout_ms")
+
+
 class TestEngineTools:
     def test_handle_grep(self, engine):
         # Add some data

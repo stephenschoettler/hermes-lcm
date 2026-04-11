@@ -103,6 +103,33 @@ class SummaryDAG:
         node.node_id = cur.lastrowid
         return node.node_id
 
+    def delete_below_depth(self, session_id: str, min_depth: int) -> int:
+        """Delete all nodes for a session with depth < min_depth.
+
+        Returns the number of deleted nodes.  Used during session reset
+        to retain only high-level summaries across sessions.
+        """
+        cur = self._conn.execute(
+            """DELETE FROM summary_nodes
+               WHERE session_id = ? AND depth < ?""",
+            (session_id, min_depth),
+        )
+        deleted = cur.rowcount
+        if deleted:
+            self._conn.commit()
+        return deleted
+
+    def delete_session_nodes(self, session_id: str) -> int:
+        """Delete all nodes for a session. Returns count deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM summary_nodes WHERE session_id = ?",
+            (session_id,),
+        )
+        deleted = cur.rowcount
+        if deleted:
+            self._conn.commit()
+        return deleted
+
     # -- Read ---------------------------------------------------------------
 
     def get_node(self, node_id: int) -> Optional[SummaryNode]:

@@ -58,6 +58,12 @@ class LCMEngine(ContextEngine):
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
 
+        # Cursor: index in the current messages list up to which all
+        # messages have been persisted.  After compress() shortens the
+        # list, the cursor resets to len(compressed) so that only
+        # genuinely new messages (appended after compaction) get ingested.
+        self._ingest_cursor: int = 0
+
         # Wire tool handlers
         lcm_tools.set_engine(self)
 
@@ -189,6 +195,9 @@ class LCMEngine(ContextEngine):
         # Step 7: Assemble new active context
         compressed = self._assemble_context(messages[0], messages[fresh_tail_start:])
         self.compression_count += 1
+        # Reset cursor to the length of the compressed context so that
+        # only messages appended *after* this point get ingested next time.
+        self._ingest_cursor = len(compressed)
 
         logger.info(
             "LCM compaction #%d: %d messages → %d (L%d, %d→%d tokens, %d DAG nodes)",
@@ -219,8 +228,20 @@ class LCMEngine(ContextEngine):
     def on_session_reset(self) -> None:
         super().on_session_reset()
         self._last_compacted_store_id = 0
+        self._ingest_cursor = 0
         self._context_probed = False
         self._context_probe_persistable = False
+
+        # Retain DAG nodes across sessions based on config.
+        #   -1  → keep all nodes
+        #    0  → delete everything
+        #    N  → keep nodes at depth >= N (e.g. 2 keeps d2+)
+        retain = self._config.new_session_retain_depth
+        if self._session_id and retain != -1:
+            if retain == 0:
+                self._dag.delete_session_nodes(self._session_id)
+            else:
+                self._dag.delete_below_depth(self._session_id, retain)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND]
@@ -264,26 +285,31 @@ class LCMEngine(ContextEngine):
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> None:
         """Persist new messages to the store.
 
-        Skips messages that look like they've already been stored
-        (dedup by role+content for the current session).
+        Uses a cursor to track which portion of the current messages list
+        has already been persisted.  After compress() shortens the list,
+        the cursor is reset to len(compressed), so only messages appended
+        after compaction are ingested — regardless of how the store count
+        compares to the current list length.
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
             return
 
-        existing_count = self._store.get_session_count(self._session_id)
-        logger.debug("Ingest: session=%s existing=%d incoming=%d", self._session_id, existing_count, len(messages))
+        n = len(messages)
+        cursor = self._ingest_cursor
+        logger.debug(
+            "Ingest: session=%s cursor=%d incoming=%d",
+            self._session_id, cursor, n,
+        )
 
-        # Only ingest messages beyond what we've already stored
-        # This is a simple heuristic — in practice, the message list
-        # grows monotonically during a session
-        new_messages = messages[existing_count:] if existing_count < len(messages) else []
+        new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
             return
 
         estimates = [count_message_tokens(m) for m in new_messages]
         self._store.append_batch(self._session_id, new_messages, estimates)
+        self._ingest_cursor = n
         logger.debug("Ingested %d messages into LCM store", len(new_messages))
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
@@ -355,7 +381,16 @@ class LCMEngine(ContextEngine):
         if max_depth == 0:
             return  # condensation disabled
 
-        for depth in range(max_depth if max_depth > 0 else 10):
+        # When max_depth is -1 (unlimited), derive the upper bound from
+        # the deepest existing node + 1, so condensation can always
+        # create the next depth level.
+        if max_depth < 0:
+            all_nodes = self._dag.get_session_nodes(self._session_id)
+            upper = (max(n.depth for n in all_nodes) + 1) if all_nodes else 1
+        else:
+            upper = max_depth
+
+        for depth in range(upper):
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
