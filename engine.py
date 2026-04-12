@@ -211,6 +211,8 @@ class LCMEngine(ContextEngine):
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
+        self._ingest_cursor = 0
+        self._last_compacted_store_id = 0
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
         # Pick up context_length from kwargs if provided
@@ -241,6 +243,12 @@ class LCMEngine(ContextEngine):
                 self._dag.delete_session_nodes(self._session_id)
             else:
                 self._dag.delete_below_depth(self._session_id, retain)
+
+    def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
+        """Move retained summaries from the old session into the new one."""
+        if not old_session_id or not new_session_id or old_session_id == new_session_id:
+            return 0
+        return self._dag.reassign_session_nodes(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND]
@@ -312,30 +320,30 @@ class LCMEngine(ContextEngine):
         logger.debug("Ingested %d messages into LCM store", len(new_messages))
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
-        """Map message list back to store_ids via content matching.
+        """Map current raw messages back to store_ids in stable store order.
 
-        Uses (role, content) to match against stored messages.  Robust
-        across compaction cycles — synthetic summary messages that aren't
-        in the store are silently skipped.
+        Matching starts strictly after ``_last_compacted_store_id`` so repeated
+        content from older already-compacted history cannot hijack the mapping.
+        Synthetic summary messages simply fail to match and are skipped.
         """
-        from collections import defaultdict
+        candidates = [
+            stored for stored in self._store.get_session_messages(self._session_id)
+            if stored["store_id"] > self._last_compacted_store_id
+        ]
 
-        all_stored = self._store.get_session_messages(self._session_id)
-        # Build ordered lookup: (role, content) → [store_id, ...]
-        lookup: dict[tuple, list[int]] = defaultdict(list)
-        for s in all_stored:
-            key = (s.get("role", ""), s.get("content") or "")
-            lookup[key].append(s["store_id"])
-
-        ids = []
-        consumed: set[int] = set()
+        ids: list[int] = []
+        store_idx = 0
         for msg in messages:
-            key = (msg.get("role", ""), msg.get("content") or "")
-            for sid in lookup.get(key, []):
-                if sid not in consumed:
-                    ids.append(sid)
-                    consumed.add(sid)
+            role = msg.get("role", "")
+            content = msg.get("content") or ""
+            probe_idx = store_idx
+            while probe_idx < len(candidates):
+                stored = candidates[probe_idx]
+                if stored.get("role", "") == role and (stored.get("content") or "") == content:
+                    ids.append(stored["store_id"])
+                    store_idx = probe_idx + 1
                     break
+                probe_idx += 1
 
         return ids
 

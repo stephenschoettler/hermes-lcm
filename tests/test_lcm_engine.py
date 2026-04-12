@@ -290,6 +290,32 @@ class TestStoreIdMapping:
         finally:
             esc._call_llm_for_summary = original_fn
 
+    def test_repeated_content_maps_to_later_store_rows(self, engine):
+        import hermes_lcm.escalation as esc
+        original_fn = esc._call_llm_for_summary
+        esc._call_llm_for_summary = self._mock_summarize
+        try:
+            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+            for _ in range(20):
+                messages.append({"role": "user", "content": "repeat"})
+                messages.append({"role": "assistant", "content": "same"})
+
+            compressed = engine.compress(messages)
+            first_node = engine._dag.get_session_nodes("test-session")[0]
+            first_max = max(first_node.source_ids)
+
+            for _ in range(15):
+                compressed.append({"role": "user", "content": "repeat"})
+                compressed.append({"role": "assistant", "content": "same"})
+
+            engine.compress(compressed)
+            nodes = engine._dag.get_session_nodes("test-session")
+            second_node = nodes[1]
+            assert second_node.source_ids
+            assert all(store_id > first_max for store_id in second_node.source_ids)
+        finally:
+            esc._call_llm_for_summary = original_fn
+
 
 class TestSessionRetainDepth:
     """Tests for issue #2a — new_session_retain_depth wiring."""
@@ -341,6 +367,27 @@ class TestSessionRetainDepth:
             ))
         engine.on_session_reset()
         assert len(engine._dag.get_session_nodes("test-session")) == 3
+
+    def test_carry_over_moves_retained_nodes_into_new_session(self, engine):
+        engine._config.new_session_retain_depth = 2
+        import time
+        for depth in range(4):
+            engine._dag.add_node(SummaryNode(
+                session_id="old-session", depth=depth,
+                summary=f"d{depth} summary", token_count=100,
+                source_token_count=500, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            ))
+
+        engine._session_id = "old-session"
+        engine.on_session_reset()
+        moved = engine.carry_over_new_session_context("old-session", "new-session")
+
+        assert moved == 2
+        assert engine._dag.get_session_nodes("old-session") == []
+        new_nodes = engine._dag.get_session_nodes("new-session")
+        assert len(new_nodes) == 2
+        assert all(node.depth >= 2 for node in new_nodes)
 
 
 class TestUnlimitedCondensationDepth:

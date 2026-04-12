@@ -106,7 +106,7 @@ class SummaryDAG:
     def delete_below_depth(self, session_id: str, min_depth: int) -> int:
         """Delete all nodes for a session with depth < min_depth.
 
-        Returns the number of deleted nodes.  Used during session reset
+        Returns the number of deleted nodes. Used during session reset
         to retain only high-level summaries across sessions.
         """
         cur = self._conn.execute(
@@ -129,6 +129,21 @@ class SummaryDAG:
         if deleted:
             self._conn.commit()
         return deleted
+
+    def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:
+        """Move all nodes from one session_id to another.
+
+        Used for /new carry-over where retained summaries should become part of
+        the fresh session while preserving node IDs and node-to-node links.
+        """
+        cur = self._conn.execute(
+            "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
+            (new_session_id, old_session_id),
+        )
+        moved = cur.rowcount
+        if moved:
+            self._conn.commit()
+        return moved
 
     # -- Read ---------------------------------------------------------------
 
