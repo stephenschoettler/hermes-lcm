@@ -54,6 +54,7 @@ into anything that was compacted.
 - **3-level escalation** — L1 detailed → L2 bullets → L3 deterministic truncate (guaranteed convergence)
 - **Agent tools** — `lcm_grep`, `lcm_describe`, `lcm_expand`, `lcm_expand_query` for structured retrieval
 - **Current-turn search** — live messages ingested before tool execution
+- **Session filtering** — exclude noisy sessions entirely or mark them read-only with glob patterns
 - **Profile-scoped** — separate DB per Hermes profile
 
 ## Requirements
@@ -111,12 +112,25 @@ Environment variables (all optional):
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of context window triggering compaction |
 | `LCM_INCREMENTAL_MAX_DEPTH` | `1` | Max condensation depth (`0` = disabled, `-1` = unlimited) |
 | `LCM_CONDENSATION_FANIN` | `4` | Same-depth nodes needed to trigger condensation |
+| `LCM_IGNORE_SESSION_PATTERNS` | *(empty)* | Comma-separated glob patterns for sessions to exclude from LCM storage entirely |
+| `LCM_STATELESS_SESSION_PATTERNS` | *(empty)* | Comma-separated glob patterns for sessions that stay read-only (`platform:session_id` matching supported) |
 | `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization |
 | `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after `/new` (`-1` = all, `0` = none, `2` = keep d2+) |
+
+Pattern syntax matches `lossless-claw`:
+- `*` matches within one colon-delimited segment
+- `**` can span across colons
+
+Hermes currently matches each pattern against multiple candidate keys for flexibility:
+- raw `session_id`
+- `platform`
+- `platform:session_id`
+
+That means patterns like `cron:*` can catch Hermes cron sessions today, while plain raw session-id matching still works if you know the exact IDs you want to target.
 
 ## Agent Tools
 
@@ -150,7 +164,7 @@ hermes-lcm/
 ├── tokens.py        # tiktoken with char-based fallback
 ├── schemas.py       # tool schemas (what the LLM sees)
 ├── tools.py         # tool handlers (lcm_grep, lcm_describe, lcm_expand, lcm_expand_query)
-└── tests/           # 54 tests
+└── tests/           # 59 tests
 ```
 
 **Running tests:**

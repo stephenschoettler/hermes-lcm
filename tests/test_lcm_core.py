@@ -8,6 +8,12 @@ from hermes_lcm.tokens import count_tokens, count_message_tokens, count_messages
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.escalation import _deterministic_truncate
+from hermes_lcm.session_patterns import (
+    build_session_match_keys,
+    compile_session_pattern,
+    compile_session_patterns,
+    matches_session_pattern,
+)
 
 
 class TestConfig:
@@ -17,6 +23,10 @@ class TestConfig:
         assert c.leaf_chunk_tokens == 20_000
         assert c.context_threshold == 0.75
         assert c.condensation_fanin == 4
+        assert c.ignore_session_patterns == []
+        assert c.stateless_session_patterns == []
+        assert c.ignore_session_patterns_source == "default"
+        assert c.stateless_session_patterns_source == "default"
         assert c.summary_model == ""
         assert c.expansion_model == ""
         assert c.summary_timeout_ms == 60_000
@@ -25,15 +35,53 @@ class TestConfig:
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.80")
+        monkeypatch.setenv("LCM_IGNORE_SESSION_PATTERNS", "cron:*,subagent:**")
+        monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "telegram:*, cli:debug")
         monkeypatch.setenv("LCM_EXPANSION_MODEL", "openai/gpt-5.4-mini")
         monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
         assert c.context_threshold == 0.80
+        assert c.ignore_session_patterns == ["cron:*", "subagent:**"]
+        assert c.stateless_session_patterns == ["telegram:*", "cli:debug"]
+        assert c.ignore_session_patterns_source == "env"
+        assert c.stateless_session_patterns_source == "env"
         assert c.expansion_model == "openai/gpt-5.4-mini"
         assert c.summary_timeout_ms == 45_000
         assert c.expansion_timeout_ms == 90_000
+
+
+class TestSessionPatterns:
+    def test_compile_pattern_wildcards(self):
+        base_cron = compile_session_pattern("cron:*")
+        deep_cron = compile_session_pattern("cron:**")
+
+        assert base_cron.match("cron:job-123")
+        assert not base_cron.match("cron:nightly:run-1")
+        assert deep_cron.match("cron:nightly:run-1")
+
+    def test_build_session_match_keys(self):
+        assert build_session_match_keys("sess-123", platform="cron") == [
+            "sess-123",
+            "cron",
+            "cron:sess-123",
+        ]
+
+    def test_matches_any_compiled_pattern(self):
+        patterns = compile_session_patterns(["cron:**", "telegram:*"])
+        assert matches_session_pattern(
+            build_session_match_keys("cron_123", platform="cron"),
+            patterns,
+        )
+        assert matches_session_pattern(
+            build_session_match_keys("debug", platform="telegram"),
+            patterns,
+        )
+        assert not matches_session_pattern(
+            build_session_match_keys("sess-123", platform="cli"),
+            patterns,
+        )
 
 
 class TestTokens:

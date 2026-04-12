@@ -16,6 +16,11 @@ from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
 from .schemas import LCM_DESCRIBE, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_GREP
+from .session_patterns import (
+    build_session_match_keys,
+    compile_session_patterns,
+    matches_session_pattern,
+)
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -54,6 +59,16 @@ class LCMEngine(ContextEngine):
         self._dag = SummaryDAG(db_path)
 
         self._session_id: str = ""
+        self._session_platform: str = ""
+        self._session_match_keys: list[str] = []
+        self._session_ignored = False
+        self._session_stateless = False
+        self._compiled_ignore_session_patterns = compile_session_patterns(
+            self._config.ignore_session_patterns
+        )
+        self._compiled_stateless_session_patterns = compile_session_patterns(
+            self._config.stateless_session_patterns
+        )
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -97,6 +112,8 @@ class LCMEngine(ContextEngine):
         self.last_total_tokens = usage.get("total_tokens", 0)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
+        if self._session_ignored or self._session_stateless:
+            return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self.threshold_tokens <= 0:
             return False
@@ -104,6 +121,8 @@ class LCMEngine(ContextEngine):
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
+        if self._session_ignored or self._session_stateless:
+            return False
         if self._session_id and messages:
             try:
                 self._ingest_messages(messages)
@@ -125,6 +144,14 @@ class LCMEngine(ContextEngine):
         5. Assemble new active context: summaries + fresh tail
         """
         if not messages:
+            return messages
+
+        if self._session_ignored or self._session_stateless:
+            logger.debug(
+                "LCM compress bypassed for %s session %s",
+                "ignored" if self._session_ignored else "stateless",
+                self._session_id or "(unknown)",
+            )
             return messages
 
         prompt_tokens = current_tokens or self.last_prompt_tokens
@@ -212,8 +239,10 @@ class LCMEngine(ContextEngine):
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
+        self._session_platform = str(kwargs.get("platform") or "")
         self._ingest_cursor = 0
         self._last_compacted_store_id = 0
+        self._refresh_session_filters()
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
         # Pick up context_length from kwargs if provided
@@ -222,6 +251,7 @@ class LCMEngine(ContextEngine):
             self.threshold_tokens = int(
                 self.context_length * self._config.context_threshold
             )
+        self._log_session_filter_diagnostics()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         # Ensure all messages are persisted
@@ -249,6 +279,12 @@ class LCMEngine(ContextEngine):
         """Move retained summaries from the old session into the new one."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
+        if self._session_ignored and new_session_id == self._session_id:
+            logger.debug(
+                "LCM carry-over skipped for ignored session %s",
+                new_session_id,
+            )
+            return 0
         return self._dag.reassign_session_nodes(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -257,8 +293,8 @@ class LCMEngine(ContextEngine):
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
-        
-        if messages and self._session_id:
+
+        if messages and self._session_id and not (self._session_ignored or self._session_stateless):
             try:
                 self._ingest_messages(messages)
             except Exception as e:
@@ -281,6 +317,13 @@ class LCMEngine(ContextEngine):
             status["engine"] = "lcm"
             status["store_messages"] = self._store.get_session_count(self._session_id)
             status["dag_nodes"] = len(self._dag.get_session_nodes(self._session_id))
+            status["session_platform"] = self._session_platform
+            status["session_ignored"] = self._session_ignored
+            status["session_stateless"] = self._session_stateless
+            status["ignore_session_patterns"] = list(self._config.ignore_session_patterns)
+            status["stateless_session_patterns"] = list(self._config.stateless_session_patterns)
+            status["ignore_session_patterns_source"] = self._config.ignore_session_patterns_source
+            status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
         return status
 
     def update_model(self, model: str, context_length: int,
@@ -288,6 +331,49 @@ class LCMEngine(ContextEngine):
                      provider: str = "") -> None:
         self.context_length = context_length
         self.threshold_tokens = int(context_length * self._config.context_threshold)
+
+    def _refresh_session_filters(self) -> None:
+        self._session_match_keys = build_session_match_keys(
+            self._session_id,
+            platform=self._session_platform,
+        )
+        self._session_ignored = matches_session_pattern(
+            self._session_match_keys,
+            self._compiled_ignore_session_patterns,
+        )
+        self._session_stateless = (
+            not self._session_ignored
+            and matches_session_pattern(
+                self._session_match_keys,
+                self._compiled_stateless_session_patterns,
+            )
+        )
+
+    def _log_session_filter_diagnostics(self) -> None:
+        if self._config.ignore_session_patterns:
+            logger.info(
+                "LCM ignore_session_patterns from %s: %s",
+                self._config.ignore_session_patterns_source,
+                ", ".join(self._config.ignore_session_patterns),
+            )
+        if self._config.stateless_session_patterns:
+            logger.info(
+                "LCM stateless_session_patterns from %s: %s",
+                self._config.stateless_session_patterns_source,
+                ", ".join(self._config.stateless_session_patterns),
+            )
+        if self._session_ignored:
+            logger.info(
+                "LCM session %s matched ignore_session_patterns via %s — skipping writes and compaction",
+                self._session_id,
+                ", ".join(self._session_match_keys),
+            )
+        elif self._session_stateless:
+            logger.info(
+                "LCM session %s matched stateless_session_patterns via %s — read-only mode (no LCM writes)",
+                self._session_id,
+                ", ".join(self._session_match_keys),
+            )
 
     # -- Internal: message ingestion ---------------------------------------
 
@@ -302,6 +388,14 @@ class LCMEngine(ContextEngine):
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
+            return
+
+        if self._session_ignored or self._session_stateless:
+            logger.debug(
+                "Ingest skipped for %s session %s",
+                "ignored" if self._session_ignored else "stateless",
+                self._session_id,
+            )
             return
 
         n = len(messages)

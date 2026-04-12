@@ -81,9 +81,97 @@ class TestEngineABC:
             messages.append({"role": "user", "content": f"Question {i}: " + "x" * 200})
             messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
 
-        engine.compress(messages, focus_topic="database schema")
+        engine.compress(messages, focus_topic="database migrations")
 
-        assert captured["focus_topic"] == "database schema"
+        assert captured["focus_topic"] == "database migrations"
+
+
+class TestSessionFiltering:
+    def test_on_session_start_marks_ignored_session_and_reports_status(self, tmp_path, caplog):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_ignore.db"),
+            ignore_session_patterns=["cron:*"],
+            ignore_session_patterns_source="env",
+        )
+        instance = LCMEngine(config=config)
+
+        with caplog.at_level("INFO", logger="hermes_lcm.engine"):
+            instance.on_session_start("cron_123", platform="cron", context_length=1000)
+
+        status = instance.get_status()
+        assert status["session_ignored"] is True
+        assert status["session_stateless"] is False
+        assert status["ignore_session_patterns"] == ["cron:*"]
+        assert status["ignore_session_patterns_source"] == "env"
+        assert "LCM ignore_session_patterns from env: cron:*" in caplog.text
+        assert "matched ignore_session_patterns" in caplog.text
+
+    def test_on_session_start_marks_stateless_session_and_reports_status(self, tmp_path, caplog):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_stateless.db"),
+            stateless_session_patterns=["telegram:*"],
+            stateless_session_patterns_source="env",
+        )
+        instance = LCMEngine(config=config)
+
+        with caplog.at_level("INFO", logger="hermes_lcm.engine"):
+            instance.on_session_start("debug", platform="telegram", context_length=1000)
+
+        status = instance.get_status()
+        assert status["session_ignored"] is False
+        assert status["session_stateless"] is True
+        assert status["stateless_session_patterns"] == ["telegram:*"]
+        assert status["stateless_session_patterns_source"] == "env"
+        assert "LCM stateless_session_patterns from env: telegram:*" in caplog.text
+        assert "matched stateless_session_patterns" in caplog.text
+
+    def test_ignored_session_does_not_write_to_store_or_compact(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_ignore_behavior.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("cron_123", platform="cron", context_length=1000)
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+            {"role": "user", "content": "again"},
+        ]
+
+        result = instance.compress(messages)
+
+        assert result == messages
+        assert instance._store.get_session_count("cron_123") == 0
+        assert instance._dag.get_session_nodes("cron_123") == []
+        assert instance.compression_count == 0
+
+    def test_stateless_session_does_not_write_to_store_or_compact(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_stateless_behavior.db"),
+            stateless_session_patterns=["telegram:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("debug", platform="telegram", context_length=1000)
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+            {"role": "user", "content": "again"},
+        ]
+
+        result = instance.compress(messages)
+
+        assert result == messages
+        assert instance._store.get_session_count("debug") == 0
+        assert instance._dag.get_session_nodes("debug") == []
+        assert instance.compression_count == 0
 
 
 class TestEngineIngest:

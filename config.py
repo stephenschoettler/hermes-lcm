@@ -3,6 +3,10 @@ import os
 from dataclasses import dataclass, field
 
 
+def _parse_pattern_list(raw: str) -> list[str]:
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 @dataclass
 class LCMConfig:
     """All tunables for the LCM engine."""
@@ -32,6 +36,15 @@ class LCMConfig:
     # Reserve this many tokens from the model context window before assembly
     # (0 = disabled). Effective cap becomes context_length - reserve_tokens_floor.
     reserve_tokens_floor: int = 0
+
+    # -- Session filtering ---
+    # Sessions to exclude from LCM storage entirely.
+    ignore_session_patterns: list[str] = field(default_factory=list)
+    # Sessions that may read carried-over LCM state but never write new data.
+    stateless_session_patterns: list[str] = field(default_factory=list)
+    # Diagnostics: where each pattern list came from.
+    ignore_session_patterns_source: str = "default"
+    stateless_session_patterns_source: str = "default"
 
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
@@ -71,5 +84,15 @@ class LCMConfig:
         c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
         c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)
+
+        raw_ignore = os.environ.get("LCM_IGNORE_SESSION_PATTERNS")
+        if raw_ignore is not None:
+            c.ignore_session_patterns = _parse_pattern_list(raw_ignore)
+            c.ignore_session_patterns_source = "env"
+
+        raw_stateless = os.environ.get("LCM_STATELESS_SESSION_PATTERNS")
+        if raw_stateless is not None:
+            c.stateless_session_patterns = _parse_pattern_list(raw_stateless)
+            c.stateless_session_patterns_source = "env"
 
         return c
