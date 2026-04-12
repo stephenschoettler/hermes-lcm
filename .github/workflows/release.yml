@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "${{ github.ref_name }}" ]; then
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            echo "Initial release." >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            git log --pretty=format:"- %s (%h)" "$PREV_TAG".."${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          generate_release_notes: false
