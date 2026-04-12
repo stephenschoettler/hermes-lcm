@@ -7,6 +7,7 @@ Level 3 (Fallback):   Deterministic truncation — no LLM, guaranteed convergenc
 Each level checks if Tokens(summary) < Tokens(source). If not, escalates.
 """
 
+import inspect
 import logging
 from typing import List, Optional
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 def _call_llm_for_summary(prompt: str, max_tokens: int,
-                           model: str = "") -> Optional[str]:
+                           model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
     try:
         from agent.auxiliary_client import call_llm
@@ -28,6 +29,8 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
         }
         if model:
             call_kwargs["model"] = model
+        if timeout is not None:
+            call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
         content = response.choices[0].message.content
         if not isinstance(content, str):
@@ -36,6 +39,20 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
     except Exception as e:
         logger.warning("LLM summarization failed: %s", e)
         return None
+
+
+def _invoke_summary_llm(prompt: str, max_tokens: int, model: str = "", timeout: float | None = None) -> Optional[str]:
+    kwargs = {"model": model} if model else {}
+    if timeout is not None:
+        try:
+            sig = inspect.signature(_call_llm_for_summary)
+            if "timeout" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                kwargs["timeout"] = timeout
+        except Exception:
+            pass
+    return _call_llm_for_summary(prompt, max_tokens, **kwargs)
 
 
 def _build_l1_prompt(text: str, token_budget: int, depth: int, focus_topic: str = "") -> str:
@@ -110,6 +127,7 @@ def summarize_with_escalation(
     token_budget: int,
     depth: int = 0,
     model: str = "",
+    timeout: float | None = None,
     l2_budget_ratio: float = 0.50,
     l3_truncate_tokens: int = 512,
     focus_topic: str = "",
@@ -121,7 +139,7 @@ def summarize_with_escalation(
     """
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(text, token_budget, depth, focus_topic=focus_topic)
-    l1_result = _call_llm_for_summary(l1_prompt, token_budget * 2, model=model)
+    l1_result = _invoke_summary_llm(l1_prompt, token_budget * 2, model=model, timeout=timeout)
 
     if l1_result and count_tokens(l1_result) < source_tokens:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
@@ -130,7 +148,7 @@ def summarize_with_escalation(
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
     l2_prompt = _build_l2_prompt(text, l2_budget, focus_topic=focus_topic)
-    l2_result = _call_llm_for_summary(l2_prompt, l2_budget * 2, model=model)
+    l2_result = _invoke_summary_llm(l2_prompt, l2_budget * 2, model=model, timeout=timeout)
 
     if l2_result and count_tokens(l2_result) < source_tokens:
         logger.debug("L2 summarization succeeded (%d tokens)", count_tokens(l2_result))

@@ -71,3 +71,41 @@ LCM_EXPAND = {
         "required": ["node_id"],
     },
 }
+
+LCM_EXPAND_QUERY = {
+    "name": "lcm_expand_query",
+    "description": (
+        "Answer a natural-language question using expanded LCM context. Provide a prompt, and either "
+        "query matching summaries to expand or explicit node_ids to inspect. Uses the expansion path "
+        "instead of the summarization path so retrieval/synthesis can use a different model or timeout."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The question or task to answer from expanded LCM context",
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional search query used to find candidate summaries before expansion",
+            },
+            "node_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Optional explicit summary node IDs to expand instead of searching",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Max candidate summaries to expand when using query (default 5)",
+                "default": 5,
+            },
+            "max_tokens": {
+                "type": "integer",
+                "description": "Max answer tokens for synthesis (default 2000)",
+                "default": 2000,
+            },
+        },
+        "required": ["prompt"],
+    },
+}

@@ -17,13 +17,23 @@ class TestConfig:
         assert c.leaf_chunk_tokens == 20_000
         assert c.context_threshold == 0.75
         assert c.condensation_fanin == 4
+        assert c.summary_model == ""
+        assert c.expansion_model == ""
+        assert c.summary_timeout_ms == 60_000
+        assert c.expansion_timeout_ms == 120_000
 
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.80")
+        monkeypatch.setenv("LCM_EXPANSION_MODEL", "openai/gpt-5.4-mini")
+        monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
+        monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
         assert c.context_threshold == 0.80
+        assert c.expansion_model == "openai/gpt-5.4-mini"
+        assert c.summary_timeout_ms == 45_000
+        assert c.expansion_timeout_ms == 90_000
 
 
 class TestTokens:

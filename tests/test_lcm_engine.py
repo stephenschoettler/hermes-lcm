@@ -37,6 +37,7 @@ class TestEngineABC:
         assert "lcm_grep" in names
         assert "lcm_describe" in names
         assert "lcm_expand" in names
+        assert "lcm_expand_query" in names
 
     def test_should_compress(self, engine):
         assert not engine.should_compress(1000)
@@ -428,19 +429,22 @@ class TestUnlimitedCondensationDepth:
 
 
 class TestConfigCleanup:
-    """Tests for issue #2c — removed config options."""
+    """Tests for issue #2c follow-up — expansion path is now separate from summary-only config."""
 
-    def test_no_expansion_model(self):
+    def test_has_expansion_model(self):
         config = LCMConfig()
-        assert not hasattr(config, "expansion_model")
+        assert hasattr(config, "expansion_model")
+        assert config.expansion_model == ""
 
-    def test_no_summary_timeout(self):
+    def test_has_summary_timeout_ms(self):
         config = LCMConfig()
-        assert not hasattr(config, "summary_timeout_ms")
+        assert hasattr(config, "summary_timeout_ms")
+        assert config.summary_timeout_ms == 60_000
 
-    def test_no_delegation_timeout(self):
+    def test_has_expansion_timeout_ms(self):
         config = LCMConfig()
-        assert not hasattr(config, "delegation_timeout_ms")
+        assert hasattr(config, "expansion_timeout_ms")
+        assert config.expansion_timeout_ms == 120_000
 
 
 class TestAssemblyGuardrails:
@@ -663,6 +667,55 @@ class TestEngineTools:
         assert result_b["total_results"] == 1
         assert "alpha" in result_a["results"][0]["snippet"]
         assert "beta" in result_b["results"][0]["snippet"]
+
+    def test_handle_expand_query_requires_prompt(self, engine):
+        result = json.loads(engine.handle_tool_call("lcm_expand_query", {"query": "docker"}))
+        assert "error" in result
+        assert "prompt" in result["error"]
+
+    def test_handle_expand_query_uses_expansion_model(self, engine, monkeypatch):
+        engine._config.expansion_model = "expansion-model-x"
+        engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Docker rollout summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        seen = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            seen["prompt"] = prompt
+            seen["context_blocks"] = context_blocks
+            seen["model"] = model
+            seen["max_tokens"] = max_tokens
+            seen["timeout"] = timeout
+            return "Expansion answer"
+
+        monkeypatch.setattr("hermes_lcm.tools._synthesize_expansion_answer", fake_synthesize)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?", "max_tokens": 500},
+            )
+        )
+
+        assert result["answer"] == "Expansion answer"
+        assert result["model"] == "expansion-model-x"
+        assert result["node_ids"] == [node_id]
+        assert seen["model"] == "expansion-model-x"
+        assert seen["timeout"] == engine._config.expansion_timeout_ms / 1000
+        assert seen["max_tokens"] == 500
+        assert seen["prompt"] == "What was the plan?"
+        assert seen["context_blocks"]
 
     def test_describe_and_expand_are_session_scoped(self, engine):
         node_id = engine._dag.add_node(

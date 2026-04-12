@@ -24,6 +24,123 @@ def _get_session_node(engine: "LCMEngine", node_id: int):
     return node
 
 
+def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
+    from .tokens import count_tokens
+
+    messages = []
+    budget_used = 0
+    for store_id in node.source_ids:
+        stored = engine._store.get(store_id)
+        if not stored or stored.get("session_id") != engine._session_id:
+            continue
+        content = stored.get("content", "")
+        msg_tokens = count_tokens(content)
+        if budget_used + msg_tokens > max_tokens and messages:
+            messages.append(
+                {
+                    "note": f"Truncated — {len(node.source_ids) - len(messages)} more messages available",
+                }
+            )
+            break
+        messages.append(
+            {
+                "store_id": stored["store_id"],
+                "role": stored["role"],
+                "content": content[:2000] if len(content) > 2000 else content,
+            }
+        )
+        budget_used += msg_tokens
+    return messages
+
+
+def _expand_child_nodes(engine: "LCMEngine", node) -> list[dict[str, Any]]:
+    children = [child for child in engine._dag.get_source_nodes(node) if child.session_id == engine._session_id]
+    return [
+        {
+            "node_id": child.node_id,
+            "depth": child.depth,
+            "summary": child.summary[:1000],
+            "token_count": child.token_count,
+            "expand_hint": child.expand_hint,
+        }
+        for child in children
+    ]
+
+
+def _collect_context_blocks_for_node(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "summary",
+            "node_id": node.node_id,
+            "depth": node.depth,
+            "summary": node.summary,
+            "expand_hint": node.expand_hint,
+            "token_count": node.token_count,
+        }
+    ]
+
+    if node.source_type == "messages":
+        messages = _expand_message_sources(engine, node, max_tokens=max_tokens)
+        if messages:
+            blocks.append(
+                {
+                    "type": "messages",
+                    "node_id": node.node_id,
+                    "messages": messages,
+                }
+            )
+    elif node.source_type == "nodes":
+        children = _expand_child_nodes(engine, node)
+        if children:
+            blocks.append(
+                {
+                    "type": "child_nodes",
+                    "node_id": node.node_id,
+                    "children": children,
+                }
+            )
+
+    return blocks
+
+
+def _synthesize_expansion_answer(
+    *,
+    prompt: str,
+    context_blocks: list[dict[str, Any]],
+    model: str,
+    max_tokens: int,
+    timeout: float,
+) -> str:
+    from agent.auxiliary_client import call_llm
+
+    system_prompt = (
+        "You answer questions using expanded LCM retrieval context. "
+        "Be concise, factual, and grounded in the provided context. "
+        "If the context is insufficient, say so plainly."
+    )
+    user_prompt = (
+        f"QUESTION:\n{prompt}\n\n"
+        "EXPANDED CONTEXT:\n"
+        f"{json.dumps(context_blocks, ensure_ascii=False, indent=2)}"
+    )
+    call_kwargs = {
+        "task": "compression",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_tokens,
+        "timeout": timeout,
+    }
+    if model:
+        call_kwargs["model"] = model
+    response = call_llm(**call_kwargs)
+    content = response.choices[0].message.content
+    if not isinstance(content, str):
+        content = str(content) if content else ""
+    return content.strip()
+
+
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     """Search across the full DAG and raw messages for the current session."""
     engine = _require_engine(kwargs)
@@ -132,32 +249,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     max_tokens = args.get("max_tokens", 4000)
 
     if node.source_type == "messages":
-        from .tokens import count_tokens
-
-        messages = []
-        budget_used = 0
-        for store_id in node.source_ids:
-            stored = engine._store.get(store_id)
-            if not stored or stored.get("session_id") != engine._session_id:
-                continue
-            content = stored.get("content", "")
-            msg_tokens = count_tokens(content)
-            if budget_used + msg_tokens > max_tokens and messages:
-                messages.append(
-                    {
-                        "note": f"Truncated — {len(node.source_ids) - len(messages)} more messages available",
-                    }
-                )
-                break
-            messages.append(
-                {
-                    "store_id": stored["store_id"],
-                    "role": stored["role"],
-                    "content": content[:2000] if len(content) > 2000 else content,
-                }
-            )
-            budget_used += msg_tokens
-
+        messages = _expand_message_sources(engine, node, max_tokens=max_tokens)
         return json.dumps(
             {
                 "node_id": node_id,
@@ -168,23 +260,85 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         )
 
     if node.source_type == "nodes":
-        children = [child for child in engine._dag.get_source_nodes(node) if child.session_id == engine._session_id]
+        children = _expand_child_nodes(engine, node)
         return json.dumps(
             {
                 "node_id": node_id,
                 "depth": node.depth,
                 "source_type": "nodes",
-                "expanded": [
-                    {
-                        "node_id": child.node_id,
-                        "depth": child.depth,
-                        "summary": child.summary[:1000],
-                        "token_count": child.token_count,
-                        "expand_hint": child.expand_hint,
-                    }
-                    for child in children
-                ],
+                "expanded": children,
             }
         )
 
     return json.dumps({"error": f"Unknown source_type: {node.source_type}"})
+
+
+def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
+    """Answer a question by expanding matching summaries or explicit node ids."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return json.dumps({"error": "prompt is required"})
+
+    max_tokens = int(args.get("max_tokens", 2000))
+    max_results = int(args.get("max_results", 5))
+    query = str(args.get("query") or "").strip()
+    raw_node_ids = args.get("node_ids") or []
+
+    nodes = []
+    if raw_node_ids:
+        for node_id in raw_node_ids:
+            node = _get_session_node(engine, int(node_id))
+            if node is not None:
+                nodes.append(node)
+    elif query:
+        nodes = engine._dag.search(query, session_id=engine._session_id, limit=max_results)
+    else:
+        return json.dumps({"error": "Provide either query or node_ids"})
+
+    if not nodes:
+        return json.dumps(
+            {
+                "prompt": prompt,
+                "query": query,
+                "answer": "No matching summaries found in the current session.",
+                "node_ids": [],
+                "matches": [],
+            }
+        )
+
+    context_blocks = []
+    for node in nodes[:max_results]:
+        context_blocks.extend(_collect_context_blocks_for_node(engine, node, max_tokens=max_tokens))
+
+    model = engine._config.expansion_model or engine._config.summary_model or ""
+    timeout = engine._config.expansion_timeout_ms / 1000
+    answer = _synthesize_expansion_answer(
+        prompt=prompt,
+        context_blocks=context_blocks,
+        model=model,
+        max_tokens=max_tokens,
+        timeout=timeout,
+    )
+
+    return json.dumps(
+        {
+            "prompt": prompt,
+            "query": query,
+            "answer": answer,
+            "model": model,
+            "node_ids": [node.node_id for node in nodes[:max_results]],
+            "matches": [
+                {
+                    "node_id": node.node_id,
+                    "depth": node.depth,
+                    "summary": node.summary[:300],
+                    "expand_hint": node.expand_hint,
+                }
+                for node in nodes[:max_results]
+            ],
+        }
+    )

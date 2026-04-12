@@ -52,7 +52,7 @@ into anything that was compacted.
 - **Immutable store** — every message persisted in SQLite, never modified
 - **Summary DAG** — hierarchical compaction (D0 minutes → D1 hours → D2 days)
 - **3-level escalation** — L1 detailed → L2 bullets → L3 deterministic truncate (guaranteed convergence)
-- **Agent tools** — `lcm_grep`, `lcm_describe`, `lcm_expand` for structured retrieval
+- **Agent tools** — `lcm_grep`, `lcm_describe`, `lcm_expand`, `lcm_expand_query` for structured retrieval
 - **Current-turn search** — live messages ingested before tool execution
 - **Profile-scoped** — separate DB per Hermes profile
 
@@ -94,7 +94,7 @@ Verify with `hermes plugins`:
 
 ```
 Plugins (1):
-  ✓ hermes-lcm v0.1.0 (3 tools, 0 hooks)
+  ✓ hermes-lcm v0.1.0 (4 tools, 0 hooks)
 
 Provider Plugins:
   Context Engine: lcm
@@ -112,6 +112,9 @@ Environment variables (all optional):
 | `LCM_INCREMENTAL_MAX_DEPTH` | `1` | Max condensation depth (`0` = disabled, `-1` = unlimited) |
 | `LCM_CONDENSATION_FANIN` | `4` | Same-depth nodes needed to trigger condensation |
 | `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization |
+| `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis |
+| `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
+| `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after `/new` (`-1` = all, `0` = none, `2` = keep d2+) |
 
@@ -122,6 +125,7 @@ Environment variables (all optional):
 | `lcm_grep` | Search raw messages AND summaries across all depths. FTS5 syntax. |
 | `lcm_describe` | Inspect DAG structure — token counts, children, expand hints. No node_id = session overview. |
 | `lcm_expand` | Recover original content from a summary node. Token-budgeted. |
+| `lcm_expand_query` | Answer a question from expanded LCM context using either a query or explicit node_ids. Uses the expansion path/model instead of the summarization path. |
 
 ## How It Works
 
@@ -130,7 +134,7 @@ Environment variables (all optional):
 3. **Condense** — when enough D0 nodes accumulate, they're condensed into D1 nodes (and so on up)
 4. **Escalate** — if a summary is too long, escalate: L1 detailed → L2 bullets → L3 deterministic truncate
 5. **Assemble** — active context = system prompt + highest-depth summaries + fresh tail
-6. **Retrieve** — agent uses `lcm_grep`/`lcm_describe`/`lcm_expand` to drill into compacted history
+6. **Retrieve** — agent uses `lcm_grep`/`lcm_describe`/`lcm_expand`/`lcm_expand_query` to drill into compacted history or synthesize answers from expanded context
 
 ## Architecture
 
@@ -145,8 +149,8 @@ hermes-lcm/
 ├── config.py        # LCMConfig + env var overrides
 ├── tokens.py        # tiktoken with char-based fallback
 ├── schemas.py       # tool schemas (what the LLM sees)
-├── tools.py         # tool handlers (lcm_grep, lcm_describe, lcm_expand)
-└── tests/           # 46 tests
+├── tools.py         # tool handlers (lcm_grep, lcm_describe, lcm_expand, lcm_expand_query)
+└── tests/           # 54 tests
 ```
 
 **Running tests:**

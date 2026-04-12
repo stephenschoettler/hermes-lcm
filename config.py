@@ -1,5 +1,4 @@
 """LCM configuration with defaults and env var overrides."""
-
 import os
 from dataclasses import dataclass, field
 
@@ -36,6 +35,11 @@ class LCMConfig:
 
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
+    expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
+
+    # -- Timeouts ---
+    summary_timeout_ms: int = 60_000
+    expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
     database_path: str = ""       # empty = auto (~/.hermes/lcm.db)
@@ -62,6 +66,9 @@ class LCMConfig:
         c.max_assembly_tokens = _int("LCM_MAX_ASSEMBLY_TOKENS", c.max_assembly_tokens)
         c.reserve_tokens_floor = _int("LCM_RESERVE_TOKENS_FLOOR", c.reserve_tokens_floor)
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
+        c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
+        c.summary_timeout_ms = _int("LCM_SUMMARY_TIMEOUT_MS", c.summary_timeout_ms)
+        c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
         c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)
 

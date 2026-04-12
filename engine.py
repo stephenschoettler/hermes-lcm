@@ -15,7 +15,7 @@ from agent.context_engine import ContextEngine
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
-from .schemas import LCM_DESCRIBE, LCM_EXPAND, LCM_GREP
+from .schemas import LCM_DESCRIBE, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_GREP
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -165,6 +165,7 @@ class LCMEngine(ContextEngine):
             token_budget=token_budget,
             depth=0,
             model=self._config.summary_model,
+            timeout=self._config.summary_timeout_ms / 1000,
             l2_budget_ratio=self._config.l2_budget_ratio,
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
@@ -251,7 +252,7 @@ class LCMEngine(ContextEngine):
         return self._dag.reassign_session_nodes(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND]
+        return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND, LCM_EXPAND_QUERY]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         # Ingest live messages if passed (enables current-turn search)
@@ -267,6 +268,7 @@ class LCMEngine(ContextEngine):
             "lcm_grep": lcm_tools.lcm_grep,
             "lcm_describe": lcm_tools.lcm_describe,
             "lcm_expand": lcm_tools.lcm_expand,
+            "lcm_expand_query": lcm_tools.lcm_expand_query,
         }
         handler = handlers.get(name)
         if handler:
@@ -423,6 +425,7 @@ class LCMEngine(ContextEngine):
                 token_budget=token_budget,
                 depth=depth + 1,
                 model=self._config.summary_model,
+                timeout=self._config.summary_timeout_ms / 1000,
                 l2_budget_ratio=self._config.l2_budget_ratio,
                 l3_truncate_tokens=self._config.l3_truncate_tokens,
                 focus_topic=focus_topic or "",
