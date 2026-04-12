@@ -27,6 +27,13 @@ class LCMConfig:
     # L3 deterministic truncate token limit
     l3_truncate_tokens: int = 512
 
+    # -- Assembly guardrails ---
+    # Hard cap for the assembled active context (0 = disabled)
+    max_assembly_tokens: int = 0
+    # Reserve this many tokens from the model context window before assembly
+    # (0 = disabled). Effective cap becomes context_length - reserve_tokens_floor.
+    reserve_tokens_floor: int = 0
+
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
 
@@ -50,6 +57,10 @@ class LCMConfig:
         c.context_threshold = _float("LCM_CONTEXT_THRESHOLD", c.context_threshold)
         c.incremental_max_depth = _int("LCM_INCREMENTAL_MAX_DEPTH", c.incremental_max_depth)
         c.condensation_fanin = _int("LCM_CONDENSATION_FANIN", c.condensation_fanin)
+        c.l2_budget_ratio = _float("LCM_L2_BUDGET_RATIO", c.l2_budget_ratio)
+        c.l3_truncate_tokens = _int("LCM_L3_TRUNCATE_TOKENS", c.l3_truncate_tokens)
+        c.max_assembly_tokens = _int("LCM_MAX_ASSEMBLY_TOKENS", c.max_assembly_tokens)
+        c.reserve_tokens_floor = _int("LCM_RESERVE_TOKENS_FLOOR", c.reserve_tokens_floor)
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
         c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)

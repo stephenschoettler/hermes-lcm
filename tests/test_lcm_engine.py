@@ -1,6 +1,8 @@
 """Integration tests for the LCM engine."""
 
 import json
+import logging
+import time
 import pytest
 
 from agent.context_engine import ContextEngine
@@ -439,6 +441,191 @@ class TestConfigCleanup:
     def test_no_delegation_timeout(self):
         config = LCMConfig()
         assert not hasattr(config, "delegation_timeout_ms")
+
+
+class TestAssemblyGuardrails:
+    def test_max_assembly_tokens_caps_recent_tail(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail.db"),
+            max_assembly_tokens=60,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        result = instance._assemble_context(
+            {"role": "system", "content": "s" * 10},
+            [
+                {"role": "user", "content": "a" * 20},
+                {"role": "assistant", "content": "b" * 20},
+                {"role": "user", "content": "c" * 20},
+            ],
+        )
+
+        assert [msg["content"] for msg in result[1:]] == ["b" * 20, "c" * 20]
+
+    def test_reserve_tokens_floor_caps_recent_tail(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_headroom.db"),
+            reserve_tokens_floor=40,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+        instance.context_length = 100
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        result = instance._assemble_context(
+            {"role": "system", "content": "s" * 10},
+            [
+                {"role": "user", "content": "a" * 20},
+                {"role": "assistant", "content": "b" * 20},
+                {"role": "user", "content": "c" * 20},
+            ],
+        )
+
+        assert [msg["content"] for msg in result[1:]] == ["b" * 20, "c" * 20]
+
+    def test_max_assembly_tokens_keeps_tail_contiguous_with_varied_sizes(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_varied.db"),
+            max_assembly_tokens=70,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        result = instance._assemble_context(
+            {"role": "system", "content": "s" * 10},
+            [
+                {"role": "user", "content": "a" * 10},
+                {"role": "assistant", "content": "b" * 45},
+                {"role": "user", "content": "c" * 20},
+            ],
+        )
+
+        assert [msg["content"] for msg in result[1:]] == ["c" * 20]
+
+    def test_summary_budget_keeps_summary_order_contiguous(self, tmp_path, monkeypatch):
+        import importlib
+        from hermes_lcm.dag import SummaryNode
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_summary.db"),
+            max_assembly_tokens=189,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        instance._dag.add_node(SummaryNode(
+            session_id="guardrail-session", depth=2,
+            summary="A" * 15, token_count=15,
+            source_token_count=100, source_ids=[],
+            source_type="messages", created_at=time.time(),
+        ))
+        instance._dag.add_node(SummaryNode(
+            session_id="guardrail-session", depth=1,
+            summary="B" * 120, token_count=120,
+            source_token_count=200, source_ids=[],
+            source_type="messages", created_at=time.time(),
+        ))
+        instance._dag.add_node(SummaryNode(
+            session_id="guardrail-session", depth=0,
+            summary="C" * 10, token_count=10,
+            source_token_count=80, source_ids=[],
+            source_type="messages", created_at=time.time(),
+        ))
+
+        result = instance._assemble_context(
+            {"role": "system", "content": "s" * 10},
+            [{"role": "user", "content": "tail" * 10}],
+        )
+
+        assert len(result) == 3
+        summary_blob = result[1]["content"]
+        assert "A" * 15 in summary_blob
+        assert "B" * 120 not in summary_blob
+        assert "C" * 10 not in summary_blob
+
+    def test_max_assembly_tokens_keeps_newest_tail_message_even_if_it_alone_exceeds_cap(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_newest.db"),
+            max_assembly_tokens=50,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        result = instance._assemble_context(
+            {"role": "system", "content": "s" * 10},
+            [
+                {"role": "user", "content": "a" * 20},
+                {"role": "assistant", "content": "b" * 60},
+            ],
+        )
+
+        assert [msg["content"] for msg in result[1:]] == ["b" * 60]
+
+    def test_reserve_tokens_floor_warns_when_misconfigured(self, tmp_path, caplog):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_guardrail_warn.db"),
+            reserve_tokens_floor=100,
+        )
+        instance = LCMEngine(config=config)
+        instance.context_length = 100
+
+        with caplog.at_level(logging.WARNING, logger="hermes_lcm.engine"):
+            assert instance._effective_assembly_token_cap() is None
+
+        assert "reserve_tokens_floor=100 disables reserve-based assembly cap" in caplog.text
 
 
 class TestEngineTools:
