@@ -64,9 +64,6 @@ class LCMEngine(ContextEngine):
         # genuinely new messages (appended after compaction) get ingested.
         self._ingest_cursor: int = 0
 
-        # Wire tool handlers
-        lcm_tools.set_engine(self)
-
         # State required by ContextEngine ABC and run_agent.py compatibility
         self.model = ""
         self.base_url = ""
@@ -263,7 +260,7 @@ class LCMEngine(ContextEngine):
         }
         handler = handlers.get(name)
         if handler:
-            return handler(args)
+            return handler(args, engine=self)
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
 
     def get_status(self) -> Dict[str, Any]:

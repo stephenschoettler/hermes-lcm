@@ -5,6 +5,7 @@ import pytest
 
 from agent.context_engine import ContextEngine
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 
 
@@ -387,3 +388,62 @@ class TestEngineTools:
     def test_handle_unknown_tool(self, engine):
         result = json.loads(engine.handle_tool_call("unknown_tool", {}))
         assert "error" in result
+
+    def test_tool_dispatch_is_bound_to_engine_instance(self, tmp_path):
+        config_a = LCMConfig(database_path=str(tmp_path / "a.db"))
+        config_b = LCMConfig(database_path=str(tmp_path / "b.db"))
+
+        engine_a = LCMEngine(config=config_a)
+        engine_a._session_id = "session-a"
+        engine_b = LCMEngine(config=config_b)
+        engine_b._session_id = "session-b"
+
+        engine_a._store.append("session-a", {"role": "user", "content": "alpha project"})
+        engine_b._store.append("session-b", {"role": "user", "content": "beta project"})
+
+        result_a = json.loads(engine_a.handle_tool_call("lcm_grep", {"query": "alpha"}))
+        result_b = json.loads(engine_b.handle_tool_call("lcm_grep", {"query": "beta"}))
+
+        assert result_a["total_results"] == 1
+        assert result_b["total_results"] == 1
+        assert "alpha" in result_a["results"][0]["snippet"]
+        assert "beta" in result_b["results"][0]["snippet"]
+
+    def test_describe_and_expand_are_session_scoped(self, engine):
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="session-a",
+                depth=0,
+                summary="secret summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        engine._session_id = "session-b"
+
+        describe = json.loads(engine.handle_tool_call("lcm_describe", {"node_id": node_id}))
+        expand = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+
+        assert "error" in describe
+        assert "error" in expand
+
+    def test_describe_overview_includes_sparse_high_depth_nodes(self, engine):
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=2,
+                summary="durable summary",
+                token_count=100,
+                source_token_count=500,
+                source_ids=[],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        overview = json.loads(engine.handle_tool_call("lcm_describe", {}))
+        assert "d2" in overview["depths"]
