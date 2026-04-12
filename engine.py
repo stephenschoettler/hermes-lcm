@@ -465,6 +465,23 @@ class LCMEngine(ContextEngine):
             )
         result.append(sys_msg)
 
+        assembly_cap = self._effective_assembly_token_cap()
+
+        tail_selected = tail_messages
+        tail_budget = None
+        if assembly_cap is not None:
+            used = count_message_tokens(sys_msg)
+            kept_tail_reversed: list[Dict[str, Any]] = []
+            tail_token_total = 0
+            for msg in reversed(tail_messages):
+                msg_tokens = count_message_tokens(msg)
+                if used + tail_token_total + msg_tokens > assembly_cap:
+                    continue
+                kept_tail_reversed.append(msg)
+                tail_token_total += msg_tokens
+            tail_selected = list(reversed(kept_tail_reversed))
+            tail_budget = max(0, assembly_cap - used - tail_token_total)
+
         # Collect DAG summaries — highest depth first for context hierarchy
         all_nodes = self._dag.get_session_nodes(self._session_id)
         if all_nodes:
@@ -488,16 +505,47 @@ class LCMEngine(ContextEngine):
                     )
 
             if summary_parts:
-                combined = "\n\n---\n\n".join(summary_parts)
                 # Choose role to avoid consecutive same-role
                 last_role = result[-1].get("role", "system")
                 summary_role = "assistant" if last_role != "assistant" else "user"
-                result.append({"role": summary_role, "content": combined})
+                selected_parts = summary_parts
+                if tail_budget is not None:
+                    selected_parts = []
+                    for part in summary_parts:
+                        candidate = "\n\n---\n\n".join(selected_parts + [part])
+                        candidate_msg = {"role": summary_role, "content": candidate}
+                        if count_message_tokens(candidate_msg) <= tail_budget:
+                            selected_parts.append(part)
+                if selected_parts:
+                    combined = "\n\n---\n\n".join(selected_parts)
+                    result.append({"role": summary_role, "content": combined})
 
         # Fresh tail
-        result.extend(tail_messages)
+        result.extend(tail_selected)
 
         return result
+
+    def _effective_assembly_token_cap(self) -> Optional[int]:
+        """Return the active assembly cap, if any.
+
+        Two knobs can constrain the assembled active context:
+        - max_assembly_tokens: explicit hard cap
+        - reserve_tokens_floor: keep headroom inside context_length
+        """
+        caps: list[int] = []
+
+        if self._config.max_assembly_tokens > 0:
+            caps.append(self._config.max_assembly_tokens)
+
+        if self.context_length > 0 and self._config.reserve_tokens_floor > 0:
+            reserve_cap = self.context_length - self._config.reserve_tokens_floor
+            if reserve_cap > 0:
+                caps.append(reserve_cap)
+
+        if not caps:
+            return None
+
+        return max(1, min(caps))
 
     # -- Internal: helpers -------------------------------------------------
 

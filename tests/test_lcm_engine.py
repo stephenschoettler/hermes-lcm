@@ -372,6 +372,69 @@ class TestConfigCleanup:
         assert not hasattr(config, "delegation_timeout_ms")
 
 
+class TestAssemblyGuardrails:
+    def test_max_assembly_tokens_caps_recent_tail(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail.db"),
+            max_assembly_tokens=60,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        result = instance._assemble_context(
+            {"role": "system", "content": "s" * 10},
+            [
+                {"role": "user", "content": "a" * 20},
+                {"role": "assistant", "content": "b" * 20},
+                {"role": "user", "content": "c" * 20},
+            ],
+        )
+
+        assert [msg["content"] for msg in result[1:]] == ["b" * 20, "c" * 20]
+
+    def test_reserve_tokens_floor_caps_recent_tail(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_headroom.db"),
+            reserve_tokens_floor=40,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+        instance.context_length = 100
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        result = instance._assemble_context(
+            {"role": "system", "content": "s" * 10},
+            [
+                {"role": "user", "content": "a" * 20},
+                {"role": "assistant", "content": "b" * 20},
+                {"role": "user", "content": "c" * 20},
+            ],
+        )
+
+        assert [msg["content"] for msg in result[1:]] == ["b" * 20, "c" * 20]
+
+
 class TestEngineTools:
     def test_handle_grep(self, engine):
         # Add some data
