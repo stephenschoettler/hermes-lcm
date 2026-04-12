@@ -221,6 +221,54 @@ class TestPostCompactionIngestion:
             esc._call_llm_for_summary = original_fn
 
 
+class TestStoreIdMapping:
+    """Regression test — _get_store_ids_for_messages must use content
+    matching, not position, so source_ids stay correct after compaction."""
+
+    def _make_long_conversation(self, n_turns=20):
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(n_turns):
+            messages.append({"role": "user", "content": f"Question {i}: " + "x" * 200})
+            messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
+        return messages
+
+    def _mock_summarize(self, prompt, max_tokens, model=""):
+        return "Mock summary of conversation.\nExpand for details about: earlier turns"
+
+    def test_source_ids_correct_after_second_compaction(self, engine):
+        """DAG nodes from a second compress() must not reference the
+        synthetic summary message or map to wrong store rows."""
+        import hermes_lcm.escalation as esc
+        original_fn = esc._call_llm_for_summary
+        esc._call_llm_for_summary = self._mock_summarize
+        try:
+            # First compaction
+            messages = self._make_long_conversation(20)
+            compressed = engine.compress(messages)
+
+            # Add new turns and compact again
+            for i in range(15):
+                compressed.append({"role": "user", "content": f"Round2 Q{i}: " + "z" * 200})
+                compressed.append({"role": "assistant", "content": f"Round2 A{i}: " + "w" * 200})
+
+            engine.compress(compressed)
+
+            # Get all DAG nodes — the second node's source_ids should
+            # only reference real stored messages, not the summary
+            nodes = engine._dag.get_session_nodes("test-session")
+            assert len(nodes) >= 2
+
+            second_node = nodes[1]
+            for sid in second_node.source_ids:
+                stored = engine._store.get(sid)
+                assert stored is not None, f"source_id {sid} not in store"
+                # Must not be a synthetic summary
+                assert "Mock summary" not in (stored.get("content") or ""), \
+                    f"source_id {sid} points to synthetic summary"
+        finally:
+            esc._call_llm_for_summary = original_fn
+
+
 class TestSessionRetainDepth:
     """Tests for issue #2a — new_session_retain_depth wiring."""
 

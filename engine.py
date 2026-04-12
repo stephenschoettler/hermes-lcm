@@ -313,24 +313,31 @@ class LCMEngine(ContextEngine):
         logger.debug("Ingested %d messages into LCM store", len(new_messages))
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
-        """Map message list back to store_ids.
+        """Map message list back to store_ids via content matching.
 
-        Uses position-based mapping since messages are ingested in order.
+        Uses (role, content) to match against stored messages.  Robust
+        across compaction cycles — synthetic summary messages that aren't
+        in the store are silently skipped.
         """
-        all_stored = self._store.get_session_messages(self._session_id)
-        # Build content→store_id index for the session
-        # Use (role, content_prefix) as key since content can be very long
-        ids = []
-        stored_by_idx = {i: s["store_id"] for i, s in enumerate(all_stored)}
+        from collections import defaultdict
 
-        # Messages in the compaction range correspond to store indices 1..N
-        # (index 0 is the system prompt)
-        for i, msg in enumerate(messages):
-            # The message at position i in to_compact corresponds to
-            # store index i+1 (skipping system prompt at 0)
-            store_idx = i + 1
-            if store_idx in stored_by_idx:
-                ids.append(stored_by_idx[store_idx])
+        all_stored = self._store.get_session_messages(self._session_id)
+        # Build ordered lookup: (role, content) → [store_id, ...]
+        lookup: dict[tuple, list[int]] = defaultdict(list)
+        for s in all_stored:
+            key = (s.get("role", ""), s.get("content") or "")
+            lookup[key].append(s["store_id"])
+
+        ids = []
+        consumed: set[int] = set()
+        for msg in messages:
+            key = (msg.get("role", ""), msg.get("content") or "")
+            for sid in lookup.get(key, []):
+                if sid not in consumed:
+                    ids.append(sid)
+                    consumed.add(sid)
+                    break
+
         return ids
 
     # -- Internal: summarization -------------------------------------------
