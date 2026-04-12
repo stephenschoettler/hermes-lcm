@@ -146,7 +146,7 @@ hermes-lcm/
 ├── tokens.py        # tiktoken with char-based fallback
 ├── schemas.py       # tool schemas (what the LLM sees)
 ├── tools.py         # tool handlers (lcm_grep, lcm_describe, lcm_expand)
-└── tests/           # 35 tests
+└── tests/           # 46 tests
 ```
 
 Requires the **pluggable context engine slot** — an ABC (`ContextEngine`) in
