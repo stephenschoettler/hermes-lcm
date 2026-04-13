@@ -66,12 +66,18 @@ into anything that was compacted.
 ## Install
 
 ```bash
-# Clone into your Hermes plugins directory
-git clone https://github.com/stephenschoettler/hermes-lcm ~/.hermes/plugins/hermes-lcm
+# Clone into the context engine plugin directory
+git clone https://github.com/stephenschoettler/hermes-lcm \
+  ~/.hermes/hermes-agent/plugins/context_engine/lcm
 
 # Or for a specific profile
-git clone https://github.com/stephenschoettler/hermes-lcm ~/.hermes/profiles/myprofile/plugins/hermes-lcm
+git clone https://github.com/stephenschoettler/hermes-lcm \
+  ~/.hermes/profiles/myprofile/hermes-agent/plugins/context_engine/lcm
 ```
+
+> **Note:** Context engines must be installed under `plugins/context_engine/<name>/`,
+> not `plugins/<name>/`. The general `~/.hermes/plugins/` directory is for tools,
+> hooks, and CLI extensions — context engines are discovered separately.
 
 Restart Hermes. Activate the engine — either via the interactive UI or config file:
 
