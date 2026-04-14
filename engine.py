@@ -330,7 +330,7 @@ class LCMEngine(ContextEngine):
 
     def update_model(self, model: str, context_length: int,
                      base_url: str = "", api_key: str = "",
-                     provider: str = "") -> None:
+                     provider: str = "", api_mode: str = "", **kwargs) -> None:
         self.context_length = context_length
         self.threshold_tokens = int(context_length * self._config.context_threshold)
 
