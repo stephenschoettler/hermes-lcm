@@ -483,6 +483,82 @@ class TestSessionRetainDepth:
         assert all(node.depth >= 2 for node in new_nodes)
 
 
+class TestSessionRollover:
+    def test_rollover_session_rebinds_engine_and_carries_retained_nodes(self, engine):
+        engine._config.new_session_retain_depth = 2
+        from hermes_lcm.dag import SummaryNode
+        import time
+
+        engine.on_session_start("old-session", platform="cli", context_length=200000)
+        for depth in range(4):
+            engine._dag.add_node(SummaryNode(
+                session_id="old-session", depth=depth,
+                summary=f"old d{depth}", token_count=100,
+                source_token_count=500, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            ))
+
+        moved = engine.rollover_session(
+            "old-session",
+            "new-session",
+            previous_messages=[
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+            ],
+            platform="cli",
+            context_length=200000,
+        )
+
+        assert moved == 2
+        assert engine._session_id == "new-session"
+        assert engine._session_platform == "cli"
+        assert engine._store.get_session_count("old-session") == 3
+        assert engine._dag.get_session_nodes("old-session") == []
+        new_nodes = engine._dag.get_session_nodes("new-session")
+        assert len(new_nodes) == 2
+        assert all(node.depth >= 2 for node in new_nodes)
+
+    def test_rollover_session_supports_repeated_new_session_boundaries_without_duplicate_nodes(self, engine):
+        engine._config.new_session_retain_depth = 2
+        from hermes_lcm.dag import SummaryNode
+        import time
+
+        engine.on_session_start("s1", platform="cli", context_length=200000)
+        for depth in range(4):
+            engine._dag.add_node(SummaryNode(
+                session_id="s1", depth=depth,
+                summary=f"seed d{depth}", token_count=100,
+                source_token_count=500, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            ))
+
+        moved1 = engine.rollover_session("s1", "s2", previous_messages=[], platform="cli", context_length=200000)
+        assert moved1 == 2
+
+        engine._dag.add_node(SummaryNode(
+            session_id="s2", depth=2,
+            summary="fresh d2", token_count=100,
+            source_token_count=500, source_ids=[],
+            source_type="messages", created_at=time.time(),
+        ))
+        engine._dag.add_node(SummaryNode(
+            session_id="s2", depth=0,
+            summary="fresh d0", token_count=100,
+            source_token_count=500, source_ids=[],
+            source_type="messages", created_at=time.time(),
+        ))
+
+        moved2 = engine.rollover_session("s2", "s3", previous_messages=[], platform="cli", context_length=200000)
+
+        assert moved2 == 3
+        s3_nodes = engine._dag.get_session_nodes("s3")
+        assert len(s3_nodes) == 3
+        assert sorted(node.summary for node in s3_nodes) == ["fresh d2", "seed d2", "seed d3"]
+        assert engine._dag.get_session_nodes("s2") == []
+        assert engine._session_id == "s3"
+
+
 class TestUnlimitedCondensationDepth:
     """Tests for issue #2b — max_depth=-1 should be truly unlimited."""
 

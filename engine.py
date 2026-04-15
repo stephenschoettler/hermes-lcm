@@ -287,6 +287,35 @@ class LCMEngine(ContextEngine):
             return 0
         return self._dag.reassign_session_nodes(old_session_id, new_session_id)
 
+    def rollover_session(
+        self,
+        old_session_id: str,
+        new_session_id: str,
+        previous_messages: List[Dict[str, Any]] | None = None,
+        carry_over_context: bool = True,
+        **kwargs,
+    ) -> int:
+        """Complete a Hermes-style `/new` rollover for this engine.
+
+        This is a small helper for host/runtime integrations that need the
+        correct lifecycle ordering in one call:
+        1. flush old-session messages into the store
+        2. prune/reset retained DAG state on the old session
+        3. bind the engine to the new session
+        4. optionally move retained summaries into the new session
+        """
+        previous_messages = previous_messages or []
+
+        if old_session_id:
+            self.on_session_end(old_session_id, previous_messages)
+            self.on_session_reset()
+
+        self.on_session_start(new_session_id, **kwargs)
+
+        if not carry_over_context:
+            return 0
+        return self.carry_over_new_session_context(old_session_id, new_session_id)
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_STATUS, LCM_DOCTOR]
 
