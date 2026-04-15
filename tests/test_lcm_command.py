@@ -36,6 +36,22 @@ def test_lcm_status_default_reports_current_session(engine):
     assert "dag_nodes: 0" in result
 
 
+def test_lcm_status_explains_unbound_runtime_before_first_session(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_unbound.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._store.append("telegram:chat-1", {"role": "user", "content": "hello"}, token_estimate=7)
+
+    result = handle_lcm_command("status", engine)
+
+    assert "LCM status" in result
+    assert "session_id: (unbound)" in result
+    assert "session_platform: (unbound)" in result
+    assert "threshold_tokens: (uninitialized)" in result
+    assert "message_sessions_total: 1" in result
+    assert "messages_total: 1" in result
+    assert "note: no active Hermes session has initialized LCM in this process yet" in result
+
+
 def test_lcm_doctor_reports_health_checks(engine):
     result = handle_lcm_command("doctor", engine)
 

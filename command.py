@@ -48,21 +48,42 @@ def _status_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
+    session_bound = bool(engine._session_id)
+
+    def _safe_scalar(conn, query: str) -> int | str:
+        try:
+            return int(conn.execute(query).fetchone()[0])
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"error: {exc}"
+
     lines = [
         "LCM status",
         f"engine: {status.get('engine', engine.name)}",
-        f"session_id: {engine._session_id or '(none)'}",
-        f"session_platform: {status.get('session_platform') or '(unknown)'}",
+        f"session_id: {engine._session_id or '(unbound)'}",
+        f"session_platform: {status.get('session_platform') or ('(unbound)' if not session_bound else '(unknown)')}",
         f"database_path: {db_path}",
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
-        f"store_messages: {status.get('store_messages', 0)}",
-        f"dag_nodes: {status.get('dag_nodes', 0)}",
         f"compression_count: {engine.compression_count}",
-        f"threshold_tokens: {engine.threshold_tokens}",
+        f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"session_ignored: {_fmt_bool(status.get('session_ignored'))}",
         f"session_stateless: {_fmt_bool(status.get('session_stateless'))}",
     ]
+
+    if session_bound:
+        lines.extend([
+            f"store_messages: {status.get('store_messages', 0)}",
+            f"dag_nodes: {status.get('dag_nodes', 0)}",
+        ])
+    else:
+        lines.extend([
+            f"messages_total: {_safe_scalar(engine._store._conn, 'SELECT COUNT(*) FROM messages')}",
+            f"message_sessions_total: {_safe_scalar(engine._store._conn, 'SELECT COUNT(DISTINCT session_id) FROM messages')}",
+            f"summary_nodes_total: {_safe_scalar(engine._dag._conn, 'SELECT COUNT(*) FROM summary_nodes')}",
+            f"summary_node_sessions_total: {_safe_scalar(engine._dag._conn, 'SELECT COUNT(DISTINCT session_id) FROM summary_nodes')}",
+            "note: no active Hermes session has initialized LCM in this process yet — after a fresh restart, send one normal message first if you want live per-session runtime details",
+        ])
+
     if "ignore_session_patterns_source" in status:
         lines.append(
             f"ignore_session_patterns_source: {status.get('ignore_session_patterns_source')}"
