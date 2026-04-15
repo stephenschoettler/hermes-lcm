@@ -55,6 +55,21 @@ class TestConfig:
         assert c.summary_timeout_ms == 45_000
         assert c.expansion_timeout_ms == 90_000
 
+    def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch):
+        monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
+        monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "")
+        monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "bad-float")
+        monkeypatch.setenv("LCM_MAX_ASSEMBLY_TOKENS", "nope")
+        monkeypatch.setenv("LCM_RESERVE_TOKENS_FLOOR", "still-nope")
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 64
+        assert c.leaf_chunk_tokens == 20_000
+        assert c.context_threshold == 0.75
+        assert c.max_assembly_tokens == 0
+        assert c.reserve_tokens_floor == 0
+
 
 class TestSessionPatterns:
     def test_compile_pattern_wildcards(self):

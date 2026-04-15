@@ -45,6 +45,17 @@ class TestEngineABC:
         assert not engine.should_compress(1000)
         assert engine.should_compress(engine.threshold_tokens)
 
+    def test_should_compress_when_explicit_assembly_cap_is_hit(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_should_compress_cap.db"),
+            max_assembly_tokens=90,
+        )
+        instance = LCMEngine(config=config)
+        instance.context_length = 200000
+        instance.threshold_tokens = int(200000 * config.context_threshold)
+
+        assert instance.should_compress(90)
+
     def test_update_from_response(self, engine):
         engine.update_from_response({
             "prompt_tokens": 5000,
@@ -796,6 +807,298 @@ class TestAssemblyGuardrails:
             assert instance._effective_assembly_token_cap() is None
 
         assert "reserve_tokens_floor=100 disables reserve-based assembly cap" in caplog.text
+
+    def test_compress_forces_overflow_recovery_when_context_hits_assembly_cap(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=100,
+            database_path=str(tmp_path / "lcm_guardrail_forced.db"),
+            max_assembly_tokens=90,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+        monkeypatch.setattr(lcm_engine_module, "count_tokens", lambda text: len(text))
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "summarize_with_escalation",
+            lambda **kwargs: ("summary", 1),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "a" * 20},
+            {"role": "assistant", "content": "b" * 20},
+            {"role": "user", "content": "c" * 20},
+            {"role": "assistant", "content": "d" * 20},
+        ]
+
+        result = instance.compress(messages, current_tokens=90)
+
+        assert len(result) < len(messages)
+        assert result[-2:] == messages[-2:]
+        assert lcm_engine_module.count_messages_tokens(result) < 90
+        assert instance._dag.get_session_nodes("guardrail-session")
+
+    def test_forced_overflow_tail_capping_updates_bookkeeping_without_middle_compaction(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_tail_only.db"),
+            max_assembly_tokens=70,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "a" * 40},
+            {"role": "assistant", "content": "b" * 40},
+        ]
+
+        result = instance.compress(messages, current_tokens=90)
+
+        assert result == [messages[0], messages[-1]]
+        assert instance.compression_count == 1
+        assert instance._ingest_cursor == len(result)
+        assert not instance.get_status()["overflow_recovery_failed"]
+
+    def test_forced_overflow_recovery_reserves_provider_overhead(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_overhead.db"),
+            max_assembly_tokens=90,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "a" * 30},
+            {"role": "assistant", "content": "b" * 40},
+        ]
+
+        result = instance.compress(messages, current_tokens=100)
+
+        assert result == [messages[0], messages[-1]]
+        assert lcm_engine_module.count_messages_tokens(result) < 70
+
+    def test_forced_overflow_recovery_does_not_duplicate_existing_summary_message(self, tmp_path, monkeypatch):
+        import importlib
+        from hermes_lcm.dag import SummaryNode
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_summary_dup.db"),
+            max_assembly_tokens=90,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        node = SummaryNode(
+            session_id="guardrail-session",
+            depth=0,
+            summary="sum",
+            token_count=3,
+            source_token_count=50,
+            source_ids=[],
+            source_type="messages",
+            created_at=time.time(),
+            expand_hint="x",
+        )
+        node_id = instance._dag.add_node(node)
+        summary_blob = (
+            f"[Recent Summary (d0, node {node_id})]\n"
+            f"sum\n"
+            f"[Expand for details: x]"
+        )
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "assistant", "content": summary_blob},
+            {"role": "user", "content": "tail" * 2},
+        ]
+
+        result = instance.compress(messages, current_tokens=90)
+
+        joined = "\n\n".join(msg.get("content", "") for msg in result)
+        assert joined.count("[Expand for details:") == 1
+        assert not instance.get_status()["overflow_recovery_failed"]
+
+    def test_forced_overflow_recovery_flags_irreducible_single_tail_overflow(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_irreducible.db"),
+            max_assembly_tokens=70,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "a" * 20},
+            {"role": "assistant", "content": "b" * 80},
+        ]
+
+        result = instance.compress(messages, current_tokens=110)
+
+        assert result == [messages[0], messages[-1]]
+        assert instance.get_status()["overflow_recovery_failed"]
+
+    def test_overflow_recovery_failure_flag_resets_after_successful_compression(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=100,
+            database_path=str(tmp_path / "lcm_guardrail_flag_reset.db"),
+            max_assembly_tokens=70,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+        monkeypatch.setattr(lcm_engine_module, "count_tokens", lambda text: len(text))
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "summarize_with_escalation",
+            lambda **kwargs: ("summary", 1),
+        )
+
+        failed_messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "a" * 20},
+            {"role": "assistant", "content": "b" * 80},
+        ]
+        instance.compress(failed_messages, current_tokens=110)
+        assert instance.get_status()["overflow_recovery_failed"]
+
+        success_messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "a" * 20},
+            {"role": "assistant", "content": "b" * 20},
+            {"role": "user", "content": "c" * 20},
+            {"role": "assistant", "content": "d" * 20},
+        ]
+        instance.compress(success_messages, current_tokens=90)
+
+        assert not instance.get_status()["overflow_recovery_failed"]
+
+    def test_compress_ignores_stale_last_prompt_tokens_for_overflow_recovery(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_stale_prompt.db"),
+            max_assembly_tokens=70,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+        instance.last_prompt_tokens = 200
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "a" * 20},
+            {"role": "assistant", "content": "b" * 20},
+        ]
+
+        result = instance.compress(messages)
+
+        assert result == messages
 
 
 class TestEngineTools:
