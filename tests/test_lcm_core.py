@@ -357,6 +357,47 @@ class TestMessageStore:
 
         store.close()
 
+    def test_search_sort_modes_apply_before_limit(self, store):
+        older_strong = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "database migration plan database migration plan database migration plan with rollback notes",
+            },
+        )
+        newer_weak = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "recent status note about the database migration plan",
+            },
+        )
+        store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1_700_000_000, older_strong),
+        )
+        store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1_800_000_000, newer_weak),
+        )
+        store._conn.commit()
+
+        recency_results = store.search(
+            '"database migration plan"',
+            session_id="sess1",
+            limit=1,
+            sort="recency",
+        )
+        relevance_results = store.search(
+            '"database migration plan"',
+            session_id="sess1",
+            limit=1,
+            sort="relevance",
+        )
+
+        assert recency_results[0]["store_id"] == newer_weak
+        assert relevance_results[0]["store_id"] == older_strong
+
     def test_pin_unpin(self, store):
         sid = store.append("sess1", {"role": "user", "content": "important"})
         store.pin(sid)
@@ -606,6 +647,36 @@ class TestSummaryDAG:
         fts_count = dag._conn.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0]
         assert fts_count == 1
         dag.close()
+
+    def test_search_sort_modes_apply_before_limit(self, dag):
+        older_strong = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="error handling checklist error handling checklist error handling checklist with confirmed fixes",
+            token_count=18, source_ids=[1], source_type="messages",
+            created_at=1_700_000_000,
+        ))
+        newer_weak = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="recent note mentioning the error handling checklist",
+            token_count=9, source_ids=[2], source_type="messages",
+            created_at=1_800_000_000,
+        ))
+
+        recency_results = dag.search(
+            '"error handling checklist"',
+            session_id="s1",
+            limit=1,
+            sort="recency",
+        )
+        hybrid_results = dag.search(
+            '"error handling checklist"',
+            session_id="s1",
+            limit=1,
+            sort="hybrid",
+        )
+
+        assert recency_results[0].node_id == newer_weak
+        assert hybrid_results[0].node_id == older_strong
 
     def test_describe_subtree(self, dag):
         c1 = dag.add_node(SummaryNode(

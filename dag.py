@@ -28,6 +28,25 @@ from .db_bootstrap import (
 
 logger = logging.getLogger(__name__)
 
+AGE_DECAY_RATE = 0.001
+
+
+def _normalize_search_sort(sort: str | None) -> str:
+    normalized = (sort or "recency").strip().lower()
+    return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
+
+
+def _build_search_order_by(sort: str | None, created_at_expr: str) -> str:
+    normalized = _normalize_search_sort(sort)
+    if normalized == "relevance":
+        return f"rank ASC, {created_at_expr} DESC"
+    if normalized == "hybrid":
+        return (
+            f"(rank / (1 + (((strftime('%s','now') - {created_at_expr}) / 3600.0) * {AGE_DECAY_RATE}))) ASC, "
+            f"{created_at_expr} DESC"
+        )
+    return f"{created_at_expr} DESC"
+
 
 @dataclass
 class SummaryNode:
@@ -42,6 +61,7 @@ class SummaryNode:
     source_type: str = "messages"  # "messages" or "nodes"
     created_at: float = 0.0
     expand_hint: str = ""  # "Expand for details about: ..."
+    search_rank: float | None = None
 
 
 class SummaryDAG:
@@ -231,23 +251,24 @@ class SummaryDAG:
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,
-               limit: int = 20) -> List[SummaryNode]:
+               limit: int = 20, sort: str | None = None) -> List[SummaryNode]:
         """FTS5 search across all summary nodes."""
+        order_by = _build_search_order_by(sort, "n.created_at")
         try:
             if session_id:
                 rows = self._conn.execute(
-                    """SELECT n.* FROM nodes_fts fts
+                    f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                        JOIN summary_nodes n ON n.node_id = fts.rowid
                        WHERE nodes_fts MATCH ? AND n.session_id = ?
-                       ORDER BY rank LIMIT ?""",
+                       ORDER BY {order_by} LIMIT ?""",
                     (query, session_id, limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
-                    """SELECT n.* FROM nodes_fts fts
+                    f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                        JOIN summary_nodes n ON n.node_id = fts.rowid
                        WHERE nodes_fts MATCH ?
-                       ORDER BY rank LIMIT ?""",
+                       ORDER BY {order_by} LIMIT ?""",
                     (query, limit),
                 ).fetchall()
             return [self._row_to_node(r) for r in rows]
@@ -257,14 +278,14 @@ class SummaryDAG:
                 rows = self._conn.execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ? AND LOWER(COALESCE(summary, '')) LIKE ?
-                       ORDER BY created_at LIMIT ?""",
+                       ORDER BY created_at DESC LIMIT ?""",
                     (session_id, like, limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
                     """SELECT * FROM summary_nodes
                        WHERE LOWER(COALESCE(summary, '')) LIKE ?
-                       ORDER BY created_at LIMIT ?""",
+                       ORDER BY created_at DESC LIMIT ?""",
                     (like, limit),
                 ).fetchall()
             return [self._row_to_node(r) for r in rows]
@@ -326,6 +347,7 @@ class SummaryDAG:
             source_type=row[7],
             created_at=row[8],
             expand_hint=row[9] or "",
+            search_rank=row[10] if len(row) > 10 else None,
         )
 
     def close(self):

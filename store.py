@@ -22,6 +22,25 @@ from .db_bootstrap import (
 
 logger = logging.getLogger(__name__)
 
+AGE_DECAY_RATE = 0.001
+
+
+def _normalize_search_sort(sort: str | None) -> str:
+    normalized = (sort or "recency").strip().lower()
+    return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
+
+
+def _build_search_order_by(sort: str | None, timestamp_expr: str) -> str:
+    normalized = _normalize_search_sort(sort)
+    if normalized == "relevance":
+        return f"rank ASC, {timestamp_expr} DESC"
+    if normalized == "hybrid":
+        return (
+            f"(rank / (1 + (((strftime('%s','now') - {timestamp_expr}) / 3600.0) * {AGE_DECAY_RATE}))) ASC, "
+            f"{timestamp_expr} DESC"
+        )
+    return f"{timestamp_expr} DESC"
+
 
 class MessageStore:
     """SQLite-backed immutable message store."""
@@ -219,32 +238,35 @@ class MessageStore:
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,
-               limit: int = 20) -> List[Dict[str, Any]]:
+               limit: int = 20, sort: str | None = None) -> List[Dict[str, Any]]:
         """FTS5 search across messages. Returns matches with snippets."""
+        order_by = _build_search_order_by(sort, "m.timestamp")
         try:
             if session_id:
                 rows = self._conn.execute(
-                    """SELECT m.*, snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                    f"""SELECT m.*, rank as search_rank,
+                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
                        JOIN messages m ON m.store_id = fts.rowid
                        WHERE messages_fts MATCH ? AND m.session_id = ?
-                       ORDER BY rank LIMIT ?""",
+                       ORDER BY {order_by} LIMIT ?""",
                     (query, session_id, limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
-                    """SELECT m.*, snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                    f"""SELECT m.*, rank as search_rank,
+                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
                        JOIN messages m ON m.store_id = fts.rowid
                        WHERE messages_fts MATCH ?
-                       ORDER BY rank LIMIT ?""",
+                       ORDER BY {order_by} LIMIT ?""",
                     (query, limit),
                 ).fetchall()
             results = []
             for r in rows:
                 d = self._row_to_dict(r)
-                # snippet is the extra column
-                d["snippet"] = r[-1] if len(r) > 10 else ""
+                d["search_rank"] = r[10] if len(r) > 10 else None
+                d["snippet"] = r[11] if len(r) > 11 else ""
                 results.append(d)
             return results
         except sqlite3.DatabaseError:
@@ -253,14 +275,14 @@ class MessageStore:
                 rows = self._conn.execute(
                     """SELECT * FROM messages
                        WHERE session_id = ? AND LOWER(COALESCE(content, '')) LIKE ?
-                       ORDER BY store_id LIMIT ?""",
+                       ORDER BY timestamp DESC LIMIT ?""",
                     (session_id, like, limit),
                 ).fetchall()
             else:
                 rows = self._conn.execute(
                     """SELECT * FROM messages
                        WHERE LOWER(COALESCE(content, '')) LIKE ?
-                       ORDER BY store_id LIMIT ?""",
+                       ORDER BY timestamp DESC LIMIT ?""",
                     (like, limit),
                 ).fetchall()
             results = []

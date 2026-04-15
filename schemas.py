@@ -14,12 +14,24 @@ LCM_GREP = {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Search query (FTS5 syntax: keywords, phrases, OR/NOT)",
+                "description": (
+                    "Search query (FTS5 syntax: keywords, phrases, OR/NOT). "
+                    "FTS5 defaults to AND matching, so prefer 1-3 distinctive terms or one quoted multi-word phrase."
+                ),
             },
             "limit": {
                 "type": "integer",
                 "description": "Max results to return (default 10)",
                 "default": 10,
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["recency", "relevance", "hybrid"],
+                "description": (
+                    "How to order matches. 'recency' favors newer hits, 'relevance' favors strongest FTS matches, "
+                    "and 'hybrid' keeps strong older matches competitive while still boosting newer context."
+                ),
+                "default": "recency",
             },
         },
         "required": ["query"],

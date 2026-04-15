@@ -4,12 +4,37 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, Dict, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
 
 logger = logging.getLogger(__name__)
+
+AGE_DECAY_RATE = 0.001
+
+
+def _normalize_search_sort(sort: str | None) -> str:
+    normalized = (sort or "recency").strip().lower()
+    return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
+
+
+def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple[float, float, int]:
+    sort_timestamp = float(result.get("_sort_ts") or 0.0)
+    rank = result.get("_sort_rank")
+    rank_value = float(rank) if rank is not None else float("inf")
+    type_bias = 0 if result.get("type") == "message" else 1
+
+    if sort == "relevance":
+        return (rank_value, -sort_timestamp, type_bias)
+
+    if sort == "hybrid":
+        age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
+        blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
+        return (blended, -sort_timestamp, type_bias)
+
+    return (-sort_timestamp, rank_value, type_bias)
 
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
@@ -152,11 +177,12 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "No query provided"})
 
     limit = args.get("limit", 10)
+    sort = _normalize_search_sort(args.get("sort"))
     session_id = engine._session_id
     results = []
 
     try:
-        msg_hits = engine._store.search(query, session_id=session_id, limit=limit)
+        msg_hits = engine._store.search(query, session_id=session_id, limit=limit, sort=sort)
         for hit in msg_hits:
             results.append(
                 {
@@ -165,13 +191,15 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "store_id": hit["store_id"],
                     "role": hit["role"],
                     "snippet": hit.get("snippet", hit.get("content", "")[:200]),
+                    "_sort_ts": hit.get("timestamp", 0),
+                    "_sort_rank": hit.get("search_rank"),
                 }
             )
     except Exception as exc:
         logger.debug("Message search failed: %s", exc)
 
     try:
-        node_hits = engine._dag.search(query, session_id=session_id, limit=limit)
+        node_hits = engine._dag.search(query, session_id=session_id, limit=limit, sort=sort)
         for node in node_hits:
             results.append(
                 {
@@ -181,13 +209,18 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "snippet": node.summary[:300],
                     "token_count": node.token_count,
                     "expand_hint": node.expand_hint,
+                    "_sort_ts": node.created_at,
+                    "_sort_rank": node.search_rank,
                 }
             )
     except Exception as exc:
         logger.debug("Node search failed: %s", exc)
 
-    results.sort(key=lambda result: (0 if result["type"] == "message" else 1, result.get("depth", "")))
-    return json.dumps({"query": query, "total_results": len(results), "results": results[:limit]})
+    results.sort(key=lambda result: _combined_result_sort_key(result, sort))
+    for result in results:
+        result.pop("_sort_ts", None)
+        result.pop("_sort_rank", None)
+    return json.dumps({"query": query, "sort": sort, "total_results": len(results), "results": results[:limit]})
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:

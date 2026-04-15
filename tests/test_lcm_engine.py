@@ -1108,6 +1108,19 @@ class TestEngineTools:
         result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
         assert "results" in result
 
+    def test_handle_grep_reports_sort_mode(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "user", "content": "database migration plan database migration plan"},
+        )
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": '"database migration plan"', "limit": 1, "sort": "relevance"},
+            )
+        )
+        assert result["sort"] == "relevance"
+
     def test_handle_describe_overview(self, engine):
         result = json.loads(engine.handle_tool_call("lcm_describe", {}))
         assert "session_id" in result
