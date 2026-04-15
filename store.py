@@ -13,6 +13,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .db_bootstrap import (
+    ExternalContentFtsSpec,
+    configure_connection,
+    ensure_external_content_fts,
+    set_schema_version,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -27,8 +34,7 @@ class MessageStore:
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        configure_connection(self._conn)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,23 +53,29 @@ class MessageStore:
             CREATE INDEX IF NOT EXISTS idx_msg_session_ts
                 ON messages(session_id, timestamp);
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-                content,
-                content=messages,
-                content_rowid=store_id
-            );
-
-            CREATE TRIGGER IF NOT EXISTS msg_fts_insert
-                AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, content)
-                    VALUES (new.store_id, new.content);
-            END;
-
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
         """)
+        ensure_external_content_fts(
+            self._conn,
+            ExternalContentFtsSpec(
+                table_name="messages_fts",
+                content_table="messages",
+                content_rowid="store_id",
+                indexed_column="content",
+                trigger_name="msg_fts_insert",
+                trigger_sql="""
+                    CREATE TRIGGER IF NOT EXISTS msg_fts_insert
+                        AFTER INSERT ON messages BEGIN
+                        INSERT INTO messages_fts(rowid, content)
+                            VALUES (new.store_id, new.content);
+                    END;
+                """,
+            ),
+        )
+        set_schema_version(self._conn)
         self._conn.commit()
 
     # -- Write operations ---------------------------------------------------

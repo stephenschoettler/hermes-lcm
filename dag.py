@@ -19,6 +19,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .db_bootstrap import (
+    ExternalContentFtsSpec,
+    configure_connection,
+    ensure_external_content_fts,
+    set_schema_version,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +54,7 @@ class SummaryDAG:
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        configure_connection(self._conn)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS summary_nodes (
                 node_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,18 +71,29 @@ class SummaryDAG:
             CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
                 ON summary_nodes(session_id, depth, created_at);
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-                summary,
-                content=summary_nodes,
-                content_rowid=node_id
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
             );
-
-            CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
-                AFTER INSERT ON summary_nodes BEGIN
-                INSERT INTO nodes_fts(rowid, summary)
-                    VALUES (new.node_id, new.summary);
-            END;
         """)
+        ensure_external_content_fts(
+            self._conn,
+            ExternalContentFtsSpec(
+                table_name="nodes_fts",
+                content_table="summary_nodes",
+                content_rowid="node_id",
+                indexed_column="summary",
+                trigger_name="nodes_fts_insert",
+                trigger_sql="""
+                    CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
+                        AFTER INSERT ON summary_nodes BEGIN
+                        INSERT INTO nodes_fts(rowid, summary)
+                            VALUES (new.node_id, new.summary);
+                    END;
+                """,
+            ),
+        )
+        set_schema_version(self._conn)
         self._conn.commit()
 
     # -- Write --------------------------------------------------------------

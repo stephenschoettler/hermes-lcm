@@ -1,6 +1,8 @@
 """Tests for LCM core components: store, DAG, tokens, config, escalation."""
 
 import json
+import sqlite3
+
 import pytest
 
 from hermes_lcm.config import LCMConfig
@@ -143,6 +145,98 @@ class TestMessageStore:
         results = store.search("docker", session_id="sess1")
         assert len(results) >= 1
 
+    def test_init_repairs_malformed_message_fts_and_sets_schema_version(self, tmp_path):
+        db_path = tmp_path / "legacy-store.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_estimate INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0
+            );
+            CREATE TABLE messages_fts (
+                rowid INTEGER PRIMARY KEY,
+                content TEXT
+            );
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO messages (session_id, role, content, timestamp, token_estimate, pinned)
+            VALUES ('sess1', 'user', 'legacy docker migration note', 1.0, 7, 0);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        store = MessageStore(db_path)
+
+        version = store._conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version == ("1",)
+
+        results = store.search("docker", session_id="sess1")
+        assert len(results) == 1
+        assert results[0]["content"] == "legacy docker migration note"
+
+        store.close()
+
+    def test_init_recreates_missing_message_fts_trigger(self, tmp_path):
+        db_path = tmp_path / "legacy-trigger.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_estimate INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0
+            );
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content,
+                content=messages,
+                content_rowid=store_id
+            );
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        store = MessageStore(db_path)
+        store.append("sess1", {"role": "user", "content": "fresh searchable message"})
+
+        results = store.search("searchable", session_id="sess1")
+        assert len(results) == 1
+
+        trigger_names = {
+            row[0]
+            for row in store._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name='msg_fts_insert'"
+            ).fetchall()
+        }
+        assert trigger_names == {"msg_fts_insert"}
+
+        store.close()
+
     def test_pin_unpin(self, store):
         sid = store.append("sess1", {"role": "user", "content": "important"})
         store.pin(sid)
@@ -212,6 +306,106 @@ class TestSummaryDAG:
         ))
         results = dag.search("Docker", session_id="s1")
         assert len(results) >= 1
+
+    def test_init_repairs_malformed_nodes_fts_and_sets_schema_version(self, tmp_path):
+        db_path = tmp_path / "legacy-dag.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE summary_nodes (
+                node_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                depth INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                token_count INTEGER DEFAULT 0,
+                source_token_count INTEGER DEFAULT 0,
+                source_ids TEXT NOT NULL DEFAULT '[]',
+                source_type TEXT NOT NULL DEFAULT 'messages',
+                created_at REAL NOT NULL,
+                expand_hint TEXT DEFAULT ''
+            );
+            CREATE TABLE nodes_fts (
+                rowid INTEGER PRIMARY KEY,
+                summary TEXT
+            );
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO summary_nodes (
+                session_id, depth, summary, token_count, source_token_count,
+                source_ids, source_type, created_at, expand_hint
+            ) VALUES (
+                's1', 0, 'legacy summary about docker recovery', 9, 18,
+                '[1]', 'messages', 1.0, ''
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        dag = SummaryDAG(db_path)
+
+        version = dag._conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version == ("1",)
+
+        results = dag.search("docker", session_id="s1")
+        assert len(results) == 1
+        assert results[0].summary == "legacy summary about docker recovery"
+
+        dag.close()
+
+    def test_init_recreates_missing_nodes_fts_trigger(self, tmp_path):
+        db_path = tmp_path / "legacy-nodes-trigger.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE summary_nodes (
+                node_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                depth INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                token_count INTEGER DEFAULT 0,
+                source_token_count INTEGER DEFAULT 0,
+                source_ids TEXT NOT NULL DEFAULT '[]',
+                source_type TEXT NOT NULL DEFAULT 'messages',
+                created_at REAL NOT NULL,
+                expand_hint TEXT DEFAULT ''
+            );
+            CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                summary,
+                content=summary_nodes,
+                content_rowid=node_id
+            );
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        dag = SummaryDAG(db_path)
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0, summary="fresh dag search result",
+            token_count=5, source_ids=[1], source_type="messages",
+        ))
+
+        results = dag.search("fresh", session_id="s1")
+        assert len(results) == 1
+
+        trigger_names = {
+            row[0]
+            for row in dag._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name='nodes_fts_insert'"
+            ).fetchall()
+        }
+        assert trigger_names == {"nodes_fts_insert"}
+
+        dag.close()
 
     def test_describe_subtree(self, dag):
         c1 = dag.add_node(SummaryNode(
