@@ -7,9 +7,9 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 from __future__ import annotations
 
 import sqlite3
-from typing import Iterable
+from typing import Iterable, Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 
 
@@ -21,15 +21,13 @@ class ExternalContentFtsSpec:
         content_table: str,
         content_rowid: str,
         indexed_column: str,
-        trigger_name: str,
-        trigger_sql: str,
+        trigger_sqls: Sequence[str],
     ) -> None:
         self.table_name = table_name
         self.content_table = content_table
         self.content_rowid = content_rowid
         self.indexed_column = indexed_column
-        self.trigger_name = trigger_name
-        self.trigger_sql = trigger_sql
+        self.trigger_sqls = tuple(trigger_sqls)
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
@@ -45,6 +43,42 @@ def ensure_metadata_table(conn: sqlite3.Connection) -> None:
             value TEXT
         )
         """
+    )
+
+
+def get_schema_version(conn: sqlite3.Connection) -> int:
+    ensure_metadata_table(conn)
+    row = conn.execute(
+        "SELECT value FROM metadata WHERE key = 'schema_version'"
+    ).fetchone()
+    if not row or row[0] is None:
+        return 0
+    try:
+        return int(str(row[0]))
+    except (TypeError, ValueError):
+        return 0
+
+
+def ensure_migration_state_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_migration_state (
+            step_name TEXT PRIMARY KEY,
+            completed_at REAL NOT NULL
+        )
+        """
+    )
+
+
+def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
+    ensure_migration_state_table(conn)
+    conn.execute(
+        """
+        INSERT INTO lcm_migration_state(step_name, completed_at)
+        VALUES(?, strftime('%s','now'))
+        ON CONFLICT(step_name) DO UPDATE SET completed_at = excluded.completed_at
+        """,
+        (step_name,),
     )
 
 
@@ -139,4 +173,17 @@ def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentF
             f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}) VALUES('rebuild')"
         )
 
-    conn.execute(spec.trigger_sql)
+    for trigger_sql in spec.trigger_sqls:
+        conn.execute(trigger_sql)
+
+
+def run_versioned_migrations(conn: sqlite3.Connection) -> None:
+    ensure_metadata_table(conn)
+    ensure_migration_state_table(conn)
+
+    current_version = get_schema_version(conn)
+    if current_version < 2:
+        mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
+        current_version = 2
+
+    set_schema_version(conn, current_version)

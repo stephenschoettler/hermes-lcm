@@ -182,7 +182,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("1",)
+        assert version == ("2",)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -216,6 +216,7 @@ class TestMessageStore:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '1');
             """
         )
         conn.commit()
@@ -227,15 +228,36 @@ class TestMessageStore:
         results = store.search("searchable", session_id="sess1")
         assert len(results) == 1
 
+        version = store._conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version == ("2",)
+
+        migration_state = store._conn.execute(
+            "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
+        ).fetchall()
+        assert ("v2_external_content_fts_triggers",) in migration_state
+
         trigger_names = {
             row[0]
             for row in store._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='trigger' AND name='msg_fts_insert'"
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('msg_fts_insert', 'msg_fts_delete')"
             ).fetchall()
         }
-        assert trigger_names == {"msg_fts_insert"}
+        assert trigger_names == {"msg_fts_insert", "msg_fts_delete"}
 
         store.close()
+
+    def test_search_falls_back_to_like_when_message_fts_breaks(self, store):
+        store.append("sess1", {"role": "user", "content": "docker fallback search still works"})
+        store._conn.execute("DROP TABLE messages_fts")
+        store._conn.commit()
+
+        results = store.search("fallback", session_id="sess1")
+
+        assert len(results) == 1
+        assert results[0]["content"] == "docker fallback search still works"
+        assert "fallback" in results[0]["snippet"].lower()
 
     def test_pin_unpin(self, store):
         sid = store.append("sess1", {"role": "user", "content": "important"})
@@ -349,7 +371,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("1",)
+        assert version == ("2",)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -383,6 +405,7 @@ class TestSummaryDAG:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '1');
             """
         )
         conn.commit()
@@ -397,15 +420,39 @@ class TestSummaryDAG:
         results = dag.search("fresh", session_id="s1")
         assert len(results) == 1
 
+        version = dag._conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        assert version == ("2",)
+
+        migration_state = dag._conn.execute(
+            "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
+        ).fetchall()
+        assert ("v2_external_content_fts_triggers",) in migration_state
+
         trigger_names = {
             row[0]
             for row in dag._conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='trigger' AND name='nodes_fts_insert'"
+                "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('nodes_fts_insert', 'nodes_fts_delete')"
             ).fetchall()
         }
-        assert trigger_names == {"nodes_fts_insert"}
+        assert trigger_names == {"nodes_fts_insert", "nodes_fts_delete"}
 
         dag.close()
+
+    def test_search_falls_back_to_like_when_nodes_fts_breaks(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="dag fallback search still works",
+            token_count=10, source_ids=[1], source_type="messages",
+        ))
+        dag._conn.execute("DROP TABLE nodes_fts")
+        dag._conn.commit()
+
+        results = dag.search("fallback", session_id="s1")
+
+        assert len(results) == 1
+        assert results[0].summary == "dag fallback search still works"
 
     def test_describe_subtree(self, dag):
         c1 = dag.add_node(SummaryNode(
