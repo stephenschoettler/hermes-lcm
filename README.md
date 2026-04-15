@@ -101,6 +101,14 @@ git clone https://github.com/stephenschoettler/hermes-lcm \
   ~/.hermes/profiles/myprofile/hermes-agent/plugins/context_engine/lcm
 ```
 
+## Update
+
+```bash
+cd ~/.hermes/hermes-agent/plugins/context_engine/lcm && git pull
+```
+
+Restart Hermes after updating.
+
 > **Note:** Context engines must be installed under `plugins/context_engine/<name>/`,
 > not `plugins/<name>/`. The general `~/.hermes/plugins/` directory is for tools,
 > hooks, and CLI extensions — context engines are discovered separately.
