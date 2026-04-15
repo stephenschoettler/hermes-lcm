@@ -468,6 +468,42 @@ class TestEngineCompress:
         assert candidate_raw[2]["content"] in compressed_contents
         assert candidate_raw[3]["content"] in compressed_contents
 
+    def test_dynamic_leaf_chunk_sizing_runs_bounded_catchup_passes_when_pressure_remains_high(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=180,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=360,
+            database_path=str(tmp_path / "lcm_dynamic_leaf_catchup.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "test-session"
+        engine.context_length = 1200
+        engine.threshold_tokens = 700
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(16):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({
+                "role": role,
+                "content": f"Message {i}: " + ("dense " * 40),
+            })
+
+        import hermes_lcm.engine as engine_module
+
+        def mock_summary(**kwargs):
+            return "Catchup summary.\nExpand for details about: oldest raw chunk", 1
+
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", mock_summary)
+
+        compressed = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        nodes = engine._dag.get_session_nodes("test-session")
+        assert len(nodes) >= 2
+        assert count_messages_tokens(compressed) < engine.threshold_tokens
+        compressed_contents = [msg.get("content") for msg in compressed]
+        assert messages[-1]["content"] in compressed_contents
+
     def test_adaptive_leaf_rescue_stops_after_bounded_retry_worthy_failures(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
@@ -1545,6 +1581,26 @@ class TestEngineTools:
             )
         )
         assert result["sort"] == "relevance"
+
+    def test_handle_grep_prefers_conversational_hits_over_tool_output_noise(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "user", "content": "vendoring should stay generic host support only"},
+        )
+        engine._store.append(
+            "test-session",
+            {"role": "tool", "content": '{"vendoring":"vendoring vendoring vendoring","payload":"generic host support"}'},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["role"] == "user"
+        assert result["results"][1]["role"] == "tool"
 
     def test_handle_describe_overview(self, engine):
         result = json.loads(engine.handle_tool_call("lcm_describe", {}))

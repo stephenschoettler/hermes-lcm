@@ -292,86 +292,104 @@ class LCMEngine(ContextEngine):
         # Step 1: Ingest new messages into the immutable store
         self._ingest_messages(messages)
 
-        # Step 2: Identify fresh tail boundary
-        n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        working_messages = list(messages)
+        leaf_compacted_this_turn = False
+        leaf_passes = 0
+        max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
+        estimated_active_tokens = (
+            observed_prompt_tokens
+            if observed_prompt_tokens is not None and observed_prompt_tokens > 0
+            else count_messages_tokens(messages)
+        )
 
-        # Protect system prompt (always index 0)
-        if fresh_tail_start <= 1:
-            # Not enough messages to compact
-            if force_overflow and len(messages) >= 1:
-                compressed = self._assemble_overflow_recovery_context(
-                    messages[0],
-                    messages[1:],
-                    assembly_cap_override=recovery_assembly_cap,
-                )
-                return self._finalize_forced_overflow_result(
-                    messages,
-                    compressed,
-                    assembly_cap_override=recovery_assembly_cap,
-                )
-            return messages
+        while leaf_passes < max_leaf_passes:
+            n = len(working_messages)
+            fresh_tail_start = max(0, n - self._config.fresh_tail_count)
 
-        # Step 3: Identify messages eligible for leaf compaction
-        # Skip system prompt (index 0), candidate raw backlog is indices 1..fresh_tail_start
-        candidate_raw = messages[1:fresh_tail_start]
+            # Protect system prompt (always index 0)
+            if fresh_tail_start <= 1:
+                break
 
-        if not candidate_raw:
-            if force_overflow and len(messages) >= 1:
-                compressed = self._assemble_overflow_recovery_context(
-                    messages[0],
-                    messages[1:],
-                    assembly_cap_override=recovery_assembly_cap,
-                )
-                return self._finalize_forced_overflow_result(
-                    messages,
-                    compressed,
-                    assembly_cap_override=recovery_assembly_cap,
-                )
-            return messages
+            # Skip system prompt (index 0), candidate raw backlog is indices 1..fresh_tail_start
+            candidate_raw = working_messages[1:fresh_tail_start]
+            if not candidate_raw:
+                break
 
-        raw_tokens_outside_tail = count_messages_tokens(candidate_raw)
-        if self._config.dynamic_leaf_chunk_enabled:
-            working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
-            if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
-                return messages
-            if force_overflow:
-                to_compact = candidate_raw
+            raw_tokens_outside_tail = count_messages_tokens(candidate_raw)
+            if self._config.dynamic_leaf_chunk_enabled:
+                working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
+                if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
+                    break
+                if force_overflow:
+                    to_compact = candidate_raw
+                else:
+                    to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
-                to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
-        else:
-            if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
-                # Not enough to justify compaction
-                return messages
-            to_compact = candidate_raw
+                if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
+                    break
+                to_compact = candidate_raw
 
-        # Step 4: Serialize and summarize, with bounded smaller-chunk rescue for retry-worthy failures
-        compacted_chunk, source_tokens, summary_text, level, rescue_attempts = self._summarize_leaf_chunk_with_rescue(
-            to_compact,
-            focus_topic=focus_topic,
-        )
-        remaining_messages = messages[1 + len(compacted_chunk):]
+            if not to_compact:
+                break
 
-        # Step 5: Create DAG node
-        # Collect store_ids for source tracking
-        source_store_ids = self._get_store_ids_for_messages(compacted_chunk)
-        earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
+            compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
+                to_compact,
+                focus_topic=focus_topic,
+            )
+            remaining_messages = working_messages[1 + len(compacted_chunk):]
 
-        node = SummaryNode(
-            session_id=self._session_id,
-            depth=0,
-            summary=summary_text,
-            token_count=count_tokens(summary_text),
-            source_token_count=source_tokens,
-            source_ids=source_store_ids,
-            source_type="messages",
-            created_at=time.time(),
-            earliest_at=earliest_at,
-            latest_at=latest_at,
-            expand_hint=self._extract_expand_hint(summary_text),
-        )
-        self._dag.add_node(node)
-        self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
+            source_store_ids = self._get_store_ids_for_messages(compacted_chunk)
+            earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
+            summary_tokens = count_tokens(summary_text)
+
+            node = SummaryNode(
+                session_id=self._session_id,
+                depth=0,
+                summary=summary_text,
+                token_count=summary_tokens,
+                source_token_count=source_tokens,
+                source_ids=source_store_ids,
+                source_type="messages",
+                created_at=time.time(),
+                earliest_at=earliest_at,
+                latest_at=latest_at,
+                expand_hint=self._extract_expand_hint(summary_text),
+            )
+            self._dag.add_node(node)
+            self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
+
+            working_messages = [working_messages[0]] + remaining_messages
+            leaf_compacted_this_turn = True
+            leaf_passes += 1
+            estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
+
+            if not self._config.dynamic_leaf_chunk_enabled:
+                break
+
+            if not force_overflow:
+                if self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
+                    break
+                remaining_raw = working_messages[1:max(0, len(working_messages) - self._config.fresh_tail_count)]
+                if not remaining_raw:
+                    break
+                remaining_raw_tokens = count_messages_tokens(remaining_raw)
+                remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
+                if remaining_raw_tokens < remaining_threshold:
+                    break
+
+        if not leaf_compacted_this_turn:
+            if force_overflow and len(messages) >= 1:
+                compressed = self._assemble_overflow_recovery_context(
+                    messages[0],
+                    messages[1:],
+                    assembly_cap_override=recovery_assembly_cap,
+                )
+                return self._finalize_forced_overflow_result(
+                    messages,
+                    compressed,
+                    assembly_cap_override=recovery_assembly_cap,
+                )
+            return messages
 
         # Step 6: Check if condensation is needed
         self._maybe_condense(
@@ -382,8 +400,8 @@ class LCMEngine(ContextEngine):
 
         # Step 7: Assemble new active context
         compressed = self._assemble_context(
-            messages[0],
-            remaining_messages,
+            working_messages[0],
+            working_messages[1:],
             assembly_cap_override=recovery_assembly_cap,
         )
         self.compression_count += 1
@@ -402,9 +420,14 @@ class LCMEngine(ContextEngine):
         self._ingest_cursor = len(compressed)
 
         logger.info(
-            "LCM compaction #%d: %d messages → %d (L%d, %d→%d tokens, %d DAG nodes%s)",
-            self.compression_count, n, len(compressed), level,
-            source_tokens, count_tokens(summary_text),
+            "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",
+            self.compression_count,
+            len(messages),
+            len(compressed),
+            leaf_passes,
+            "es" if leaf_passes != 1 else "",
+            count_messages_tokens(messages),
+            count_messages_tokens(compressed),
             len(self._dag.get_session_nodes(self._session_id)),
             ", forced overflow recovery" if force_overflow else "",
         )

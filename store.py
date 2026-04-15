@@ -37,30 +37,41 @@ def _normalize_search_sort(sort: str | None) -> str:
     return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
 
 
-def _build_search_order_by(sort: str | None, timestamp_expr: str) -> str:
+def _build_search_order_by(
+    sort: str | None,
+    timestamp_expr: str,
+    role_penalty_expr: str | None = None,
+) -> str:
     normalized = _normalize_search_sort(sort)
+    order_parts: list[str] = []
+    if role_penalty_expr:
+        order_parts.append(f"{role_penalty_expr} ASC")
     if normalized == "relevance":
-        return f"rank ASC, {timestamp_expr} DESC"
+        order_parts.extend(["rank ASC", f"{timestamp_expr} DESC"])
+        return ", ".join(order_parts)
     if normalized == "hybrid":
-        return (
-            f"(rank / (1 + (((strftime('%s','now') - {timestamp_expr}) / 3600.0) * {AGE_DECAY_RATE}))) ASC, "
-            f"{timestamp_expr} DESC"
-        )
-    return f"{timestamp_expr} DESC"
+        order_parts.extend([
+            f"(rank / (1 + (((strftime('%s','now') - {timestamp_expr}) / 3600.0) * {AGE_DECAY_RATE}))) ASC",
+            f"{timestamp_expr} DESC",
+        ])
+        return ", ".join(order_parts)
+    order_parts.extend([f"{timestamp_expr} DESC", "rank ASC"])
+    return ", ".join(order_parts)
 
 
-def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float]:
+def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float]:
     normalized = _normalize_search_sort(sort)
     score = float(result.get("_fallback_score") or 0.0)
     timestamp = float(result.get("timestamp") or 0.0)
+    role_bias = 1.0 if result.get("role") == "tool" else 0.0
 
     if normalized == "relevance":
-        return (-score, -timestamp)
+        return (role_bias, -score, -timestamp)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
         blended = score / (1 + (age_hours * AGE_DECAY_RATE))
-        return (-blended, -timestamp)
-    return (-timestamp, -score)
+        return (role_bias, -blended, -timestamp)
+    return (role_bias, -timestamp, -score)
 
 
 class MessageStore:
@@ -276,7 +287,11 @@ class MessageStore:
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
 
-        order_by = _build_search_order_by(sort, "m.timestamp")
+        order_by = _build_search_order_by(
+            sort,
+            "m.timestamp",
+            "CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END",
+        )
         try:
             if session_id:
                 rows = self._conn.execute(

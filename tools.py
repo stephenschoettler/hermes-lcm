@@ -20,21 +20,22 @@ def _normalize_search_sort(sort: str | None) -> str:
     return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
 
 
-def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple[float, float, int]:
+def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple[float, float, int, int]:
     sort_timestamp = float(result.get("_sort_ts") or 0.0)
     rank = result.get("_sort_rank")
     rank_value = float(rank) if rank is not None else float("inf")
     type_bias = 0 if result.get("type") == "message" else 1
+    role_bias = 1 if result.get("role") == "tool" else 0
 
     if sort == "relevance":
-        return (rank_value, -sort_timestamp, type_bias)
+        return (role_bias, rank_value, -sort_timestamp, type_bias)
 
     if sort == "hybrid":
         age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
         blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
-        return (blended, -sort_timestamp, type_bias)
+        return (role_bias, blended, -sort_timestamp, type_bias)
 
-    return (-sort_timestamp, rank_value, type_bias)
+    return (role_bias, -sort_timestamp, rank_value, type_bias)
 
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":

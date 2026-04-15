@@ -483,6 +483,46 @@ class TestMessageStore:
         assert results[0]["store_id"] == target
         assert results[0]["snippet"]
 
+    def test_search_prefers_conversational_hits_over_tool_output_noise(self, store):
+        user_id = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "vendoring external plugin support should stay generic host support only",
+            },
+        )
+        tool_id = store.append(
+            "sess1",
+            {
+                "role": "tool",
+                "content": '{"vendoring":"vendoring vendoring vendoring","payload":"external plugin generic host support"}',
+            },
+        )
+
+        relevance_results = store.search("vendoring", session_id="sess1", limit=2, sort="relevance")
+        fallback_results = store.search("hermes-lcm", session_id="sess1", limit=2, sort="relevance")
+
+        assert relevance_results[0]["store_id"] == user_id
+        assert relevance_results[1]["store_id"] == tool_id
+
+        fallback_user_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "hermes-lcm should stay external and plugin-only in practice",
+            },
+        )
+        fallback_tool_id = store.append(
+            "sess1",
+            {
+                "role": "tool",
+                "content": '{"query":"hermes-lcm","matches":["hermes-lcm","hermes-lcm"]}',
+            },
+        )
+        fallback_results = store.search("hermes-lcm", session_id="sess1", limit=2, sort="relevance")
+        assert fallback_results[0]["store_id"] == fallback_user_id
+        assert fallback_results[1]["store_id"] == fallback_tool_id
+
     def test_pin_unpin(self, store):
         sid = store.append("sess1", {"role": "user", "content": "important"})
         store.pin(sid)
