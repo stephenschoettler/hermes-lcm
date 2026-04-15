@@ -22,6 +22,10 @@ _EMOJI_RE = re.compile(
     r"]"
 )
 _QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"')
+_BOOLEAN_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
+_RISKY_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9][\-:/][A-Za-z0-9]")
+_SPLIT_PUNCT_RE = re.compile(r"[-:/]+")
+_STRIP_EDGE_PUNCT = "()[]{}.,;"
 
 
 def contains_cjk(text: str) -> bool:
@@ -32,8 +36,40 @@ def contains_emoji(text: str) -> bool:
     return bool(_EMOJI_RE.search(text or ""))
 
 
+def contains_risky_fts_ascii(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if raw.count('"') % 2:
+        return True
+    text_without_phrases = _QUOTED_PHRASE_RE.sub(" ", raw)
+    return bool(_RISKY_FTS_TOKEN_RE.search(text_without_phrases))
+
+
 def requires_like_fallback(query: str) -> bool:
-    return contains_cjk(query) or contains_emoji(query)
+    return contains_cjk(query) or contains_emoji(query) or contains_risky_fts_ascii(query)
+
+
+def _token_variants(token: str) -> List[str]:
+    cleaned = (token or "").strip().strip(_STRIP_EDGE_PUNCT)
+    if not cleaned:
+        return []
+    if cleaned.upper() in _BOOLEAN_OPERATORS:
+        return []
+
+    variants = [cleaned]
+    if _SPLIT_PUNCT_RE.search(cleaned):
+        parts = [part for part in _SPLIT_PUNCT_RE.split(cleaned) if part]
+        if len(parts) > 1:
+            variants.extend(parts)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        if variant not in seen:
+            deduped.append(variant)
+            seen.add(variant)
+    return deduped
 
 
 def extract_search_terms(query: str) -> List[str]:
@@ -49,12 +85,12 @@ def extract_search_terms(query: str) -> List[str]:
 
     text_without_phrases = _QUOTED_PHRASE_RE.sub(" ", text)
     for token in text_without_phrases.split():
-        cleaned = token.strip()
-        if cleaned:
-            terms.append(cleaned)
+        terms.extend(_token_variants(token))
 
     if not terms:
-        terms.append(text)
+        fallback_text = text.strip().strip(_STRIP_EDGE_PUNCT)
+        if fallback_text:
+            terms.append(fallback_text)
 
     deduped: list[str] = []
     seen: set[str] = set()

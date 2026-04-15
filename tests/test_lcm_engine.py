@@ -1609,6 +1609,47 @@ class TestEngineTools:
         assert seen["prompt"] == "What was the plan?"
         assert seen["context_blocks"]
 
+    def test_handle_expand_query_hyphenated_operator_query_falls_back_cleanly(self, engine, monkeypatch):
+        engine._store.append(
+            "test-session",
+            {
+                "role": "user",
+                "content": "hermes-lcm plugin-only external context-engine generic host support no vendoring stays external",
+            },
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="hermes-lcm plugin-only external context-engine generic host support no vendoring stays external",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        monkeypatch.setattr(
+            "hermes_lcm.tools._synthesize_expansion_answer",
+            lambda **kwargs: "Recovered through normalized retrieval",
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "query": "8416 OR vendored OR vendoring OR plugin-only OR external context-engine OR generic host support OR hermes-lcm stays external OR no vendoring",
+                    "prompt": "What were the agreements?",
+                    "max_tokens": 500,
+                },
+            )
+        )
+
+        assert result["answer"] == "Recovered through normalized retrieval"
+        assert result["node_ids"] == [node_id]
+        assert result["matches"]
+
     def test_describe_and_expand_are_session_scoped(self, engine):
         node_id = engine._dag.add_node(
             SummaryNode(

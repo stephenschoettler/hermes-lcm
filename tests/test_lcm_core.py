@@ -460,6 +460,29 @@ class TestMessageStore:
         assert recency_results[0]["store_id"] == newer_weak
         assert relevance_results[0]["store_id"] == older_strong
 
+    def test_search_hyphenated_operator_queries_fall_back_cleanly(self, store):
+        target = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "hermes-lcm plugin-only external context-engine generic host support no vendoring stays external",
+            },
+        )
+        store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "or or or filler words without the target concepts",
+            },
+        )
+
+        query = "8416 OR vendored OR vendoring OR plugin-only OR external context-engine OR generic host support OR hermes-lcm stays external OR no vendoring"
+        results = store.search(query, session_id="sess1", limit=5, sort="relevance")
+
+        assert len(results) == 1
+        assert results[0]["store_id"] == target
+        assert results[0]["snippet"]
+
     def test_pin_unpin(self, store):
         sid = store.append("sess1", {"role": "user", "content": "important"})
         store.pin(sid)
@@ -847,6 +870,30 @@ class TestSummaryDAG:
 
         assert recency_results[0].node_id == newer_weak
         assert relevance_results[0].node_id == older_strong
+
+    def test_search_hyphenated_operator_queries_fall_back_cleanly(self, dag):
+        target = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="hermes-lcm plugin-only external context-engine generic host support no vendoring stays external",
+            token_count=10, source_ids=[1], source_type="messages",
+            created_at=1_700_000_000,
+            earliest_at=1_700_000_000,
+            latest_at=1_700_000_000,
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="or or or filler words without the target concepts",
+            token_count=10, source_ids=[2], source_type="messages",
+            created_at=1_800_000_000,
+            earliest_at=1_800_000_000,
+            latest_at=1_800_000_000,
+        ))
+
+        query = "8416 OR vendored OR vendoring OR plugin-only OR external context-engine OR generic host support OR hermes-lcm stays external OR no vendoring"
+        results = dag.search(query, session_id="s1", limit=5, sort="relevance")
+
+        assert len(results) == 1
+        assert results[0].node_id == target
 
     def test_describe_subtree(self, dag):
         c1 = dag.add_node(SummaryNode(
