@@ -7,6 +7,26 @@ def _parse_pattern_list(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _parse_int_env(key: str, default: int) -> int:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float_env(key: str, default: float) -> float:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class LCMConfig:
     """All tunables for the LCM engine."""
@@ -65,8 +85,8 @@ class LCMConfig:
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
         c = cls()
-        _int = lambda key, default: int(os.environ.get(key, default))
-        _float = lambda key, default: float(os.environ.get(key, default))
+        _int = _parse_int_env
+        _float = _parse_float_env
         _str = lambda key, default: os.environ.get(key, default)
 
         c.fresh_tail_count = _int("LCM_FRESH_TAIL_COUNT", c.fresh_tail_count)

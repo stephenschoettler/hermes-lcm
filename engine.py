@@ -6,6 +6,7 @@ with a DAG-based summarization system that preserves every message.
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -99,6 +100,7 @@ class LCMEngine(ContextEngine):
         self._context_probe_persistable = False
         self.quiet_mode = False
         self.summary_model = self._config.summary_model
+        self._last_overflow_recovery_failed = False
 
     @property
     def name(self) -> str:
@@ -115,6 +117,8 @@ class LCMEngine(ContextEngine):
         if self._session_ignored or self._session_stateless:
             return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if self._should_force_overflow_recovery(observed_tokens=tokens):
+            return True
         if self.threshold_tokens <= 0:
             return False
         return tokens >= self.threshold_tokens
@@ -130,6 +134,8 @@ class LCMEngine(ContextEngine):
                 logger.debug("Ingest during preflight: %s", e)
         from .tokens import count_messages_tokens
         rough = count_messages_tokens(messages)
+        if self._should_force_overflow_recovery(observed_tokens=rough):
+            return True
         return rough >= self.threshold_tokens
 
     def compress(self, messages: List[Dict[str, Any]],
@@ -154,7 +160,19 @@ class LCMEngine(ContextEngine):
             )
             return messages
 
-        prompt_tokens = current_tokens or self.last_prompt_tokens
+        observed_prompt_tokens = current_tokens if current_tokens is not None else None
+        force_overflow = self._should_force_overflow_recovery(
+            observed_tokens=observed_prompt_tokens,
+            messages=messages,
+        )
+        recovery_assembly_cap = (
+            self._overflow_recovery_assembly_cap(
+                observed_tokens=observed_prompt_tokens,
+                messages=messages,
+            )
+            if force_overflow
+            else None
+        )
 
         # Step 1: Ingest new messages into the immutable store
         self._ingest_messages(messages)
@@ -166,6 +184,17 @@ class LCMEngine(ContextEngine):
         # Protect system prompt (always index 0)
         if fresh_tail_start <= 1:
             # Not enough messages to compact
+            if force_overflow and len(messages) >= 1:
+                compressed = self._assemble_overflow_recovery_context(
+                    messages[0],
+                    messages[1:],
+                    assembly_cap_override=recovery_assembly_cap,
+                )
+                return self._finalize_forced_overflow_result(
+                    messages,
+                    compressed,
+                    assembly_cap_override=recovery_assembly_cap,
+                )
             return messages
 
         # Step 3: Identify messages to compact (between system prompt and fresh tail)
@@ -173,11 +202,22 @@ class LCMEngine(ContextEngine):
         to_compact = messages[1:fresh_tail_start]
 
         if not to_compact:
+            if force_overflow and len(messages) >= 1:
+                compressed = self._assemble_overflow_recovery_context(
+                    messages[0],
+                    messages[1:],
+                    assembly_cap_override=recovery_assembly_cap,
+                )
+                return self._finalize_forced_overflow_result(
+                    messages,
+                    compressed,
+                    assembly_cap_override=recovery_assembly_cap,
+                )
             return messages
 
         # Calculate source tokens
         source_tokens = count_messages_tokens(to_compact)
-        if source_tokens < self._config.leaf_chunk_tokens:
+        if source_tokens < self._config.leaf_chunk_tokens and not force_overflow:
             # Not enough to justify compaction
             return messages
 
@@ -220,17 +260,32 @@ class LCMEngine(ContextEngine):
         self._maybe_condense(focus_topic=focus_topic)
 
         # Step 7: Assemble new active context
-        compressed = self._assemble_context(messages[0], messages[fresh_tail_start:])
+        compressed = self._assemble_context(
+            messages[0],
+            messages[fresh_tail_start:],
+            assembly_cap_override=recovery_assembly_cap,
+        )
         self.compression_count += 1
+        if recovery_assembly_cap is None:
+            self._last_overflow_recovery_failed = False
+        else:
+            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > recovery_assembly_cap
+            if self._last_overflow_recovery_failed:
+                logger.warning(
+                    "LCM overflow recovery could not get under cap=%d after compaction; returning best-effort context (%d tokens)",
+                    recovery_assembly_cap,
+                    count_messages_tokens(compressed),
+                )
         # Reset cursor to the length of the compressed context so that
         # only messages appended *after* this point get ingested next time.
         self._ingest_cursor = len(compressed)
 
         logger.info(
-            "LCM compaction #%d: %d messages → %d (L%d, %d→%d tokens, %d DAG nodes)",
+            "LCM compaction #%d: %d messages → %d (L%d, %d→%d tokens, %d DAG nodes%s)",
             self.compression_count, n, len(compressed), level,
             source_tokens, count_tokens(summary_text),
             len(self._dag.get_session_nodes(self._session_id)),
+            ", forced overflow recovery" if force_overflow else "",
         )
 
         return compressed
@@ -242,6 +297,7 @@ class LCMEngine(ContextEngine):
         self._session_platform = str(kwargs.get("platform") or "")
         self._ingest_cursor = 0
         self._last_compacted_store_id = 0
+        self._last_overflow_recovery_failed = False
         self._refresh_session_filters()
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
@@ -263,6 +319,7 @@ class LCMEngine(ContextEngine):
         self._ingest_cursor = 0
         self._context_probed = False
         self._context_probe_persistable = False
+        self._last_overflow_recovery_failed = False
 
         # Retain DAG nodes across sessions based on config.
         #   -1  → keep all nodes
@@ -326,6 +383,7 @@ class LCMEngine(ContextEngine):
             status["stateless_session_patterns"] = list(self._config.stateless_session_patterns)
             status["ignore_session_patterns_source"] = self._config.ignore_session_patterns_source
             status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
+            status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
         return status
 
     def update_model(self, model: str, context_length: int,
@@ -549,8 +607,13 @@ class LCMEngine(ContextEngine):
 
     # -- Internal: context assembly ----------------------------------------
 
-    def _assemble_context(self, system_msg: Dict[str, Any],
-                          tail_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _assemble_context(
+        self,
+        system_msg: Dict[str, Any],
+        tail_messages: List[Dict[str, Any]],
+        assembly_cap_override: Optional[int] = None,
+        include_lcm_note: bool = True,
+    ) -> List[Dict[str, Any]]:
         """Build the active context from DAG summaries + fresh tail.
 
         Structure:
@@ -562,7 +625,7 @@ class LCMEngine(ContextEngine):
 
         # System prompt with LCM annotation
         sys_msg = system_msg.copy()
-        if self.compression_count == 0:
+        if self.compression_count == 0 and include_lcm_note:
             sys_content = sys_msg.get("content", "")
             sys_msg["content"] = (
                 sys_content
@@ -573,7 +636,11 @@ class LCMEngine(ContextEngine):
             )
         result.append(sys_msg)
 
-        assembly_cap = self._effective_assembly_token_cap()
+        assembly_cap = (
+            assembly_cap_override
+            if assembly_cap_override is not None
+            else self._effective_assembly_token_cap()
+        )
 
         tail_selected = tail_messages
         summary_budget = None
@@ -634,6 +701,83 @@ class LCMEngine(ContextEngine):
 
         return result
 
+    def _finalize_forced_overflow_result(
+        self,
+        original_messages: List[Dict[str, Any]],
+        compressed: List[Dict[str, Any]],
+        assembly_cap_override: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if compressed != original_messages:
+            self._ingest_cursor = len(compressed)
+            logger.info(
+                "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
+                len(original_messages),
+                len(compressed),
+            )
+
+        effective_cap = (
+            assembly_cap_override
+            if assembly_cap_override is not None
+            else self._effective_assembly_token_cap()
+        )
+        if effective_cap is None:
+            self._last_overflow_recovery_failed = False
+        else:
+            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > effective_cap
+            if self._last_overflow_recovery_failed:
+                logger.warning(
+                    "LCM overflow recovery could not get under cap=%d; returning best-effort context (%d tokens)",
+                    effective_cap,
+                    count_messages_tokens(compressed),
+                )
+        return compressed
+
+    def _should_force_overflow_recovery(
+        self,
+        observed_tokens: Optional[int] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        assembly_cap = self._effective_assembly_token_cap()
+        if assembly_cap is None:
+            return False
+
+        tokens = self._overflow_recovery_signal_tokens(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        )
+        if tokens is None:
+            return False
+        return tokens >= assembly_cap
+
+    def _overflow_recovery_signal_tokens(
+        self,
+        observed_tokens: Optional[int] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[int]:
+        candidates: list[int] = []
+        if observed_tokens is not None and observed_tokens > 0:
+            candidates.append(observed_tokens)
+        if messages is not None:
+            candidates.append(count_messages_tokens(messages))
+        if not candidates:
+            return None
+        return max(candidates)
+
+    def _overflow_recovery_assembly_cap(
+        self,
+        observed_tokens: Optional[int] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[int]:
+        assembly_cap = self._effective_assembly_token_cap()
+        if assembly_cap is None:
+            return None
+        if messages is None or observed_tokens is None or observed_tokens <= 0:
+            return assembly_cap
+
+        message_tokens = count_messages_tokens(messages)
+        overhead_tokens = max(0, observed_tokens - message_tokens)
+        return max(1, assembly_cap - overhead_tokens)
+
     def _effective_assembly_token_cap(self) -> Optional[int]:
         """Return the active assembly cap, if any.
 
@@ -663,6 +807,48 @@ class LCMEngine(ContextEngine):
         return max(1, min(caps))
 
     # -- Internal: helpers -------------------------------------------------
+
+    def _assemble_overflow_recovery_context(
+        self,
+        system_msg: Dict[str, Any],
+        tail_messages: List[Dict[str, Any]],
+        assembly_cap_override: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if tail_messages:
+            first = tail_messages[0]
+            content = first.get("content") or ""
+            role = first.get("role") or ""
+            if role == "assistant" and self._looks_like_active_summary_blob(content):
+                candidate = self._assemble_context(
+                    system_msg,
+                    tail_messages[1:],
+                    assembly_cap_override=assembly_cap_override,
+                    include_lcm_note=False,
+                )
+                if any(
+                    (msg.get("content") or "") == content
+                    for msg in candidate[1:]
+                ):
+                    return candidate
+
+        return self._assemble_context(
+            system_msg,
+            tail_messages,
+            assembly_cap_override=assembly_cap_override,
+            include_lcm_note=False,
+        )
+
+    @staticmethod
+    def _looks_like_active_summary_blob(content: str) -> bool:
+        if not isinstance(content, str) or not content:
+            return False
+        block = (
+            r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]\n"
+            r".*?\n"
+            r"\[Expand for details: .*?\]"
+        )
+        pattern = rf"^{block}(?:\n\n---\n\n{block})*$"
+        return re.fullmatch(pattern, content, flags=re.DOTALL) is not None
 
     @staticmethod
     def _extract_expand_hint(summary: str) -> str:
