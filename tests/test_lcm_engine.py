@@ -6,6 +6,7 @@ import time
 import pytest
 
 import hermes_lcm.engine as lcm_engine
+import hermes_lcm.tools as lcm_tools
 
 from agent.context_engine import ContextEngine
 from hermes_lcm.config import LCMConfig
@@ -481,7 +482,10 @@ class TestEngineCompress:
         engine = LCMEngine(config=config)
         engine._session_id = "test-session"
         engine.context_length = 1200
-        engine.threshold_tokens = 700
+        # Set threshold so estimated_active_tokens stays above it across at
+        # least two compaction passes (794 → ~463 after pass 1 → ~375 after
+        # pass 2), forcing the loop to run bounded catch-up.
+        engine.threshold_tokens = 450
 
         messages = [{"role": "system", "content": "You are a helpful assistant."}]
         for i in range(16):
@@ -2479,7 +2483,7 @@ class TestEngineTools:
             seen["timeout"] = timeout
             return "Expansion answer"
 
-        monkeypatch.setattr("hermes_lcm.tools._synthesize_expansion_answer", fake_synthesize)
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
 
         result = json.loads(
             engine.handle_tool_call(
@@ -2519,7 +2523,7 @@ class TestEngineTools:
         )
 
         monkeypatch.setattr(
-            "hermes_lcm.tools._synthesize_expansion_answer",
+            lcm_tools, "_synthesize_expansion_answer",
             lambda **kwargs: "Recovered through normalized retrieval",
         )
 
