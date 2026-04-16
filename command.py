@@ -37,6 +37,7 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm or /lcm status: show current LCM runtime/session status",
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor clean: best-effort scan of obvious junk/noise session candidates without deleting anything",
+        "- /lcm doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
         "- /lcm backup: create a timestamped SQLite backup before any future cleanup workflow",
         "- /lcm help: show this help",
     ])
@@ -95,6 +96,128 @@ def _status_text(engine) -> str:
     return "\n".join(lines)
 
 
+def _scan_clean_candidates(engine) -> dict[str, Any]:
+    conn = engine._store._conn
+    try:
+        rows = conn.execute(
+            """
+            WITH session_ids AS (
+                SELECT session_id FROM messages
+                UNION
+                SELECT session_id FROM summary_nodes
+            ),
+            message_stats AS (
+                SELECT session_id,
+                       COUNT(*) AS message_count,
+                       COALESCE(SUM(token_estimate), 0) AS token_total
+                FROM messages
+                GROUP BY session_id
+            ),
+            node_stats AS (
+                SELECT session_id, COUNT(*) AS node_count
+                FROM summary_nodes
+                GROUP BY session_id
+            )
+            SELECT s.session_id,
+                   COALESCE(m.message_count, 0) AS message_count,
+                   COALESCE(m.token_total, 0) AS token_total,
+                   COALESCE(n.node_count, 0) AS node_count
+            FROM session_ids s
+            LEFT JOIN message_stats m ON m.session_id = s.session_id
+            LEFT JOIN node_stats n ON n.session_id = s.session_id
+            ORDER BY s.session_id
+            """
+        ).fetchall()
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "error": str(exc),
+            "candidates": [],
+            "ignored_count": 0,
+            "stateless_count": 0,
+            "protected_count": 0,
+        }
+
+    candidates = []
+    ignored_count = 0
+    stateless_count = 0
+    protected_count = 0
+
+    for session_id, message_count, token_total, node_count in rows:
+        keys = build_session_match_keys(session_id)
+        matched_classes = []
+        if matches_session_pattern(keys, engine._compiled_ignore_session_patterns):
+            matched_classes.append("ignored-pattern")
+            ignored_count += 1
+        elif matches_session_pattern(keys, engine._compiled_stateless_session_patterns):
+            matched_classes.append("stateless-pattern")
+            stateless_count += 1
+        if not matched_classes:
+            continue
+        if session_id == getattr(engine, "_session_id", ""):
+            protected_count += 1
+            continue
+        candidates.append(
+            {
+                "session_id": session_id,
+                "classes": matched_classes,
+                "message_count": int(message_count),
+                "node_count": int(node_count),
+                "token_total": int(token_total),
+            }
+        )
+
+    return {
+        "error": None,
+        "candidates": candidates,
+        "ignored_count": ignored_count,
+        "stateless_count": stateless_count,
+        "protected_count": protected_count,
+    }
+
+
+def _backup_database(engine) -> dict[str, Any]:
+    db_path = Path(engine._store.db_path)
+    if not db_path.exists():
+        return {
+            "ok": False,
+            "db_path": db_path,
+            "error": "database file does not exist",
+        }
+
+    backup_root = Path(engine._hermes_home).expanduser() if getattr(engine, "_hermes_home", "") else db_path.parent
+    backup_dir = backup_root / "backups" / "lcm"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = backup_dir / f"{db_path.stem}-{timestamp}.sqlite3"
+
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        engine._store._conn.commit()
+        engine._dag._conn.commit()
+        lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
+        if lifecycle_conn is not None:
+            lifecycle_conn.commit()
+
+        dest = sqlite3.connect(str(backup_path))
+        try:
+            engine._store._conn.backup(dest)
+        finally:
+            dest.close()
+    except (OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "db_path": db_path,
+            "error": str(exc),
+        }
+
+    backup_size = backup_path.stat().st_size if backup_path.exists() else 0
+    return {
+        "ok": True,
+        "db_path": db_path,
+        "backup_path": backup_path,
+        "backup_size": backup_size,
+    }
+
+
 def _doctor_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     store_conn = engine._store._conn
@@ -147,8 +270,55 @@ def _doctor_text(engine) -> str:
 
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
+    clean_scan = _scan_clean_candidates(engine)
 
-    doctor_status = "ok" if integrity == "ok" and not issues else "issues-found"
+    debt_rows = []
+    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
+    if lifecycle_conn is not None:
+        try:
+            debt_rows = lifecycle_conn.execute(
+                """
+                SELECT conversation_id, debt_kind, debt_size_estimate
+                FROM lcm_lifecycle_state
+                WHERE debt_kind IS NOT NULL AND debt_size_estimate > 0
+                ORDER BY updated_at DESC
+                """
+            ).fetchall()
+        except Exception as exc:  # pragma: no cover - defensive
+            issues.append("lifecycle_state")
+            debt_rows = [(f"error: {exc}", "error", 0)]
+
+    observations: list[str] = []
+    recommended_actions: list[str] = []
+
+    if debt_rows:
+        first = debt_rows[0]
+        observations.append(
+            f"maintenance_debt: {len(debt_rows)} conversation(s) currently carry deferred maintenance debt; first={first[0]} kind={first[1]} size={first[2]}"
+        )
+        recommended_actions.append(
+            "let normal compaction turns reduce maintenance debt before attempting broader cleanup"
+        )
+
+    if clean_scan["error"]:
+        observations.append(f"cleanup_candidates: scan error: {clean_scan['error']}")
+    elif clean_scan["candidates"]:
+        observations.append(
+            f"cleanup_candidates: {len(clean_scan['candidates'])} pattern-matched junk/noise session candidate(s) detected"
+        )
+        recommended_actions.append("inspect candidate sessions with `/lcm doctor clean`")
+        recommended_actions.append("create a safety snapshot first with `/lcm backup`")
+    else:
+        observations.append("cleanup_candidates: none")
+
+    if clean_scan.get("protected_count"):
+        observations.append(
+            f"protected_sessions: skipped {clean_scan['protected_count']} currently bound session(s) from cleanup candidates"
+        )
+
+    doctor_status = "issues-found" if integrity != "ok" or issues else (
+        "action-recommended" if recommended_actions else "ok"
+    )
     lines = [
         "LCM doctor",
         f"status: {doctor_status}",
@@ -169,81 +339,38 @@ def _doctor_text(engine) -> str:
         lines.append(f"issues: {', '.join(issues)}")
     else:
         lines.append("issues: none")
+    lines.append("observations:")
+    for item in observations:
+        lines.append(f"- {item}")
+    lines.append("recommended_actions:")
+    if recommended_actions:
+        for item in recommended_actions:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- none")
     return "\n".join(lines)
 
 
 def _doctor_clean_text(engine) -> str:
-    conn = engine._store._conn
-    try:
-        rows = conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id, COUNT(*) AS node_count
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            ORDER BY s.session_id
-            """
-        ).fetchall()
-    except Exception as exc:  # pragma: no cover - defensive
+    scan = _scan_clean_candidates(engine)
+    if scan["error"]:
         return "\n".join([
             "LCM doctor clean",
             "status: error",
-            f"error: {exc}",
+            f"error: {scan['error']}",
             "note: read-only scan only — no rows were deleted",
         ])
 
-    candidates = []
-    ignored_count = 0
-    stateless_count = 0
-
-    for session_id, message_count, token_total, node_count in rows:
-        keys = build_session_match_keys(session_id)
-        matched_classes = []
-        if matches_session_pattern(keys, engine._compiled_ignore_session_patterns):
-            matched_classes.append("ignored-pattern")
-            ignored_count += 1
-        elif matches_session_pattern(keys, engine._compiled_stateless_session_patterns):
-            matched_classes.append("stateless-pattern")
-            stateless_count += 1
-        if not matched_classes:
-            continue
-        candidates.append(
-            {
-                "session_id": session_id,
-                "classes": matched_classes,
-                "message_count": int(message_count),
-                "node_count": int(node_count),
-                "token_total": int(token_total),
-            }
-        )
-
+    candidates = scan["candidates"]
     lines = [
         "LCM doctor clean",
         f"status: {'candidates-found' if candidates else 'ok'}",
         f"candidate_sessions: {len(candidates)}",
-        f"ignored_pattern_matches: {ignored_count}",
-        f"stateless_pattern_matches: {stateless_count}",
+        f"ignored_pattern_matches: {scan['ignored_count']}",
+        f"stateless_pattern_matches: {scan['stateless_count']}",
     ]
+    if scan["protected_count"]:
+        lines.append(f"protected_sessions_skipped: {scan['protected_count']}")
 
     if not candidates:
         lines.append("result: no obvious junk/noise session candidates detected")
@@ -261,49 +388,79 @@ def _doctor_clean_text(engine) -> str:
         lines.append(f"... {len(candidates) - 20} more candidate session(s) omitted")
     lines.append("note: best-effort stored-session scan only — platform-only matches may not be reconstructable from the SQLite state")
     lines.append("note: read-only scan only — no rows were deleted")
+    lines.append("note: use `/lcm doctor clean apply` only after a backup-first review of these safe candidates")
     return "\n".join(lines)
 
 
+def _doctor_clean_apply_text(engine) -> str:
+    scan = _scan_clean_candidates(engine)
+    if scan["error"]:
+        return "\n".join([
+            "LCM doctor clean apply",
+            "status: error",
+            f"error: {scan['error']}",
+            "note: cleanup apply aborted before any rows were deleted",
+        ])
+
+    candidates = scan["candidates"]
+    if not candidates:
+        return "\n".join([
+            "LCM doctor clean apply",
+            "status: ok",
+            "candidate_sessions: 0",
+            "result: no safe cleanup candidates detected",
+            "note: nothing was deleted",
+        ])
+
+    backup = _backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "LCM doctor clean apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"error: backup failed: {backup['error']}",
+            "note: cleanup apply aborted before any rows were deleted",
+        ])
+
+    session_ids = {item["session_id"] for item in candidates}
+    messages_deleted = sum(engine._store.delete_session_messages(session_id) for session_id in session_ids)
+    nodes_deleted = sum(engine._dag.delete_session_nodes(session_id) for session_id in session_ids)
+    lifecycle_deleted, lifecycle_skipped = engine._lifecycle.delete_safe_rows_for_sessions(
+        session_ids,
+        protected_session_ids={getattr(engine, "_session_id", "")},
+    )
+
+    return "\n".join([
+        "LCM doctor clean apply",
+        "status: ok",
+        f"database_path: {backup['db_path']}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+        f"candidate_sessions: {len(candidates)}",
+        f"messages_deleted: {messages_deleted}",
+        f"nodes_deleted: {nodes_deleted}",
+        f"lifecycle_rows_deleted: {lifecycle_deleted}",
+        f"lifecycle_rows_skipped: {lifecycle_skipped}",
+        "note: backup created before cleanup apply",
+    ])
+
+
 def _backup_text(engine) -> str:
-    db_path = Path(engine._store.db_path)
-    if not db_path.exists():
+    backup = _backup_database(engine)
+    if not backup["ok"]:
         return "\n".join([
             "LCM backup",
             "status: error",
-            f"database_path: {db_path}",
-            "error: database file does not exist",
+            f"database_path: {backup['db_path']}",
+            f"error: {backup['error']}",
         ])
 
-    backup_root = Path(engine._hermes_home).expanduser() if getattr(engine, "_hermes_home", "") else db_path.parent
-    backup_dir = backup_root / "backups" / "lcm"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = backup_dir / f"{db_path.stem}-{timestamp}.sqlite3"
-
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        engine._store._conn.commit()
-        engine._dag._conn.commit()
-
-        dest = sqlite3.connect(str(backup_path))
-        try:
-            engine._store._conn.backup(dest)
-        finally:
-            dest.close()
-    except (OSError, sqlite3.Error) as exc:
-        return "\n".join([
-            "LCM backup",
-            "status: error",
-            f"database_path: {db_path}",
-            f"error: {exc}",
-        ])
-
-    backup_size = backup_path.stat().st_size if backup_path.exists() else 0
     return "\n".join([
         "LCM backup",
         "status: ok",
-        f"database_path: {db_path}",
-        f"backup_path: {backup_path}",
-        f"backup_size: {_fmt_size(backup_size)}",
+        f"database_path: {backup['db_path']}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
         "note: backup created before any future cleanup/apply workflow",
     ])
 
@@ -327,8 +484,8 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         if len(rest) == 1 and rest[0].lower() == "clean":
             return _doctor_clean_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "apply":
-            return _help_text("`/lcm doctor clean apply` is not implemented yet. This slice is read-only diagnostics only.")
-        return _help_text("`/lcm doctor` currently supports only `clean` as an extra subcommand.")
+            return _doctor_clean_apply_text(engine)
+        return _help_text("`/lcm doctor` currently supports `clean` and `clean apply` as extra subcommands.")
 
     if head == "backup":
         if rest:

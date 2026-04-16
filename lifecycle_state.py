@@ -409,6 +409,42 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    def delete_safe_rows_for_sessions(
+        self,
+        session_ids: set[str] | list[str] | tuple[str, ...],
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[int, int]:
+        candidates = {str(s) for s in session_ids if s}
+        if not candidates:
+            return 0, 0
+        protected = {str(s) for s in (protected_session_ids or ()) if s}
+        deleted = 0
+        skipped = 0
+        rows = self._conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
+        for row in rows:
+            refs = {
+                str(value)
+                for value in (row["current_session_id"], row["last_finalized_session_id"])
+                if value
+            }
+            if not refs or not (refs & candidates):
+                continue
+            if refs & protected:
+                skipped += 1
+                continue
+            if refs <= candidates:
+                self._conn.execute(
+                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (row["conversation_id"],),
+                )
+                deleted += 1
+                continue
+            skipped += 1
+        if deleted:
+            self._conn.commit()
+        return deleted, skipped
+
     def advance_frontier(
         self,
         conversation_id: str | None,

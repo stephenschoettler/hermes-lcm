@@ -10,6 +10,7 @@ import pytest
 import hermes_lcm.command as command_mod
 from hermes_lcm.command import _fmt_size, handle_lcm_command
 from hermes_lcm.config import LCMConfig
+from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
 
 
@@ -61,6 +62,29 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "nodes_fts: ok" in result
 
 
+def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_doctor_actions.db"),
+        ignore_session_patterns=["cron*"],
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+    engine._lifecycle.record_debt("live-session", kind="raw_backlog", size_estimate=321)
+    engine._store.append("cron_20260414", {"role": "user", "content": "scheduled report"}, token_estimate=12)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "observations:" in result
+    assert "recommended_actions:" in result
+    assert "maintenance_debt" in result
+    assert "cleanup_candidates" in result
+    assert "/lcm doctor clean" in result
+    assert "/lcm backup" in result
+
+
 def test_lcm_help_on_unknown_subcommand(engine):
     result = handle_lcm_command("wat", engine)
 
@@ -72,8 +96,8 @@ def test_lcm_help_on_unknown_subcommand(engine):
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports only `clean`" in result
-    assert "clean apply" not in result
+    assert "currently supports `clean` and `clean apply`" in result
+    assert "/lcm doctor clean apply" in result
 
 
 def test_lcm_doctor_clean_reports_pattern_matched_junk_candidates(tmp_path):
@@ -144,6 +168,70 @@ def test_lcm_backup_returns_error_when_sqlite_backup_fails(engine, monkeypatch):
     assert "LCM backup" in result
     assert "status: error" in result
     assert "disk I/O error" in result
+
+
+def test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_apply.db"),
+        ignore_session_patterns=["cron*"],
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+
+    engine._store.append("cron_20260414", {"role": "user", "content": "scheduled report"}, token_estimate=12)
+    engine._store.append("normal_session", {"role": "user", "content": "real conversation"}, token_estimate=20)
+    engine._dag.add_node(SummaryNode(
+        session_id="cron_20260414",
+        depth=0,
+        summary="scheduled report summary",
+        token_count=5,
+        source_token_count=12,
+        source_ids=[1],
+        source_type="messages",
+        created_at=1.0,
+    ))
+    engine._lifecycle.bind_session("cron_20260414")
+    engine._lifecycle.finalize_session("cron_20260414", "cron_20260414", frontier_store_id=1)
+
+    result = handle_lcm_command("doctor clean apply", engine)
+
+    assert "LCM doctor clean apply" in result
+    assert "status: ok" in result
+    backup_line = next(line for line in result.splitlines() if line.startswith("backup_path: "))
+    backup_path = Path(backup_line.split(": ", 1)[1])
+    assert backup_path.exists()
+    assert engine._store.get_range("cron_20260414") == []
+    assert engine._dag.get_session_nodes("cron_20260414") == []
+    assert engine._lifecycle.get_by_conversation("cron_20260414") is None
+    assert len(engine._store.get_range("normal_session")) == 1
+
+
+def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_apply_fail.db"),
+        ignore_session_patterns=["cron*"],
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+    engine._store.append("cron_20260414", {"role": "user", "content": "scheduled report"}, token_estimate=12)
+
+    def boom(_path):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(command_mod.sqlite3, "connect", boom)
+
+    result = handle_lcm_command("doctor clean apply", engine)
+
+    assert "LCM doctor clean apply" in result
+    assert "status: error" in result
+    assert "backup failed" in result.lower()
+    assert len(engine._store.get_range("cron_20260414")) == 1
 
 
 class _FakeCursor:
