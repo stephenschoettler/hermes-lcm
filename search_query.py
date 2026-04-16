@@ -25,7 +25,10 @@ _QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"')
 _BOOLEAN_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 _RISKY_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9][\-:/][A-Za-z0-9]")
 _SPLIT_PUNCT_RE = re.compile(r"[-:/]+")
-_STRIP_EDGE_PUNCT = "()[]{}.,;"
+_STRIP_EDGE_PUNCT = "\"'()[]{}.,;"
+
+
+_WORD_RE = re.compile(r"[\w-]+", re.UNICODE)
 
 
 def contains_cjk(text: str) -> bool:
@@ -101,6 +104,10 @@ def extract_search_terms(query: str) -> List[str]:
     return deduped
 
 
+def extract_quoted_phrases(query: str) -> List[str]:
+    return [phrase.strip() for phrase in _QUOTED_PHRASE_RE.findall(query or "") if phrase.strip()]
+
+
 def escape_like(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -111,6 +118,92 @@ def count_term_matches(text: str, term: str) -> int:
     if not haystack or not needle:
         return 0
     return haystack.lower().count(needle.lower())
+
+
+def compute_directness_score(text: str, terms: List[str], phrases: List[str] | None = None) -> float:
+    content = text or ""
+    if not content:
+        return 0.0
+
+    unique_hits = 0
+    total_hits = 0
+    non_phrase_unique_hits = 0
+    non_phrase_total_hits = 0
+    normalized_phrases = {(phrase or "").strip().lower() for phrase in (phrases or []) if (phrase or "").strip()}
+    for term in terms:
+        matches = count_term_matches(content, term)
+        if matches > 0:
+            unique_hits += 1
+            total_hits += matches
+            if term.strip().lower() not in normalized_phrases:
+                non_phrase_unique_hits += 1
+                non_phrase_total_hits += matches
+
+    phrase_hits = 0
+    lowered = content.lower()
+    for phrase in phrases or []:
+        if phrase and phrase.lower() in lowered:
+            phrase_hits += 1
+
+    repetition_penalty = max(0, total_hits - unique_hits)
+    non_phrase_repetition_penalty = max(0, non_phrase_total_hits - non_phrase_unique_hits)
+    score = float((unique_hits * 5) + (phrase_hits * 8))
+    if not phrases:
+        score -= min(repetition_penalty, 6)
+    else:
+        score -= min(non_phrase_repetition_penalty, 6)
+
+    if phrases:
+        for phrase in phrases:
+            normalized_phrase = (phrase or "").strip().lower()
+            if not normalized_phrase:
+                continue
+            phrase_occurrences = lowered.count(normalized_phrase)
+            if phrase_occurrences <= 1:
+                continue
+            segments = re.split(re.escape(normalized_phrase), lowered)
+            gap_unique_counts = []
+            for segment in segments:
+                segment_tokens = [
+                    token.lower()
+                    for token in _WORD_RE.findall(segment)
+                    if any(char.isalpha() for char in token)
+                ]
+                gap_unique_counts.append(len(set(segment_tokens)))
+            interior_gap_counts = gap_unique_counts[1:-1]
+            tail_gap_count = gap_unique_counts[-1] if gap_unique_counts else 0
+            extra_occurrences = phrase_occurrences - 1
+            score -= extra_occurrences * 0.5
+            score -= sum(1.5 for count in interior_gap_counts if 0 < count <= 4)
+            if all(count == 0 for count in interior_gap_counts) and tail_gap_count <= 2:
+                score -= min(extra_occurrences, 3) * 1.0
+
+    return score
+
+
+def _is_precise_query_shape(terms: List[str], phrases: List[str] | None = None) -> bool:
+    if len(terms) == 1:
+        return True
+    return len(phrases or []) == 1 and len(terms) <= 2
+
+
+def should_widen_candidate_fetch(terms: List[str], phrases: List[str] | None = None) -> bool:
+    return _is_precise_query_shape(terms, phrases)
+
+
+def should_apply_directness_rank_adjustment(terms: List[str], phrases: List[str] | None = None) -> bool:
+    return _is_precise_query_shape(terms, phrases)
+
+
+def compute_directness_rank_bonus_upper_bound(terms: List[str], phrases: List[str] | None = None) -> float:
+    return float((len(terms) * 5) + (len(phrases or []) * 8))
+
+
+def compute_search_fetch_limit(limit: int, terms: List[str], phrases: List[str] | None = None) -> int:
+    base = max(limit * 5, limit, 20)
+    if should_widen_candidate_fetch(terms, phrases):
+        return max(base, limit * 10, 50)
+    return base
 
 
 def build_snippet(text: str, terms: List[str], width: int = 80) -> str:

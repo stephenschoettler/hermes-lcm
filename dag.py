@@ -26,10 +26,16 @@ from .db_bootstrap import (
     run_versioned_migrations,
 )
 from .search_query import (
+    compute_directness_rank_bonus_upper_bound,
+    compute_directness_score,
+    compute_search_fetch_limit,
+    contains_risky_fts_ascii,
     count_term_matches,
     escape_like,
+    extract_quoted_phrases,
     extract_search_terms,
     requires_like_fallback,
+    should_apply_directness_rank_adjustment,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,24 +54,55 @@ def _build_search_order_by(sort: str | None, recency_expr: str) -> str:
         return f"rank ASC, {recency_expr} DESC"
     if normalized == "hybrid":
         return (
-            f"(rank / (1 + (((strftime('%s','now') - {recency_expr}) / 3600.0) * {AGE_DECAY_RATE}))) ASC, "
+            f"(rank / (1 + (MAX(0.0, ((strftime('%s','now') - {recency_expr}) / 3600.0)) * {AGE_DECAY_RATE}))) ASC, "
             f"{recency_expr} DESC"
         )
     return f"{recency_expr} DESC"
 
 
-def _fallback_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float]:
+def _fallback_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float, float]:
     normalized = _normalize_search_sort(sort)
     score = float(node.search_rank or 0.0) * -1.0
     recency = float(node.latest_at or node.created_at or 0.0)
+    directness = float(node.search_directness or 0.0)
 
     if normalized == "relevance":
-        return (-score, -recency)
+        return (-score, -directness, -recency)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - recency) / 3600.0)
         blended = score / (1 + (age_hours * AGE_DECAY_RATE))
-        return (-blended, -recency)
-    return (-recency, -score)
+        return (-blended, -directness, -recency)
+    return (-recency, -score, -directness)
+
+
+def _fts_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float, float]:
+    normalized = _normalize_search_sort(sort)
+    rank = node.search_rank
+    rank_value = float(rank) if rank is not None else float("inf")
+    recency = float(node.latest_at or node.created_at or 0.0)
+    directness = float(node.search_directness or 0.0)
+
+    if normalized == "relevance":
+        return (rank_value, -directness, -recency)
+    if normalized == "hybrid":
+        age_hours = max(0.0, (time.time() - recency) / 3600.0)
+        strength = (-rank_value) if rank is not None else float("-inf")
+        blended_strength = strength / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("-inf")
+        return (-blended_strength, -directness, -recency)
+    return (-recency, rank_value, 0.0)
+
+
+def _fts_primary_value(node: "SummaryNode", sort: str | None) -> float:
+    normalized = _normalize_search_sort(sort)
+    rank = node.search_rank
+    rank_value = float(rank) if rank is not None else float("inf")
+    if normalized == "hybrid":
+        recency = float(node.latest_at or node.created_at or 0.0)
+        age_hours = max(0.0, (time.time() - recency) / 3600.0)
+        strength = (-rank_value) if rank is not None else float("-inf")
+        blended_strength = strength / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("-inf")
+        return -blended_strength
+    return rank_value
 
 
 @dataclass
@@ -84,6 +121,7 @@ class SummaryNode:
     latest_at: float | None = None
     expand_hint: str = ""  # "Expand for details about: ..."
     search_rank: float | None = None
+    search_directness: float = 0.0
 
 
 class SummaryDAG:
@@ -292,34 +330,65 @@ class SummaryDAG:
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None) -> List[SummaryNode]:
         """FTS5 search across all summary nodes."""
+        terms = extract_search_terms(query)
+        phrases = extract_quoted_phrases(query)
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
 
         order_by = _build_search_order_by(sort, "COALESCE(n.latest_at, n.created_at)")
-        try:
-            if session_id:
-                rows = self._conn.execute(
-                    f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
-                       JOIN summary_nodes n ON n.node_id = fts.rowid
-                       WHERE nodes_fts MATCH ? AND n.session_id = ?
-                       ORDER BY {order_by} LIMIT ?""",
-                    (query, session_id, limit),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
-                       JOIN summary_nodes n ON n.node_id = fts.rowid
-                       WHERE nodes_fts MATCH ?
-                       ORDER BY {order_by} LIMIT ?""",
-                    (query, limit),
-                ).fetchall()
-        except sqlite3.Error:
-            return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
-        return [self._row_to_node(r) for r in rows]
+        fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
+        apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
+        max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 2e-7
+        offset = 0
+        results: list[SummaryNode] = []
+        while True:
+            try:
+                if session_id:
+                    rows = self._conn.execute(
+                        f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
+                           JOIN summary_nodes n ON n.node_id = fts.rowid
+                           WHERE nodes_fts MATCH ? AND n.session_id = ?
+                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                        (query, session_id, fetch_limit, offset),
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
+                           JOIN summary_nodes n ON n.node_id = fts.rowid
+                           WHERE nodes_fts MATCH ?
+                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                        (query, fetch_limit, offset),
+                    ).fetchall()
+            except sqlite3.Error:
+                return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
+
+            raw_nodes = [self._row_to_node(r) for r in rows]
+            raw_primary_values: list[float] = []
+            for node in raw_nodes:
+                node.search_directness = compute_directness_score(node.summary, terms, phrases)
+                if apply_directness_adjustment and node.search_rank is not None:
+                    rank_adjustment = max(float(node.search_directness), 0.0)
+                    node.search_rank = float(node.search_rank) - (rank_adjustment * 2e-7)
+                raw_primary_values.append(_fts_primary_value(node, sort))
+                results.append(node)
+            results.sort(key=lambda node: _fts_result_sort_key(node, sort))
+
+            if not apply_directness_adjustment or len(rows) < fetch_limit or len(results) <= limit:
+                return results[:limit]
+
+            worst_visible_primary = _fts_primary_value(results[min(limit, len(results)) - 1], sort)
+            last_fetched_primary = raw_primary_values[-1]
+            best_unseen_primary = last_fetched_primary - max_rank_bonus
+            if best_unseen_primary > worst_visible_primary:
+                return results[:limit]
+
+            offset += len(rows)
+            fetch_limit *= 2
 
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None) -> List[SummaryNode]:
         terms = extract_search_terms(query)
+        phrases = extract_quoted_phrases(query)
         if not terms:
             return []
 
@@ -338,13 +407,18 @@ class SummaryDAG:
             f"SELECT * FROM summary_nodes WHERE {' AND '.join(where)}",
             args,
         ).fetchall()
+        collapse_risky_repeats = contains_risky_fts_ascii(query)
         nodes: list[SummaryNode] = []
         for row in rows:
             node = self._row_to_node(row)
-            score = sum(count_term_matches(node.summary, term) for term in terms)
+            score = sum(
+                min(count_term_matches(node.summary, term), 1) if collapse_risky_repeats else count_term_matches(node.summary, term)
+                for term in terms
+            )
             if score <= 0:
                 continue
             node.search_rank = -float(score)
+            node.search_directness = compute_directness_score(node.summary, terms, phrases)
             nodes.append(node)
 
         nodes.sort(key=lambda node: _fallback_result_sort_key(node, sort))

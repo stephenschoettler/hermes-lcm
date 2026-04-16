@@ -1602,6 +1602,586 @@ class TestEngineTools:
         assert result["results"][0]["role"] == "user"
         assert result["results"][1]["role"] == "tool"
 
+    def test_handle_grep_relevance_prefers_user_over_newer_assistant_on_similar_match(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "user", "content": "external plugin host support should stay generic"},
+        )
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "external plugin host support should stay generic"},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "external plugin host support", "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["role"] == "user"
+        assert result["results"][1]["role"] == "assistant"
+
+    def test_handle_grep_relevance_does_not_let_weaker_user_hit_beat_stronger_assistant_hit(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "user", "content": "vendoring blah blah external blah host"},
+        )
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "vendoring external host"},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring external host", "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "message"
+        assert result["results"][0]["role"] == "assistant"
+        assert result["results"][1]["type"] == "message"
+        assert result["results"][1]["role"] == "user"
+
+    def test_handle_grep_relevance_still_surfaces_preferred_user_hit_from_large_same_rank_pool(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "user", "content": "vendoring"},
+        )
+        for _ in range(150):
+            engine._store.append(
+                "test-session",
+                {"role": "assistant", "content": "vendoring"},
+            )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 5, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "message"
+        assert result["results"][0]["role"] == "user"
+
+    def test_handle_grep_relevance_prefers_assistant_over_tool_on_similar_match(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "plugin-only support should stay external and generic"},
+        )
+        engine._store.append(
+            "test-session",
+            {"role": "tool", "content": "plugin-only support should stay external and generic"},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "plugin-only", "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["role"] == "assistant"
+        assert result["results"][1]["role"] == "tool"
+
+    def test_handle_grep_relevance_prefers_direct_hit_over_repetition_spam_for_single_term_query(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "query audit notes: vendoring vendoring vendoring vendoring vendoring"},
+        )
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "Keep vendoring out of hermes-agent."},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["snippet"].startswith("Keep >>>vendoring<<< out")
+
+    def test_handle_grep_relevance_prefers_direct_summary_hit_over_repetition_spam_summary(self, engine):
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Summary notes: vendoring vendoring vendoring vendoring vendoring",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=1_700_000_000,
+                earliest_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Keep vendoring out of hermes-agent.",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[2],
+                source_type="messages",
+                created_at=1_699_999_000,
+                earliest_at=1_699_999_000,
+                latest_at=1_699_999_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "summary"
+        assert result["results"][0]["snippet"].startswith("Keep vendoring out of hermes-agent")
+
+    def test_handle_grep_relevance_still_surfaces_direct_summary_when_single_term_matches_many_spammy_candidates(self, engine):
+        for idx in range(150):
+            engine._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=0,
+                    summary=f"Summary spam {idx}: vendoring vendoring vendoring vendoring vendoring",
+                    token_count=10,
+                    source_token_count=20,
+                    source_ids=[idx + 1],
+                    source_type="messages",
+                    created_at=1_700_000_000 + idx,
+                    earliest_at=1_700_000_000 + idx,
+                    latest_at=1_700_000_000 + idx,
+                )
+            )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Keep vendoring out of hermes-agent.",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[999],
+                source_type="messages",
+                created_at=1_699_999_000,
+                earliest_at=1_699_999_000,
+                latest_at=1_699_999_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 5, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "summary"
+        assert result["results"][0]["snippet"].startswith("Keep vendoring out of hermes-agent")
+
+    def test_handle_grep_relevance_still_surfaces_direct_phrase_summary_when_phrase_matches_many_spammy_candidates(self, engine):
+        for idx in range(150):
+            engine._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=0,
+                    summary=f"Summary spam {idx}: vendoring external vendoring external vendoring external status",
+                    token_count=10,
+                    source_token_count=20,
+                    source_ids=[3000 + idx],
+                    source_type="messages",
+                    created_at=1_700_000_000 + idx,
+                    earliest_at=1_700_000_000 + idx,
+                    latest_at=1_700_000_000 + idx,
+                )
+            )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Keep vendoring external support plugin-only.",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[9999],
+                source_type="messages",
+                created_at=1_699_999_000,
+                earliest_at=1_699_999_000,
+                latest_at=1_699_999_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": '"vendoring external"', "limit": 5, "sort": "relevance"},
+            )
+        )
+
+        assert any(
+            item["type"] == "summary" and item["snippet"].startswith("Keep vendoring external support")
+            for item in result["results"]
+        )
+
+    def test_handle_grep_relevance_prefers_direct_phrase_summary_over_repeated_phrase_with_varied_filler(self, engine):
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="vendoring external rollout checklist vendoring external support matrix vendoring external adapter notes",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[4100],
+                source_type="messages",
+                created_at=1_700_000_100,
+                earliest_at=1_700_000_100,
+                latest_at=1_700_000_100,
+            )
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Keep vendoring external support plugin-only.",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[4101],
+                source_type="messages",
+                created_at=1_700_000_000,
+                earliest_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": '"vendoring external"', "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "summary"
+        assert result["results"][0]["snippet"].startswith("Keep vendoring external support")
+
+    def test_handle_grep_relevance_prefers_direct_phrase_summary_over_repeated_phrase_with_richer_filler(self, engine):
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="vendoring external rollout checklist vendoring external support matrix vendoring external adapter integration notes",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[4110],
+                source_type="messages",
+                created_at=1_700_000_100,
+                earliest_at=1_700_000_100,
+                latest_at=1_700_000_100,
+            )
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Keep vendoring external support plugin-only.",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[4111],
+                source_type="messages",
+                created_at=1_700_000_000,
+                earliest_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": '"vendoring external"', "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "summary"
+        assert result["results"][0]["snippet"].startswith("Keep vendoring external support")
+
+    def test_handle_grep_relevance_unmatched_quote_still_finds_results(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "Keep vendoring out of hermes-agent."},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": '"vendoring', "limit": 5, "sort": "relevance"},
+            )
+        )
+
+        assert result["total_results"] == 1
+        assert result["results"][0]["type"] == "message"
+        assert result["results"][0]["snippet"].startswith("Keep vendoring out")
+
+    def test_handle_grep_recency_same_timestamp_pool_matches_store_ordering(self, engine):
+        ids = engine._store.append_batch(
+            "test-session",
+            [
+                {
+                    "role": "assistant",
+                    "content": f"alpha alpha alpha beta beta gamma gamma gamma spam {idx}",
+                }
+                for idx in range(120)
+            ] + [
+                {
+                    "role": "assistant",
+                    "content": "keep alpha beta gamma concise",
+                }
+            ],
+        )
+
+        store_results = engine._store.search("alpha beta gamma", session_id="test-session", limit=5, sort="recency")
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "alpha beta gamma", "limit": 5, "sort": "recency"},
+            )
+        )
+
+        assert [item["type"] for item in result["results"]] == ["message"] * len(result["results"])
+        assert [item["store_id"] for item in result["results"]] == [hit["store_id"] for hit in store_results]
+
+    def test_handle_grep_hybrid_summary_only_matches_dag_order_for_future_timestamps(self, engine):
+        now = time.time()
+        future = now + (60 * 24 * 3600)
+        future_node = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="vendoring",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[8001],
+                source_type="messages",
+                created_at=future,
+                earliest_at=future,
+                latest_at=future,
+            )
+        )
+        current_node = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="vendoring",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[8002],
+                source_type="messages",
+                created_at=now,
+                earliest_at=now,
+                latest_at=now,
+            )
+        )
+
+        dag_results = engine._dag.search("vendoring", session_id="test-session", limit=2, sort="hybrid")
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 2, "sort": "hybrid"},
+            )
+        )
+
+        assert [node.node_id for node in dag_results] == [future_node, current_node]
+        assert [item["node_id"] for item in result["results"]] == [future_node, current_node]
+
+    def test_handle_grep_hybrid_message_only_clamps_future_timestamps_consistently(self, engine):
+        now = time.time()
+        future = now + (60 * 24 * 3600)
+        current_ids = [
+            engine._store.append(
+                "test-session",
+                {"role": "assistant", "content": "vendoring external"},
+            )
+            for _ in range(20)
+        ]
+        future_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "vendoring external"},
+        )
+        for current_id in current_ids:
+            engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (now, current_id))
+        engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (future, future_id))
+        engine._store._conn.commit()
+
+        store_results = engine._store.search("vendoring external", session_id="test-session", limit=1, sort="hybrid")
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring external", "limit": 1, "sort": "hybrid"},
+            )
+        )
+
+        assert [hit["store_id"] for hit in store_results] == [future_id]
+        assert [item["store_id"] for item in result["results"]] == [future_id]
+
+    def test_handle_grep_relevance_prefers_much_better_summary_over_vague_user_hit(self, engine):
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "vendoring? maybe?"},
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="Summary: keep hermes-lcm external and never vendor it into hermes-agent. generic host support only.",
+                token_count=20,
+                source_token_count=40,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1_700_000_000,
+                earliest_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "never vendor hermes-agent", "limit": 2, "sort": "relevance"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "summary"
+        assert result["results"][0]["snippet"].startswith("Summary: keep hermes-lcm external")
+        assert result["results"][1]["type"] == "message"
+        assert result["results"][1]["role"] == "user"
+
+    def test_handle_grep_hybrid_prefers_much_better_summary_over_vague_recent_user_hit(self, engine):
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "vendoring? maybe?"},
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="Summary: keep hermes-lcm external and never vendor it into hermes-agent. generic host support only.",
+                token_count=20,
+                source_token_count=40,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1_700_000_000,
+                earliest_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "never vendor hermes-agent", "limit": 2, "sort": "hybrid"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "summary"
+        assert result["results"][0]["snippet"].startswith("Summary: keep hermes-lcm external")
+        assert result["results"][1]["type"] == "message"
+        assert result["results"][1]["role"] == "user"
+
+    def test_handle_grep_hybrid_does_not_let_weak_summary_beat_stronger_message_hit(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "Keep vendoring out of hermes-agent."},
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="vendoring vendoring vendoring vendoring vendoring",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=1_700_000_000,
+                earliest_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 2, "sort": "hybrid"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "message"
+        assert result["results"][0]["role"] == "assistant"
+        assert result["results"][1]["type"] == "summary"
+
+    def test_handle_grep_recency_preserves_message_ordering_for_same_timestamp_hits(self, engine):
+        ids = engine._store.append_batch(
+            "test-session",
+            [
+                {"role": "user", "content": "vendoring"},
+                {"role": "assistant", "content": "vendoring vendoring vendoring vendoring vendoring"},
+            ],
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id IN (?, ?)",
+            (1_700_000_000, ids[0], ids[1]),
+        )
+        engine._store._conn.commit()
+
+        store_hits = engine._store.search("vendoring", session_id="test-session", limit=2, sort="recency")
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 2, "sort": "recency"},
+            )
+        )
+
+        assert [hit["role"] for hit in store_hits] == ["user", "assistant"]
+        assert [item["role"] for item in result["results"]] == ["user", "assistant"]
+
+    def test_handle_grep_recency_prefers_message_over_weaker_summary_at_same_timestamp(self, engine):
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "Keep vendoring external support clean."},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1_700_000_000, store_id),
+        )
+        engine._store._conn.commit()
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="vendoring vendoring vendoring",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1_700_000_000,
+                earliest_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "vendoring", "limit": 2, "sort": "recency"},
+            )
+        )
+
+        assert result["results"][0]["type"] == "message"
+        assert result["results"][0]["role"] == "user"
+        assert result["results"][1]["type"] == "summary"
+
     def test_handle_describe_overview(self, engine):
         result = json.loads(engine.handle_tool_call("lcm_describe", {}))
         assert "session_id" in result

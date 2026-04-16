@@ -21,15 +21,43 @@ from .db_bootstrap import (
 )
 from .search_query import (
     build_snippet,
+    compute_directness_rank_bonus_upper_bound,
+    compute_directness_score,
+    compute_search_fetch_limit,
+    contains_risky_fts_ascii,
     count_term_matches,
     escape_like,
+    extract_quoted_phrases,
     extract_search_terms,
     requires_like_fallback,
+    should_apply_directness_rank_adjustment,
 )
 
 logger = logging.getLogger(__name__)
 
 AGE_DECAY_RATE = 0.001
+
+
+_MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
+
+
+def _message_role_bias(role: str | None) -> float:
+    if role == "user":
+        return 0.0
+    if role == "assistant":
+        return 1.0
+    if role == "tool":
+        return 2.0
+    return 1.0
+
+
+def _message_directness_score(role: str | None, content: str | None, terms: List[str], phrases: List[str] | None = None) -> float:
+    score = compute_directness_score(content or "", terms, phrases)
+    if role == "tool":
+        stripped = (content or "").lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            score -= 4.0
+    return score
 
 
 def _normalize_search_sort(sort: str | None) -> str:
@@ -44,34 +72,68 @@ def _build_search_order_by(
 ) -> str:
     normalized = _normalize_search_sort(sort)
     order_parts: list[str] = []
-    if role_penalty_expr:
-        order_parts.append(f"{role_penalty_expr} ASC")
     if normalized == "relevance":
-        order_parts.extend(["rank ASC", f"{timestamp_expr} DESC"])
+        if role_penalty_expr:
+            order_parts.extend(["rank ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"])
+        else:
+            order_parts.extend(["rank ASC", f"{timestamp_expr} DESC"])
         return ", ".join(order_parts)
     if normalized == "hybrid":
-        order_parts.extend([
-            f"(rank / (1 + (((strftime('%s','now') - {timestamp_expr}) / 3600.0) * {AGE_DECAY_RATE}))) ASC",
-            f"{timestamp_expr} DESC",
-        ])
+        blended = f"(rank / (1 + (MAX(0.0, ((strftime('%s','now') - {timestamp_expr}) / 3600.0)) * {AGE_DECAY_RATE})))"
+        if role_penalty_expr:
+            order_parts.extend([f"{blended} ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"])
+        else:
+            order_parts.extend([f"{blended} ASC", f"{timestamp_expr} DESC"])
         return ", ".join(order_parts)
-    order_parts.extend([f"{timestamp_expr} DESC", "rank ASC"])
+    order_parts.append(f"{timestamp_expr} DESC")
+    if role_penalty_expr:
+        order_parts.append(f"{role_penalty_expr} ASC")
+    order_parts.append("rank ASC")
     return ", ".join(order_parts)
 
 
-def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float]:
+def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
     normalized = _normalize_search_sort(sort)
     score = float(result.get("_fallback_score") or 0.0)
+    directness = float(result.get("_directness_score") or 0.0)
     timestamp = float(result.get("timestamp") or 0.0)
-    role_bias = 1.0 if result.get("role") == "tool" else 0.0
+    role_bias = _message_role_bias(result.get("role"))
 
     if normalized == "relevance":
-        return (role_bias, -score, -timestamp)
+        return (-score, -directness, role_bias, -timestamp)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
         blended = score / (1 + (age_hours * AGE_DECAY_RATE))
-        return (role_bias, -blended, -timestamp)
-    return (role_bias, -timestamp, -score)
+        return (-blended, -directness, role_bias, -timestamp)
+    return (-timestamp, role_bias, -score, -directness)
+
+
+def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
+    normalized = _normalize_search_sort(sort)
+    rank = result.get("search_rank")
+    rank_value = float(rank) if rank is not None else float("inf")
+    directness = float(result.get("_directness_score") or 0.0)
+    timestamp = float(result.get("timestamp") or 0.0)
+    role_bias = _message_role_bias(result.get("role"))
+
+    if normalized == "relevance":
+        return (rank_value, -directness, role_bias, -timestamp)
+    if normalized == "hybrid":
+        age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
+        blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
+        return (blended, -directness, role_bias, -timestamp)
+    return (-timestamp, role_bias, rank_value, 0.0)
+
+
+def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
+    normalized = _normalize_search_sort(sort)
+    rank = result.get("search_rank")
+    rank_value = float(rank) if rank is not None else float("inf")
+    if normalized == "hybrid":
+        timestamp = float(result.get("timestamp") or 0.0)
+        age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
+        return rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
+    return rank_value
 
 
 class MessageStore:
@@ -284,48 +346,75 @@ class MessageStore:
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None) -> List[Dict[str, Any]]:
         """FTS5 search across messages. Returns matches with snippets."""
+        terms = extract_search_terms(query)
+        phrases = extract_quoted_phrases(query)
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
 
         order_by = _build_search_order_by(
             sort,
             "m.timestamp",
-            "CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END",
+            _MESSAGE_ROLE_BIAS_SQL,
         )
-        try:
-            if session_id:
-                rows = self._conn.execute(
-                    f"""SELECT m.*, rank as search_rank,
-                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                       FROM messages_fts fts
-                       JOIN messages m ON m.store_id = fts.rowid
-                       WHERE messages_fts MATCH ? AND m.session_id = ?
-                       ORDER BY {order_by} LIMIT ?""",
-                    (query, session_id, limit),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    f"""SELECT m.*, rank as search_rank,
-                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                       FROM messages_fts fts
-                       JOIN messages m ON m.store_id = fts.rowid
-                       WHERE messages_fts MATCH ?
-                       ORDER BY {order_by} LIMIT ?""",
-                    (query, limit),
-                ).fetchall()
-        except sqlite3.Error:
-            return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
-        results = []
-        for r in rows:
-            d = self._row_to_dict(r)
-            d["search_rank"] = r[10] if len(r) > 10 else None
-            d["snippet"] = r[11] if len(r) > 11 else ""
-            results.append(d)
-        return results
+        fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
+        apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
+        max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
+        offset = 0
+        results: list[Dict[str, Any]] = []
+        while True:
+            try:
+                if session_id:
+                    rows = self._conn.execute(
+                        f"""SELECT m.*, rank as search_rank,
+                                  snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                           FROM messages_fts fts
+                           JOIN messages m ON m.store_id = fts.rowid
+                           WHERE messages_fts MATCH ? AND m.session_id = ?
+                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                        (query, session_id, fetch_limit, offset),
+                    ).fetchall()
+                else:
+                    rows = self._conn.execute(
+                        f"""SELECT m.*, rank as search_rank,
+                                  snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                           FROM messages_fts fts
+                           JOIN messages m ON m.store_id = fts.rowid
+                           WHERE messages_fts MATCH ?
+                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                        (query, fetch_limit, offset),
+                    ).fetchall()
+            except sqlite3.Error:
+                return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
+
+            raw_primary_values: list[float] = []
+            for r in rows:
+                d = self._row_to_dict(r)
+                d["search_rank"] = r[10] if len(r) > 10 else None
+                d["snippet"] = r[11] if len(r) > 11 else ""
+                d["_directness_score"] = _message_directness_score(d.get("role"), d.get("content"), terms, phrases)
+                if apply_directness_adjustment and d["search_rank"] is not None:
+                    rank_adjustment = max(float(d["_directness_score"]), 0.0)
+                    d["search_rank"] = float(d["search_rank"]) - (rank_adjustment * 3e-7)
+                raw_primary_values.append(_fts_primary_value(d, sort))
+                results.append(d)
+            results.sort(key=lambda result: _fts_result_sort_key(result, sort))
+
+            if not apply_directness_adjustment or len(rows) < fetch_limit or len(results) <= limit:
+                return results[:limit]
+
+            worst_visible_primary = _fts_primary_value(results[min(limit, len(results)) - 1], sort)
+            last_fetched_primary = raw_primary_values[-1]
+            best_unseen_primary = last_fetched_primary - max_rank_bonus
+            if best_unseen_primary > worst_visible_primary:
+                return results[:limit]
+
+            offset += len(rows)
+            fetch_limit *= 2
 
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None) -> List[Dict[str, Any]]:
         terms = extract_search_terms(query)
+        phrases = extract_quoted_phrases(query)
         if not terms:
             return []
 
@@ -341,20 +430,24 @@ class MessageStore:
         where.append("(" + " OR ".join(like_clauses) + ")")
 
         rows = self._conn.execute(
-            f"SELECT * FROM messages WHERE {' AND '.join(where)}"
-            , args,
+            f"SELECT * FROM messages WHERE {' AND '.join(where)}",
+            args,
         ).fetchall()
-
-        results: list[Dict[str, Any]] = []
+        results: List[Dict[str, Any]] = []
+        collapse_risky_repeats = contains_risky_fts_ascii(query)
         for row in rows:
             result = self._row_to_dict(row)
             content = result.get("content") or ""
-            score = sum(count_term_matches(content, term) for term in terms)
+            score = sum(
+                min(count_term_matches(content, term), 1) if collapse_risky_repeats else count_term_matches(content, term)
+                for term in terms
+            )
             if score <= 0:
                 continue
             result["search_rank"] = -float(score)
             result["snippet"] = build_snippet(content, terms)
             result["_fallback_score"] = float(score)
+            result["_directness_score"] = _message_directness_score(result.get("role"), content, terms, phrases)
             results.append(result)
 
         results.sort(key=lambda result: _fallback_result_sort_key(result, sort))

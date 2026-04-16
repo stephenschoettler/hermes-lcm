@@ -523,6 +523,319 @@ class TestMessageStore:
         assert fallback_results[0]["store_id"] == fallback_user_id
         assert fallback_results[1]["store_id"] == fallback_tool_id
 
+    def test_search_relevance_prefers_user_over_newer_assistant_on_similar_match(self, store):
+        user_id = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "vendoring should stay external plugin host support only",
+            },
+        )
+        assistant_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "vendoring should stay external plugin host support only",
+            },
+        )
+
+        results = store.search("vendoring", session_id="sess1", limit=2, sort="relevance")
+
+        assert results[0]["store_id"] == user_id
+        assert results[1]["store_id"] == assistant_id
+
+    def test_search_relevance_does_not_let_weaker_user_hit_beat_stronger_assistant_hit(self, store):
+        weaker_user_id = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "vendoring blah blah external blah host",
+            },
+        )
+        stronger_assistant_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "vendoring external host",
+            },
+        )
+
+        results = store.search("vendoring external host", session_id="sess1", limit=2, sort="relevance")
+
+        assert results[0]["store_id"] == stronger_assistant_id
+        assert results[1]["store_id"] == weaker_user_id
+
+    def test_search_relevance_still_surfaces_preferred_user_hit_from_large_same_rank_pool(self, store):
+        preferred_user_id = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "vendoring",
+            },
+        )
+        for _ in range(150):
+            store.append(
+                "sess1",
+                {
+                    "role": "assistant",
+                    "content": "vendoring",
+                },
+            )
+
+        results = store.search("vendoring", session_id="sess1", limit=5, sort="relevance")
+
+        assert results[0]["store_id"] == preferred_user_id
+        assert results[0]["role"] == "user"
+
+    def test_search_relevance_top_results_do_not_change_when_limit_increases_on_large_single_term_pool(self, store):
+        store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "vendoring",
+            },
+        )
+        for idx in range(250):
+            content = (
+                '{"vendoring":"vendoring vendoring vendoring"}'
+                if idx % 5 == 0
+                else "vendoring vendoring vendoring vendoring vendoring spam"
+            )
+            store.append(
+                "sess1",
+                {
+                    "role": "tool" if idx % 5 == 0 else "assistant",
+                    "content": content,
+                },
+            )
+        top_5 = [result["store_id"] for result in store.search("vendoring", session_id="sess1", limit=5, sort="relevance")]
+        top_50 = [result["store_id"] for result in store.search("vendoring", session_id="sess1", limit=50, sort="relevance")[:5]]
+
+        assert top_5 == top_50
+
+    def test_search_relevance_prefers_assistant_over_tool_on_similar_match(self, store):
+        assistant_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "plugin-only support should stay external and generic",
+            },
+        )
+        tool_id = store.append(
+            "sess1",
+            {
+                "role": "tool",
+                "content": "plugin-only support should stay external and generic",
+            },
+        )
+
+        results = store.search("plugin-only", session_id="sess1", limit=2, sort="relevance")
+
+        assert results[0]["store_id"] == assistant_id
+        assert results[1]["store_id"] == tool_id
+
+    def test_search_relevance_still_returns_tool_when_it_is_only_real_hit(self, store):
+        tool_id = store.append(
+            "sess1",
+            {
+                "role": "tool",
+                "content": '{"verdict":"tool-only hit about vendoring boundaries"}',
+            },
+        )
+
+        results = store.search("tool-only", session_id="sess1", limit=2, sort="relevance")
+
+        assert len(results) == 1
+        assert results[0]["store_id"] == tool_id
+
+    def test_search_relevance_prefers_direct_hit_over_repetition_spam_for_single_term_query(self, store):
+        spam_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "query audit notes: vendoring vendoring vendoring vendoring vendoring",
+            },
+        )
+        direct_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "Keep vendoring out of hermes-agent.",
+            },
+        )
+
+        results = store.search("vendoring", session_id="sess1", limit=2, sort="relevance")
+
+        assert results[0]["store_id"] == direct_id
+        assert results[1]["store_id"] == spam_id
+
+    def test_search_relevance_still_surfaces_direct_phrase_hit_when_phrase_matches_many_spammy_candidates(self, store):
+        for _ in range(150):
+            store.append(
+                "sess1",
+                {
+                    "role": "assistant",
+                    "content": 'vendoring external vendoring external vendoring external spam note',
+                },
+            )
+        direct_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "Keep vendoring external support plugin-only.",
+            },
+        )
+
+        results = store.search('"vendoring external"', session_id="sess1", limit=5, sort="relevance")
+
+        assert direct_id in [result["store_id"] for result in results]
+
+    def test_search_relevance_prefers_direct_phrase_hit_over_repeated_phrase_with_varied_filler(self, store):
+        spam_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "vendoring external rollout checklist vendoring external support matrix vendoring external adapter notes",
+            },
+        )
+        direct_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "Keep vendoring external support plugin-only.",
+            },
+        )
+
+        results = store.search('"vendoring external"', session_id="sess1", limit=2, sort="relevance")
+
+        assert results[0]["store_id"] == direct_id
+        assert results[1]["store_id"] == spam_id
+
+    def test_search_relevance_prefers_direct_phrase_hit_over_repeated_phrase_with_richer_filler(self, store):
+        spam_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "vendoring external rollout checklist vendoring external support matrix vendoring external adapter integration notes",
+            },
+        )
+        direct_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "Keep vendoring external support plugin-only.",
+            },
+        )
+
+        results = store.search('"vendoring external"', session_id="sess1", limit=2, sort="relevance")
+
+        assert results[0]["store_id"] == direct_id
+        assert results[1]["store_id"] == spam_id
+
+    def test_search_relevance_still_surfaces_direct_phrase_hit_when_phrase_plus_extra_term_matches_many_spammy_candidates(self, store):
+        for idx in range(25):
+            store.append(
+                "sess1",
+                {
+                    "role": "assistant",
+                    "content": f"vendoring external plugin rollout {idx} vendoring external plugin support {idx}",
+                },
+            )
+        direct_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "Keep vendoring external plugin support simple.",
+            },
+        )
+
+        results = store.search('"vendoring external" plugin', session_id="sess1", limit=5, sort="relevance")
+
+        assert direct_id in [result["store_id"] for result in results]
+        assert results[0]["store_id"] == direct_id
+
+    def test_search_relevance_prefers_direct_phrase_hit_over_repeated_non_phrase_term_spam(self, store):
+        for idx in range(30):
+            store.append(
+                "sess1",
+                {
+                    "role": "assistant",
+                    "content": f"vendoring external plugin plugin plugin plugin {idx}",
+                },
+            )
+        direct_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "Keep vendoring external plugin support simple.",
+            },
+        )
+
+        results = store.search('"vendoring external" plugin', session_id="sess1", limit=5, sort="relevance")
+
+        assert direct_id in [result["store_id"] for result in results]
+        assert results[0]["store_id"] == direct_id
+
+    def test_search_like_fallback_strips_unmatched_quote_characters(self, store):
+        direct_id = store.append(
+            "sess1",
+            {
+                "role": "assistant",
+                "content": "Keep vendoring out of hermes-agent.",
+            },
+        )
+
+        results = store.search('"vendoring', session_id="sess1", limit=5, sort="relevance")
+
+        assert [result["store_id"] for result in results] == [direct_id]
+
+    def test_search_recency_same_timestamp_pool_is_limit_stable(self, store):
+        ids = store.append_batch(
+            "sess1",
+            [
+                {
+                    "role": "assistant",
+                    "content": f"alpha alpha alpha beta beta gamma gamma gamma spam {idx}",
+                }
+                for idx in range(120)
+            ] + [
+                {
+                    "role": "assistant",
+                    "content": "keep alpha beta gamma concise",
+                }
+            ],
+        )
+        timestamp = store.get(ids[0])["timestamp"]
+
+        short_results = store.search("alpha beta gamma", session_id="sess1", limit=5, sort="recency")
+        long_results = store.search("alpha beta gamma", session_id="sess1", limit=200, sort="recency")
+
+        assert [result["timestamp"] for result in short_results] == [timestamp] * len(short_results)
+        assert [result["store_id"] for result in short_results] == [result["store_id"] for result in long_results[:5]]
+
+    def test_search_hybrid_clamps_future_timestamps_consistently(self, store):
+        now = time.time()
+        future = now + (60 * 24 * 3600)
+        current_ids = [
+            store.append(
+                "sess1",
+                {"role": "assistant", "content": "vendoring external"},
+            )
+            for _ in range(20)
+        ]
+        future_id = store.append(
+            "sess1",
+            {"role": "assistant", "content": "vendoring external"},
+        )
+        for current_id in current_ids:
+            store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (now, current_id))
+        store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (future, future_id))
+        store._conn.commit()
+
+        results = store.search("vendoring external", session_id="sess1", limit=1, sort="hybrid")
+
+        assert [result["store_id"] for result in results] == [future_id]
+
     def test_pin_unpin(self, store):
         sid = store.append("sess1", {"role": "user", "content": "important"})
         store.pin(sid)
@@ -834,7 +1147,7 @@ class TestSummaryDAG:
             session_id="s1", depth=0,
             summary="error handling checklist error handling checklist error handling checklist with confirmed fixes",
             token_count=18, source_ids=[1], source_type="messages",
-            created_at=1_900_000_000,
+            created_at=1_700_000_000,
             earliest_at=1_700_000_000,
             latest_at=1_700_000_000,
         ))
@@ -842,9 +1155,9 @@ class TestSummaryDAG:
             session_id="s1", depth=0,
             summary="recent note mentioning the error handling checklist",
             token_count=9, source_ids=[2], source_type="messages",
-            created_at=1_800_000_000,
-            earliest_at=1_800_000_000,
-            latest_at=1_800_000_000,
+            created_at=1_700_086_400,
+            earliest_at=1_700_086_400,
+            latest_at=1_700_086_400,
         ))
 
         recency_results = dag.search(
@@ -934,6 +1247,231 @@ class TestSummaryDAG:
 
         assert len(results) == 1
         assert results[0].node_id == target
+
+    def test_search_hybrid_clamps_future_timestamps_consistently(self, dag):
+        now = time.time()
+        future = now + (60 * 24 * 3600)
+        future_node = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="vendoring",
+            token_count=10, source_ids=[3001], source_type="messages",
+            created_at=future,
+            earliest_at=future,
+            latest_at=future,
+        ))
+        current_node = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="vendoring",
+            token_count=10, source_ids=[3002], source_type="messages",
+            created_at=now,
+            earliest_at=now,
+            latest_at=now,
+        ))
+
+        results = dag.search("vendoring", session_id="s1", limit=2, sort="hybrid")
+
+        assert [node.node_id for node in results] == [future_node, current_node]
+
+    def test_search_relevance_prefers_direct_summary_hit_over_repetition_spam_for_single_term_query(self, dag):
+        spammy = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Summary notes: vendoring vendoring vendoring vendoring vendoring",
+            token_count=10, source_ids=[1], source_type="messages",
+            created_at=1_700_000_000,
+            earliest_at=1_700_000_000,
+            latest_at=1_700_000_000,
+        ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring out of hermes-agent.",
+            token_count=10, source_ids=[2], source_type="messages",
+            created_at=1_699_999_000,
+            earliest_at=1_699_999_000,
+            latest_at=1_699_999_000,
+        ))
+
+        results = dag.search("vendoring", session_id="s1", limit=2, sort="relevance")
+
+        assert results[0].node_id == direct
+        assert results[1].node_id == spammy
+
+    def test_search_relevance_still_surfaces_direct_summary_when_single_term_matches_many_spammy_candidates(self, dag):
+        for idx in range(150):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"Summary spam {idx}: vendoring vendoring vendoring vendoring vendoring",
+                token_count=10, source_ids=[idx + 1], source_type="messages",
+                created_at=1_700_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_000 + idx,
+            ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring out of hermes-agent.",
+            token_count=10, source_ids=[999], source_type="messages",
+            created_at=1_699_999_000,
+            earliest_at=1_699_999_000,
+            latest_at=1_699_999_000,
+        ))
+
+        results = dag.search("vendoring", session_id="s1", limit=5, sort="relevance")
+
+        assert [node.node_id for node in results[:1]] == [direct]
+        assert direct in [node.node_id for node in results]
+
+    def test_search_relevance_prefers_direct_summary_over_risky_ascii_repetition_spam_in_like_fallback(self, dag):
+        spammy = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="plugin-only plugin-only plugin-only plugin-only status dump",
+            token_count=10, source_ids=[1001], source_type="messages",
+            created_at=1_700_000_100,
+            earliest_at=1_700_000_100,
+            latest_at=1_700_000_100,
+        ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep plugin-only support external.",
+            token_count=10, source_ids=[1002], source_type="messages",
+            created_at=1_700_000_000,
+            earliest_at=1_700_000_000,
+            latest_at=1_700_000_000,
+        ))
+
+        results = dag.search("plugin-only", session_id="s1", limit=2, sort="relevance")
+
+        assert results[0].node_id == direct
+        assert results[1].node_id == spammy
+
+    def test_search_relevance_still_surfaces_direct_phrase_summary_when_phrase_matches_many_spammy_candidates(self, dag):
+        for idx in range(150):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"Summary spam {idx}: vendoring external vendoring external vendoring external status",
+                token_count=10, source_ids=[2000 + idx], source_type="messages",
+                created_at=1_700_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_000 + idx,
+            ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring external support plugin-only.",
+            token_count=10, source_ids=[9999], source_type="messages",
+            created_at=1_699_999_000,
+            earliest_at=1_699_999_000,
+            latest_at=1_699_999_000,
+        ))
+
+        results = dag.search('"vendoring external"', session_id="s1", limit=5, sort="relevance")
+
+        assert direct in [node.node_id for node in results]
+
+    def test_search_relevance_prefers_direct_phrase_summary_over_repeated_phrase_with_varied_filler(self, dag):
+        spammy = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="vendoring external rollout checklist vendoring external support matrix vendoring external adapter notes",
+            token_count=10, source_ids=[4001], source_type="messages",
+            created_at=1_700_000_100,
+            earliest_at=1_700_000_100,
+            latest_at=1_700_000_100,
+        ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring external support plugin-only.",
+            token_count=10, source_ids=[4002], source_type="messages",
+            created_at=1_700_000_000,
+            earliest_at=1_700_000_000,
+            latest_at=1_700_000_000,
+        ))
+
+        results = dag.search('"vendoring external"', session_id="s1", limit=2, sort="relevance")
+
+        assert results[0].node_id == direct
+        assert results[1].node_id == spammy
+
+    def test_search_relevance_prefers_direct_phrase_summary_over_repeated_phrase_with_richer_filler(self, dag):
+        spammy = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="vendoring external rollout checklist vendoring external support matrix vendoring external adapter integration notes",
+            token_count=10, source_ids=[4011], source_type="messages",
+            created_at=1_700_000_100,
+            earliest_at=1_700_000_100,
+            latest_at=1_700_000_100,
+        ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring external support plugin-only.",
+            token_count=10, source_ids=[4012], source_type="messages",
+            created_at=1_700_000_000,
+            earliest_at=1_700_000_000,
+            latest_at=1_700_000_000,
+        ))
+
+        results = dag.search('"vendoring external"', session_id="s1", limit=2, sort="relevance")
+
+        assert results[0].node_id == direct
+        assert results[1].node_id == spammy
+
+    def test_search_relevance_still_surfaces_direct_phrase_summary_when_phrase_plus_extra_term_matches_many_spammy_candidates(self, dag):
+        for idx in range(25):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"vendoring external plugin rollout {idx} vendoring external plugin support {idx}",
+                token_count=10, source_ids=[5000 + idx], source_type="messages",
+                created_at=1_700_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_000 + idx,
+            ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring external plugin support simple.",
+            token_count=10, source_ids=[5999], source_type="messages",
+            created_at=1_699_999_000,
+            earliest_at=1_699_999_000,
+            latest_at=1_699_999_000,
+        ))
+
+        results = dag.search('"vendoring external" plugin', session_id="s1", limit=5, sort="relevance")
+
+        assert direct in [node.node_id for node in results]
+        assert results[0].node_id == direct
+
+    def test_search_relevance_prefers_direct_phrase_summary_over_repeated_non_phrase_term_spam(self, dag):
+        for idx in range(30):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"vendoring external plugin plugin plugin plugin {idx}",
+                token_count=10, source_ids=[6100 + idx], source_type="messages",
+                created_at=1_700_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_000 + idx,
+            ))
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring external plugin support simple.",
+            token_count=10, source_ids=[6999], source_type="messages",
+            created_at=1_699_999_000,
+            earliest_at=1_699_999_000,
+            latest_at=1_699_999_000,
+        ))
+
+        results = dag.search('"vendoring external" plugin', session_id="s1", limit=5, sort="relevance")
+
+        assert direct in [node.node_id for node in results]
+        assert results[0].node_id == direct
+
+    def test_search_like_fallback_strips_unmatched_quote_characters_for_summaries(self, dag):
+        direct = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Keep vendoring out of hermes-agent.",
+            token_count=10, source_ids=[7100], source_type="messages",
+            created_at=1_700_000_000,
+            earliest_at=1_700_000_000,
+            latest_at=1_700_000_000,
+        ))
+
+        results = dag.search('"vendoring', session_id="s1", limit=5, sort="relevance")
+
+        assert [node.node_id for node in results] == [direct]
 
     def test_describe_subtree(self, dag):
         c1 = dag.add_node(SummaryNode(

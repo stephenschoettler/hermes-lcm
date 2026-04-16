@@ -10,6 +10,7 @@ from typing import Any, Dict, TYPE_CHECKING
 if TYPE_CHECKING:
     from .engine import LCMEngine
 
+
 logger = logging.getLogger(__name__)
 
 AGE_DECAY_RATE = 0.001
@@ -20,22 +21,36 @@ def _normalize_search_sort(sort: str | None) -> str:
     return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
 
 
-def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple[float, float, int, int]:
+def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     sort_timestamp = float(result.get("_sort_ts") or 0.0)
     rank = result.get("_sort_rank")
     rank_value = float(rank) if rank is not None else float("inf")
+    directness = float(result.get("_sort_directness") or 0.0)
     type_bias = 0 if result.get("type") == "message" else 1
-    role_bias = 1 if result.get("role") == "tool" else 0
+    role = result.get("role")
+    if role == "user":
+        role_bias = 0
+    elif role == "assistant":
+        role_bias = 1
+    elif role == "tool":
+        role_bias = 2
+    else:
+        role_bias = 1
+
+    effective_directness = directness if result.get("type") == "message" else (directness * 0.8)
 
     if sort == "relevance":
-        return (role_bias, rank_value, -sort_timestamp, type_bias)
+        return (rank_value, -effective_directness, role_bias, -sort_timestamp, type_bias)
 
     if sort == "hybrid":
         age_hours = max(0.0, (time.time() - sort_timestamp) / 3600.0)
         blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
-        return (role_bias, blended, -sort_timestamp, type_bias)
+        summary_override = int(result.get("_hybrid_summary_override") or 0)
+        return (-summary_override, blended, -effective_directness, role_bias, -sort_timestamp, type_bias)
 
-    return (role_bias, -sort_timestamp, rank_value, type_bias)
+    if result.get("type") == "message":
+        return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
+    return (-sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
 
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
@@ -179,11 +194,12 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
     limit = args.get("limit", 10)
     sort = _normalize_search_sort(args.get("sort"))
+    source_limit = max(limit * 4, limit, 20)
     session_id = engine._session_id
     results = []
 
     try:
-        msg_hits = engine._store.search(query, session_id=session_id, limit=limit, sort=sort)
+        msg_hits = engine._store.search(query, session_id=session_id, limit=source_limit, sort=sort)
         for hit in msg_hits:
             results.append(
                 {
@@ -194,13 +210,14 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "snippet": hit.get("snippet", hit.get("content", "")[:200]),
                     "_sort_ts": hit.get("timestamp", 0),
                     "_sort_rank": hit.get("search_rank"),
+                    "_sort_directness": hit.get("_directness_score") or 0.0,
                 }
             )
     except Exception as exc:
         logger.debug("Message search failed: %s", exc)
 
     try:
-        node_hits = engine._dag.search(query, session_id=session_id, limit=limit, sort=sort)
+        node_hits = engine._dag.search(query, session_id=session_id, limit=source_limit, sort=sort)
         for node in node_hits:
             results.append(
                 {
@@ -214,15 +231,27 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "latest_at": node.latest_at,
                     "_sort_ts": node.latest_at or node.created_at,
                     "_sort_rank": node.search_rank,
+                    "_sort_directness": node.search_directness or 0.0,
                 }
             )
     except Exception as exc:
         logger.debug("Node search failed: %s", exc)
 
+    if sort == "hybrid":
+        max_message_directness = max(
+            (float(result.get("_sort_directness") or 0.0) for result in results if result.get("type") == "message"),
+            default=0.0,
+        )
+        for result in results:
+            if result.get("type") == "summary":
+                result["_hybrid_summary_override"] = 1 if float(result.get("_sort_directness") or 0.0) >= (max_message_directness + 8.0) else 0
+
     results.sort(key=lambda result: _combined_result_sort_key(result, sort))
     for result in results:
         result.pop("_sort_ts", None)
         result.pop("_sort_rank", None)
+        result.pop("_sort_directness", None)
+        result.pop("_hybrid_summary_override", None)
     return json.dumps({"query": query, "sort": sort, "total_results": len(results), "results": results[:limit]})
 
 
