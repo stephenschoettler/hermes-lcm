@@ -7,18 +7,13 @@ import logging
 import time
 from typing import Any, Dict, TYPE_CHECKING
 
+from .search_query import AGE_DECAY_RATE, normalize_search_sort
+
 if TYPE_CHECKING:
     from .engine import LCMEngine
 
 
 logger = logging.getLogger(__name__)
-
-AGE_DECAY_RATE = 0.001
-
-
-def _normalize_search_sort(sort: str | None) -> str:
-    normalized = (sort or "recency").strip().lower()
-    return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
 
 
 def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
@@ -195,7 +190,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "No query provided"})
 
     limit = args.get("limit", 10)
-    sort = _normalize_search_sort(args.get("sort"))
+    sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
     session_id = engine._session_id
     results = []
@@ -216,7 +211,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 }
             )
     except Exception as exc:
-        logger.debug("Message search failed: %s", exc)
+        logger.warning("Message search failed: %s", exc)
 
     try:
         node_hits = engine._dag.search(query, session_id=session_id, limit=source_limit, sort=sort)
@@ -237,7 +232,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 }
             )
     except Exception as exc:
-        logger.debug("Node search failed: %s", exc)
+        logger.warning("Node search failed: %s", exc)
 
     if sort == "hybrid":
         max_message_directness = max(

@@ -2677,3 +2677,98 @@ class TestEngineTools:
 
         orphan_check = next(c for c in result["checks"] if c["check"] == "orphaned_dag_nodes")
         assert orphan_check["status"] == "warn"
+
+
+class TestExtractionDuringCompress:
+    """Integration test: extraction runs end-to-end through engine.compress()."""
+
+    def test_compress_with_extraction_enabled_writes_daily_file(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        import hermes_lcm.engine as engine_module
+        import hermes_lcm.extraction as ext_module
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_extract.db"),
+            extraction_enabled=True,
+            extraction_output_path=str(tmp_path / "extractions"),
+            extraction_model="test-extract-model",
+            fresh_tail_count=4,
+            leaf_chunk_tokens=100,
+        )
+        eng = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        eng._session_id = "extract-integration"
+        eng.context_length = 200000
+        eng.threshold_tokens = 500
+
+        extraction_calls = []
+
+        def mock_extraction_llm(prompt, model="", timeout=None):
+            extraction_calls.append({"prompt": prompt, "model": model, "timeout": timeout})
+            return "- Decided to use PostgreSQL\n- Will migrate by Friday"
+
+        def mock_summary(**kwargs):
+            return "Leaf summary.\nExpand for details about: test", 1
+
+        monkeypatch.setattr(ext_module, "_call_extraction_llm", mock_extraction_llm)
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", mock_summary)
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(20):
+            messages.append({"role": "user", "content": f"Q{i}: " + "x" * 200})
+            messages.append({"role": "assistant", "content": f"A{i}: " + "y" * 200})
+
+        result = eng.compress(messages)
+
+        # Extraction was invoked with correct model
+        assert len(extraction_calls) > 0
+        assert extraction_calls[0]["model"] == "test-extract-model"
+
+        # Extraction prompt contains serialized message roles
+        assert "[USER]:" in extraction_calls[0]["prompt"]
+        assert "[ASSISTANT]:" in extraction_calls[0]["prompt"]
+
+        # Daily file created with extracted content
+        files = list(Path(tmp_path / "extractions").glob("*.md"))
+        assert len(files) >= 1
+        content = files[0].read_text()
+        assert "PostgreSQL" in content
+        assert "extract-integration" in content
+
+        # Compression still completed (extraction didn't block it)
+        assert result[0]["role"] == "system"
+        assert len(eng._dag.get_session_nodes("extract-integration")) > 0
+
+    def test_compress_proceeds_when_extraction_fails(self, tmp_path, monkeypatch):
+        import hermes_lcm.engine as engine_module
+        import hermes_lcm.extraction as ext_module
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_extract_fail.db"),
+            extraction_enabled=True,
+            extraction_output_path=str(tmp_path / "extractions"),
+            fresh_tail_count=4,
+            leaf_chunk_tokens=100,
+        )
+        eng = LCMEngine(config=config)
+        eng._session_id = "extract-fail"
+        eng.context_length = 200000
+        eng.threshold_tokens = 500
+
+        def failing_extraction_llm(prompt, model="", timeout=None):
+            raise RuntimeError("LLM service down")
+
+        def mock_summary(**kwargs):
+            return "Leaf summary.\nExpand for details about: test", 1
+
+        monkeypatch.setattr(ext_module, "_call_extraction_llm", failing_extraction_llm)
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", mock_summary)
+
+        messages = [{"role": "system", "content": "You are helpful."}]
+        for i in range(20):
+            messages.append({"role": "user", "content": f"Q{i}: " + "x" * 200})
+            messages.append({"role": "assistant", "content": f"A{i}: " + "y" * 200})
+
+        # Should not raise — extraction failure is non-blocking
+        result = eng.compress(messages)
+        assert result[0]["role"] == "system"
+        assert len(eng._dag.get_session_nodes("extract-fail")) > 0

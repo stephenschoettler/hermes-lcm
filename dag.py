@@ -34,22 +34,17 @@ from .search_query import (
     escape_like,
     extract_quoted_phrases,
     extract_search_terms,
+    normalize_search_sort,
     requires_like_fallback,
+    AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
 
 logger = logging.getLogger(__name__)
 
-AGE_DECAY_RATE = 0.001
-
-
-def _normalize_search_sort(sort: str | None) -> str:
-    normalized = (sort or "recency").strip().lower()
-    return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
-
 
 def _build_search_order_by(sort: str | None, recency_expr: str) -> str:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     if normalized == "relevance":
         return f"rank ASC, {recency_expr} DESC"
     if normalized == "hybrid":
@@ -61,7 +56,7 @@ def _build_search_order_by(sort: str | None, recency_expr: str) -> str:
 
 
 def _fallback_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float, float]:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     score = float(node.search_rank or 0.0) * -1.0
     recency = float(node.latest_at or node.created_at or 0.0)
     directness = float(node.search_directness or 0.0)
@@ -76,7 +71,7 @@ def _fallback_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[fl
 
 
 def _fts_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, float, float]:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     rank = node.search_rank
     rank_value = float(rank) if rank is not None else float("inf")
     recency = float(node.latest_at or node.created_at or 0.0)
@@ -93,7 +88,7 @@ def _fts_result_sort_key(node: "SummaryNode", sort: str | None) -> tuple[float, 
 
 
 def _fts_primary_value(node: "SummaryNode", sort: str | None) -> float:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     rank = node.search_rank
     rank_value = float(rank) if rank is not None else float("inf")
     if normalized == "hybrid":
@@ -359,7 +354,8 @@ class SummaryDAG:
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
                         (query, fetch_limit, offset),
                     ).fetchall()
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
+                logger.warning("FTS node search failed, falling back to LIKE: %s", exc)
                 return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
 
             raw_nodes = [self._row_to_node(r) for r in rows]

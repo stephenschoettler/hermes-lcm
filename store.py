@@ -29,13 +29,13 @@ from .search_query import (
     escape_like,
     extract_quoted_phrases,
     extract_search_terms,
+    normalize_search_sort,
     requires_like_fallback,
+    AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
 
 logger = logging.getLogger(__name__)
-
-AGE_DECAY_RATE = 0.001
 
 
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
@@ -60,17 +60,12 @@ def _message_directness_score(role: str | None, content: str | None, terms: List
     return score
 
 
-def _normalize_search_sort(sort: str | None) -> str:
-    normalized = (sort or "recency").strip().lower()
-    return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
-
-
 def _build_search_order_by(
     sort: str | None,
     timestamp_expr: str,
     role_penalty_expr: str | None = None,
 ) -> str:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     order_parts: list[str] = []
     if normalized == "relevance":
         if role_penalty_expr:
@@ -93,7 +88,7 @@ def _build_search_order_by(
 
 
 def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     score = float(result.get("_fallback_score") or 0.0)
     directness = float(result.get("_directness_score") or 0.0)
     timestamp = float(result.get("timestamp") or 0.0)
@@ -109,7 +104,7 @@ def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple
 
 
 def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     rank = result.get("search_rank")
     rank_value = float(rank) if rank is not None else float("inf")
     directness = float(result.get("_directness_score") or 0.0)
@@ -126,7 +121,7 @@ def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[floa
 
 
 def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
-    normalized = _normalize_search_sort(sort)
+    normalized = normalize_search_sort(sort)
     rank = result.get("search_rank")
     rank_value = float(rank) if rank is not None else float("inf")
     if normalized == "hybrid":
@@ -408,7 +403,8 @@ class MessageStore:
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
                         (query, fetch_limit, offset),
                     ).fetchall()
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
+                logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
                 return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
 
             raw_primary_values: list[float] = []

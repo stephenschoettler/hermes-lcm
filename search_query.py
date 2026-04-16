@@ -206,6 +206,15 @@ def compute_search_fetch_limit(limit: int, terms: List[str], phrases: List[str] 
     return base
 
 
+AGE_DECAY_RATE = 0.001
+
+
+def normalize_search_sort(sort: str | None) -> str:
+    """Normalize sort parameter to one of: recency, relevance, hybrid."""
+    normalized = (sort or "recency").strip().lower()
+    return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
+
+
 def build_snippet(text: str, terms: List[str], width: int = 80) -> str:
     content = (text or "")
     if not content:

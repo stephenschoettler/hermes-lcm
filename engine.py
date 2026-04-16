@@ -142,7 +142,7 @@ class LCMEngine(ContextEngine):
             try:
                 self._ingest_messages(messages)
             except Exception as e:
-                logger.debug("Ingest during preflight: %s", e)
+                logger.warning("Ingest during preflight: %s", e)
         from .tokens import count_messages_tokens
         rough = count_messages_tokens(messages)
         if self._should_force_overflow_recovery(observed_tokens=rough):
@@ -635,7 +635,7 @@ class LCMEngine(ContextEngine):
             try:
                 self._ingest_messages(messages)
             except Exception as e:
-                logger.debug("Ingest during tool call failed: %s", e)
+                logger.warning("Ingest during tool call failed: %s", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
@@ -825,7 +825,7 @@ class LCMEngine(ContextEngine):
                 timeout=self._config.summary_timeout_ms / 1000,
             )
         except Exception as e:
-            logger.debug("Pre-compaction extraction failed (non-blocking): %s", e)
+            logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
