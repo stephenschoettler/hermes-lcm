@@ -68,10 +68,12 @@ def _get_session_node(engine: "LCMEngine", node_id: int):
 def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
+    stored_by_id = engine._store.get_batch(node.source_ids)
+
     messages = []
     budget_used = 0
     for store_id in node.source_ids:
-        stored = engine._store.get(store_id)
+        stored = stored_by_id.get(store_id)
         if not stored or stored.get("session_id") != engine._session_id:
             continue
         content = stored.get("content", "")

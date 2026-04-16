@@ -853,6 +853,29 @@ class TestMessageStore:
 
         assert [result["store_id"] for result in results] == [future_id]
 
+    def test_get_batch_returns_multiple_messages_in_single_query(self, store):
+        id1 = store.append("sess1", {"role": "user", "content": "first"})
+        id2 = store.append("sess1", {"role": "assistant", "content": "second"})
+        id3 = store.append("sess1", {"role": "user", "content": "third"})
+
+        result = store.get_batch([id1, id3])
+
+        assert len(result) == 2
+        assert result[id1]["content"] == "first"
+        assert result[id3]["content"] == "third"
+        assert id2 not in result
+
+    def test_get_batch_returns_empty_dict_for_empty_input(self, store):
+        assert store.get_batch([]) == {}
+
+    def test_get_batch_skips_missing_store_ids(self, store):
+        id1 = store.append("sess1", {"role": "user", "content": "exists"})
+
+        result = store.get_batch([id1, 99999])
+
+        assert len(result) == 1
+        assert result[id1]["content"] == "exists"
+
     def test_pin_unpin(self, store):
         sid = store.append("sess1", {"role": "user", "content": "important"})
         store.pin(sid)

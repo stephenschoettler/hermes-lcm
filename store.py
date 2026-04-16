@@ -293,6 +293,20 @@ class MessageStore:
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
+    def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """Retrieve multiple messages by store_id in a single query.
+
+        Returns a dict mapping store_id → message dict.
+        """
+        if not store_ids:
+            return {}
+        placeholders = ",".join("?" for _ in store_ids)
+        rows = self._conn.execute(
+            f"SELECT * FROM messages WHERE store_id IN ({placeholders})",
+            store_ids,
+        ).fetchall()
+        return {row[0]: self._row_to_dict(row) for row in rows}
+
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
                   limit: int = 1000) -> List[Dict[str, Any]]:
