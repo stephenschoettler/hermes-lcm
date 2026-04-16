@@ -55,7 +55,8 @@ def _invoke_summary_llm(prompt: str, max_tokens: int, model: str = "", timeout: 
     return _call_llm_for_summary(prompt, max_tokens, **kwargs)
 
 
-def _build_l1_prompt(text: str, token_budget: int, depth: int, focus_topic: str = "") -> str:
+def _build_l1_prompt(text: str, token_budget: int, depth: int,
+                     focus_topic: str = "", custom_instructions: str = "") -> str:
     """Level 1: preserve details."""
     depth_guidance = {
         0: "Preserve decisions, rationale, constraints, active tasks, file paths, commands, and specific values.",
@@ -71,11 +72,15 @@ def _build_l1_prompt(text: str, token_budget: int, depth: int, focus_topic: str 
             "Spend roughly 60-70% of the summary budget on that topic when relevant.\n"
         )
 
+    custom_block = ""
+    if custom_instructions:
+        custom_block = f"\nAdditional instructions:\n{custom_instructions}\n"
+
     return f"""Summarize this conversation segment for future turns.
 {guidance}
 Remove repetition and conversational filler.
 End with: "Expand for details about: <what was compressed>"
-{focus_guidance}
+{focus_guidance}{custom_block}
 
 Target ~{token_budget} tokens.
 
@@ -83,7 +88,8 @@ CONTENT:
 {text}"""
 
 
-def _build_l2_prompt(text: str, token_budget: int, focus_topic: str = "") -> str:
+def _build_l2_prompt(text: str, token_budget: int,
+                     focus_topic: str = "", custom_instructions: str = "") -> str:
     """Level 2: aggressive bullet points."""
     focus_guidance = ""
     if focus_topic:
@@ -91,10 +97,14 @@ def _build_l2_prompt(text: str, token_budget: int, focus_topic: str = "") -> str
             f'Prioritize bullets related to: "{focus_topic}" when present.\n'
         )
 
+    custom_block = ""
+    if custom_instructions:
+        custom_block = f"\nAdditional instructions:\n{custom_instructions}\n"
+
     return f"""Compress this into bullet points. Maximum {token_budget} tokens.
 Keep only: decisions made, files changed, errors hit, current state.
 Drop all reasoning, alternatives considered, and process detail.
-{focus_guidance}
+{focus_guidance}{custom_block}
 
 CONTENT:
 {text}"""
@@ -131,6 +141,7 @@ def summarize_with_escalation(
     l2_budget_ratio: float = 0.50,
     l3_truncate_tokens: int = 512,
     focus_topic: str = "",
+    custom_instructions: str = "",
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
@@ -138,7 +149,9 @@ def summarize_with_escalation(
     output shorter than the source.
     """
     # Level 1: detailed summary
-    l1_prompt = _build_l1_prompt(text, token_budget, depth, focus_topic=focus_topic)
+    l1_prompt = _build_l1_prompt(text, token_budget, depth,
+                                 focus_topic=focus_topic,
+                                 custom_instructions=custom_instructions)
     l1_result = _invoke_summary_llm(l1_prompt, token_budget * 2, model=model, timeout=timeout)
 
     if l1_result and count_tokens(l1_result) < source_tokens:
@@ -147,7 +160,9 @@ def summarize_with_escalation(
 
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
-    l2_prompt = _build_l2_prompt(text, l2_budget, focus_topic=focus_topic)
+    l2_prompt = _build_l2_prompt(text, l2_budget,
+                                 focus_topic=focus_topic,
+                                 custom_instructions=custom_instructions)
     l2_result = _invoke_summary_llm(l2_prompt, l2_budget * 2, model=model, timeout=timeout)
 
     if l2_result and count_tokens(l2_result) < source_tokens:

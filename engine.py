@@ -16,6 +16,7 @@ from agent.context_engine import ContextEngine
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
+from .extraction import extract_before_compaction
 from .schemas import LCM_DESCRIBE, LCM_DOCTOR, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_GREP, LCM_STATUS
 from .session_patterns import (
     build_session_match_keys,
@@ -236,6 +237,7 @@ class LCMEngine(ContextEngine):
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
+                    custom_instructions=self._config.custom_instructions,
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
@@ -334,6 +336,10 @@ class LCMEngine(ContextEngine):
 
             if not to_compact:
                 break
+
+            # Pre-compaction extraction: best-effort, never blocks compaction
+            if self._config.extraction_enabled:
+                self._run_pre_compaction_extraction(to_compact)
 
             compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
                 to_compact,
@@ -733,6 +739,25 @@ class LCMEngine(ContextEngine):
 
     # -- Internal: summarization -------------------------------------------
 
+    def _run_pre_compaction_extraction(self, messages: List[Dict[str, Any]]) -> None:
+        """Best-effort extraction of decisions before compaction."""
+        try:
+            serialized = self._serialize_messages(messages)
+            output_path = self._config.extraction_output_path
+            if not output_path:
+                base = self._hermes_home or os.path.expanduser("~/.hermes")
+                output_path = os.path.join(base, "lcm-extractions")
+            extraction_model = self._config.extraction_model or self._config.summary_model
+            extract_before_compaction(
+                serialized_messages=serialized,
+                output_path=output_path,
+                session_id=self._session_id or "",
+                model=extraction_model,
+                timeout=self._config.summary_timeout_ms / 1000,
+            )
+        except Exception as e:
+            logger.debug("Pre-compaction extraction failed (non-blocking): %s", e)
+
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
         parts = []
@@ -853,6 +878,7 @@ class LCMEngine(ContextEngine):
                 l2_budget_ratio=self._config.l2_budget_ratio,
                 l3_truncate_tokens=self._config.l3_truncate_tokens,
                 focus_topic=focus_topic or "",
+                custom_instructions=self._config.custom_instructions,
             )
 
             earliest_at, latest_at = self._dag.get_source_time_window([n.node_id for n in to_condense])

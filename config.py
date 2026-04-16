@@ -88,6 +88,18 @@ class LCMConfig:
     ignore_session_patterns_source: str = "default"
     stateless_session_patterns_source: str = "default"
 
+    # -- Summary instructions ---
+    # Custom instructions injected into all summarization prompts
+    custom_instructions: str = ""
+
+    # -- Pre-compaction extraction ---
+    # Extract decisions/commitments to files before compaction
+    extraction_enabled: bool = False
+    # Model for extraction (empty = fall back to summary_model)
+    extraction_model: str = ""
+    # Directory for daily extraction files (empty = auto: ~/.hermes/lcm-extractions/)
+    extraction_output_path: str = ""
+
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
@@ -132,6 +144,10 @@ class LCMConfig:
         c.l3_truncate_tokens = _int("LCM_L3_TRUNCATE_TOKENS", c.l3_truncate_tokens)
         c.max_assembly_tokens = _int("LCM_MAX_ASSEMBLY_TOKENS", c.max_assembly_tokens)
         c.reserve_tokens_floor = _int("LCM_RESERVE_TOKENS_FLOOR", c.reserve_tokens_floor)
+        c.custom_instructions = _str("LCM_CUSTOM_INSTRUCTIONS", c.custom_instructions)
+        c.extraction_enabled = _parse_bool_env("LCM_EXTRACTION_ENABLED", c.extraction_enabled)
+        c.extraction_model = _str("LCM_EXTRACTION_MODEL", c.extraction_model)
+        c.extraction_output_path = _str("LCM_EXTRACTION_OUTPUT_PATH", c.extraction_output_path)
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
         c.summary_timeout_ms = _int("LCM_SUMMARY_TIMEOUT_MS", c.summary_timeout_ms)

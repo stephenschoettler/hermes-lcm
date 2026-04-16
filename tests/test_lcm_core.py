@@ -4,6 +4,7 @@ import json
 import sqlite3
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -32,6 +33,10 @@ class TestConfig:
         assert c.dynamic_leaf_chunk_max == 40_000
         assert c.cache_friendly_condensation_enabled is False
         assert c.cache_friendly_min_debt_groups == 2
+        assert c.custom_instructions == ""
+        assert c.extraction_enabled is False
+        assert c.extraction_model == ""
+        assert c.extraction_output_path == ""
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
         assert c.ignore_session_patterns_source == "default"
@@ -53,6 +58,10 @@ class TestConfig:
         monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_MAX", "64000")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", "1")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
+        monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Write as a neutral documenter.")
+        monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
+        monkeypatch.setenv("LCM_EXTRACTION_MODEL", "openai/gpt-5.4-mini")
+        monkeypatch.setenv("LCM_EXTRACTION_OUTPUT_PATH", "/tmp/extractions")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
         assert c.context_threshold == 0.80
@@ -67,6 +76,10 @@ class TestConfig:
         assert c.dynamic_leaf_chunk_max == 64_000
         assert c.cache_friendly_condensation_enabled is True
         assert c.cache_friendly_min_debt_groups == 3
+        assert c.custom_instructions == "Write as a neutral documenter."
+        assert c.extraction_enabled is True
+        assert c.extraction_model == "openai/gpt-5.4-mini"
+        assert c.extraction_output_path == "/tmp/extractions"
 
     def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
@@ -1549,3 +1562,127 @@ class TestEscalation:
 
     def test_truncate_short(self):
         assert _deterministic_truncate("hello", 1000) == "hello"
+
+    def test_custom_instructions_injected_into_l1_prompt(self):
+        from hermes_lcm.escalation import _build_l1_prompt
+        prompt = _build_l1_prompt(
+            "test content", 500, depth=0,
+            custom_instructions="Write as a neutral documenter.",
+        )
+        assert "Additional instructions:" in prompt
+        assert "Write as a neutral documenter." in prompt
+
+    def test_custom_instructions_injected_into_l2_prompt(self):
+        from hermes_lcm.escalation import _build_l2_prompt
+        prompt = _build_l2_prompt(
+            "test content", 500,
+            custom_instructions="Use third person only.",
+        )
+        assert "Additional instructions:" in prompt
+        assert "Use third person only." in prompt
+
+    def test_custom_instructions_omitted_when_empty(self):
+        from hermes_lcm.escalation import _build_l1_prompt, _build_l2_prompt
+        l1 = _build_l1_prompt("test", 500, depth=0, custom_instructions="")
+        l2 = _build_l2_prompt("test", 500, custom_instructions="")
+        assert "Additional instructions:" not in l1
+        assert "Additional instructions:" not in l2
+
+
+class TestExtraction:
+    def test_extract_writes_daily_file(self, tmp_path):
+        from hermes_lcm.extraction import extract_before_compaction
+
+        # Mock the LLM call
+        import hermes_lcm.extraction as ext_module
+        original = ext_module._call_extraction_llm
+
+        def mock_llm(prompt, model="", timeout=None):
+            return "- Decided to use PostgreSQL for the user store\n- Stephen will handle the migration by Friday"
+
+        ext_module._call_extraction_llm = mock_llm
+        try:
+            output_dir = str(tmp_path / "extractions")
+            result = extract_before_compaction(
+                serialized_messages="[USER]: Let's use PostgreSQL\n[ASSISTANT]: Done",
+                output_path=output_dir,
+                session_id="test-session",
+            )
+            assert result is True
+
+            files = list(Path(tmp_path / "extractions").glob("*.md"))
+            assert len(files) == 1
+            content = files[0].read_text()
+            assert "PostgreSQL" in content
+            assert "test-session" in content
+            assert "migration" in content
+        finally:
+            ext_module._call_extraction_llm = original
+
+    def test_extract_skips_when_nothing_to_extract(self, tmp_path):
+        from hermes_lcm.extraction import extract_before_compaction
+        import hermes_lcm.extraction as ext_module
+        original = ext_module._call_extraction_llm
+
+        def mock_llm(prompt, model="", timeout=None):
+            return "NOTHING_TO_EXTRACT"
+
+        ext_module._call_extraction_llm = mock_llm
+        try:
+            output_dir = str(tmp_path / "extractions")
+            result = extract_before_compaction(
+                serialized_messages="[USER]: hello\n[ASSISTANT]: hi",
+                output_path=output_dir,
+            )
+            assert result is True
+            files = list(Path(tmp_path / "extractions").glob("*.md"))
+            assert len(files) == 0
+        finally:
+            ext_module._call_extraction_llm = original
+
+    def test_extract_never_blocks_on_failure(self, tmp_path):
+        from hermes_lcm.extraction import extract_before_compaction
+        import hermes_lcm.extraction as ext_module
+        original = ext_module._call_extraction_llm
+
+        def mock_llm(prompt, model="", timeout=None):
+            return None
+
+        ext_module._call_extraction_llm = mock_llm
+        try:
+            result = extract_before_compaction(
+                serialized_messages="test",
+                output_path=str(tmp_path / "extractions"),
+            )
+            # Should return True (nothing to write) not raise
+            assert result is True
+        finally:
+            ext_module._call_extraction_llm = original
+
+    def test_extract_appends_to_existing_daily_file(self, tmp_path):
+        from hermes_lcm.extraction import extract_before_compaction
+        import hermes_lcm.extraction as ext_module
+        original = ext_module._call_extraction_llm
+
+        call_count = 0
+
+        def mock_llm(prompt, model="", timeout=None):
+            nonlocal call_count
+            call_count += 1
+            return f"- Decision {call_count}"
+
+        ext_module._call_extraction_llm = mock_llm
+        try:
+            output_dir = str(tmp_path / "extractions")
+            extract_before_compaction("first", output_path=output_dir, session_id="s1")
+            extract_before_compaction("second", output_path=output_dir, session_id="s2")
+
+            files = list(Path(tmp_path / "extractions").glob("*.md"))
+            assert len(files) == 1
+            content = files[0].read_text()
+            assert "Decision 1" in content
+            assert "Decision 2" in content
+            assert "s1" in content
+            assert "s2" in content
+        finally:
+            ext_module._call_extraction_llm = original
