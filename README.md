@@ -20,54 +20,22 @@ Inspired by [lossless-claw](https://github.com/martian-engineering/lossless-claw
 When context fills up, agents replace your conversation with a flat lossy summary.
 Details get lost. The model confidently misremembers. No way to go back.
 
-```
-Standard compression:
-
-  Turn 1-50:  "You discussed database schema changes and deployment plans"
-  Turn 51+:   (live conversation)
-
-  You: "What column type did we decide on for the user_events table?"
-  Agent: "I believe we discussed using JSONB" ← wrong, it was an integer array
-```
+<p align="center">
+  <img src="docs/standard_compression.png" alt="Standard compression" width="700">
+</p>
 
 ## The Fix
 
 Every message persisted. Hierarchical DAG summaries. Agent tools to drill back
 into anything that was compacted.
 
-```
-LCM compression:
+<p align="center">
+  <img src="docs/lcm_compression.png" alt="LCM compression" width="700">
+</p>
 
-  D2 summary: project overview, key decisions (weeks of context)
-  D1 summary: database schema discussion, deployment checklist (hours)
-  D0 summary: specific column decisions, migration commands (minutes)
-  Fresh tail: last 64 messages (live, never compacted)
-
-  You: "What column type did we decide on for the user_events table?"
-  Agent: [lcm_grep: "user_events column type"] → integer[] with GIN index
-```
-
-```
-  Active Context                    Summary DAG
- ┌────────────────────┐
- │  System Prompt     │            ┌──────────┐
- │  (with LCM note)   │            │ D2 node  │ ← weeks
- ├────────────────────┤            ├──────────┤
- │  DAG Summaries     │ ─────────  │ D1 node  │ ← hours
- │  (highest depth)   │            │ D1 node  │
- ├────────────────────┤            ├──────────┤
- │  Fresh Tail        │            │ D0 node  │ ← minutes
- │  (last 64 msgs)    │            │ D0 node  │
- │  (never compacted) │            │ D0 node  │
- └────────────────────┘            └──────────┘
-                                        │
-                                        ▼
-                              ┌────────────────────┐
-                              │ Immutable Store    │
-                              │ (SQLite + FTS5)    │
-                              │ Every msg verbatim │
-                              └────────────────────┘
-```
+<p align="center">
+  <img src="docs/architecture.png" alt="Architecture" width="700">
+</p>
 
 ## Why This Plugin
 
