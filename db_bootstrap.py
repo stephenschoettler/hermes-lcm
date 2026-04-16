@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable, Sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -67,6 +67,31 @@ def ensure_migration_state_table(conn: sqlite3.Connection) -> None:
             completed_at REAL NOT NULL
         )
         """
+    )
+
+
+def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_lifecycle_state (
+            conversation_id TEXT PRIMARY KEY,
+            current_session_id TEXT,
+            last_finalized_session_id TEXT,
+            current_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+            last_finalized_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+            current_bound_at REAL,
+            last_finalized_at REAL,
+            last_rollover_at REAL,
+            last_reset_at REAL,
+            updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lcm_lifecycle_current_session ON lcm_lifecycle_state(current_session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lcm_lifecycle_last_finalized_session ON lcm_lifecycle_state(last_finalized_session_id)"
     )
 
 
@@ -198,5 +223,12 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 2:
         mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
         current_version = 2
+
+    if current_version < 3:
+        ensure_lifecycle_state_table(conn)
+        mark_migration_step_complete(conn, "v3_lifecycle_state")
+        current_version = 3
+    else:
+        ensure_lifecycle_state_table(conn)
 
     set_schema_version(conn, current_version)

@@ -5,6 +5,8 @@ import logging
 import time
 import pytest
 
+import hermes_lcm.engine as lcm_engine
+
 from agent.context_engine import ContextEngine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
@@ -1029,6 +1031,143 @@ class TestSessionRollover:
         assert sorted(node.summary for node in s3_nodes) == ["fresh d2", "seed d2", "seed d3"]
         assert engine._dag.get_session_nodes("s2") == []
         assert engine._session_id == "s3"
+
+    def test_rollover_session_records_durable_lifecycle_state_idempotently(self, engine):
+        engine._config.new_session_retain_depth = 2
+        from hermes_lcm.dag import SummaryNode
+        import time
+
+        engine.on_session_start("s1", platform="cli", context_length=200000)
+        for depth in range(3):
+            engine._dag.add_node(SummaryNode(
+                session_id="s1", depth=depth,
+                summary=f"seed d{depth}", token_count=100,
+                source_token_count=500, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            ))
+
+        moved = engine.rollover_session("s1", "s2", previous_messages=[], platform="cli", context_length=200000)
+        assert moved == 1
+
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert state is not None
+        assert state.current_session_id == "s2"
+        assert state.last_finalized_session_id == "s1"
+
+        moved_repeat = engine.rollover_session("s1", "s2", previous_messages=[], platform="cli", context_length=200000)
+        assert moved_repeat == 0
+
+        state_repeat = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert state_repeat is not None
+        assert state_repeat.current_session_id == "s2"
+        assert state_repeat.last_finalized_session_id == "s1"
+        assert engine._lifecycle.row_count() == 1
+
+    def test_on_session_start_recovers_durable_lifecycle_state_after_restart(self, engine, monkeypatch):
+        engine.on_session_start("active-session", platform="cli", context_length=200000)
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("durable summary", 1),
+        )
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "alpha " * 80},
+            {"role": "assistant", "content": "beta " * 80},
+            {"role": "user", "content": "gamma " * 80},
+            {"role": "assistant", "content": "delta " * 80},
+            {"role": "user", "content": "epsilon " * 80},
+            {"role": "assistant", "content": "zeta"},
+        ]
+        engine.compress(messages)
+        old_conversation_id = engine._conversation_id
+        old_frontier = engine._last_compacted_store_id
+        assert old_frontier > 0
+
+        restarted = LCMEngine(config=engine._config)
+        restarted.on_session_start("active-session", platform="cli", context_length=200000)
+
+        assert restarted._conversation_id == old_conversation_id
+        assert restarted._last_compacted_store_id == old_frontier
+        recovered = restarted._lifecycle.get_by_conversation(old_conversation_id)
+        assert recovered is not None
+        assert recovered.current_session_id == "active-session"
+
+    def test_frontier_marker_only_advances_after_successful_leaf_compaction(self, engine, monkeypatch):
+        engine.on_session_start("frontier-session", platform="cli", context_length=200000)
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("frontier summary", 1),
+        )
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "alpha " * 80},
+            {"role": "assistant", "content": "beta " * 80},
+            {"role": "user", "content": "gamma " * 80},
+            {"role": "assistant", "content": "delta " * 80},
+            {"role": "user", "content": "epsilon " * 80},
+            {"role": "assistant", "content": "zeta"},
+        ]
+        engine.compress(messages)
+
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert state is not None
+        assert state.current_frontier_store_id == engine._last_compacted_store_id
+        frontier_before_failure = state.current_frontier_store_id
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: (_ for _ in ()).throw(TimeoutError("summary timed out")),
+        )
+        failing_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "epsilon " * 80},
+            {"role": "assistant", "content": "zeta " * 80},
+            {"role": "user", "content": "eta " * 80},
+            {"role": "assistant", "content": "theta " * 80},
+            {"role": "user", "content": "iota " * 80},
+            {"role": "assistant", "content": "kappa"},
+        ]
+        with pytest.raises(TimeoutError):
+            engine.compress(failing_messages)
+
+        after_failure = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert after_failure is not None
+        assert after_failure.current_frontier_store_id == frontier_before_failure
+
+    def test_rollover_resets_active_frontier_but_preserves_last_finalized_frontier(self, engine, monkeypatch):
+        engine.on_session_start("frontier-old", platform="cli", context_length=200000)
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("rollover summary", 1),
+        )
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "alpha " * 80},
+            {"role": "assistant", "content": "beta " * 80},
+            {"role": "user", "content": "gamma " * 80},
+            {"role": "assistant", "content": "delta " * 80},
+            {"role": "user", "content": "epsilon " * 80},
+            {"role": "assistant", "content": "zeta"},
+        ]
+        engine.compress(messages)
+        old_frontier = engine._last_compacted_store_id
+
+        engine.rollover_session("frontier-old", "frontier-new", previous_messages=[], platform="cli", context_length=200000)
+
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert state is not None
+        assert state.current_session_id == "frontier-new"
+        assert state.current_frontier_store_id == 0
+        assert state.last_finalized_session_id == "frontier-old"
+        assert state.last_finalized_frontier_store_id == old_frontier
+        assert state.last_rollover_at is not None
+        assert state.last_reset_at is not None
 
 
 class TestUnlimitedCondensationDepth:

@@ -12,6 +12,7 @@ from hermes_lcm.tokens import count_tokens, count_message_tokens, count_messages
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.escalation import _deterministic_truncate
+from hermes_lcm.lifecycle_state import LifecycleStateStore
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
     compile_session_pattern,
@@ -211,7 +212,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("2",)
+        assert version == ("3",)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -260,7 +261,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("2",)
+        assert version == ("3",)
 
         migration_state = store._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
@@ -853,6 +854,55 @@ class TestMessageStore:
         assert len(msg["tool_calls"]) == 1
 
 
+class TestLifecycleStateStore:
+    def test_init_creates_lifecycle_state_table(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "lifecycle.db")
+
+        tables = {
+            row[0]
+            for row in state._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='lcm_lifecycle_state'"
+            ).fetchall()
+        }
+        assert tables == {"lcm_lifecycle_state"}
+        assert state.get_by_session("missing") is None
+
+        state.close()
+
+    def test_init_upgrades_legacy_db_and_keeps_missing_state_safe(self, tmp_path):
+        db_path = tmp_path / "legacy-lifecycle.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '2');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        state = LifecycleStateStore(db_path)
+
+        version = state._conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        assert version == "3"
+
+        tables = {
+            row[0]
+            for row in state._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='lcm_lifecycle_state'"
+            ).fetchall()
+        }
+        assert tables == {"lcm_lifecycle_state"}
+        assert state.get_by_session("unknown-session") is None
+
+        state.close()
+
+
 class TestSummaryDAG:
     @pytest.fixture
     def dag(self, tmp_path):
@@ -948,7 +998,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("2",)
+        assert version == ("3",)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -1000,7 +1050,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("2",)
+        assert version == ("3",)
 
         migration_state = dag._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"

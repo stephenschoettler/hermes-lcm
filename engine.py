@@ -22,6 +22,7 @@ from .session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+from .lifecycle_state import LifecycleStateStore
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -58,9 +59,11 @@ class LCMEngine(ContextEngine):
 
         self._store = MessageStore(db_path)
         self._dag = SummaryDAG(db_path)
+        self._lifecycle = LifecycleStateStore(db_path)
 
         self._session_id: str = ""
         self._session_platform: str = ""
+        self._conversation_id: str = ""
         self._session_match_keys: list[str] = []
         self._session_ignored = False
         self._session_stateless = False
@@ -357,6 +360,7 @@ class LCMEngine(ContextEngine):
             )
             self._dag.add_node(node)
             self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
+            self._persist_frontier_marker()
 
             working_messages = [working_messages[0]] + remaining_messages
             leaf_compacted_this_turn = True
@@ -436,6 +440,25 @@ class LCMEngine(ContextEngine):
 
     # -- ContextEngine optional methods ------------------------------------
 
+    def _bind_lifecycle_state(
+        self,
+        session_id: str,
+        *,
+        conversation_id: str | None = None,
+    ) -> None:
+        state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
+        self._conversation_id = state.conversation_id
+        self._last_compacted_store_id = state.current_frontier_store_id
+
+    def _persist_frontier_marker(self) -> None:
+        if not self._session_id or not self._conversation_id:
+            return
+        self._lifecycle.advance_frontier(
+            self._conversation_id,
+            self._session_id,
+            self._last_compacted_store_id,
+        )
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
@@ -452,14 +475,24 @@ class LCMEngine(ContextEngine):
             self.threshold_tokens = int(
                 self.context_length * self._config.context_threshold
             )
+        self._bind_lifecycle_state(
+            session_id,
+            conversation_id=kwargs.get("conversation_id"),
+        )
         self._log_session_filter_diagnostics()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         # Ensure all messages are persisted
         self._ingest_messages(messages)
+        self._lifecycle.finalize_session(
+            self._conversation_id,
+            session_id,
+            frontier_store_id=self._last_compacted_store_id,
+        )
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
+        self._lifecycle.record_reset(self._conversation_id)
         self._last_compacted_store_id = 0
         self._ingest_cursor = 0
         self._context_probed = False
@@ -508,12 +541,13 @@ class LCMEngine(ContextEngine):
         4. optionally move retained summaries into the new session
         """
         previous_messages = previous_messages or []
+        conversation_id = self._conversation_id or old_session_id or new_session_id
 
         if old_session_id:
             self.on_session_end(old_session_id, previous_messages)
             self.on_session_reset()
 
-        self.on_session_start(new_session_id, **kwargs)
+        self.on_session_start(new_session_id, conversation_id=conversation_id, **kwargs)
 
         if not carry_over_context:
             return 0
@@ -547,6 +581,7 @@ class LCMEngine(ContextEngine):
 
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
+        lifecycle_state = self._lifecycle.get_by_conversation(self._conversation_id)
         if self._session_id:
             status["engine"] = "lcm"
             status["store_messages"] = self._store.get_session_count(self._session_id)
@@ -560,6 +595,20 @@ class LCMEngine(ContextEngine):
             status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
+            status["conversation_id"] = self._conversation_id
+            if lifecycle_state is not None:
+                status["lifecycle"] = {
+                    "conversation_id": lifecycle_state.conversation_id,
+                    "current_session_id": lifecycle_state.current_session_id,
+                    "last_finalized_session_id": lifecycle_state.last_finalized_session_id,
+                    "current_frontier_store_id": lifecycle_state.current_frontier_store_id,
+                    "last_finalized_frontier_store_id": lifecycle_state.last_finalized_frontier_store_id,
+                    "current_bound_at": lifecycle_state.current_bound_at,
+                    "last_finalized_at": lifecycle_state.last_finalized_at,
+                    "last_rollover_at": lifecycle_state.last_rollover_at,
+                    "last_reset_at": lifecycle_state.last_reset_at,
+                    "updated_at": lifecycle_state.updated_at,
+                }
         return status
 
     def update_model(self, model: str, context_length: int,
