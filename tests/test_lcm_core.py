@@ -1659,6 +1659,37 @@ class TestExtraction:
         finally:
             ext_module._call_extraction_llm = original
 
+    def test_engine_extraction_uses_default_path_when_config_empty(self, tmp_path, monkeypatch):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+        import hermes_lcm.extraction as ext_module
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_extract.db"),
+            extraction_enabled=True,
+            extraction_output_path="",
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        original = ext_module._call_extraction_llm
+
+        def mock_llm(prompt, model="", timeout=None):
+            return "- Decided to use Redis for caching"
+
+        ext_module._call_extraction_llm = mock_llm
+        try:
+            engine._run_pre_compaction_extraction([
+                {"role": "user", "content": "Let's use Redis"},
+                {"role": "assistant", "content": "Done"},
+            ])
+            extraction_dir = tmp_path / "hermes" / "lcm-extractions"
+            files = list(extraction_dir.glob("*.md"))
+            assert len(files) == 1
+            assert "Redis" in files[0].read_text()
+        finally:
+            ext_module._call_extraction_llm = original
+
     def test_extract_appends_to_existing_daily_file(self, tmp_path):
         from hermes_lcm.extraction import extract_before_compaction
         import hermes_lcm.extraction as ext_module
