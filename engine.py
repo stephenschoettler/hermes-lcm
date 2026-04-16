@@ -17,7 +17,11 @@ from agent.context_engine import ContextEngine
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
-from .extraction import extract_before_compaction
+from .extraction import (
+    extract_before_compaction,
+    sanitize_pre_compaction_content,
+    sanitize_pre_compaction_tool_arguments,
+)
 from .schemas import LCM_DESCRIBE, LCM_DOCTOR, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_GREP, LCM_STATUS
 from .session_patterns import (
     build_session_match_keys,
@@ -829,6 +833,7 @@ class LCMEngine(ContextEngine):
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content") or ""
+            content = sanitize_pre_compaction_content(content)
 
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
@@ -848,6 +853,7 @@ class LCMEngine(ContextEngine):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
                             args = fn.get("arguments", "")
+                            args = sanitize_pre_compaction_tool_arguments(args)
                             if len(args) > 500:
                                 args = args[:400] + "..."
                             tc_parts.append(f"  {name}({args})")

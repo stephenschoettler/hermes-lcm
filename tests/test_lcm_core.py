@@ -1620,6 +1620,217 @@ class TestEscalation:
 
 
 class TestExtraction:
+    def test_serialize_messages_replaces_pure_inline_media_with_attachment_marker(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "user",
+                "content": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA",
+            }
+        ])
+
+        assert "[USER]: [Media attachment]" == serialized
+        assert "data:image/png;base64" not in serialized
+
+    def test_serialize_messages_preserves_text_but_replaces_inline_media_suffix(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "assistant",
+                "content": "Here is the chart you asked for.\n\ndata:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA",
+            }
+        ])
+
+        assert "Here is the chart you asked for." in serialized
+        assert "[with media attachment]" in serialized
+        assert "data:image/png;base64" not in serialized
+
+    def test_serialize_messages_handles_chat_completions_style_multimodal_blocks(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Please remember this screenshot."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA"},
+                    },
+                ],
+            }
+        ])
+
+        assert "Please remember this screenshot." in serialized
+        assert "[with media attachment]" in serialized
+        assert "data:image/png;base64" not in serialized
+
+    def test_serialize_messages_handles_responses_style_multimodal_blocks(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this."},
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA",
+                    },
+                ],
+            }
+        ])
+
+        assert "Describe this." in serialized
+        assert "[with media attachment]" in serialized
+        assert "data:image/png;base64" not in serialized
+
+    def test_serialize_messages_leaves_non_media_application_data_uri_alone(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        content = "data:application/json;base64,eyJmb28iOiAiYmFyIiwgImJheiI6IDEyfQ=="
+        serialized = engine._serialize_messages([
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": content,
+            }
+        ])
+
+        assert content in serialized
+        assert "[Media attachment]" not in serialized
+        assert "[with media attachment]" not in serialized
+
+    def test_serialize_messages_sanitizes_tool_call_arguments_media_payloads(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "assistant",
+                "content": "Calling the image tool now.",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": '{"image":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA"}',
+                        }
+                    }
+                ],
+            }
+        ])
+
+        assert "vision_analyze" in serialized
+        assert '"image": "[Media attachment]"' in serialized
+        assert "data:image/png;base64" not in serialized
+
+    def test_serialize_messages_sanitizes_parsed_tool_call_arguments_media_payloads(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "assistant",
+                "content": "Calling the image tool now.",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "vision_analyze",
+                            "arguments": {
+                                "prompt": "Describe the chart",
+                                "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA",
+                            },
+                        }
+                    }
+                ],
+            }
+        ])
+
+        assert '"prompt": "Describe the chart"' in serialized
+        assert '"image": "[Media attachment]"' in serialized
+        assert "data:image/png;base64" not in serialized
+
+    def test_serialize_messages_preserves_structured_file_block_metadata(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Use the uploaded document."},
+                    {
+                        "type": "input_file",
+                        "file_id": "file_123",
+                        "filename": "requirements.pdf",
+                        "mime_type": "application/pdf",
+                    },
+                ],
+            }
+        ])
+
+        assert "Use the uploaded document." in serialized
+        assert "type=input_file" in serialized
+        assert "file_123" in serialized
+        assert "requirements.pdf" in serialized
+
+    def test_run_pre_compaction_extraction_uses_media_cleaned_text(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+        import hermes_lcm.extraction as ext_module
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_extract.db"),
+            extraction_enabled=True,
+            extraction_output_path=str(tmp_path / "extractions"),
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        original = ext_module._call_extraction_llm
+        seen_prompt = {}
+
+        def mock_llm(prompt, model="", timeout=None):
+            seen_prompt["prompt"] = prompt
+            return "- Captured media cleanup"
+
+        ext_module._call_extraction_llm = mock_llm
+        try:
+            engine._run_pre_compaction_extraction([
+                {
+                    "role": "user",
+                    "content": "Please save this image for later\n\ndata:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAUA",
+                },
+            ])
+        finally:
+            ext_module._call_extraction_llm = original
+
+        assert "[with media attachment]" in seen_prompt["prompt"]
+        assert "data:image/png;base64" not in seen_prompt["prompt"]
+
     def test_extract_writes_daily_file(self, tmp_path):
         from hermes_lcm.extraction import extract_before_compaction
 
