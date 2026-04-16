@@ -260,6 +260,17 @@ class MessageStore:
                 ids.append(cur.lastrowid)
         return ids
 
+    def delete_session_messages(self, session_id: str) -> int:
+        """Delete all messages for a session. Returns count deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM messages WHERE session_id = ?",
+            (session_id,),
+        )
+        deleted = cur.rowcount
+        if deleted:
+            self._conn.commit()
+        return deleted
+
     def pin(self, store_id: int) -> None:
         """Mark a message as pinned (protected from pruning)."""
         self._conn.execute(
