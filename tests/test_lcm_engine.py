@@ -1170,6 +1170,104 @@ class TestSessionRollover:
         assert state.last_reset_at is not None
 
 
+class TestDeferredMaintenanceDebt:
+    @staticmethod
+    def _make_backlog_messages(count: int = 12) -> list[dict]:
+        messages = [{"role": "system", "content": "sys"}]
+        for i in range(count):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": (f"chunk-{i} " * 220).strip()})
+        return messages
+
+    def test_debt_persists_when_bounded_leaf_passes_leave_raw_backlog(self, engine, monkeypatch):
+        engine._config.dynamic_leaf_chunk_enabled = True
+        engine._config.dynamic_leaf_chunk_max = 100
+        engine._config.leaf_chunk_tokens = 100
+        engine._config.fresh_tail_count = 2
+        engine._config.deferred_maintenance_enabled = True
+        engine._config.deferred_maintenance_max_passes = 1
+        engine.on_session_start("debt-session", platform="cli", context_length=200000)
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", lambda **kwargs: ("debt summary", 1))
+        monkeypatch.setattr(engine, "_working_leaf_chunk_tokens", lambda raw_tokens: 100)
+        monkeypatch.setattr(
+            engine,
+            "_assemble_context",
+            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+        )
+
+        compressed = engine.compress(self._make_backlog_messages())
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+
+        assert state is not None
+        assert state.debt_kind == "raw_backlog"
+        assert state.debt_size_estimate > 0
+        assert engine.should_compress_preflight(compressed) is True
+        refreshed = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert refreshed is not None
+        assert refreshed.debt_kind == "raw_backlog"
+
+    def test_bounded_catchup_reduces_then_clears_debt_only_after_backlog_shrinks(self, engine, monkeypatch):
+        engine._config.dynamic_leaf_chunk_enabled = True
+        engine._config.dynamic_leaf_chunk_max = 100
+        engine._config.leaf_chunk_tokens = 100
+        engine._config.fresh_tail_count = 2
+        engine._config.deferred_maintenance_enabled = True
+        engine.on_session_start("debt-session", platform="cli", context_length=200000)
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", lambda **kwargs: ("debt summary", 1))
+        monkeypatch.setattr(engine, "_working_leaf_chunk_tokens", lambda raw_tokens: 100)
+        monkeypatch.setattr(
+            engine,
+            "_assemble_context",
+            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+        )
+
+        first = engine.compress(self._make_backlog_messages())
+        debt1 = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert debt1 is not None and debt1.debt_kind == "raw_backlog"
+
+        engine._config.deferred_maintenance_max_passes = 1
+        second = engine.compress(first)
+        debt2 = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert debt2 is not None and debt2.debt_kind == "raw_backlog"
+        assert debt2.debt_size_estimate < debt1.debt_size_estimate
+        assert debt2.last_maintenance_attempt_at is not None
+
+        engine._config.deferred_maintenance_max_passes = 10
+        third = engine.compress(second)
+        debt3 = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert debt3 is not None
+        assert debt3.debt_kind is None
+        assert debt3.debt_size_estimate == 0
+        assert third[0]["role"] == "system"
+
+    def test_status_and_lcm_status_surface_debt_state(self, engine, monkeypatch):
+        engine._config.dynamic_leaf_chunk_enabled = True
+        engine._config.dynamic_leaf_chunk_max = 100
+        engine._config.leaf_chunk_tokens = 100
+        engine._config.fresh_tail_count = 2
+        engine._config.deferred_maintenance_enabled = True
+        engine.on_session_start("debt-session", platform="cli", context_length=200000)
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", lambda **kwargs: ("debt summary", 1))
+        monkeypatch.setattr(engine, "_working_leaf_chunk_tokens", lambda raw_tokens: 100)
+        monkeypatch.setattr(
+            engine,
+            "_assemble_context",
+            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+        )
+
+        engine.compress(self._make_backlog_messages())
+        status = engine.get_status()
+        assert status["lifecycle"]["debt_kind"] == "raw_backlog"
+        assert status["lifecycle"]["debt_size_estimate"] > 0
+
+        tool_status = json.loads(engine.handle_tool_call("lcm_status", {}))
+        assert tool_status["lifecycle"]["debt_kind"] == "raw_backlog"
+        assert tool_status["config"]["deferred_maintenance_enabled"] is True
+
+
 class TestUnlimitedCondensationDepth:
     """Tests for issue #2b — max_depth=-1 should be truly unlimited."""
 

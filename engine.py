@@ -143,7 +143,10 @@ class LCMEngine(ContextEngine):
         rough = count_messages_tokens(messages)
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return True
-        return rough >= self.threshold_tokens
+        if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+            return True
+        self._refresh_raw_backlog_debt(messages)
+        return self._should_run_deferred_maintenance(messages)
 
     def _working_leaf_chunk_tokens(self, raw_tokens_outside_tail: int) -> int:
         base = max(1, self._config.leaf_chunk_tokens)
@@ -301,7 +304,15 @@ class LCMEngine(ContextEngine):
         working_messages = list(messages)
         leaf_compacted_this_turn = False
         leaf_passes = 0
-        max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
+        deferred_maintenance_active = (
+            not force_overflow and self._should_run_deferred_maintenance(working_messages)
+        )
+        if deferred_maintenance_active:
+            self._lifecycle.record_maintenance_attempt(self._conversation_id)
+        base_max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
+        max_leaf_passes = base_max_leaf_passes
+        if deferred_maintenance_active:
+            max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
         estimated_active_tokens = (
             observed_prompt_tokens
             if observed_prompt_tokens is not None and observed_prompt_tokens > 0
@@ -378,7 +389,7 @@ class LCMEngine(ContextEngine):
                 break
 
             if not force_overflow:
-                if self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
+                if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
                     break
                 remaining_raw = working_messages[1:max(0, len(working_messages) - self._config.fresh_tail_count)]
                 if not remaining_raw:
@@ -389,6 +400,7 @@ class LCMEngine(ContextEngine):
                     break
 
         if not leaf_compacted_this_turn:
+            self._refresh_raw_backlog_debt(working_messages)
             if force_overflow and len(messages) >= 1:
                 compressed = self._assemble_overflow_recovery_context(
                     messages[0],
@@ -410,6 +422,7 @@ class LCMEngine(ContextEngine):
         )
 
         # Step 7: Assemble new active context
+        self._refresh_raw_backlog_debt(working_messages)
         compressed = self._assemble_context(
             working_messages[0],
             working_messages[1:],
@@ -465,6 +478,53 @@ class LCMEngine(ContextEngine):
             self._session_id,
             self._last_compacted_store_id,
         )
+
+    def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        n = len(messages)
+        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        if fresh_tail_start <= 1:
+            return []
+        return messages[1:fresh_tail_start]
+
+    def _raw_backlog_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        backlog = self._raw_backlog_messages(messages)
+        if not backlog:
+            return 0
+        return count_messages_tokens(backlog)
+
+    def _raw_backlog_threshold(self, raw_tokens: int) -> int:
+        if self._config.dynamic_leaf_chunk_enabled:
+            return self._working_leaf_chunk_tokens(raw_tokens)
+        return max(1, self._config.leaf_chunk_tokens)
+
+    def _has_raw_backlog_debt(self) -> bool:
+        if not self._config.deferred_maintenance_enabled or not self._conversation_id:
+            return False
+        state = self._lifecycle.get_by_conversation(self._conversation_id)
+        return bool(state and state.debt_kind == "raw_backlog" and state.debt_size_estimate > 0)
+
+    def _should_run_deferred_maintenance(self, messages: List[Dict[str, Any]]) -> bool:
+        if not self._has_raw_backlog_debt():
+            return False
+        raw_tokens = self._raw_backlog_tokens(messages)
+        if raw_tokens <= 0:
+            return False
+        return raw_tokens >= self._raw_backlog_threshold(raw_tokens)
+
+    def _refresh_raw_backlog_debt(self, messages: List[Dict[str, Any]]) -> None:
+        if not self._config.deferred_maintenance_enabled or not self._conversation_id:
+            return
+        raw_tokens = self._raw_backlog_tokens(messages)
+        threshold = self._raw_backlog_threshold(raw_tokens) if raw_tokens > 0 else 0
+        if raw_tokens > 0 and raw_tokens >= threshold:
+            self._lifecycle.record_debt(
+                self._conversation_id,
+                kind="raw_backlog",
+                size_estimate=raw_tokens,
+            )
+            return
+        if self._has_raw_backlog_debt():
+            self._lifecycle.clear_debt(self._conversation_id)
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
@@ -610,8 +670,12 @@ class LCMEngine(ContextEngine):
                     "last_finalized_session_id": lifecycle_state.last_finalized_session_id,
                     "current_frontier_store_id": lifecycle_state.current_frontier_store_id,
                     "last_finalized_frontier_store_id": lifecycle_state.last_finalized_frontier_store_id,
+                    "debt_kind": lifecycle_state.debt_kind,
+                    "debt_size_estimate": lifecycle_state.debt_size_estimate,
                     "current_bound_at": lifecycle_state.current_bound_at,
                     "last_finalized_at": lifecycle_state.last_finalized_at,
+                    "debt_updated_at": lifecycle_state.debt_updated_at,
+                    "last_maintenance_attempt_at": lifecycle_state.last_maintenance_attempt_at,
                     "last_rollover_at": lifecycle_state.last_rollover_at,
                     "last_reset_at": lifecycle_state.last_reset_at,
                     "updated_at": lifecycle_state.updated_at,

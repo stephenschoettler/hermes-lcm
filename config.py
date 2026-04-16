@@ -65,6 +65,12 @@ class LCMConfig:
     # Minimum number of same-depth fanin groups before one follow-on
     # condensation pass is allowed in cache-friendly mode
     cache_friendly_min_debt_groups: int = 2
+    # When enabled, turns can persist raw-backlog maintenance debt and use
+    # later bounded catch-up passes to reduce it.
+    deferred_maintenance_enabled: bool = False
+    # Maximum extra leaf passes a debt-triggered later turn may spend on
+    # catch-up work.
+    deferred_maintenance_max_passes: int = 4
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -139,6 +145,14 @@ class LCMConfig:
         c.cache_friendly_min_debt_groups = _int(
             "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS",
             c.cache_friendly_min_debt_groups,
+        )
+        c.deferred_maintenance_enabled = _parse_bool_env(
+            "LCM_DEFERRED_MAINTENANCE_ENABLED",
+            c.deferred_maintenance_enabled,
+        )
+        c.deferred_maintenance_max_passes = _int(
+            "LCM_DEFERRED_MAINTENANCE_MAX_PASSES",
+            c.deferred_maintenance_max_passes,
         )
         c.l2_budget_ratio = _float("LCM_L2_BUDGET_RATIO", c.l2_budget_ratio)
         c.l3_truncate_tokens = _int("LCM_L3_TRUNCATE_TOKENS", c.l3_truncate_tokens)

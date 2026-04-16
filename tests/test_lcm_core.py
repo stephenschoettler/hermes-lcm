@@ -37,6 +37,8 @@ class TestConfig:
         assert c.extraction_enabled is False
         assert c.extraction_model == ""
         assert c.extraction_output_path == ""
+        assert c.deferred_maintenance_enabled is False
+        assert c.deferred_maintenance_max_passes == 4
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
         assert c.ignore_session_patterns_source == "default"
@@ -225,7 +227,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        assert version == ("4",)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -274,12 +276,13 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        assert version == ("4",)
 
         migration_state = store._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
         ).fetchall()
         assert ("v2_external_content_fts_triggers",) in migration_state
+        assert ("v4_lifecycle_debt_columns",) in migration_state
 
         trigger_names = {
             row[0]
@@ -902,7 +905,7 @@ class TestLifecycleStateStore:
         version = state._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "3"
+        assert version == "4"
 
         tables = {
             row[0]
@@ -911,7 +914,33 @@ class TestLifecycleStateStore:
             ).fetchall()
         }
         assert tables == {"lcm_lifecycle_state"}
+        columns = {
+            row[1]
+            for row in state._conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
+        }
+        assert {"debt_kind", "debt_size_estimate", "debt_updated_at", "last_maintenance_attempt_at"} <= columns
         assert state.get_by_session("unknown-session") is None
+
+        state.close()
+
+    def test_record_debt_and_clear_debt(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "lifecycle-debt.db")
+        bound = state.bind_session("sess-1")
+
+        updated = state.record_debt(bound.conversation_id, kind="raw_backlog", size_estimate=321)
+        assert updated is not None
+        assert updated.debt_kind == "raw_backlog"
+        assert updated.debt_size_estimate == 321
+        assert updated.debt_updated_at is not None
+
+        attempted = state.record_maintenance_attempt(bound.conversation_id)
+        assert attempted is not None
+        assert attempted.last_maintenance_attempt_at is not None
+
+        cleared = state.clear_debt(bound.conversation_id)
+        assert cleared is not None
+        assert cleared.debt_kind is None
+        assert cleared.debt_size_estimate == 0
 
         state.close()
 
@@ -1011,7 +1040,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        assert version == ("4",)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -1063,12 +1092,13 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        assert version == ("4",)
 
         migration_state = dag._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
         ).fetchall()
         assert ("v2_external_content_fts_triggers",) in migration_state
+        assert ("v4_lifecycle_debt_columns",) in migration_state
 
         trigger_names = {
             row[0]

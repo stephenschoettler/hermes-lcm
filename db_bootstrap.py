@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Iterable, Sequence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
@@ -79,8 +79,12 @@ def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
             last_finalized_session_id TEXT,
             current_frontier_store_id INTEGER NOT NULL DEFAULT 0,
             last_finalized_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+            debt_kind TEXT,
+            debt_size_estimate INTEGER NOT NULL DEFAULT 0,
             current_bound_at REAL,
             last_finalized_at REAL,
+            debt_updated_at REAL,
+            last_maintenance_attempt_at REAL,
             last_rollover_at REAL,
             last_reset_at REAL,
             updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
@@ -93,6 +97,25 @@ def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_lcm_lifecycle_last_finalized_session ON lcm_lifecycle_state(last_finalized_session_id)"
     )
+
+
+def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
+    ensure_lifecycle_state_table(conn)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
+    }
+    if "debt_kind" not in columns:
+        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_kind TEXT")
+    if "debt_size_estimate" not in columns:
+        conn.execute(
+            "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_size_estimate INTEGER NOT NULL DEFAULT 0"
+        )
+    if "debt_updated_at" not in columns:
+        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_updated_at REAL")
+    if "last_maintenance_attempt_at" not in columns:
+        conn.execute(
+            "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_maintenance_attempt_at REAL"
+        )
 
 
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
@@ -230,5 +253,10 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         current_version = 3
     else:
         ensure_lifecycle_state_table(conn)
+
+    ensure_lifecycle_state_columns(conn)
+    if current_version < 4:
+        mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
+        current_version = 4
 
     set_schema_version(conn, current_version)

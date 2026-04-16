@@ -435,6 +435,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     total_dag_tokens = sum(d["tokens"] for d in depths.values())
     total_source_tokens = sum(d["source_tokens"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
+    lifecycle = engine.get_status().get("lifecycle")
 
     return json.dumps({
         "session_id": session_id,
@@ -461,6 +462,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "dynamic_leaf_chunk_max": engine._config.dynamic_leaf_chunk_max,
             "cache_friendly_condensation_enabled": engine._config.cache_friendly_condensation_enabled,
             "cache_friendly_min_debt_groups": engine._config.cache_friendly_min_debt_groups,
+            "deferred_maintenance_enabled": engine._config.deferred_maintenance_enabled,
+            "deferred_maintenance_max_passes": engine._config.deferred_maintenance_max_passes,
             "context_threshold": engine._config.context_threshold,
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
@@ -471,6 +474,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "ignored": engine._session_ignored,
             "stateless": engine._session_stateless,
         },
+        "lifecycle": lifecycle,
     })
 
 
