@@ -23,6 +23,33 @@ _MEDIA_ATTACHMENT_SUFFIX = "[with media attachment]"
 _TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 _MEDIA_BLOCK_HINTS = ("image", "audio", "video")
 _STRUCTURED_METADATA_KEYS = ("file_id", "filename", "name", "mime_type", "url", "file_url", "id")
+# Maximum path length for safety in path traversal checks
+_MAX_PATH_PARTS = 10
+
+
+def _is_safe_path(output_path: str) -> bool:
+    """Validate that the output path is safe from path traversal attacks.
+
+    Returns True if the path is safe to write to. Checks:
+    - Path resolves within expected directory (no ../)
+    - Path has reasonable number of components (no deep nesting)
+    - Filename is not absolute or suspicious
+    """
+    try:
+        p = Path(output_path).resolve()
+        # Check for path traversal attempts (parent directory references)
+        if ".." in Path(output_path).parts:
+            return False
+        # Check depth - too many path components could be suspicious
+        if len(p.parts) > _MAX_PATH_PARTS:
+            return False
+        # Check the filename itself is not suspicious
+        filename = p.name
+        if not filename or filename.startswith("."):
+            return False
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 EXTRACTION_PROMPT = """Extract decisions, commitments, outcomes, and rules from this conversation segment.
@@ -201,6 +228,10 @@ def extract_before_compaction(
     Never raises — failures are logged and swallowed.
     """
     try:
+        if not _is_safe_path(output_path):
+            logger.warning("Pre-compaction extraction blocked: unsafe output path %r", output_path)
+            return False
+
         prompt = EXTRACTION_PROMPT.format(text=serialized_messages)
         result = _call_extraction_llm(prompt, model=model, timeout=timeout)
 

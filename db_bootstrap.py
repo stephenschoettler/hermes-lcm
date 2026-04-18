@@ -6,11 +6,24 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from typing import Iterable, Sequence
 
 SCHEMA_VERSION = 4
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+# Minimum disk space (in bytes) required before attempting FTS rebuild
+_MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+def _check_disk_space(path: str) -> bool:
+    """Return True if there is at least _MIN_DISK_SPACE_BYTES free on the volume."""
+    try:
+        stat = os.statvfs(path)
+        free_bytes = stat.f_bavail * stat.f_frsize
+        return free_bytes >= _MIN_DISK_SPACE_BYTES
+    except OSError:
+        return True  # If we can't check, proceed optimistically
 
 
 class ExternalContentFtsSpec:
@@ -220,6 +233,15 @@ def _drop_fts_table(conn: sqlite3.Connection, table_name: str) -> None:
 
 def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
     if _fts_needs_rebuild(conn, spec):
+        # Check disk space before attempting rebuild to avoid crashes
+        db_path = conn.execute("PRAGMA database_list").fetchone()
+        if db_path:
+            db_file = db_path[2]
+            if db_file and not _check_disk_space(db_file):
+                raise OSError(
+                    f"Insufficient disk space to rebuild FTS table '{spec.table_name}': "
+                    f"need at least {_MIN_DISK_SPACE_BYTES // (1024*1024)} MB"
+                )
         _drop_fts_table(conn, spec.table_name)
         conn.execute(
             f"""

@@ -748,6 +748,10 @@ class LCMEngine(ContextEngine):
         the cursor is reset to len(compressed), so only messages appended
         after compaction are ingested — regardless of how the store count
         compares to the current list length.
+
+        A consistency check detects cursor desync: if the store already
+        contains more messages than the cursor position suggests, the cursor
+        is advanced to match the store so duplicate ingestion is avoided.
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
@@ -767,6 +771,17 @@ class LCMEngine(ContextEngine):
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
         )
+
+        # Consistency check: detect cursor desync vs actual store state
+        store_count = self._store.get_session_count(self._session_id)
+        if store_count > cursor:
+            logger.warning(
+                "LCM ingest cursor desync detected: store=%d > cursor=%d for session %s. "
+                "Recovering by advancing cursor to store count.",
+                store_count, cursor, self._session_id,
+            )
+            cursor = store_count
+            self._ingest_cursor = cursor
 
         new_messages = messages[cursor:] if cursor < n else []
 

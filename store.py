@@ -31,6 +31,7 @@ from .search_query import (
     extract_search_terms,
     normalize_search_sort,
     requires_like_fallback,
+    sanitize_fts5_query,
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
@@ -371,6 +372,9 @@ class MessageStore:
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
 
+        # Sanitize the query to prevent FTS5 query injection
+        safe_query = sanitize_fts5_query(query)
+
         order_by = _build_search_order_by(
             sort,
             "m.timestamp",
@@ -391,7 +395,7 @@ class MessageStore:
                            JOIN messages m ON m.store_id = fts.rowid
                            WHERE messages_fts MATCH ? AND m.session_id = ?
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, session_id, fetch_limit, offset),
+                        (safe_query, session_id, fetch_limit, offset),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
@@ -401,7 +405,7 @@ class MessageStore:
                            JOIN messages m ON m.store_id = fts.rowid
                            WHERE messages_fts MATCH ?
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, fetch_limit, offset),
+                        (safe_query, fetch_limit, offset),
                     ).fetchall()
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
@@ -434,8 +438,10 @@ class MessageStore:
 
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None) -> List[Dict[str, Any]]:
-        terms = extract_search_terms(query)
-        phrases = extract_quoted_phrases(query)
+        # Sanitize FTS5 special characters before extracting terms for LIKE fallback
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
         if not terms:
             return []
 

@@ -185,6 +185,14 @@ def _backup_database(engine) -> dict[str, Any]:
         }
 
     backup_root = Path(engine._hermes_home).expanduser() if getattr(engine, "_hermes_home", "") else db_path.parent
+    # Guard against path traversal: ensure backup root is a parent of the final path
+    try:
+        backup_root = backup_root.resolve()
+        db_path_resolved = db_path.resolve()
+        if not str(db_path_resolved).startswith(str(backup_root)):
+            backup_root = db_path.parent
+    except (OSError, ValueError):
+        backup_root = db_path.parent
     backup_dir = backup_root / "backups" / "lcm"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = backup_dir / f"{db_path.stem}-{timestamp}.sqlite3"

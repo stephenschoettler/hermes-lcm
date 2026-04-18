@@ -26,6 +26,25 @@ _BOOLEAN_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 _RISKY_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9][\-:/][A-Za-z0-9]")
 _SPLIT_PUNCT_RE = re.compile(r"[-:/]+")
 _STRIP_EDGE_PUNCT = "\"'()[]{}.,;"
+# Characters that are special in FTS5 query syntax
+_FTS5_SPECIAL_CHARS = frozenset('"()*^-:{}')
+
+
+def sanitize_fts5_query(query: str) -> str:
+    """Strip FTS5 special syntax characters from a raw query string.
+
+    This prevents FTS5 query injection when a user-supplied string is used
+    directly in a FTS5 MATCH expression.
+    """
+    if not query:
+        return ""
+    result = []
+    for char in query:
+        if char in _FTS5_SPECIAL_CHARS:
+            result.append(" ")
+        else:
+            result.append(char)
+    return "".join(result).strip()
 
 
 _WORD_RE = re.compile(r"[\w-]+", re.UNICODE)
