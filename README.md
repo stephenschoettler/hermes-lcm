@@ -224,6 +224,7 @@ Issues and PRs welcome. This project has active community contributors and CI ru
 - **New features** should be scoped and backwards-compatible
 - **Tests required** — run `python -m pytest tests/ -v` before submitting
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for issue, branch, validation, and PR guidance.
 See the [releases page](https://github.com/stephenschoettler/hermes-lcm/releases) for changelogs.
 
 ## License
