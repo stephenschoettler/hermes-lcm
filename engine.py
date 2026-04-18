@@ -775,7 +775,12 @@ class LCMEngine(ContextEngine):
             return
 
         estimates = [count_message_tokens(m) for m in new_messages]
-        self._store.append_batch(self._session_id, new_messages, estimates)
+        self._store.append_batch(
+            self._session_id,
+            new_messages,
+            estimates,
+            source=self._session_platform,
+        )
         self._ingest_cursor = n
         logger.debug("Ingested %d messages into LCM store", len(new_messages))
 

@@ -45,6 +45,11 @@ class TestEngineABC:
         assert "lcm_doctor" in names
         assert "lcm_expand_query" in names
 
+        grep_schema = next(s for s in schemas if s["name"] == "lcm_grep")
+        grep_props = grep_schema["parameters"]["properties"]
+        assert "session_scope" in grep_props
+        assert "source" in grep_props
+
     def test_should_compress(self, engine):
         assert not engine.should_compress(1000)
         assert engine.should_compress(engine.threshold_tokens)
@@ -1824,6 +1829,105 @@ class TestEngineTools:
             )
         )
         assert result["sort"] == "relevance"
+
+    def test_handle_grep_source_filter_across_sessions_includes_only_matching_summaries(self, engine):
+        engine._store.append("s-discord", {"role": "user", "content": "docker logs from discord"}, source="discord")
+        engine._store.append("s-telegram", {"role": "user", "content": "docker logs from telegram"}, source="telegram")
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="s-discord",
+                depth=0,
+                summary="discord summary about docker logs",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="s-telegram",
+                depth=0,
+                summary="telegram summary about docker logs",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[2],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "source": "discord", "limit": 10},
+            )
+        )
+
+        assert result["session_scope"] == "all"
+        assert result["source"] == "discord"
+        assert any(item["type"] == "message" for item in result["results"])
+        assert any(item["type"] == "summary" for item in result["results"])
+        assert all(item.get("session_id") == "s-discord" for item in result["results"])
+        assert all(item.get("source", "discord") == "discord" for item in result["results"] if item["type"] == "message")
+
+    def test_handle_grep_source_filter_excludes_unrelated_summaries_in_mixed_source_session(self, engine):
+        discord_store_id = engine._store.append(
+            "mixed-session",
+            {"role": "user", "content": "docker logs from discord"},
+            source="discord",
+        )
+        telegram_store_id = engine._store.append(
+            "mixed-session",
+            {"role": "user", "content": "docker logs from telegram"},
+            source="telegram",
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="mixed-session",
+                depth=0,
+                summary="discord summary about docker logs",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[discord_store_id],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="mixed-session",
+                depth=0,
+                summary="telegram summary about docker logs",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[telegram_store_id],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "source": "discord", "limit": 10},
+            )
+        )
+
+        assert any(item["type"] == "message" for item in result["results"])
+        assert any(item["type"] == "summary" for item in result["results"])
+        assert all(item.get("session_id") == "mixed-session" for item in result["results"])
+        assert all(
+            "telegram summary" not in item.get("snippet", "")
+            for item in result["results"]
+            if item["type"] == "summary"
+        )
+        assert any(
+            "discord summary" in item.get("snippet", "")
+            for item in result["results"]
+            if item["type"] == "summary"
+        )
 
     def test_handle_grep_prefers_conversational_hits_over_tool_output_noise(self, engine):
         engine._store.append(

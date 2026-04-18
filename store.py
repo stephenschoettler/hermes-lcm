@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 
 
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
+_MESSAGE_SELECT_COLUMNS = (
+    "store_id, session_id, source, role, content, tool_call_id, "
+    "tool_calls, tool_name, timestamp, token_estimate, pinned"
+)
 
 
 def _message_role_bias(role: str | None) -> float:
@@ -147,6 +151,7 @@ class MessageStore:
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
+                source TEXT DEFAULT '',
                 role TEXT NOT NULL,
                 content TEXT,
                 tool_call_id TEXT,
@@ -192,23 +197,35 @@ class MessageStore:
             ),
         )
         run_versioned_migrations(self._conn)
+        self._ensure_source_column()
         self._conn.commit()
+
+    def _ensure_source_column(self) -> None:
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "source" not in columns:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_source_session ON messages(source, session_id, store_id)"
+        )
 
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
-               token_estimate: int = 0) -> int:
+               token_estimate: int = 0, source: str = "") -> int:
         """Persist a message and return its store_id."""
         tool_calls = msg.get("tool_calls")
         tc_json = json.dumps(tool_calls) if tool_calls else None
 
         cur = self._conn.execute(
             """INSERT INTO messages
-               (session_id, role, content, tool_call_id, tool_calls,
+               (session_id, source, role, content, tool_call_id, tool_calls,
                 tool_name, timestamp, token_estimate, pinned)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
+                source or "",
                 msg.get("role", "unknown"),
                 msg.get("content"),
                 msg.get("tool_call_id"),
@@ -224,7 +241,8 @@ class MessageStore:
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
-                     token_estimates: List[int] | None = None) -> List[int]:
+                     token_estimates: List[int] | None = None,
+                     source: str = "") -> List[int]:
         """Persist multiple messages in one transaction. Returns store_ids."""
         if token_estimates is None:
             token_estimates = [0] * len(messages)
@@ -237,11 +255,12 @@ class MessageStore:
                 tc_json = json.dumps(tc) if tc else None
                 cur = self._conn.execute(
                     """INSERT INTO messages
-                       (session_id, role, content, tool_call_id, tool_calls,
+                       (session_id, source, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
+                        source or "",
                         msg.get("role", "unknown"),
                         msg.get("content"),
                         msg.get("tool_call_id"),
@@ -284,7 +303,7 @@ class MessageStore:
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
         row = self._conn.execute(
-            "SELECT * FROM messages WHERE store_id = ?", (store_id,)
+            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
         ).fetchone()
         return self._row_to_dict(row) if row else None
 
@@ -297,7 +316,7 @@ class MessageStore:
             return {}
         placeholders = ",".join("?" for _ in store_ids)
         rows = self._conn.execute(
-            f"SELECT * FROM messages WHERE store_id IN ({placeholders})",
+            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
             store_ids,
         ).fetchall()
         return {row[0]: self._row_to_dict(row) for row in rows}
@@ -308,14 +327,14 @@ class MessageStore:
         """Get messages in a store_id range for a session."""
         if end_id is not None:
             rows = self._conn.execute(
-                """SELECT * FROM messages
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                    WHERE session_id = ? AND store_id >= ? AND store_id <= ?
                    ORDER BY store_id LIMIT ?""",
                 (session_id, start_id, end_id, limit),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                """SELECT * FROM messages
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                    WHERE session_id = ? AND store_id >= ?
                    ORDER BY store_id LIMIT ?""",
                 (session_id, start_id, limit),
@@ -326,7 +345,7 @@ class MessageStore:
                              limit: int = 10000) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
         rows = self._conn.execute(
-            """SELECT * FROM messages
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ?
                ORDER BY store_id LIMIT ?""",
             (session_id, limit),
@@ -364,12 +383,13 @@ class MessageStore:
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,
-               limit: int = 20, sort: str | None = None) -> List[Dict[str, Any]]:
+               limit: int = 20, sort: str | None = None,
+               source: str | None = None) -> List[Dict[str, Any]]:
         """FTS5 search across messages. Returns matches with snippets."""
         terms = extract_search_terms(query)
         phrases = extract_quoted_phrases(query)
         if requires_like_fallback(query):
-            return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
+            return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
         order_by = _build_search_order_by(
             sort,
@@ -384,34 +404,65 @@ class MessageStore:
         while True:
             try:
                 if session_id:
-                    rows = self._conn.execute(
-                        f"""SELECT m.*, rank as search_rank,
-                                  snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                           FROM messages_fts fts
-                           JOIN messages m ON m.store_id = fts.rowid
-                           WHERE messages_fts MATCH ? AND m.session_id = ?
-                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, session_id, fetch_limit, offset),
-                    ).fetchall()
+                    if source:
+                        rows = self._conn.execute(
+                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
+                                      rank as search_rank,
+                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                               FROM messages_fts fts
+                               JOIN messages m ON m.store_id = fts.rowid
+                               WHERE messages_fts MATCH ? AND m.session_id = ? AND m.source = ?
+                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                            (query, session_id, source, fetch_limit, offset),
+                        ).fetchall()
+                    else:
+                        rows = self._conn.execute(
+                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
+                                      rank as search_rank,
+                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                               FROM messages_fts fts
+                               JOIN messages m ON m.store_id = fts.rowid
+                               WHERE messages_fts MATCH ? AND m.session_id = ?
+                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                            (query, session_id, fetch_limit, offset),
+                        ).fetchall()
                 else:
-                    rows = self._conn.execute(
-                        f"""SELECT m.*, rank as search_rank,
-                                  snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                           FROM messages_fts fts
-                           JOIN messages m ON m.store_id = fts.rowid
-                           WHERE messages_fts MATCH ?
-                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, fetch_limit, offset),
-                    ).fetchall()
+                    if source:
+                        rows = self._conn.execute(
+                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
+                                      rank as search_rank,
+                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                               FROM messages_fts fts
+                               JOIN messages m ON m.store_id = fts.rowid
+                               WHERE messages_fts MATCH ? AND m.source = ?
+                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                            (query, source, fetch_limit, offset),
+                        ).fetchall()
+                    else:
+                        rows = self._conn.execute(
+                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
+                                      rank as search_rank,
+                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                               FROM messages_fts fts
+                               JOIN messages m ON m.store_id = fts.rowid
+                               WHERE messages_fts MATCH ?
+                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                            (query, fetch_limit, offset),
+                        ).fetchall()
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
-                return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
+                return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
             raw_primary_values: list[float] = []
             for r in rows:
                 d = self._row_to_dict(r)
-                d["search_rank"] = r[10] if len(r) > 10 else None
-                d["snippet"] = r[11] if len(r) > 11 else ""
+                base_columns = 11
+                d["search_rank"] = r[base_columns] if len(r) > base_columns else None
+                d["snippet"] = r[base_columns + 1] if len(r) > (base_columns + 1) else ""
                 d["_directness_score"] = _message_directness_score(d.get("role"), d.get("content"), terms, phrases)
                 if apply_directness_adjustment and d["search_rank"] is not None:
                     rank_adjustment = max(float(d["_directness_score"]), 0.0)
@@ -433,7 +484,8 @@ class MessageStore:
             fetch_limit *= 2
 
     def _search_like(self, query: str, session_id: str | None = None,
-                     limit: int = 20, sort: str | None = None) -> List[Dict[str, Any]]:
+                     limit: int = 20, sort: str | None = None,
+                     source: str | None = None) -> List[Dict[str, Any]]:
         terms = extract_search_terms(query)
         phrases = extract_quoted_phrases(query)
         if not terms:
@@ -444,6 +496,9 @@ class MessageStore:
         if session_id:
             where.append("session_id = ?")
             args.append(session_id)
+        if source:
+            where.append("source = ?")
+            args.append(source)
         like_clauses = []
         for term in terms:
             like_clauses.append("content LIKE ? ESCAPE '\\'")
@@ -451,7 +506,7 @@ class MessageStore:
         where.append("(" + " OR ".join(like_clauses) + ")")
 
         rows = self._conn.execute(
-            f"SELECT * FROM messages WHERE {' AND '.join(where)}",
+            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE {' AND '.join(where)}",
             args,
         ).fetchall()
         results: List[Dict[str, Any]] = []
@@ -483,7 +538,7 @@ class MessageStore:
         if row is None:
             return {}
         cols = [
-            "store_id", "session_id", "role", "content", "tool_call_id",
+            "store_id", "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned",
         ]
         d = dict(zip(cols, row[:len(cols)]))

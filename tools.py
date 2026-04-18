@@ -207,7 +207,7 @@ def _synthesize_expansion_answer(
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
-    """Search across the full DAG and raw messages for the current session."""
+    """Search across the full DAG and raw messages."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
@@ -219,17 +219,27 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     limit = args.get("limit", 10)
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
-    session_id = engine._session_id
+    session_scope = str(args.get("session_scope", "current")).lower()
+    source = str(args.get("source") or "").strip() or None
+    session_id = None if session_scope == "all" else engine._session_id
     results = []
 
     try:
-        msg_hits = engine._store.search(query, session_id=session_id, limit=source_limit, sort=sort)
+        msg_hits = engine._store.search(
+            query,
+            session_id=session_id,
+            limit=source_limit,
+            sort=sort,
+            source=source,
+        )
         for hit in msg_hits:
             results.append(
                 {
                     "type": "message",
                     "depth": "raw",
                     "store_id": hit["store_id"],
+                    "session_id": hit["session_id"],
+                    "source": hit.get("source") or "",
                     "role": hit["role"],
                     "snippet": hit.get("snippet", hit.get("content", "")[:200]),
                     "_sort_ts": hit.get("timestamp", 0),
@@ -241,13 +251,20 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         logger.warning("Message search failed: %s", exc)
 
     try:
-        node_hits = engine._dag.search(query, session_id=session_id, limit=source_limit, sort=sort)
+        node_hits = engine._dag.search(
+            query,
+            session_id=session_id,
+            limit=source_limit,
+            sort=sort,
+            source=source,
+        )
         for node in node_hits:
             results.append(
                 {
                     "type": "summary",
                     "depth": f"d{node.depth}",
                     "node_id": node.node_id,
+                    "session_id": node.session_id,
                     "snippet": node.summary[:300],
                     "token_count": node.token_count,
                     "expand_hint": node.expand_hint,
@@ -276,7 +293,16 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         result.pop("_sort_rank", None)
         result.pop("_sort_directness", None)
         result.pop("_hybrid_summary_override", None)
-    return json.dumps({"query": query, "sort": sort, "total_results": len(results), "results": results[:limit]})
+    return json.dumps(
+        {
+            "query": query,
+            "sort": sort,
+            "session_scope": session_scope,
+            "source": source,
+            "total_results": len(results),
+            "results": results[:limit],
+        }
+    )
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
