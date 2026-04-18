@@ -53,6 +53,26 @@ into anything that was compacted.
 - **Session filtering** — exclude noisy sessions entirely or mark them read-only with glob patterns
 - **Profile-scoped** — separate DB per Hermes profile
 
+## LCM vs built-in compression
+
+The important distinction is **not** "LCM keeps raw data on disk while Hermes built-in compression deletes it everywhere."
+
+Hermes core persists original conversation history to `state.db` before built-in compression rewrites the active prompt window. That means built-in compression is still lossy in the **active context**, but earlier content can remain recoverable later through Hermes' broader history path such as `session_search`.
+
+`hermes-lcm` solves a different problem:
+
+- it keeps a plugin-local immutable store and DAG specifically for lossless drill-down
+- it gives the agent a direct in-plugin recall path for compacted current-session history via `lcm_grep`, `lcm_describe`, `lcm_expand`, and `lcm_expand_query`
+- it avoids relying on an auxiliary cross-session retrieval step just to recover details from the conversation that was compacted in front of the agent
+- its DAG/source-lineage rules make retrieval behavior more explicit and stable
+
+So the practical comparison is:
+
+- **Built-in compression** — active-context loss is possible, but persisted history may still be recoverable later through a separate host-level path
+- **LCM** — the agent gets an explicit, lossless, current-session recall path inside the plugin itself
+
+That is why LCM positioning should focus on **retrieval quality, autonomy, and drill-down behavior**, not on claiming that Hermes core has no persisted record of pre-compression history.
+
 ## Requirements
 
 - Hermes Agent with the **pluggable context engine slot** ([PR #7464](https://github.com/NousResearch/hermes-agent/pull/7464))
