@@ -40,6 +40,7 @@ class TestConfig:
         assert c.large_output_externalization_enabled is False
         assert c.large_output_externalization_threshold_chars == 12_000
         assert c.large_output_externalization_path == ""
+        assert c.large_output_transcript_gc_enabled is False
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
         assert c.ignore_session_patterns == []
@@ -70,6 +71,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", "true")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", "4096")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", "/tmp/lcm-large-outputs")
+        monkeypatch.setenv("LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED", "true")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
         assert c.context_threshold == 0.80
@@ -91,6 +93,7 @@ class TestConfig:
         assert c.large_output_externalization_enabled is True
         assert c.large_output_externalization_threshold_chars == 4096
         assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"
+        assert c.large_output_transcript_gc_enabled is True
 
     def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
@@ -213,6 +216,42 @@ class TestMessageStore:
         assert len(discord_results) == 1
         assert discord_results[0]["source"] == "discord"
         assert discord_results[0]["session_id"] == "sess2"
+
+    def test_gc_externalized_tool_result_rewrites_content_and_updates_fts(self, store):
+        placeholder = "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]"
+        store_id = store.append(
+            "sess1",
+            {"role": "tool", "tool_call_id": "call_gc", "content": "raw payload blob should disappear"},
+            token_estimate=50,
+        )
+
+        rewritten = store.gc_externalized_tool_result(store_id, placeholder)
+
+        assert rewritten is True
+        updated = store.get(store_id)
+        assert updated["content"] == placeholder
+        assert updated["token_estimate"] == count_message_tokens(
+            {"role": "tool", "tool_call_id": "call_gc", "content": placeholder}
+        )
+        assert updated["token_estimate"] < 50
+        assert store.search("payload", session_id="sess1")[0]["store_id"] == store_id
+        assert store.search("blob", session_id="sess1") == []
+
+    def test_gc_externalized_tool_result_skips_pinned_messages(self, store):
+        store_id = store.append(
+            "sess1",
+            {"role": "tool", "tool_call_id": "call_gc", "content": "raw payload blob should stay"},
+            token_estimate=50,
+        )
+        store.pin(store_id)
+
+        rewritten = store.gc_externalized_tool_result(
+            store_id,
+            "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]",
+        )
+
+        assert rewritten is False
+        assert store.get(store_id)["content"] == "raw payload blob should stay"
 
     def test_init_repairs_malformed_message_fts_and_sets_schema_version(self, tmp_path):
         db_path = tmp_path / "legacy-store.db"

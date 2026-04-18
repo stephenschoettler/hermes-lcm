@@ -39,14 +39,16 @@ into anything that was compacted.
 
 ## Why This Plugin
 
-~5,000 lines of Python. Zero external dependencies. 192 tests that run standalone in under a second. Full lossless context management — immutable store, hierarchical DAG, agent retrieval tools, guided compression, assembly guardrails, session filtering — in a single lightweight plugin that drops into Hermes with no build step, no runtime overhead, and nothing to configure beyond `context.engine: lcm`.
+~5,000 lines of Python. Zero external dependencies. 200+ tests that run standalone in under a second. Full lossless context management — immutable-first store, hierarchical DAG, agent retrieval tools, guided compression, assembly guardrails, session filtering — in a single lightweight plugin that drops into Hermes with no build step, no runtime overhead, and nothing to configure beyond `context.engine: lcm`.
 
 ## What It Does
 
-- **Immutable store** — every message persisted in SQLite, never modified
+- **Immutable-first store** — every message persisted in SQLite, with only narrow explicit opt-in GC tombstones for already-externalized summarized tool results
 - **Summary DAG** — hierarchical compaction (D0 minutes → D1 hours → D2 days)
 - **3-level escalation** — L1 detailed → L2 bullets → L3 deterministic truncate (guaranteed convergence)
 - **Agent tools** — `lcm_grep`, `lcm_describe`, `lcm_expand`, `lcm_expand_query` for structured retrieval
+- **Large tool-output handling** — opt-in externalization for oversized tool results, inspectable later via `externalized_ref`
+- **Optional transcript GC** — opt-in rewrite of already-externalized summarized tool-result rows to compact GC placeholders instead of deleting them
 - **Current-turn search** — live messages ingested before tool execution
 - **Session filtering** — exclude noisy sessions entirely or mark them read-only with glob patterns
 - **Profile-scoped** — separate DB per Hermes profile
@@ -126,6 +128,10 @@ Environment variables (all optional):
 | `LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS` | `2` | Debt threshold multiplier before cache-friendly gating allows a follow-on condensation pass |
 | `LCM_IGNORE_SESSION_PATTERNS` | *(empty)* | Comma-separated glob patterns for sessions to exclude from LCM storage entirely |
 | `LCM_STATELESS_SESSION_PATTERNS` | *(empty)* | Comma-separated glob patterns for sessions that stay read-only (`platform:session_id` matching supported) |
+| `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Opt-in externalization of oversized tool-result content into plugin-managed storage |
+| `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Character threshold above which tool results are externalized |
+| `LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH` | `~/.hermes/lcm-large-outputs` | Override storage directory for externalized payloads |
+| `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Opt-in rewrite of already-externalized summarized tool-result transcript rows to compact GC placeholders |
 | `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization |
 | `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
@@ -134,6 +140,22 @@ Environment variables (all optional):
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after `/new` (`-1` = all, `0` = none, `2` = keep d2+) |
 
 The point-8 compaction knobs are intentionally opt-in. `cache_friendly_*` is a plugin-local prompt-stability heuristic, not a claim that Hermes currently passes true prompt-cache metrics into `hermes-lcm`.
+
+### Large tool-output handling
+
+`hermes-lcm` now has a three-step opt-in path for oversized tool results:
+
+1. **9B externalization** — large tool results are written to plugin-managed JSON files instead of being kept inline for compaction prompts
+2. **9C retrieval** — those payloads stay inspectable later through `lcm_describe(externalized_ref=...)`, `lcm_expand(externalized_ref=...)`, or expanded summary sources that attach `externalized` metadata
+3. **9D transcript GC** — if `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED=true`, already-externalized tool-result rows that were successfully summarized can be rewritten to compact GC placeholders instead of keeping the full raw blob inline forever
+
+Important boundaries:
+- all of this remains **opt-in**
+- transcript GC rewrites only **tool-role** rows that already have a same-session externalized payload
+- the row itself is kept (same `store_id`), so summary `source_ids` still resolve cleanly
+- pinned messages are skipped
+- payload files are **not** deleted by transcript GC; retrieval stays lossless via `externalized_ref`
+- transcript GC updates the stored row content and therefore changes raw-message searchability: search should still find summaries / refs, but `lcm_grep` will no longer match the original giant tool blob text after GC
 
 Pattern syntax matches `lossless-claw`:
 - `*` matches within one colon-delimited segment
@@ -151,22 +173,23 @@ That means patterns like `cron:*` can catch Hermes cron sessions today, while pl
 | Tool | Description |
 |------|-------------|
 | `lcm_grep` | Search raw messages AND summaries across all depths. FTS5 syntax. |
-| `lcm_describe` | Inspect DAG structure — token counts, children, expand hints. No node_id = session overview. |
-| `lcm_expand` | Recover original content from a summary node. Token-budgeted. |
+| `lcm_describe` | Inspect DAG structure or an `externalized_ref` payload preview without loading full payload content. No node_id/externalized_ref = session overview. |
+| `lcm_expand` | Recover original content from a summary node, or open a stored `externalized_ref` payload directly. |
 | `lcm_expand_query` | Answer a question from expanded LCM context using either a query or explicit node_ids. Uses the expansion path/model instead of the summarization path. |
 | `lcm_status` | Quick health overview — compression count, store size, DAG depth distribution, context usage, and active config. |
 | `lcm_doctor` | Run diagnostics — database integrity, FTS index sync, orphaned nodes, config validation, context pressure. |
 
 ## Gateway Slash Commands
 
-When Hermes host support for plugin slash commands is available, `hermes-lcm` also exposes a `/lcm` operator surface for quick read-only diagnostics from chat:
+When Hermes host support for plugin slash commands is available, `hermes-lcm` also exposes a `/lcm` operator surface for quick diagnostics and safe maintenance prep from chat:
 
 - `/lcm` or `/lcm status` — current session/runtime status
 - `/lcm doctor` — SQLite + FTS health checks and store/node totals
 - `/lcm doctor clean` — best-effort read-only scan for obvious junk/noise sessions matched from stored session keys
+- `/lcm doctor clean apply` — backup-first cleanup for safe pattern-matched junk/noise session candidates
 - `/lcm backup` — create a timestamped SQLite backup before any future cleanup workflow
 
-`/lcm doctor clean apply` is intentionally not implemented yet. This slice is diagnostics-first and backup-first.
+The cleanup path stays intentionally narrow and backup-first; broader retention/prune workflows should still start with diagnostics before any apply/delete step.
 
 ## How It Works
 

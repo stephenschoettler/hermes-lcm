@@ -114,6 +114,9 @@ class LCMConfig:
     large_output_externalization_threshold_chars: int = 12_000
     # Explicit storage directory for externalized payloads (empty = auto under hermes home).
     large_output_externalization_path: str = ""
+    # When enabled, already-externalized summarized tool-result transcript rows may
+    # be rewritten to compact GC placeholders after successful leaf compaction.
+    large_output_transcript_gc_enabled: bool = False
 
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
@@ -182,6 +185,10 @@ class LCMConfig:
         c.large_output_externalization_path = _str(
             "LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH",
             c.large_output_externalization_path,
+        )
+        c.large_output_transcript_gc_enabled = _parse_bool_env(
+            "LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED",
+            c.large_output_transcript_gc_enabled,
         )
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)

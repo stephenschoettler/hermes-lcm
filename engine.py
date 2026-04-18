@@ -17,7 +17,11 @@ from agent.context_engine import ContextEngine
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
-from .externalize import maybe_externalize_tool_output
+from .externalize import (
+    build_transcript_gc_placeholder,
+    maybe_externalize_tool_output,
+    find_externalized_payload_for_message,
+)
 from .extraction import (
     extract_before_compaction,
     sanitize_pre_compaction_content,
@@ -382,6 +386,7 @@ class LCMEngine(ContextEngine):
                 expand_hint=self._extract_expand_hint(summary_text),
             )
             self._dag.add_node(node)
+            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
             self._persist_frontier_marker()
 
@@ -832,6 +837,51 @@ class LCMEngine(ContextEngine):
             )
         except Exception as e:
             logger.warning("Pre-compaction extraction failed (non-blocking): %s", e)
+
+    def _maybe_gc_compacted_tool_results(
+        self,
+        compacted_chunk: List[Dict[str, Any]],
+        source_store_ids: List[int],
+    ) -> None:
+        if not getattr(self._config, "large_output_transcript_gc_enabled", False):
+            return
+        if not compacted_chunk or not source_store_ids:
+            return
+
+        stored_by_id = self._store.get_batch(source_store_ids)
+        for store_id in source_store_ids:
+            stored = stored_by_id.get(store_id)
+            if not stored or stored.get("session_id") != self._session_id:
+                continue
+            if stored.get("role") != "tool":
+                continue
+            content = stored.get("content", "") or ""
+            tool_call_id = stored.get("tool_call_id", "") or ""
+            if not content:
+                continue
+
+            lookup_candidates = []
+            sanitized_content = sanitize_pre_compaction_content(content)
+            if sanitized_content and sanitized_content != content:
+                lookup_candidates.append(sanitized_content)
+            lookup_candidates.append(content)
+
+            externalized = None
+            for candidate in lookup_candidates:
+                externalized = find_externalized_payload_for_message(
+                    candidate,
+                    tool_call_id=tool_call_id,
+                    session_id=self._session_id,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                if externalized is not None:
+                    break
+            if externalized is None:
+                continue
+
+            placeholder = build_transcript_gc_placeholder(externalized)
+            self._store.gc_externalized_tool_result(store_id, placeholder)
 
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""

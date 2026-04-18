@@ -2696,6 +2696,175 @@ class TestEngineTools:
         assert result["content"] == content
         assert result["tool_call_id"] == "call_big"
 
+    def test_compress_gc_rewrites_summarized_externalized_tool_results(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc.db"),
+            fresh_tail_count=0,
+            leaf_chunk_tokens=50,
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_transcript_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Summarized tool result.\nExpand for details about: tool result", 1),
+        )
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "tool", "tool_call_id": "call_gc", "content": content},
+        ]
+
+        compressed = engine.compress(messages)
+
+        assert compressed[0]["role"] == "system"
+        assert compressed[1]["role"] == "assistant"
+        assert "Recent Summary" in compressed[1]["content"]
+        stored_tool = next(row for row in engine._store.get_range("test-session") if row["role"] == "tool")
+        assert stored_tool["content"].startswith("[GC'd externalized tool output:")
+        assert "ref=" in stored_tool["content"]
+        assert content[:100] not in stored_tool["content"]
+        payload_files = list((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json"))
+        assert len(payload_files) == 1
+        assert json.loads(payload_files[0].read_text())["content"] == content
+
+    def test_handle_expand_still_resolves_externalized_metadata_after_transcript_gc_rewrite(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_expand.db"),
+            fresh_tail_count=0,
+            leaf_chunk_tokens=50,
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_transcript_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Summarized tool result.\nExpand for details about: tool result", 1),
+        )
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "tool", "tool_call_id": "call_gc", "content": content},
+        ]
+
+        engine.compress(messages)
+        node_id = engine._dag.get_session_nodes("test-session")[0].node_id
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+
+        assert result["expanded"][0]["content"].startswith("[GC'd externalized tool output:")
+        assert result["expanded"][0]["externalized"]["tool_call_id"] == "call_gc"
+        assert result["expanded"][0]["externalized"]["ref"].endswith(".json")
+
+    def test_compress_gc_skips_pinned_tool_results(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_pinned.db"),
+            fresh_tail_count=0,
+            leaf_chunk_tokens=50,
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_transcript_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Summarized tool result.\nExpand for details about: tool result", 1),
+        )
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "tool", "tool_call_id": "call_gc", "content": content},
+        ]
+        engine._ingest_messages(messages)
+        tool_store_id = next(row for row in engine._store.get_range("test-session") if row["role"] == "tool")["store_id"]
+        engine._store.pin(tool_store_id)
+
+        engine.compress(messages)
+
+        assert engine._store.get(tool_store_id)["content"] == content
+
+    def test_gc_helper_does_not_miss_tool_rows_when_chunk_contains_unmatched_synthetic_messages(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_helper.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_transcript_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        tool_store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_gc", "content": content},
+        )
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_gc", "content": content}
+        ])
+
+        engine._maybe_gc_compacted_tool_results(
+            [
+                {"role": "assistant", "content": "[Recent Summary (d0, node 1)]"},
+                {"role": "tool", "tool_call_id": "call_gc", "content": content},
+            ],
+            [tool_store_id],
+        )
+
+        assert engine._store.get(tool_store_id)["content"].startswith("[GC'd externalized tool output:")
+
+    def test_handle_expand_does_not_inline_full_externalized_payload_for_gc_rows(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_budget.db"),
+            fresh_tail_count=0,
+            leaf_chunk_tokens=50,
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_transcript_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        monkeypatch.setattr(
+            lcm_engine,
+            "summarize_with_escalation",
+            lambda **kwargs: ("Summarized tool result.\nExpand for details about: tool result", 1),
+        )
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "tool", "tool_call_id": "call_gc", "content": content},
+        ]
+        engine.compress(messages)
+        node_id = engine._dag.get_session_nodes("test-session")[0].node_id
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id, "max_tokens": 1}))
+
+        assert result["expanded"][0]["content"].startswith("[GC'd externalized tool output:")
+        assert result["expanded"][0]["externalized"]["ref"].endswith(".json")
+        assert "content" not in result["expanded"][0]["externalized"]
+
     def test_handle_unknown_tool(self, engine):
         result = json.loads(engine.handle_tool_call("unknown_tool", {}))
         assert "error" in result

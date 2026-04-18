@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict
 
 DEFAULT_LARGE_OUTPUT_DIRNAME = "lcm-large-outputs"
+_EXTERNALIZED_REF_RE = re.compile(r"ref=([^;\]\s]+)")
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +56,25 @@ def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
         f"[Externalized tool output: tool_call_id={summary.get('tool_call_id') or '?'}; "
         f"chars={summary.get('content_chars', 0)}; bytes={summary.get('content_bytes', 0)}; ref={summary.get('ref', '')}]"
     )
+
+
+def build_transcript_gc_placeholder(summary: Dict[str, Any]) -> str:
+    return (
+        f"[GC'd externalized tool output: tool_call_id={summary.get('tool_call_id') or '?'}; "
+        f"chars={summary.get('content_chars', 0)}; ref={summary.get('ref', '')}]"
+    )
+
+
+def extract_externalized_ref(text: str) -> str | None:
+    if not text:
+        return None
+    match = _EXTERNALIZED_REF_RE.search(text)
+    if not match:
+        return None
+    ref = match.group(1).strip()
+    if not ref or Path(ref).name != ref:
+        return None
+    return ref
 
 
 def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dict[str, Any] | None:

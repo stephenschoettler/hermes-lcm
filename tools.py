@@ -7,7 +7,11 @@ import logging
 import time
 from typing import Any, Dict, TYPE_CHECKING
 
-from .externalize import find_externalized_payload_for_message, load_externalized_payload
+from .externalize import (
+    extract_externalized_ref,
+    find_externalized_payload_for_message,
+    load_externalized_payload,
+)
 from .extraction import sanitize_pre_compaction_content
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 
@@ -98,21 +102,28 @@ def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[
             "content": content[:2000] if len(content) > 2000 else content,
         }
         if stored.get("role") == "tool":
-            lookup_candidates = [content]
-            sanitized_content = sanitize_pre_compaction_content(content)
-            if sanitized_content != content:
-                lookup_candidates.insert(0, sanitized_content)
-            for candidate in lookup_candidates:
-                externalized = find_externalized_payload_for_message(
-                    candidate,
-                    tool_call_id=stored.get("tool_call_id", ""),
-                    session_id=stored.get("session_id", ""),
-                    config=engine._config,
-                    hermes_home=engine._hermes_home,
-                )
+            ref = extract_externalized_ref(content)
+            if ref:
+                externalized = _get_externalized_payload(engine, ref)
                 if externalized is not None:
+                    externalized.pop("content", None)
                     expanded["externalized"] = externalized
-                    break
+            if "externalized" not in expanded:
+                lookup_candidates = [content]
+                sanitized_content = sanitize_pre_compaction_content(content)
+                if sanitized_content != content:
+                    lookup_candidates.insert(0, sanitized_content)
+                for candidate in lookup_candidates:
+                    externalized = find_externalized_payload_for_message(
+                        candidate,
+                        tool_call_id=stored.get("tool_call_id", ""),
+                        session_id=stored.get("session_id", ""),
+                        config=engine._config,
+                        hermes_home=engine._hermes_home,
+                    )
+                    if externalized is not None:
+                        expanded["externalized"] = externalized
+                        break
         messages.append(expanded)
         budget_used += msg_tokens
     return messages
