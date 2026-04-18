@@ -2731,6 +2731,12 @@ class TestEngineTools:
         assert stored_tool["content"].startswith("[GC'd externalized tool output:")
         assert "ref=" in stored_tool["content"]
         assert content[:100] not in stored_tool["content"]
+        assert stored_tool["token_estimate"] == count_message_tokens(
+            {"role": "tool", "tool_call_id": "call_gc", "content": stored_tool["content"]}
+        )
+        assert stored_tool["token_estimate"] < count_message_tokens(
+            {"role": "tool", "tool_call_id": "call_gc", "content": content}
+        )
         payload_files = list((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json"))
         assert len(payload_files) == 1
         assert json.loads(payload_files[0].read_text())["content"] == content

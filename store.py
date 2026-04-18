@@ -35,6 +35,7 @@ from .search_query import (
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
+from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -297,17 +298,24 @@ class MessageStore:
     def gc_externalized_tool_result(self, store_id: int, placeholder: str) -> bool:
         """Rewrite one unpinned tool-result row to a compact GC placeholder."""
         row = self._conn.execute(
-            "SELECT role, pinned, content FROM messages WHERE store_id = ?",
+            "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
             (store_id,),
         ).fetchone()
         if row is None:
             return False
-        role, pinned, current_content = row
+        role, pinned, current_content, tool_call_id = row
         if role != "tool" or bool(pinned) or current_content == placeholder:
             return False
+        placeholder_tokens = count_message_tokens(
+            {
+                "role": "tool",
+                "content": placeholder,
+                "tool_call_id": tool_call_id,
+            }
+        )
         self._conn.execute(
-            "UPDATE messages SET content = ? WHERE store_id = ?",
-            (placeholder, store_id),
+            "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
+            (placeholder, placeholder_tokens, store_id),
         )
         self._conn.commit()
         return True
