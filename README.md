@@ -172,12 +172,26 @@ That means patterns like `cron:*` can catch Hermes cron sessions today, while pl
 
 | Tool | Description |
 |------|-------------|
-| `lcm_grep` | Search raw messages AND summaries across all depths. FTS5 syntax. |
-| `lcm_describe` | Inspect DAG structure or an `externalized_ref` payload preview without loading full payload content. No node_id/externalized_ref = session overview. |
-| `lcm_expand` | Recover original content from a summary node, or open a stored `externalized_ref` payload directly. |
-| `lcm_expand_query` | Answer a question from expanded LCM context using either a query or explicit node_ids. Uses the expansion path/model instead of the summarization path. |
+| `lcm_grep` | Search raw messages AND summaries for the active/current session. Use this for intra-session recall after compaction; if you intentionally want cross-session LCM store hits, use `session_scope='all'`; otherwise prefer `session_search` for earlier separate sessions. |
+| `lcm_describe` | Inspect current-session DAG structure or an `externalized_ref` payload preview without loading full payload content. No node_id/externalized_ref = session overview. |
+| `lcm_expand` | Recover original content from a current-session summary node, or open a stored `externalized_ref` payload directly. |
+| `lcm_expand_query` | Answer a question from expanded LCM context for the active/current session using either a query or explicit node_ids. For cross-session recall, prefer `session_search` first. |
 | `lcm_status` | Quick health overview — compression count, store size, DAG depth distribution, context usage, and active config. |
 | `lcm_doctor` | Run diagnostics — database integrity, FTS index sync, orphaned nodes, config validation, context pressure. |
+
+### Tool choice guidance: LCM tools vs `session_search`
+
+When both recall paths are available to the model:
+
+- prefer **LCM tools** for recall inside the active/current conversation, especially when the relevant turns were compacted into summary nodes
+- prefer **`session_search`** when the user is asking about an earlier separate conversation, prior work from another session, or broad cross-session history
+- if you explicitly want cross-session hits from the LCM store itself, use `lcm_grep(session_scope='all')` deliberately rather than treating it as the default recall path
+
+That split is intentional:
+
+- `hermes-lcm` is strongest at lossless drill-down inside the current session's DAG/store
+- `session_search` is the broader Hermes-wide cross-session recall tool
+- putting the distinction in the tool-facing docs/schema keeps ACP/API/editor flows from relying only on accidental schema wording when both surfaces are exposed at once
 
 ## Gateway Slash Commands
 
