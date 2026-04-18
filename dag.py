@@ -323,14 +323,25 @@ class SummaryDAG:
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,
-               limit: int = 20, sort: str | None = None) -> List[SummaryNode]:
+               limit: int = 20, sort: str | None = None,
+               source: str | None = None) -> List[SummaryNode]:
         """FTS5 search across all summary nodes."""
         terms = extract_search_terms(query)
         phrases = extract_quoted_phrases(query)
         if requires_like_fallback(query):
-            return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
+            return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
         order_by = _build_search_order_by(sort, "COALESCE(n.latest_at, n.created_at)")
+        source_clause = ""
+        source_args: list[Any] = []
+        if source:
+            source_clause = (
+                " AND EXISTS ("
+                "SELECT 1 FROM messages m "
+                "WHERE m.session_id = n.session_id AND m.source = ?"
+                ")"
+            )
+            source_args.append(source)
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 2e-7
@@ -342,21 +353,21 @@ class SummaryDAG:
                     rows = self._conn.execute(
                         f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                            JOIN summary_nodes n ON n.node_id = fts.rowid
-                           WHERE nodes_fts MATCH ? AND n.session_id = ?
+                           WHERE nodes_fts MATCH ? AND n.session_id = ?{source_clause}
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, session_id, fetch_limit, offset),
+                        (query, session_id, *source_args, fetch_limit, offset),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
                         f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                            JOIN summary_nodes n ON n.node_id = fts.rowid
-                           WHERE nodes_fts MATCH ?
+                           WHERE nodes_fts MATCH ?{source_clause}
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, fetch_limit, offset),
+                        (query, *source_args, fetch_limit, offset),
                     ).fetchall()
             except sqlite3.Error as exc:
                 logger.warning("FTS node search failed, falling back to LIKE: %s", exc)
-                return self._search_like(query, session_id=session_id, limit=limit, sort=sort)
+                return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
             raw_nodes = [self._row_to_node(r) for r in rows]
             raw_primary_values: list[float] = []
@@ -382,7 +393,8 @@ class SummaryDAG:
             fetch_limit *= 2
 
     def _search_like(self, query: str, session_id: str | None = None,
-                     limit: int = 20, sort: str | None = None) -> List[SummaryNode]:
+                     limit: int = 20, sort: str | None = None,
+                     source: str | None = None) -> List[SummaryNode]:
         terms = extract_search_terms(query)
         phrases = extract_quoted_phrases(query)
         if not terms:
@@ -393,6 +405,11 @@ class SummaryDAG:
         if session_id:
             where.append("session_id = ?")
             args.append(session_id)
+        if source:
+            where.append(
+                "EXISTS (SELECT 1 FROM messages m WHERE m.session_id = summary_nodes.session_id AND m.source = ?)"
+            )
+            args.append(source)
         like_clauses = []
         for term in terms:
             like_clauses.append("summary LIKE ? ESCAPE '\\'")

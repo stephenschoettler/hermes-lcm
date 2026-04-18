@@ -34,6 +34,16 @@ LCM_GREP = {
                 ),
                 "default": "recency",
             },
+            "session_scope": {
+                "type": "string",
+                "enum": ["current", "all"],
+                "description": "Whether to search only the current session or all stored sessions.",
+                "default": "current",
+            },
+            "source": {
+                "type": "string",
+                "description": "Optional source/platform filter (for example cli, discord, telegram).",
+            },
         },
         "required": ["query"],
     },

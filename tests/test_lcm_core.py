@@ -199,6 +199,21 @@ class TestMessageStore:
         results = store.search("docker", session_id="sess1")
         assert len(results) >= 1
 
+    def test_source_stored_and_filterable(self, store):
+        store.append("sess1", {"role": "user", "content": "docker in cli"}, source="cli")
+        store.append("sess2", {"role": "user", "content": "docker in discord"}, source="discord")
+
+        cli_results = store.search("docker", source="cli")
+        discord_results = store.search("docker", source="discord")
+
+        assert len(cli_results) == 1
+        assert cli_results[0]["source"] == "cli"
+        assert cli_results[0]["session_id"] == "sess1"
+
+        assert len(discord_results) == 1
+        assert discord_results[0]["source"] == "discord"
+        assert discord_results[0]["session_id"] == "sess2"
+
     def test_init_repairs_malformed_message_fts_and_sets_schema_version(self, tmp_path):
         db_path = tmp_path / "legacy-store.db"
         conn = sqlite3.connect(db_path)
