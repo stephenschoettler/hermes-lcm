@@ -49,6 +49,21 @@ class TestEngineABC:
         grep_props = grep_schema["parameters"]["properties"]
         assert "session_scope" in grep_props
         assert "source" in grep_props
+        assert "current session" in grep_schema["description"].lower()
+        assert "session_search" in grep_schema["description"]
+        assert "session_scope='all'" in grep_schema["description"]
+        assert "session_search" in grep_props["session_scope"]["description"]
+
+        describe_schema = next(s for s in schemas if s["name"] == "lcm_describe")
+        expand_schema = next(s for s in schemas if s["name"] == "lcm_expand")
+        expand_query_schema = next(s for s in schemas if s["name"] == "lcm_expand_query")
+
+        assert "current session" in describe_schema["description"].lower()
+        assert "session_search" in describe_schema["description"]
+        assert "current session" in expand_schema["description"].lower()
+        assert "session_search" in expand_schema["description"]
+        assert "current session" in expand_query_schema["description"].lower()
+        assert "session_search" in expand_query_schema["description"]
 
     def test_should_compress(self, engine):
         assert not engine.should_compress(1000)

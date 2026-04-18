@@ -3,11 +3,12 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Search the full conversation history — raw messages AND summaries "
-        "across all depths. Use this to find specific topics, decisions, "
-        "file paths, or error messages from earlier in the conversation, "
-        "even if those turns have been compacted. Returns matches with "
-        "depth labels showing where in the hierarchy each result lives."
+        "Search the current session's conversation history — raw messages AND summaries across all depths — "
+        "to recover details from earlier in the active conversation, even if those turns were compacted. "
+        "Prefer this for intra-session recall. If the user is asking about an earlier separate conversation "
+        "or broad cross-session history, prefer session_search instead. When you intentionally want the LCM "
+        "store across sessions, use session_scope='all' explicitly. Returns matches with depth labels showing "
+        "where each result lives."
     ),
     "parameters": {
         "type": "object",
@@ -37,7 +38,11 @@ LCM_GREP = {
             "session_scope": {
                 "type": "string",
                 "enum": ["current", "all"],
-                "description": "Whether to search only the current session or all stored sessions.",
+                "description": (
+                    "Whether to search only the current session or all stored LCM sessions. "
+                    "Default is current. Use all only when you intentionally want cross-session LCM store hits; "
+                    "for general earlier-conversation recall, prefer session_search instead."
+                ),
                 "default": "current",
             },
             "source": {
@@ -52,11 +57,12 @@ LCM_GREP = {
 LCM_DESCRIBE = {
     "name": "lcm_describe",
     "description": (
-        "Inspect a summary node's subtree metadata WITHOUT loading full "
+        "Inspect a current-session summary node's subtree metadata WITHOUT loading full "
         "content, or inspect an externalized payload ref without opening the "
         "full payload. Returns token counts, child manifest, expand hints, "
         "or externalized payload metadata/preview. Use this to plan retrieval "
-        "strategy before spending tokens on lcm_expand. If called with no "
+        "strategy before spending tokens on lcm_expand inside the active conversation. "
+        "For cross-session recall, use session_search first. If called with no "
         "node_id or externalized_ref, returns the top-level DAG overview for "
         "the current session."
     ),
@@ -79,13 +85,13 @@ LCM_DESCRIBE = {
 LCM_EXPAND = {
     "name": "lcm_expand",
     "description": (
-        "Recover the original detail behind a summary node, or open an "
+        "Recover the original detail behind a current session summary node, or open an "
         "externalized payload ref directly. Given a node_id, returns the "
         "source messages or lower-depth summaries that were compacted into "
         "that node. Given externalized_ref, returns the stored payload "
         "content plus metadata. Use after lcm_describe to drill into "
-        "specific parts of the conversation history or large externalized "
-        "tool output."
+        "specific parts of the active conversation or large externalized "
+        "tool output. For cross-session recall, prefer session_search first."
     ),
     "parameters": {
         "type": "object",
@@ -141,9 +147,10 @@ LCM_DOCTOR = {
 LCM_EXPAND_QUERY = {
     "name": "lcm_expand_query",
     "description": (
-        "Answer a natural-language question using expanded LCM context. Provide a prompt, and either "
+        "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt, and either "
         "query matching summaries to expand or explicit node_ids to inspect. Uses the expansion path "
-        "instead of the summarization path so retrieval/synthesis can use a different model or timeout."
+        "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
+        "Prefer this for questions about the active conversation after compaction; for cross-session recall, use session_search first."
     ),
     "parameters": {
         "type": "object",
