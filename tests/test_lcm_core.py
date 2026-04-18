@@ -1983,6 +1983,39 @@ class TestExtraction:
         payloads = [json.loads(path.read_text()) for path in payload_files]
         assert sorted(payload["session_id"] for payload in payloads) == ["telegram:first", "telegram:second"]
 
+    def test_serialize_messages_reuses_existing_externalized_payload_for_same_session_content_and_tool_id(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        hermes_home = tmp_path / "hermes-home"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm.db"),
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=200,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        first_serialized = engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_reuse", "content": content}
+        ])
+        second_serialized = engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_reuse", "content": content}
+        ])
+
+        payload_dir = hermes_home / "lcm-large-outputs"
+        payload_files = sorted(payload_dir.glob("*.json"))
+        assert len(payload_files) == 1
+        assert first_serialized == second_serialized
+
+        payload = json.loads(payload_files[0].read_text())
+        assert payload["session_id"] == "test-session"
+        assert payload["tool_call_id"] == "call_reuse"
+        assert payload["content"] == content
+
     def test_serialize_messages_externalizes_large_tool_output_to_configured_path(self, tmp_path):
         from hermes_lcm.config import LCMConfig
         from hermes_lcm.engine import LCMEngine

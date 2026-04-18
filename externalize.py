@@ -49,6 +49,13 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
+    return (
+        f"[Externalized tool output: tool_call_id={summary.get('tool_call_id') or '?'}; "
+        f"chars={summary.get('content_chars', 0)}; bytes={summary.get('content_bytes', 0)}; ref={summary.get('ref', '')}]"
+    )
+
+
 def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dict[str, Any] | None:
     if not ref or Path(ref).name != ref:
         return None
@@ -127,6 +134,21 @@ def maybe_externalize_tool_output(
     except OSError as exc:
         logger.warning("Large tool-output externalization skipped (non-blocking): %s", exc)
         return None
+
+    existing = find_externalized_payload_for_message(
+        content,
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+        config=config,
+        hermes_home=hermes_home,
+    )
+    if existing is not None:
+        return {
+            "placeholder": _build_externalized_placeholder(existing),
+            "path": storage_dir / existing["ref"],
+            "payload": existing,
+        }
+
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     unique_suffix = f"{time.time_ns():x}"
@@ -149,9 +171,13 @@ def maybe_externalize_tool_output(
         logger.warning("Large tool-output externalization skipped (non-blocking): %s", exc)
         return None
 
-    placeholder = (
-        f"[Externalized tool output: tool_call_id={tool_call_id or '?'}; "
-        f"chars={payload['content_chars']}; bytes={payload['content_bytes']}; ref={path.name}]"
+    placeholder = _build_externalized_placeholder(
+        {
+            "tool_call_id": tool_call_id,
+            "content_chars": payload["content_chars"],
+            "content_bytes": payload["content_bytes"],
+            "ref": path.name,
+        }
     )
     return {
         "placeholder": placeholder,
