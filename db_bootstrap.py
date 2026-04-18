@@ -6,9 +6,12 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from typing import Iterable, Sequence
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 4
 SQLITE_BUSY_TIMEOUT_MS = 30_000
@@ -238,10 +241,13 @@ def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentF
         if db_path:
             db_file = db_path[2]
             if db_file and not _check_disk_space(db_file):
-                raise OSError(
-                    f"Insufficient disk space to rebuild FTS table '{spec.table_name}': "
-                    f"need at least {_MIN_DISK_SPACE_BYTES // (1024*1024)} MB"
+                logger.warning(
+                    "Low disk space for FTS rebuild of '%s' (%d MB needed), "
+                    "degrading to LIKE search",
+                    spec.table_name,
+                    _MIN_DISK_SPACE_BYTES // (1024 * 1024),
                 )
+                return
         _drop_fts_table(conn, spec.table_name)
         conn.execute(
             f"""

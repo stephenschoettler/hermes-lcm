@@ -38,12 +38,20 @@ def sanitize_fts5_query(query: str) -> str:
     """
     if not query:
         return ""
+
+    # Preserve balanced double quotes (phrase delimiters) but strip
+    # operators.  We track quote state so that " (used as a phrase
+    # delimiter) is preserved while stray " is stripped.
     result = []
+    in_quote = False
     for char in query:
-        if char in _FTS5_SPECIAL_CHARS:
-            result.append(" ")
-        else:
+        if char == '"':
+            in_quote = not in_quote
+            result.append('"')
+        elif in_quote or char not in _FTS5_SPECIAL_CHARS:
             result.append(char)
+        else:
+            result.append(' ')
     return "".join(result).strip()
 
 

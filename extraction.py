@@ -27,18 +27,19 @@ _STRUCTURED_METADATA_KEYS = ("file_id", "filename", "name", "mime_type", "url", 
 _MAX_PATH_PARTS = 10
 
 
-def _is_safe_path(output_path: str) -> bool:
+def _is_safe_path(output_path: str, safe_root: str) -> bool:
     """Validate that the output path is safe from path traversal attacks.
 
     Returns True if the path is safe to write to. Checks:
-    - Path resolves within expected directory (no ../)
+    - Path resolves within the safe_root directory
     - Path has reasonable number of components (no deep nesting)
     - Filename is not absolute or suspicious
     """
     try:
+        root = Path(safe_root).resolve()
         p = Path(output_path).resolve()
-        # Check for path traversal attempts (parent directory references)
-        if ".." in Path(output_path).parts:
+        # Check the resolved path is within the safe root
+        if not p.is_relative_to(root):
             return False
         # Check depth - too many path components could be suspicious
         if len(p.parts) > _MAX_PATH_PARTS:
@@ -228,7 +229,7 @@ def extract_before_compaction(
     Never raises — failures are logged and swallowed.
     """
     try:
-        if not _is_safe_path(output_path):
+        if not _is_safe_path(output_path, safe_root=output_path):
             logger.warning("Pre-compaction extraction blocked: unsafe output path %r", output_path)
             return False
 

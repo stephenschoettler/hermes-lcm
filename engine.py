@@ -772,15 +772,20 @@ class LCMEngine(ContextEngine):
             self._session_id, cursor, n,
         )
 
-        # Consistency check: detect cursor desync vs actual store state
+        # Consistency check: detect cursor desync vs actual store state.
+        # After compaction, _ingest_cursor is reset to len(compressed) which
+        # may be < n (original message count). In that case store_count > cursor
+        # is expected and does NOT indicate desync. We only have a real desync
+        # when store_count > n — meaning the store has messages that are not
+        # present in the current list at all.
         store_count = self._store.get_session_count(self._session_id)
-        if store_count > cursor:
+        if store_count > n:
             logger.warning(
-                "LCM ingest cursor desync detected: store=%d > cursor=%d for session %s. "
-                "Recovering by advancing cursor to store count.",
-                store_count, cursor, self._session_id,
+                "LCM ingest cursor desync detected: store=%d > message_count=%d for session %s. "
+                "Recovering by advancing cursor to message count.",
+                store_count, n, self._session_id,
             )
-            cursor = store_count
+            cursor = n
             self._ingest_cursor = cursor
 
         new_messages = messages[cursor:] if cursor < n else []
