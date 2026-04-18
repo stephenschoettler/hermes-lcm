@@ -38,6 +38,7 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor clean: best-effort scan of obvious junk/noise session candidates without deleting anything",
         "- /lcm doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
+        "- /lcm doctor retention: read-only retention analysis for stored session footprint and age",
         "- /lcm backup: create a timestamped SQLite backup before any future cleanup workflow",
         "- /lcm help: show this help",
     ])
@@ -171,6 +172,139 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
         "candidates": candidates,
         "ignored_count": ignored_count,
         "stateless_count": stateless_count,
+        "protected_count": protected_count,
+    }
+
+
+def _scan_retention_candidates(engine) -> dict[str, Any]:
+    conn = engine._store._conn
+    now = datetime.now().timestamp()
+    try:
+        rows = conn.execute(
+            """
+            WITH session_ids AS (
+                SELECT session_id FROM messages
+                UNION
+                SELECT session_id FROM summary_nodes
+            ),
+            message_stats AS (
+                SELECT session_id,
+                       COUNT(*) AS message_count,
+                       COALESCE(SUM(token_estimate), 0) AS token_total,
+                       MIN(timestamp) AS first_message_at,
+                       MAX(timestamp) AS last_message_at
+                FROM messages
+                GROUP BY session_id
+            ),
+            node_stats AS (
+                SELECT session_id,
+                       COUNT(*) AS node_count,
+                       COALESCE(SUM(token_count), 0) AS node_token_total,
+                       MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
+                       MAX(COALESCE(latest_at, created_at)) AS last_node_at
+                FROM summary_nodes
+                GROUP BY session_id
+            )
+            SELECT s.session_id,
+                   COALESCE(m.message_count, 0) AS message_count,
+                   COALESCE(m.token_total, 0) AS token_total,
+                   COALESCE(n.node_count, 0) AS node_count,
+                   COALESCE(n.node_token_total, 0) AS node_token_total,
+                   m.first_message_at,
+                   m.last_message_at,
+                   n.first_node_at,
+                   n.last_node_at
+            FROM session_ids s
+            LEFT JOIN message_stats m ON m.session_id = s.session_id
+            LEFT JOIN node_stats n ON n.session_id = s.session_id
+            ORDER BY s.session_id
+            """
+        ).fetchall()
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "error": str(exc),
+            "sessions": [],
+            "sessions_analyzed": 0,
+            "stale_sessions_30d": 0,
+            "stale_sessions_90d": 0,
+            "retained_tokens_30d": 0,
+            "retained_tokens_90d": 0,
+            "protected_count": 0,
+        }
+
+    sessions = []
+    protected_count = 0
+    stale_sessions_30d = 0
+    stale_sessions_90d = 0
+    retained_tokens_30d = 0
+    retained_tokens_90d = 0
+
+    for row in rows:
+        (
+            session_id,
+            message_count,
+            token_total,
+            node_count,
+            node_token_total,
+            first_message_at,
+            last_message_at,
+            first_node_at,
+            last_node_at,
+        ) = row
+        timestamps = [
+            ts for ts in (first_message_at, last_message_at, first_node_at, last_node_at)
+            if ts is not None
+        ]
+        if not timestamps:
+            continue
+        first_activity_at = min(float(ts) for ts in (first_message_at, first_node_at) if ts is not None)
+        last_activity_at = max(float(ts) for ts in (last_message_at, last_node_at) if ts is not None)
+        age_days = max(0.0, (now - last_activity_at) / 86400.0)
+        protected = session_id == getattr(engine, "_session_id", "")
+        total_footprint_tokens = int(token_total) + int(node_token_total)
+        if protected:
+            protected_count += 1
+        if age_days >= 30.0:
+            stale_sessions_30d += 1
+            retained_tokens_30d += total_footprint_tokens
+        if age_days >= 90.0:
+            stale_sessions_90d += 1
+            retained_tokens_90d += total_footprint_tokens
+        sessions.append(
+            {
+                "session_id": session_id,
+                "protected": protected,
+                "message_count": int(message_count),
+                "node_count": int(node_count),
+                "token_total": total_footprint_tokens,
+                "raw_token_total": int(token_total),
+                "summary_token_total": int(node_token_total),
+                "first_activity_at": float(first_activity_at),
+                "last_activity_at": float(last_activity_at),
+                "age_days": age_days,
+            }
+        )
+
+    sessions.sort(
+        key=lambda item: (
+            1 if item["protected"] else 0,
+            0 if item["age_days"] >= 30.0 else 1,
+            -item["token_total"],
+            -item["node_count"],
+            -item["message_count"],
+            item["last_activity_at"],
+            item["session_id"],
+        )
+    )
+
+    return {
+        "error": None,
+        "sessions": sessions,
+        "sessions_analyzed": len(sessions),
+        "stale_sessions_30d": stale_sessions_30d,
+        "stale_sessions_90d": stale_sessions_90d,
+        "retained_tokens_30d": retained_tokens_30d,
+        "retained_tokens_90d": retained_tokens_90d,
         "protected_count": protected_count,
     }
 
@@ -392,6 +526,50 @@ def _doctor_clean_text(engine) -> str:
     return "\n".join(lines)
 
 
+def _doctor_retention_text(engine) -> str:
+    scan = _scan_retention_candidates(engine)
+    if scan["error"]:
+        return "\n".join([
+            "LCM doctor retention",
+            "status: error",
+            f"error: {scan['error']}",
+            "note: read-only analysis only — no rows were deleted",
+        ])
+
+    sessions = scan["sessions"]
+    lines = [
+        "LCM doctor retention",
+        f"status: {'analysis-ready' if sessions else 'ok'}",
+        f"sessions_analyzed: {scan['sessions_analyzed']}",
+        f"stale_sessions_30d: {scan['stale_sessions_30d']}",
+        f"stale_sessions_90d: {scan['stale_sessions_90d']}",
+        f"retained_tokens_30d: {scan['retained_tokens_30d']}",
+        f"retained_tokens_90d: {scan['retained_tokens_90d']}",
+    ]
+    if scan["protected_count"]:
+        lines.append(f"protected_sessions: {scan['protected_count']}")
+
+    if not sessions:
+        lines.append("result: no stored sessions found for retention analysis")
+        lines.append("note: read-only analysis only — no rows were deleted")
+        return "\n".join(lines)
+
+    lines.append("retention_candidates:")
+    for item in sessions[:20]:
+        lines.append(
+            "- "
+            f"{item['session_id']} | protected={'yes' if item['protected'] else 'no'} | "
+            f"messages={item['message_count']} | nodes={item['node_count']} | "
+            f"tokens={item['token_total']} | age_days={item['age_days']:.1f}"
+        )
+    if len(sessions) > 20:
+        lines.append(f"... {len(sessions) - 20} more session(s) omitted")
+    lines.append("note: stale sessions are listed before fresh ones; within each bucket, candidates are sorted by footprint (tokens/nodes/messages), with protected current-session entries listed after non-protected ones")
+    lines.append("note: read-only analysis only — no rows were deleted")
+    lines.append("note: if you prune later, create a safety snapshot first with `/lcm backup`")
+    return "\n".join(lines)
+
+
 def _doctor_clean_apply_text(engine) -> str:
     scan = _scan_clean_candidates(engine)
     if scan["error"]:
@@ -483,9 +661,11 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
             return _doctor_text(engine)
         if len(rest) == 1 and rest[0].lower() == "clean":
             return _doctor_clean_text(engine)
+        if len(rest) == 1 and rest[0].lower() == "retention":
+            return _doctor_retention_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "apply":
             return _doctor_clean_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `clean` and `clean apply` as extra subcommands.")
+        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, and `retention` as extra subcommands.")
 
     if head == "backup":
         if rest:
