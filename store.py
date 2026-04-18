@@ -45,6 +45,21 @@ _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
     "tool_calls, tool_name, timestamp, token_estimate, pinned"
 )
+_UNKNOWN_SOURCE = "unknown"
+
+
+def _normalize_source_value(source: str | None) -> str:
+    normalized = (source or "").strip()
+    return normalized or _UNKNOWN_SOURCE
+
+
+def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
+    normalized = _normalize_source_value(source) if source is not None else ""
+    if not normalized:
+        return None, []
+    if normalized == _UNKNOWN_SOURCE:
+        return f"({column} = ? OR {column} = '')", [_UNKNOWN_SOURCE]
+    return f"{column} = ?", [normalized]
 
 
 def _message_role_bias(role: str | None) -> float:
@@ -236,7 +251,7 @@ class MessageStore:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session_id,
-                source or "",
+                _normalize_source_value(source),
                 msg.get("role", "unknown"),
                 msg.get("content"),
                 msg.get("tool_call_id"),
@@ -271,7 +286,7 @@ class MessageStore:
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
-                        source or "",
+                        _normalize_source_value(source),
                         msg.get("role", "unknown"),
                         msg.get("content"),
                         msg.get("tool_call_id"),
@@ -421,7 +436,14 @@ class MessageStore:
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
                source: str | None = None) -> List[Dict[str, Any]]:
-        """FTS5 search across messages. Returns matches with snippets."""
+        """FTS5 search across raw messages.
+
+        Retrieval contract:
+        - ``session_id`` limits which sessions are eligible
+        - ``source`` limits which raw rows inside those sessions are eligible
+        - ``source='unknown'`` means the explicit unknown-source bucket, with
+          legacy blank-source rows treated as equivalent for back-compat
+        """
         terms = extract_search_terms(query)
         phrases = extract_quoted_phrases(query)
         if requires_like_fallback(query):
@@ -435,60 +457,31 @@ class MessageStore:
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
+        source_clause, source_args = _source_filter_clause("m.source", source)
         offset = 0
         results: list[Dict[str, Any]] = []
         while True:
             try:
+                where = ["messages_fts MATCH ?"]
+                args: list[Any] = [query]
                 if session_id:
-                    if source:
-                        rows = self._conn.execute(
-                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
-                                      rank as search_rank,
-                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                               FROM messages_fts fts
-                               JOIN messages m ON m.store_id = fts.rowid
-                               WHERE messages_fts MATCH ? AND m.session_id = ? AND m.source = ?
-                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                            (query, session_id, source, fetch_limit, offset),
-                        ).fetchall()
-                    else:
-                        rows = self._conn.execute(
-                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
-                                      rank as search_rank,
-                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                               FROM messages_fts fts
-                               JOIN messages m ON m.store_id = fts.rowid
-                               WHERE messages_fts MATCH ? AND m.session_id = ?
-                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                            (query, session_id, fetch_limit, offset),
-                        ).fetchall()
-                else:
-                    if source:
-                        rows = self._conn.execute(
-                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
-                                      rank as search_rank,
-                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                               FROM messages_fts fts
-                               JOIN messages m ON m.store_id = fts.rowid
-                               WHERE messages_fts MATCH ? AND m.source = ?
-                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                            (query, source, fetch_limit, offset),
-                        ).fetchall()
-                    else:
-                        rows = self._conn.execute(
-                            f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                                      m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
-                                      rank as search_rank,
-                                      snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                               FROM messages_fts fts
-                               JOIN messages m ON m.store_id = fts.rowid
-                               WHERE messages_fts MATCH ?
-                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                            (query, fetch_limit, offset),
-                        ).fetchall()
+                    where.append("m.session_id = ?")
+                    args.append(session_id)
+                if source_clause:
+                    where.append(source_clause)
+                    args.extend(source_args)
+                args.extend([fetch_limit, offset])
+                rows = self._conn.execute(
+                    f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
+                              rank as search_rank,
+                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                       FROM messages_fts fts
+                       JOIN messages m ON m.store_id = fts.rowid
+                       WHERE {' AND '.join(where)}
+                       ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                    args,
+                ).fetchall()
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
                 return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
@@ -532,9 +525,10 @@ class MessageStore:
         if session_id:
             where.append("session_id = ?")
             args.append(session_id)
-        if source:
-            where.append("source = ?")
-            args.append(source)
+        source_clause, source_args = _source_filter_clause("source", source)
+        if source_clause:
+            where.append(source_clause)
+            args.extend(source_args)
         like_clauses = []
         for term in terms:
             like_clauses.append("content LIKE ? ESCAPE '\\'")
@@ -578,6 +572,7 @@ class MessageStore:
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned",
         ]
         d = dict(zip(cols, row[:len(cols)]))
+        d["source"] = _normalize_source_value(d.get("source"))
         # Deserialize tool_calls JSON
         if d.get("tool_calls"):
             try:

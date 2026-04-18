@@ -179,6 +179,53 @@ That means patterns like `cron:*` can catch Hermes cron sessions today, while pl
 | `lcm_status` | Quick health overview — compression count, store size, DAG depth distribution, context usage, and active config. |
 | `lcm_doctor` | Run diagnostics — database integrity, FTS index sync, orphaned nodes, config validation, context pressure. |
 
+### Retrieval contract: `session_scope` × `source`
+
+`hermes-lcm` treats `session_scope` and `source` as independent filters:
+
+- **`session_scope`** decides which sessions are eligible
+- **`source`** decides which content inside those eligible sessions is allowed to match
+
+That contract applies across:
+
+- raw message retrieval
+- DAG summary retrieval
+- merged outputs like `lcm_grep`
+- carry-over/reassigned summary nodes after `/new`
+
+#### Raw messages
+
+- `current` + no `source` → all raw rows in the current session
+- `current` + `source='discord'` → only current-session raw rows with source `discord`
+- `all` + no `source` → all raw rows across sessions
+- `all` + `source='discord'` → all raw rows across sessions with source `discord`
+
+#### DAG summaries
+
+- `current` + no `source` → all summaries eligible in the current session
+- `current` + `source='discord'` → only current-session summaries whose descendant raw-message lineage includes `discord`
+- `all` + no `source` → all eligible summaries across sessions
+- `all` + `source='discord'` → only summaries across sessions whose descendant raw-message lineage includes `discord`
+
+Mixed-source nodes may match more than one `source` filter if their descendant lineage is mixed. Filtering is based on actual descendant lineage, not on whether the surrounding session happens to contain some message from that source.
+
+#### `unknown` source
+
+`unknown` is treated as a real source value, not as a wildcard.
+
+- omitting `source` means **no source filtering**
+- `source='unknown'` means only content whose stored source is `unknown`
+- legacy blank-source rows are treated as `unknown` for backward compatibility
+
+#### Carry-over semantics
+
+`carry_over_new_session_context()` may reassign retained summary nodes into a new session, but that does **not** erase source lineage.
+
+- session eligibility may change because the node now belongs to the new session
+- source eligibility still comes from the node's descendant raw-message lineage
+
+So a carried-over node can be current-session content in the new session while still matching `source='discord'` only if its descendant raw messages include `discord`.
+
 ## Gateway Slash Commands
 
 When Hermes host support for plugin slash commands is available, `hermes-lcm` also exposes a `/lcm` operator surface for quick diagnostics and safe maintenance prep from chat:

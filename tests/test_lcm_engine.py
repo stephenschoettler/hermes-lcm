@@ -49,6 +49,8 @@ class TestEngineABC:
         grep_props = grep_schema["parameters"]["properties"]
         assert "session_scope" in grep_props
         assert "source" in grep_props
+        assert "descendant source lineage" in grep_props["source"]["description"]
+        assert "unknown" in grep_props["source"]["description"]
 
     def test_should_compress(self, engine):
         assert not engine.should_compress(1000)
@@ -966,6 +968,44 @@ class TestSessionRetainDepth:
         new_nodes = engine._dag.get_session_nodes("new-session")
         assert len(new_nodes) == 2
         assert all(node.depth >= 2 for node in new_nodes)
+
+    def test_carry_over_preserves_source_lineage_for_reassigned_nodes(self, engine):
+        discord_store_id = engine._store.append(
+            "old-session",
+            {"role": "user", "content": "docker logs from discord"},
+            source="discord",
+        )
+        engine._dag.add_node(SummaryNode(
+            session_id="old-session",
+            depth=2,
+            summary="retained discord docker summary",
+            token_count=100,
+            source_token_count=200,
+            source_ids=[discord_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+
+        engine._session_id = "old-session"
+        engine.on_session_reset()
+        moved = engine.carry_over_new_session_context("old-session", "new-session")
+        engine._session_id = "new-session"
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "current", "source": "discord", "limit": 10},
+            )
+        )
+
+        assert moved == 1
+        assert any(item["type"] == "summary" for item in result["results"])
+        assert all(item.get("session_id") == "new-session" for item in result["results"])
+        assert any(
+            "retained discord docker summary" in item.get("snippet", "")
+            for item in result["results"]
+            if item["type"] == "summary"
+        )
 
 
 class TestSessionRollover:
@@ -1925,6 +1965,43 @@ class TestEngineTools:
         )
         assert any(
             "discord summary" in item.get("snippet", "")
+            for item in result["results"]
+            if item["type"] == "summary"
+        )
+
+    def test_handle_grep_unknown_source_filter_matches_unknown_messages_and_summaries(self, engine):
+        unknown_store_id = engine._store.append(
+            "unknown-session",
+            {"role": "user", "content": "docker logs from unknown source"},
+            source="unknown",
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="unknown-session",
+                depth=0,
+                summary="unknown summary about docker logs",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[unknown_store_id],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "all", "source": "unknown", "limit": 10},
+            )
+        )
+
+        assert result["source"] == "unknown"
+        assert any(item["type"] == "message" for item in result["results"])
+        assert any(item["type"] == "summary" for item in result["results"])
+        assert all(item.get("session_id") == "unknown-session" for item in result["results"])
+        assert all(item.get("source", "unknown") == "unknown" for item in result["results"] if item["type"] == "message")
+        assert any(
+            "unknown summary" in item.get("snippet", "")
             for item in result["results"]
             if item["type"] == "summary"
         )

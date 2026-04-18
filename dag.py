@@ -26,6 +26,7 @@ from .db_bootstrap import (
     run_versioned_migrations,
 )
 from .search_query import (
+    AGE_DECAY_RATE,
     compute_directness_rank_bonus_upper_bound,
     compute_directness_score,
     compute_search_fetch_limit,
@@ -36,9 +37,10 @@ from .search_query import (
     extract_search_terms,
     normalize_search_sort,
     requires_like_fallback,
-    AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
+from .store import _normalize_source_value, _UNKNOWN_SOURCE
+
 
 logger = logging.getLogger(__name__)
 
@@ -325,7 +327,14 @@ class SummaryDAG:
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
                source: str | None = None) -> List[SummaryNode]:
-        """FTS5 search across all summary nodes."""
+        """FTS5 search across summary nodes.
+
+        Retrieval contract:
+        - ``session_id`` limits which sessions are eligible
+        - ``source`` filters summaries by descendant raw-message lineage, not by
+          session-level source presence
+        - mixed-source nodes may match more than one ``source`` filter
+        """
         terms = extract_search_terms(query)
         phrases = extract_quoted_phrases(query)
         if requires_like_fallback(query):
@@ -452,6 +461,7 @@ class SummaryDAG:
     ) -> bool:
         if not source:
             return True
+        normalized_source = _normalize_source_value(source)
         if cache is not None and node_id in cache:
             return cache[node_id]
         row = self._conn.execute(
@@ -475,10 +485,13 @@ class SummaryDAG:
             JOIN messages m
               ON walk.source_type = 'messages'
              AND m.store_id = walk.source_id
-            WHERE m.source = ?
+            WHERE CASE
+                    WHEN ? = ? THEN (m.source = ? OR m.source = '')
+                    ELSE m.source = ?
+                  END
             LIMIT 1
             """,
-            (node_id, source),
+            (node_id, normalized_source, _UNKNOWN_SOURCE, normalized_source, normalized_source),
         ).fetchone()
         matched = row is not None
         if cache is not None:

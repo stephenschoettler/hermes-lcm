@@ -42,7 +42,11 @@ LCM_GREP = {
             },
             "source": {
                 "type": "string",
-                "description": "Optional source/platform filter (for example cli, discord, telegram).",
+                "description": (
+                    "Optional source/platform filter (for example cli, discord, telegram). "
+                    "Applies directly to raw messages and to summaries via descendant source lineage. "
+                    "Use 'unknown' for explicit unknown-source content."
+                ),
             },
         },
         "required": ["query"],

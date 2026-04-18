@@ -217,6 +217,38 @@ class TestMessageStore:
         assert discord_results[0]["source"] == "discord"
         assert discord_results[0]["session_id"] == "sess2"
 
+    def test_missing_source_is_normalized_to_unknown_and_filterable(self, store):
+        store_id = store.append("sess-unknown", {"role": "user", "content": "docker with unknown source"})
+
+        stored = store.get(store_id)
+        unknown_results = store.search("docker", source="unknown")
+
+        assert stored["source"] == "unknown"
+        assert len(unknown_results) == 1
+        assert unknown_results[0]["store_id"] == store_id
+        assert unknown_results[0]["source"] == "unknown"
+
+    def test_source_unknown_filter_matches_legacy_blank_source_rows(self, tmp_path):
+        db_path = tmp_path / "legacy-unknown-source.db"
+        store = MessageStore(db_path)
+        store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy-session", "", "user", "docker with blank source", None, None, None, 1.0, 5, 0),
+        )
+        store._conn.commit()
+
+        result = store.search("docker", source="unknown")
+        fetched = store.get(1)
+
+        assert len(result) == 1
+        assert result[0]["session_id"] == "legacy-session"
+        assert result[0]["source"] == "unknown"
+        assert fetched["source"] == "unknown"
+
+        store.close()
+
     def test_gc_externalized_tool_result_rewrites_content_and_updates_fts(self, store):
         placeholder = "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]"
         store_id = store.append(

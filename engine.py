@@ -589,7 +589,14 @@ class LCMEngine(ContextEngine):
                 self._dag.delete_below_depth(self._session_id, retain)
 
     def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
-        """Move retained summaries from the old session into the new one."""
+        """Move retained summaries from the old session into the new one.
+
+        This reassigns session ownership for retained summary nodes, but it does
+        not rewrite the nodes' descendant raw-message lineage. Retrieval under
+        ``session_scope='current'`` may therefore include a carried-over node in
+        the new session, while ``source`` filtering still evaluates against the
+        node's original descendant message sources.
+        """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
         if self._session_ignored and new_session_id == self._session_id:

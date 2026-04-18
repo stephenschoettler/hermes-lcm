@@ -218,7 +218,12 @@ def _synthesize_expansion_answer(
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
-    """Search across the full DAG and raw messages."""
+    """Search raw messages + summaries using independent session/source filters.
+
+    ``session_scope`` decides which sessions are eligible.
+    ``source`` then filters raw rows directly and summaries by descendant source
+    lineage within that eligible set.
+    """
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
