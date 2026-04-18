@@ -37,6 +37,9 @@ class TestConfig:
         assert c.extraction_enabled is False
         assert c.extraction_model == ""
         assert c.extraction_output_path == ""
+        assert c.large_output_externalization_enabled is False
+        assert c.large_output_externalization_threshold_chars == 12_000
+        assert c.large_output_externalization_path == ""
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
         assert c.ignore_session_patterns == []
@@ -64,6 +67,9 @@ class TestConfig:
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("LCM_EXTRACTION_MODEL", "openai/gpt-5.4-mini")
         monkeypatch.setenv("LCM_EXTRACTION_OUTPUT_PATH", "/tmp/extractions")
+        monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", "true")
+        monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", "4096")
+        monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", "/tmp/lcm-large-outputs")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
         assert c.context_threshold == 0.80
@@ -82,6 +88,9 @@ class TestConfig:
         assert c.extraction_enabled is True
         assert c.extraction_model == "openai/gpt-5.4-mini"
         assert c.extraction_output_path == "/tmp/extractions"
+        assert c.large_output_externalization_enabled is True
+        assert c.large_output_externalization_threshold_chars == 4096
+        assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"
 
     def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
@@ -1837,6 +1846,177 @@ class TestExtraction:
         assert "type=input_file" in serialized
         assert "file_123" in serialized
         assert "requirements.pdf" in serialized
+
+    def test_serialize_messages_uses_profile_safe_default_externalization_path_for_large_tool_output(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        hermes_home = tmp_path / "hermes-home"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm.db"),
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=200,
+            ),
+            hermes_home=str(hermes_home),
+        )
+
+        content = "tool-output:" + ("x" * 5000)
+        serialized = engine._serialize_messages([
+            {
+                "role": "tool",
+                "tool_call_id": "call_big_default",
+                "content": content,
+            }
+        ])
+
+        assert "[Externalized tool output" in serialized
+        assert "call_big_default" in serialized
+        assert content[:500] not in serialized
+
+        payload_dir = hermes_home / "lcm-large-outputs"
+        payload_files = list(payload_dir.glob("*.json"))
+        assert len(payload_files) == 1
+
+        payload = json.loads(payload_files[0].read_text())
+        assert payload["kind"] == "tool_result"
+        assert payload["tool_call_id"] == "call_big_default"
+        assert payload["content"] == content
+
+    def test_serialize_messages_leaves_large_tool_output_inline_when_externalization_disabled(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        hermes_home = tmp_path / "hermes-home"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm.db"),
+                large_output_externalization_enabled=False,
+                large_output_externalization_threshold_chars=200,
+            ),
+            hermes_home=str(hermes_home),
+        )
+
+        content = "tool-output:" + ("x" * 5000)
+        serialized = engine._serialize_messages([
+            {
+                "role": "tool",
+                "tool_call_id": "call_disabled",
+                "content": content,
+            }
+        ])
+
+        assert "[Externalized tool output" not in serialized
+        assert "...[truncated]..." in serialized
+        assert not (hermes_home / "lcm-large-outputs").exists()
+
+    def test_serialize_messages_falls_back_to_truncation_when_externalization_path_is_unwritable(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        blocked_path = tmp_path / "not-a-dir"
+        blocked_path.write_text("occupied")
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm.db"),
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=200,
+                large_output_externalization_path=str(blocked_path),
+            )
+        )
+
+        content = "tool-output:" + ("x" * 5000)
+        serialized = engine._serialize_messages([
+            {
+                "role": "tool",
+                "tool_call_id": "call_unwritable",
+                "content": content,
+            }
+        ])
+
+        assert "[Externalized tool output" not in serialized
+        assert "...[truncated]..." in serialized
+
+    def test_serialize_messages_externalized_payloads_do_not_collide_for_same_second_same_tool_id(self, tmp_path, monkeypatch):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+        import hermes_lcm.externalize as ext_module
+
+        output_dir = tmp_path / "externalized"
+        original_strftime = ext_module.time.strftime
+        monkeypatch.setattr(ext_module.time, "strftime", lambda *args, **kwargs: "20260418_060000")
+        try:
+            first = LCMEngine(
+                config=LCMConfig(
+                    database_path=str(tmp_path / "first.db"),
+                    large_output_externalization_enabled=True,
+                    large_output_externalization_threshold_chars=200,
+                    large_output_externalization_path=str(output_dir),
+                )
+            )
+            first._session_id = "telegram:first"
+
+            second = LCMEngine(
+                config=LCMConfig(
+                    database_path=str(tmp_path / "second.db"),
+                    large_output_externalization_enabled=True,
+                    large_output_externalization_threshold_chars=200,
+                    large_output_externalization_path=str(output_dir),
+                )
+            )
+            second._session_id = "telegram:second"
+
+            content = "RESULT:\n" + ("abcdef" * 2000)
+            first_serialized = first._serialize_messages([
+                {"role": "tool", "tool_call_id": "call_same", "content": content}
+            ])
+            second_serialized = second._serialize_messages([
+                {"role": "tool", "tool_call_id": "call_same", "content": content}
+            ])
+        finally:
+            monkeypatch.setattr(ext_module.time, "strftime", original_strftime)
+
+        payload_files = sorted(output_dir.glob("*.json"))
+        assert len(payload_files) == 2
+        assert first_serialized != second_serialized
+
+        payloads = [json.loads(path.read_text()) for path in payload_files]
+        assert sorted(payload["session_id"] for payload in payloads) == ["telegram:first", "telegram:second"]
+
+    def test_serialize_messages_externalizes_large_tool_output_to_configured_path(self, tmp_path):
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        output_dir = tmp_path / "externalized"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm.db"),
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=200,
+                large_output_externalization_path=str(output_dir),
+            )
+        )
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        serialized = engine._serialize_messages([
+            {
+                "role": "tool",
+                "tool_call_id": "call_big_custom",
+                "content": content,
+            }
+        ])
+
+        assert "[Externalized tool output" in serialized
+        assert "call_big_custom" in serialized
+        assert content[:500] not in serialized
+
+        payload_files = list(output_dir.glob("*.json"))
+        assert len(payload_files) == 1
+
+        payload = json.loads(payload_files[0].read_text())
+        assert payload["kind"] == "tool_result"
+        assert payload["tool_call_id"] == "call_big_custom"
+        assert payload["content"] == content
 
     def test_run_pre_compaction_extraction_uses_media_cleaned_text(self, tmp_path):
         from hermes_lcm.config import LCMConfig

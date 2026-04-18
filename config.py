@@ -106,6 +106,15 @@ class LCMConfig:
     # Directory for daily extraction files (empty = auto: ~/.hermes/lcm-extractions/)
     extraction_output_path: str = ""
 
+    # -- Large tool-output externalization ---
+    # When enabled, oversized tool results are written to plugin-managed storage
+    # and replaced with compact references in pre-compaction serializer input.
+    large_output_externalization_enabled: bool = False
+    # Character threshold above which tool results are externalized.
+    large_output_externalization_threshold_chars: int = 12_000
+    # Explicit storage directory for externalized payloads (empty = auto under hermes home).
+    large_output_externalization_path: str = ""
+
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
@@ -162,6 +171,18 @@ class LCMConfig:
         c.extraction_enabled = _parse_bool_env("LCM_EXTRACTION_ENABLED", c.extraction_enabled)
         c.extraction_model = _str("LCM_EXTRACTION_MODEL", c.extraction_model)
         c.extraction_output_path = _str("LCM_EXTRACTION_OUTPUT_PATH", c.extraction_output_path)
+        c.large_output_externalization_enabled = _parse_bool_env(
+            "LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED",
+            c.large_output_externalization_enabled,
+        )
+        c.large_output_externalization_threshold_chars = _int(
+            "LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS",
+            c.large_output_externalization_threshold_chars,
+        )
+        c.large_output_externalization_path = _str(
+            "LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH",
+            c.large_output_externalization_path,
+        )
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
         c.summary_timeout_ms = _int("LCM_SUMMARY_TIMEOUT_MS", c.summary_timeout_ms)

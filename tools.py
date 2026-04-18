@@ -7,6 +7,8 @@ import logging
 import time
 from typing import Any, Dict, TYPE_CHECKING
 
+from .externalize import find_externalized_payload_for_message, load_externalized_payload
+from .extraction import sanitize_pre_compaction_content
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 
 if TYPE_CHECKING:
@@ -60,6 +62,16 @@ def _get_session_node(engine: "LCMEngine", node_id: int):
     return node
 
 
+def _get_externalized_payload(engine: "LCMEngine", ref: str) -> dict[str, Any] | None:
+    payload = load_externalized_payload(ref, config=engine._config, hermes_home=engine._hermes_home)
+    if payload is None:
+        return None
+    payload_session_id = payload.get("session_id") or ""
+    if payload_session_id and payload_session_id != engine._session_id:
+        return None
+    return payload
+
+
 def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -80,13 +92,28 @@ def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[
                 }
             )
             break
-        messages.append(
-            {
-                "store_id": stored["store_id"],
-                "role": stored["role"],
-                "content": content[:2000] if len(content) > 2000 else content,
-            }
-        )
+        expanded = {
+            "store_id": stored["store_id"],
+            "role": stored["role"],
+            "content": content[:2000] if len(content) > 2000 else content,
+        }
+        if stored.get("role") == "tool":
+            lookup_candidates = [content]
+            sanitized_content = sanitize_pre_compaction_content(content)
+            if sanitized_content != content:
+                lookup_candidates.insert(0, sanitized_content)
+            for candidate in lookup_candidates:
+                externalized = find_externalized_payload_for_message(
+                    candidate,
+                    tool_call_id=stored.get("tool_call_id", ""),
+                    session_id=stored.get("session_id", ""),
+                    config=engine._config,
+                    hermes_home=engine._hermes_home,
+                )
+                if externalized is not None:
+                    expanded["externalized"] = externalized
+                    break
+        messages.append(expanded)
         budget_used += msg_tokens
     return messages
 
@@ -253,10 +280,28 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
 
 
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
-    """Inspect a node's subtree or get session DAG overview."""
+    """Inspect a summary node's subtree or get session DAG overview."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
+
+    externalized_ref = str(args.get("externalized_ref") or "").strip()
+    if externalized_ref:
+        payload = _get_externalized_payload(engine, externalized_ref)
+        if payload is None:
+            return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+        return json.dumps(
+            {
+                "externalized_ref": externalized_ref,
+                "kind": payload.get("kind", "tool_result"),
+                "tool_call_id": payload.get("tool_call_id", ""),
+                "session_id": payload.get("session_id", ""),
+                "content_chars": payload.get("content_chars", 0),
+                "content_bytes": payload.get("content_bytes", 0),
+                "created_at": payload.get("created_at"),
+                "content_preview": (payload.get("content") or "")[:500],
+            }
+        )
 
     node_id = args.get("node_id")
     session_id = engine._session_id
@@ -300,9 +345,27 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
+    externalized_ref = str(args.get("externalized_ref") or "").strip()
+    if externalized_ref:
+        payload = _get_externalized_payload(engine, externalized_ref)
+        if payload is None:
+            return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+        return json.dumps(
+            {
+                "externalized_ref": externalized_ref,
+                "source_type": "externalized_payload",
+                "kind": payload.get("kind", "tool_result"),
+                "tool_call_id": payload.get("tool_call_id", ""),
+                "session_id": payload.get("session_id", ""),
+                "content_chars": payload.get("content_chars", 0),
+                "content_bytes": payload.get("content_bytes", 0),
+                "content": payload.get("content", ""),
+            }
+        )
+
     node_id = args.get("node_id")
     if node_id is None:
-        return json.dumps({"error": "node_id is required"})
+        return json.dumps({"error": "node_id or externalized_ref is required"})
 
     node = _get_session_node(engine, node_id)
     if node is None:

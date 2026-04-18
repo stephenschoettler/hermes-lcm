@@ -2430,6 +2430,168 @@ class TestEngineTools:
         assert "session_id" in result
         assert "store_message_count" in result
 
+    def test_handle_expand_includes_externalized_metadata_for_large_tool_result_sources(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_expand.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_big", "content": content},
+        )
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Externalized tool-output summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+
+        assert result["source_type"] == "messages"
+        assert result["expanded"][0]["store_id"] == store_id
+        assert result["expanded"][0]["externalized"]["tool_call_id"] == "call_big"
+        assert result["expanded"][0]["externalized"]["content_chars"] == len(content)
+        assert result["expanded"][0]["externalized"]["ref"].endswith(".json")
+
+    def test_handle_expand_does_not_attach_other_sessions_externalized_metadata(self, tmp_path):
+        shared_home = tmp_path / "hermes"
+        config_a = LCMConfig(
+            database_path=str(tmp_path / "a.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine_a = LCMEngine(config=config_a, hermes_home=str(shared_home))
+        engine_a._session_id = "session-a"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine_a._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_shared", "content": content}
+        ])
+
+        config_b = LCMConfig(
+            database_path=str(tmp_path / "b.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine_b = LCMEngine(config=config_b, hermes_home=str(shared_home))
+        engine_b._session_id = "session-b"
+        store_id = engine_b._store.append(
+            "session-b",
+            {"role": "tool", "tool_call_id": "call_shared", "content": content},
+        )
+        node_id = engine_b._dag.add_node(
+            SummaryNode(
+                session_id="session-b",
+                depth=0,
+                summary="Other session summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(engine_b.handle_tool_call("lcm_expand", {"node_id": node_id}))
+
+        assert "externalized" not in result["expanded"][0]
+
+    def test_handle_expand_finds_externalized_metadata_for_sanitized_tool_output(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_sanitized.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        raw_content = (("Chart screenshot notes. " * 80) + "\n\n" + "data:image/png;base64," + ("A" * 5000))
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_media", "content": raw_content},
+        )
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_media", "content": raw_content}
+        ])
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Sanitized externalized tool-output summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+
+        assert result["expanded"][0]["externalized"]["tool_call_id"] == "call_media"
+        assert result["expanded"][0]["externalized"]["session_id"] == "test-session"
+
+    def test_handle_describe_externalized_ref_returns_metadata(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_describe.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        result = json.loads(engine.handle_tool_call("lcm_describe", {"externalized_ref": ref}))
+
+        assert result["externalized_ref"] == ref
+        assert result["kind"] == "tool_result"
+        assert result["tool_call_id"] == "call_big"
+        assert result["session_id"] == "test-session"
+        assert result["content_chars"] == len(content)
+        assert result["content_preview"].startswith("RESULT:")
+
+    def test_handle_expand_externalized_ref_returns_payload_content(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_payload.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref}))
+
+        assert result["externalized_ref"] == ref
+        assert result["source_type"] == "externalized_payload"
+        assert result["content"] == content
+        assert result["tool_call_id"] == "call_big"
+
     def test_handle_unknown_tool(self, engine):
         result = json.loads(engine.handle_tool_call("unknown_tool", {}))
         assert "error" in result

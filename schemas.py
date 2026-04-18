@@ -55,6 +55,10 @@ LCM_DESCRIBE = {
                 "type": "integer",
                 "description": "Summary node ID to inspect. Omit for session overview.",
             },
+            "externalized_ref": {
+                "type": "string",
+                "description": "Optional externalized payload ref filename to inspect instead of a summary node.",
+            },
         },
         "required": [],
     },
@@ -75,13 +79,17 @@ LCM_EXPAND = {
                 "type": "integer",
                 "description": "Summary node ID to expand",
             },
+            "externalized_ref": {
+                "type": "string",
+                "description": "Optional externalized payload ref filename to expand instead of a summary node.",
+            },
             "max_tokens": {
                 "type": "integer",
                 "description": "Token budget for returned content (default 4000)",
                 "default": 4000,
             },
         },
-        "required": ["node_id"],
+        "required": [],
     },
 }
 

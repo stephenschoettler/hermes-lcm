@@ -17,6 +17,7 @@ from agent.context_engine import ContextEngine
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
+from .externalize import maybe_externalize_tool_output
 from .extraction import (
     extract_before_compaction,
     sanitize_pre_compaction_content,
@@ -837,7 +838,16 @@ class LCMEngine(ContextEngine):
 
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
-                if len(content) > 3000:
+                externalized = maybe_externalize_tool_output(
+                    content,
+                    tool_call_id=tool_id,
+                    session_id=self._session_id,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                if externalized:
+                    content = externalized["placeholder"]
+                elif len(content) > 3000:
                     content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
