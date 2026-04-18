@@ -332,38 +332,29 @@ class SummaryDAG:
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
         order_by = _build_search_order_by(sort, "COALESCE(n.latest_at, n.created_at)")
-        source_clause = ""
-        source_args: list[Any] = []
-        if source:
-            source_clause = (
-                " AND EXISTS ("
-                "SELECT 1 FROM messages m "
-                "WHERE m.session_id = n.session_id AND m.source = ?"
-                ")"
-            )
-            source_args.append(source)
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 2e-7
         offset = 0
         results: list[SummaryNode] = []
+        source_match_cache: dict[int, bool] = {}
         while True:
             try:
                 if session_id:
                     rows = self._conn.execute(
                         f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                            JOIN summary_nodes n ON n.node_id = fts.rowid
-                           WHERE nodes_fts MATCH ? AND n.session_id = ?{source_clause}
+                           WHERE nodes_fts MATCH ? AND n.session_id = ?
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, session_id, *source_args, fetch_limit, offset),
+                        (query, session_id, fetch_limit, offset),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
                         f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                            JOIN summary_nodes n ON n.node_id = fts.rowid
-                           WHERE nodes_fts MATCH ?{source_clause}
+                           WHERE nodes_fts MATCH ?
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, *source_args, fetch_limit, offset),
+                        (query, fetch_limit, offset),
                     ).fetchall()
             except sqlite3.Error as exc:
                 logger.warning("FTS node search failed, falling back to LIKE: %s", exc)
@@ -372,6 +363,8 @@ class SummaryDAG:
             raw_nodes = [self._row_to_node(r) for r in rows]
             raw_primary_values: list[float] = []
             for node in raw_nodes:
+                if source and not self._node_matches_source(node.node_id, source, cache=source_match_cache):
+                    continue
                 node.search_directness = compute_directness_score(node.summary, terms, phrases)
                 if apply_directness_adjustment and node.search_rank is not None:
                     rank_adjustment = max(float(node.search_directness), 0.0)
@@ -405,11 +398,6 @@ class SummaryDAG:
         if session_id:
             where.append("session_id = ?")
             args.append(session_id)
-        if source:
-            where.append(
-                "EXISTS (SELECT 1 FROM messages m WHERE m.session_id = summary_nodes.session_id AND m.source = ?)"
-            )
-            args.append(source)
         like_clauses = []
         for term in terms:
             like_clauses.append("summary LIKE ? ESCAPE '\\'")
@@ -422,8 +410,11 @@ class SummaryDAG:
         ).fetchall()
         collapse_risky_repeats = contains_risky_fts_ascii(query)
         nodes: list[SummaryNode] = []
+        source_match_cache: dict[int, bool] = {}
         for row in rows:
             node = self._row_to_node(row)
+            if source and not self._node_matches_source(node.node_id, source, cache=source_match_cache):
+                continue
             score = sum(
                 min(count_term_matches(node.summary, term), 1) if collapse_risky_repeats else count_term_matches(node.summary, term)
                 for term in terms
@@ -451,6 +442,48 @@ class SummaryDAG:
             node.source_ids,
         ).fetchall()
         return [self._row_to_node(r) for r in rows]
+
+    def _node_matches_source(
+        self,
+        node_id: int,
+        source: str,
+        *,
+        cache: dict[int, bool] | None = None,
+    ) -> bool:
+        if not source:
+            return True
+        if cache is not None and node_id in cache:
+            return cache[node_id]
+        row = self._conn.execute(
+            """
+            WITH RECURSIVE source_walk(source_type, source_id) AS (
+                SELECT n.source_type, CAST(j.value AS INTEGER)
+                FROM summary_nodes n, json_each(n.source_ids) j
+                WHERE n.node_id = ?
+
+                UNION ALL
+
+                SELECT child.source_type, CAST(j.value AS INTEGER)
+                FROM summary_nodes child
+                JOIN source_walk walk
+                  ON walk.source_type = 'nodes'
+                 AND child.node_id = walk.source_id
+                JOIN json_each(child.source_ids) j
+            )
+            SELECT 1
+            FROM source_walk walk
+            JOIN messages m
+              ON walk.source_type = 'messages'
+             AND m.store_id = walk.source_id
+            WHERE m.source = ?
+            LIMIT 1
+            """,
+            (node_id, source),
+        ).fetchone()
+        matched = row is not None
+        if cache is not None:
+            cache[node_id] = matched
+        return matched
 
     def get_source_time_window(self, node_ids: List[int]) -> tuple[float | None, float | None]:
         if not node_ids:
