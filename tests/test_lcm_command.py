@@ -96,8 +96,101 @@ def test_lcm_help_on_unknown_subcommand(engine):
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports `clean` and `clean apply`" in result
+    assert "currently supports `clean`, `clean apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
+    assert "/lcm doctor retention" in result
+
+
+def test_lcm_doctor_retention_reports_old_heavy_sessions(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_retention.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+
+    live_store_id = engine._store.append("live-session", {"role": "user", "content": "fresh chat"}, token_estimate=8)
+    old_store_id = engine._store.append("old-heavy", {"role": "user", "content": "archived chunk"}, token_estimate=240)
+    engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (1.0, old_store_id))
+    engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (2000000000.0, live_store_id))
+    engine._store._conn.commit()
+    engine._dag.add_node(SummaryNode(
+        session_id="old-heavy",
+        depth=0,
+        summary="old heavy summary",
+        token_count=32,
+        source_token_count=240,
+        source_ids=[old_store_id],
+        source_type="messages",
+        created_at=1.0,
+        earliest_at=1.0,
+        latest_at=1.0,
+    ))
+
+    result = handle_lcm_command("doctor retention", engine)
+
+    assert "LCM doctor retention" in result
+    assert "status: analysis-ready" in result
+    assert "sessions_analyzed: 2" in result
+    assert "stale_sessions_30d: 1" in result
+    assert "stale_sessions_90d: 1" in result
+    assert "retained_tokens_30d: 272" in result
+    assert "retained_tokens_90d: 272" in result
+    assert "retention_candidates:" in result
+    assert "old-heavy | protected=no | messages=1 | nodes=1 | tokens=272" in result
+    assert "live-session | protected=yes" in result
+    assert "note: read-only analysis only — no rows were deleted" in result
+
+
+def test_lcm_doctor_retention_counts_summary_only_sessions(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_retention_summary_only.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+
+    engine._dag.add_node(SummaryNode(
+        session_id="summary-only",
+        depth=0,
+        summary="summary only node",
+        token_count=37,
+        source_token_count=200,
+        source_ids=[101],
+        source_type="messages",
+        created_at=1.0,
+        earliest_at=1.0,
+        latest_at=1.0,
+    ))
+
+    result = handle_lcm_command("doctor retention", engine)
+
+    assert "sessions_analyzed: 1" in result
+    assert "stale_sessions_30d: 1" in result
+    assert "retained_tokens_30d: 37" in result
+    assert "summary-only | protected=no | messages=0 | nodes=1 | tokens=37" in result
+
+
+def test_lcm_doctor_retention_keeps_stale_sessions_visible_when_list_is_truncated(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_retention_many.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+
+    for idx in range(21):
+        store_id = engine._store.append(f"fresh-heavy-{idx:02d}", {"role": "user", "content": "fresh heavy"}, token_estimate=500 + idx)
+        engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (2000000000.0, store_id))
+
+    stale_id = engine._store.append("stale-small", {"role": "user", "content": "old tiny"}, token_estimate=5)
+    engine._store._conn.execute("UPDATE messages SET timestamp = ? WHERE store_id = ?", (1.0, stale_id))
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor retention", engine)
+
+    assert "stale_sessions_30d: 1" in result
+    assert "stale-small | protected=no | messages=1 | nodes=0 | tokens=5" in result
 
 
 def test_lcm_doctor_clean_reports_pattern_matched_junk_candidates(tmp_path):
