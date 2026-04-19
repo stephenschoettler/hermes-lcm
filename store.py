@@ -32,6 +32,7 @@ from .search_query import (
     extract_search_terms,
     normalize_search_sort,
     requires_like_fallback,
+    sanitize_fts5_query,
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
@@ -449,6 +450,7 @@ class MessageStore:
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
+        safe_query = sanitize_fts5_query(query)
         order_by = _build_search_order_by(
             sort,
             "m.timestamp",
@@ -463,7 +465,7 @@ class MessageStore:
         while True:
             try:
                 where = ["messages_fts MATCH ?"]
-                args: list[Any] = [query]
+                args: list[Any] = [safe_query]
                 if session_id:
                     where.append("m.session_id = ?")
                     args.append(session_id)
@@ -515,8 +517,9 @@ class MessageStore:
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
                      source: str | None = None) -> List[Dict[str, Any]]:
-        terms = extract_search_terms(query)
-        phrases = extract_quoted_phrases(query)
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
         if not terms:
             return []
 

@@ -14,6 +14,8 @@ from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.escalation import _deterministic_truncate
 from hermes_lcm.lifecycle_state import LifecycleStateStore
+from hermes_lcm.db_bootstrap import ExternalContentFtsSpec, ensure_external_content_fts
+from hermes_lcm.search_query import sanitize_fts5_query
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
     compile_session_pattern,
@@ -399,6 +401,14 @@ class TestMessageStore:
         assert len(results) == 1
         assert results[0]["content"] == "docker fallback search still works"
         assert "fallback" in results[0]["snippet"].lower()
+
+    def test_search_like_fallback_sanitizes_fts_syntax_chars(self, store):
+        store.append("sess1", {"role": "user", "content": "vendoring external support stays plugin-only"})
+
+        results = store.search("vendoring*", session_id="sess1")
+
+        assert len(results) == 1
+        assert results[0]["content"] == "vendoring external support stays plugin-only"
 
     def test_init_repairs_message_fts_drifted_row_count(self, tmp_path):
         db_path = tmp_path / "message-fts-drift.db"
@@ -1079,6 +1089,38 @@ class TestLifecycleStateStore:
         assert after_reset.last_reset_at is not None
 
         state.close()
+
+
+class TestDbBootstrapGuards:
+    def test_sanitize_fts5_query_preserves_balanced_phrase_quotes(self):
+        assert sanitize_fts5_query('"vendoring external" *') == '"vendoring external"'
+
+    def test_ensure_external_content_fts_skips_rebuild_when_disk_is_low(self, tmp_path, monkeypatch):
+        conn = sqlite3.connect(tmp_path / "low-disk.db")
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT
+            );
+            INSERT INTO messages(content) VALUES ('fresh searchable message');
+            """
+        )
+        spec = ExternalContentFtsSpec(
+            table_name="messages_fts",
+            content_table="messages",
+            content_rowid="store_id",
+            indexed_column="content",
+            trigger_sqls=(),
+        )
+        monkeypatch.setattr("hermes_lcm.db_bootstrap._check_disk_space", lambda _path: False)
+
+        ensure_external_content_fts(conn, spec)
+
+        existing = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+        ).fetchone()
+        assert existing is None
 
 
 class TestSummaryDAG:
