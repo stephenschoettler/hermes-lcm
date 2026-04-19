@@ -229,9 +229,15 @@ def extract_before_compaction(
     Never raises — failures are logged and swallowed.
     """
     try:
-        if not _is_safe_path(output_path, safe_root=output_path):
-            logger.warning("Pre-compaction extraction blocked: unsafe output path %r", output_path)
+        output_dir = Path(output_path)
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        file_path = output_dir / f"{date_str}.md"
+
+        if not _is_safe_path(str(file_path), safe_root=str(output_dir.resolve())):
+            logger.warning("Pre-compaction extraction blocked: unsafe output path %r", file_path)
             return False
+
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         prompt = EXTRACTION_PROMPT.format(text=serialized_messages)
         result = _call_extraction_llm(prompt, model=model, timeout=timeout)
@@ -239,12 +245,6 @@ def extract_before_compaction(
         if not result or result.strip() == "NOTHING_TO_EXTRACT":
             logger.debug("Pre-compaction extraction: nothing to extract")
             return True
-
-        output_dir = Path(output_path)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        file_path = output_dir / f"{date_str}.md"
 
         header = f"\n\n## Extraction — {datetime.now().strftime('%H:%M')}"
         if session_id:
