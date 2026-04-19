@@ -3145,6 +3145,9 @@ class TestEngineTools:
         assert "d0" in result["dag"]["depths"]
         assert result["config"]["fresh_tail_count"] == engine._config.fresh_tail_count
         assert result["session_filters"]["ignored"] is False
+        assert result["source_lineage"]["messages_total"] == 1
+        assert result["source_lineage"]["normalized_unknown_messages"] == 1
+        assert result["source_lineage"]["legacy_blank_source_messages"] == 0
 
     def test_handle_status_shows_compression_ratio(self, engine):
         engine._dag.add_node(

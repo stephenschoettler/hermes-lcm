@@ -537,7 +537,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     total_dag_tokens = sum(d["tokens"] for d in depths.values())
     total_source_tokens = sum(d["source_tokens"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
-    lifecycle = engine.get_status().get("lifecycle")
+    full_status = engine.get_status()
+    lifecycle = full_status.get("lifecycle")
+    source_lineage = full_status.get("source_lineage")
 
     return json.dumps({
         "session_id": session_id,
@@ -576,6 +578,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "ignored": engine._session_ignored,
             "stateless": engine._session_stateless,
         },
+        "source_lineage": source_lineage,
         "lifecycle": lifecycle,
     })
 
@@ -668,7 +671,26 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "detail": config_warnings if config_warnings else "all settings within normal ranges",
     })
 
-    # 5. Context pressure
+    # 5. Source-lineage hygiene
+    try:
+        source_stats = engine._store.get_source_stats()
+        legacy_blank_messages = source_stats["legacy_blank_source_messages"]
+        checks.append({
+            "check": "source_lineage_hygiene",
+            "status": "pass" if legacy_blank_messages == 0 else "warn",
+            "detail": {
+                **source_stats,
+                "normalization_mode": "backcompat-normalization",
+            },
+        })
+    except Exception as e:
+        checks.append({
+            "check": "source_lineage_hygiene",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 6. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         threshold_pct = round(c.context_threshold * 100, 1)

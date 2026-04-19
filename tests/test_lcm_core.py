@@ -249,6 +249,29 @@ class TestMessageStore:
 
         store.close()
 
+    def test_get_source_stats_reports_attributed_unknown_and_legacy_blank_counts(self, tmp_path):
+        db_path = tmp_path / "source-stats.db"
+        store = MessageStore(db_path)
+        store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
+        store.append("sess-unknown", {"role": "user", "content": "unknown message"})
+        store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy-session", "", "user", "legacy blank source", None, None, None, 1.0, 5, 0),
+        )
+        store._conn.commit()
+
+        stats = store.get_source_stats()
+
+        assert stats["messages_total"] == 3
+        assert stats["attributed_messages"] == 1
+        assert stats["normalized_unknown_messages"] == 1
+        assert stats["legacy_blank_source_messages"] == 1
+        assert stats["effective_unknown_messages"] == 2
+
+        store.close()
+
     def test_gc_externalized_tool_result_rewrites_content_and_updates_fts(self, store):
         placeholder = "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]"
         store_id = store.append(

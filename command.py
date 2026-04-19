@@ -51,6 +51,15 @@ def _status_text(engine) -> str:
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
     session_bound = bool(engine._session_id)
+    source_stats = status.get("source_lineage") or {}
+    source_stats = {
+        "messages_total": int(source_stats.get("messages_total", 0) or 0),
+        "attributed_messages": int(source_stats.get("attributed_messages", 0) or 0),
+        "normalized_unknown_messages": int(source_stats.get("normalized_unknown_messages", 0) or 0),
+        "legacy_blank_source_messages": int(source_stats.get("legacy_blank_source_messages", 0) or 0),
+        "effective_unknown_messages": int(source_stats.get("effective_unknown_messages", 0) or 0),
+        **({"error": source_stats.get("error")} if source_stats.get("error") else {}),
+    }
 
     def _safe_scalar(conn, query: str) -> int | str:
         try:
@@ -70,6 +79,11 @@ def _status_text(engine) -> str:
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"session_ignored: {_fmt_bool(status.get('session_ignored'))}",
         f"session_stateless: {_fmt_bool(status.get('session_stateless'))}",
+        f"source_messages_total: {source_stats['messages_total']}",
+        f"source_attributed_messages: {source_stats['attributed_messages']}",
+        f"source_unknown_messages: {source_stats['normalized_unknown_messages']}",
+        f"source_legacy_blank_messages: {source_stats['legacy_blank_source_messages']}",
+        f"source_effective_unknown_messages: {source_stats['effective_unknown_messages']}",
     ]
 
     if session_bound:
@@ -94,6 +108,8 @@ def _status_text(engine) -> str:
         lines.append(
             f"stateless_session_patterns_source: {status.get('stateless_session_patterns_source')}"
         )
+    if source_stats.get("error"):
+        lines.append(f"source_lineage_error: {source_stats['error']}")
     return "\n".join(lines)
 
 
@@ -444,6 +460,31 @@ def _doctor_text(engine) -> str:
         recommended_actions.append("create a safety snapshot first with `/lcm backup`")
     else:
         observations.append("cleanup_candidates: none")
+
+    try:
+        source_stats = engine._store.get_source_stats()
+    except Exception as exc:  # pragma: no cover - defensive
+        issues.append("source_lineage")
+        source_stats = {
+            "messages_total": 0,
+            "attributed_messages": 0,
+            "normalized_unknown_messages": 0,
+            "legacy_blank_source_messages": 0,
+            "effective_unknown_messages": 0,
+            "error": str(exc),
+        }
+    observations.append(
+        "source_lineage: "
+        f"attributed={source_stats['attributed_messages']} "
+        f"unknown={source_stats['normalized_unknown_messages']} "
+        f"legacy_blank={source_stats['legacy_blank_source_messages']} "
+        f"effective_unknown={source_stats['effective_unknown_messages']}"
+    )
+    if source_stats.get("error"):
+        observations.append(f"source_lineage_error: {source_stats['error']}")
+    if source_stats["legacy_blank_source_messages"]:
+        recommended_actions.append("review legacy blank-source rows before any destructive cleanup or migration step")
+        recommended_actions.append("treat `source=unknown` as the back-compat filter until legacy blank-source rows are normalized")
 
     if clean_scan.get("protected_count"):
         observations.append(
