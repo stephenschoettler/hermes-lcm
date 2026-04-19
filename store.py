@@ -445,12 +445,12 @@ class MessageStore:
         - ``source='unknown'`` means the explicit unknown-source bucket, with
           legacy blank-source rows treated as equivalent for back-compat
         """
-        terms = extract_search_terms(query)
-        phrases = extract_quoted_phrases(query)
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
-        safe_query = sanitize_fts5_query(query)
         order_by = _build_search_order_by(
             sort,
             "m.timestamp",

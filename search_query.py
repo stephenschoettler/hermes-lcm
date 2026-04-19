@@ -30,21 +30,38 @@ _STRIP_EDGE_PUNCT = "\"'()[]{}.,;"
 _FTS5_SPECIAL_CHARS = frozenset('"()*^-:{}')
 
 
+def _sanitize_unquoted_fts5_fragment(text: str) -> str:
+    return "".join(" " if char in _FTS5_SPECIAL_CHARS else char for char in text)
+
+
 def sanitize_fts5_query(query: str) -> str:
     """Strip FTS5 syntax operators while preserving balanced phrase quotes."""
     if not query:
         return ""
 
     result: list[str] = []
+    quote_buffer: list[str] = []
     in_quote = False
     for char in query:
         if char == '"':
-            in_quote = not in_quote
-            result.append('"')
-        elif in_quote or char not in _FTS5_SPECIAL_CHARS:
-            result.append(char)
-        else:
-            result.append(" ")
+            if in_quote:
+                result.append('"')
+                result.extend(quote_buffer)
+                result.append('"')
+                quote_buffer = []
+                in_quote = False
+            else:
+                if result and not result[-1].isspace():
+                    result.append(" ")
+                in_quote = True
+                quote_buffer = []
+            continue
+        if in_quote:
+            quote_buffer.append(char)
+            continue
+        result.append(" " if char in _FTS5_SPECIAL_CHARS else char)
+    if in_quote and quote_buffer:
+        result.extend(_sanitize_unquoted_fts5_fragment("".join(quote_buffer)))
     return "".join(result).strip()
 
 
