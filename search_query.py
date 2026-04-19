@@ -26,6 +26,26 @@ _BOOLEAN_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 _RISKY_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9][\-:/][A-Za-z0-9]")
 _SPLIT_PUNCT_RE = re.compile(r"[-:/]+")
 _STRIP_EDGE_PUNCT = "\"'()[]{}.,;"
+# Characters that are special in FTS5 query syntax
+_FTS5_SPECIAL_CHARS = frozenset('"()*^-:{}')
+
+
+def sanitize_fts5_query(query: str) -> str:
+    """Strip FTS5 syntax operators while preserving balanced phrase quotes."""
+    if not query:
+        return ""
+
+    result: list[str] = []
+    in_quote = False
+    for char in query:
+        if char == '"':
+            in_quote = not in_quote
+            result.append('"')
+        elif in_quote or char not in _FTS5_SPECIAL_CHARS:
+            result.append(char)
+        else:
+            result.append(" ")
+    return "".join(result).strip()
 
 
 _WORD_RE = re.compile(r"[\w-]+", re.UNICODE)
