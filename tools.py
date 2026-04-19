@@ -218,12 +218,7 @@ def _synthesize_expansion_answer(
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
-    """Search raw messages + summaries using independent session/source filters.
-
-    ``session_scope`` decides which sessions are eligible.
-    ``source`` then filters raw rows directly and summaries by descendant source
-    lineage within that eligible set.
-    """
+    """Search raw messages + summaries in the active session with optional source filtering."""
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
@@ -235,9 +230,12 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     limit = args.get("limit", 10)
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
-    session_scope = str(args.get("session_scope", "current")).lower()
+    requested_session_scope = str(args.get("session_scope", "current")).lower()
+    session_scope = "current"
     source = str(args.get("source") or "").strip() or None
-    session_id = None if session_scope == "all" else engine._session_id
+    if requested_session_scope != "current":
+        logger.warning("Ignoring unsupported session_scope=%s for lcm_grep", requested_session_scope)
+    session_id = engine._session_id
     results = []
 
     try:

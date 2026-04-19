@@ -6,9 +6,8 @@ LCM_GREP = {
         "Search the current session's conversation history — raw messages AND summaries across all depths — "
         "to recover details from earlier in the active conversation, even if those turns were compacted. "
         "Prefer this for intra-session recall. If the user is asking about an earlier separate conversation "
-        "or broad cross-session history, prefer session_search instead. When you intentionally want the LCM "
-        "store across sessions, use session_scope='all' explicitly. Returns matches with depth labels showing "
-        "where each result lives."
+        "or broad cross-session history, prefer session_search instead. Returns matches with depth labels "
+        "showing where each result lives."
     ),
     "parameters": {
         "type": "object",
@@ -37,11 +36,10 @@ LCM_GREP = {
             },
             "session_scope": {
                 "type": "string",
-                "enum": ["current", "all"],
+                "enum": ["current"],
                 "description": (
-                    "Whether to search only the current session or all stored LCM sessions. "
-                    "Default is current. Use all only when you intentionally want cross-session LCM store hits; "
-                    "for general earlier-conversation recall, prefer session_search instead."
+                    "Whether to search only the current session. "
+                    "Cross-session recall should use session_search instead."
                 ),
                 "default": "current",
             },
