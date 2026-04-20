@@ -404,6 +404,7 @@ class SummaryDAG:
         phrases = extract_quoted_phrases(safe_query)
         if not terms:
             return []
+        fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
         where: list[str] = ["summary IS NOT NULL"]
         args: list[Any] = []
@@ -415,9 +416,12 @@ class SummaryDAG:
             like_clauses.append("summary LIKE ? ESCAPE '\\'")
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
+        args.append(fetch_limit)
 
         rows = self._conn.execute(
-            f"SELECT * FROM summary_nodes WHERE {' AND '.join(where)}",
+            f"""SELECT * FROM summary_nodes
+                WHERE {' AND '.join(where)}
+                LIMIT ?""",
             args,
         ).fetchall()
         collapse_risky_repeats = contains_risky_fts_ascii(query)
