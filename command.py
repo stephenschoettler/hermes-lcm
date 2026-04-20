@@ -186,6 +186,18 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 def _scan_retention_candidates(engine) -> dict[str, Any]:
     conn = engine._store._conn
     now = datetime.now().timestamp()
+    session_id = getattr(engine, "_session_id", "")
+    if not session_id:
+        return {
+            "error": None,
+            "sessions": [],
+            "sessions_analyzed": 0,
+            "stale_sessions_30d": 0,
+            "stale_sessions_90d": 0,
+            "retained_tokens_30d": 0,
+            "retained_tokens_90d": 0,
+            "protected_count": 0,
+        }
     try:
         rows = conn.execute(
             """
@@ -224,8 +236,10 @@ def _scan_retention_candidates(engine) -> dict[str, Any]:
             FROM session_ids s
             LEFT JOIN message_stats m ON m.session_id = s.session_id
             LEFT JOIN node_stats n ON n.session_id = s.session_id
+            WHERE s.session_id = ?
             ORDER BY s.session_id
-            """
+            """,
+            (session_id,),
         ).fetchall()
     except Exception as exc:  # pragma: no cover - defensive
         return {
@@ -596,6 +610,7 @@ def _doctor_retention_text(engine) -> str:
         )
     if len(sessions) > 20:
         lines.append(f"... {len(sessions) - 20} more session(s) omitted")
+    lines.append("note: retention analysis is scoped to the active session only")
     lines.append("note: stale sessions are listed before fresh ones; within each bucket, candidates are sorted by footprint (tokens/nodes/messages), with protected current-session entries listed after non-protected ones")
     lines.append("note: read-only analysis only — no rows were deleted")
     lines.append("note: if you prune later, create a safety snapshot first with `/lcm backup`")
@@ -603,6 +618,15 @@ def _doctor_retention_text(engine) -> str:
 
 
 def _doctor_clean_apply_text(engine) -> str:
+    if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
+        return "\n".join([
+            "LCM doctor clean apply",
+            "status: denied",
+            "error: destructive cleanup is disabled by default",
+            "note: set LCM_DOCTOR_CLEAN_APPLY_ENABLED=true only in trusted operator environments",
+            "note: no rows were deleted",
+        ])
+
     scan = _scan_clean_candidates(engine)
     if scan["error"]:
         return "\n".join([

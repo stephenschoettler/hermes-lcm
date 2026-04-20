@@ -172,14 +172,15 @@ def test_lcm_doctor_retention_reports_old_heavy_sessions(tmp_path):
 
     assert "LCM doctor retention" in result
     assert "status: analysis-ready" in result
-    assert "sessions_analyzed: 2" in result
-    assert "stale_sessions_30d: 1" in result
-    assert "stale_sessions_90d: 1" in result
-    assert "retained_tokens_30d: 272" in result
-    assert "retained_tokens_90d: 272" in result
+    assert "sessions_analyzed: 1" in result
+    assert "stale_sessions_30d: 0" in result
+    assert "stale_sessions_90d: 0" in result
+    assert "retained_tokens_30d: 0" in result
+    assert "retained_tokens_90d: 0" in result
     assert "retention_candidates:" in result
-    assert "old-heavy | protected=no | messages=1 | nodes=1 | tokens=272" in result
     assert "live-session | protected=yes" in result
+    assert "old-heavy" not in result
+    assert "note: retention analysis is scoped to the active session only" in result
     assert "note: read-only analysis only — no rows were deleted" in result
 
 
@@ -206,10 +207,11 @@ def test_lcm_doctor_retention_counts_summary_only_sessions(tmp_path):
 
     result = handle_lcm_command("doctor retention", engine)
 
-    assert "sessions_analyzed: 1" in result
-    assert "stale_sessions_30d: 1" in result
-    assert "retained_tokens_30d: 37" in result
-    assert "summary-only | protected=no | messages=0 | nodes=1 | tokens=37" in result
+    assert "sessions_analyzed: 0" in result
+    assert "stale_sessions_30d: 0" in result
+    assert "retained_tokens_30d: 0" in result
+    assert "summary-only" not in result
+    assert "result: no stored sessions found for retention analysis" in result
 
 
 def test_lcm_doctor_retention_keeps_stale_sessions_visible_when_list_is_truncated(tmp_path):
@@ -230,8 +232,10 @@ def test_lcm_doctor_retention_keeps_stale_sessions_visible_when_list_is_truncate
 
     result = handle_lcm_command("doctor retention", engine)
 
-    assert "stale_sessions_30d: 1" in result
-    assert "stale-small | protected=no | messages=1 | nodes=0 | tokens=5" in result
+    assert "stale_sessions_30d: 0" in result
+    assert "sessions_analyzed: 0" in result
+    assert "stale-small" not in result
+    assert "result: no stored sessions found for retention analysis" in result
 
 
 def test_lcm_doctor_clean_reports_pattern_matched_junk_candidates(tmp_path):
@@ -308,6 +312,7 @@ def test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates(tmp_
     config = LCMConfig(
         database_path=str(tmp_path / "lcm_clean_apply.db"),
         ignore_session_patterns=["cron*"],
+        doctor_clean_apply_enabled=True,
     )
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
     engine._session_id = "live-session"
@@ -347,6 +352,7 @@ def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm_clean_apply_fail.db"),
         ignore_session_patterns=["cron*"],
+        doctor_clean_apply_enabled=True,
     )
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
     engine._session_id = "live-session"
@@ -365,6 +371,22 @@ def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
     assert "LCM doctor clean apply" in result
     assert "status: error" in result
     assert "backup failed" in result.lower()
+    assert len(engine._store.get_range("cron_20260414")) == 1
+
+
+def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_apply_denied.db"),
+        ignore_session_patterns=["cron*"],
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._store.append("cron_20260414", {"role": "user", "content": "scheduled report"}, token_estimate=12)
+
+    result = handle_lcm_command("doctor clean apply", engine)
+
+    assert "LCM doctor clean apply" in result
+    assert "status: denied" in result
+    assert "disabled by default" in result
     assert len(engine._store.get_range("cron_20260414")) == 1
 
 
@@ -423,3 +445,67 @@ def test_register_skips_slash_command_when_host_context_has_no_register_command(
     module.register(ctx)
 
     assert ctx.engine is not None
+
+
+def test_register_skips_lcm_slash_command_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("LCM_ENABLE_SLASH_COMMAND", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_disabled",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+            self.commands = {}
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, name, handler, description=""):
+            self.commands[name] = (handler, description)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert "lcm" not in ctx.commands
+
+
+def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.setenv("LCM_ENABLE_SLASH_COMMAND", "1")
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_enabled",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+            self.commands = {}
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, name, handler, description=""):
+            self.commands[name] = (handler, description)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert "lcm" in ctx.commands
