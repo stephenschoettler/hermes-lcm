@@ -1098,6 +1098,34 @@ class TestSessionRollover:
         assert engine._dag.get_session_nodes("s2") == []
         assert engine._session_id == "s3"
 
+    def test_rollover_session_skips_carry_over_when_old_session_is_not_bound(self, engine):
+        engine._config.new_session_retain_depth = 2
+
+        engine.on_session_start("attacker-current", platform="cli", context_length=200000)
+        engine._dag.add_node(SummaryNode(
+            session_id="victim-session",
+            depth=2,
+            summary="victim summary",
+            token_count=100,
+            source_token_count=200,
+            source_ids=[],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+
+        moved = engine.rollover_session(
+            "victim-session",
+            "attacker-new",
+            previous_messages=[],
+            platform="cli",
+            context_length=200000,
+        )
+
+        assert moved == 0
+        assert len(engine._dag.get_session_nodes("victim-session")) == 1
+        assert engine._dag.get_session_nodes("attacker-new") == []
+        assert engine._session_id == "attacker-new"
+
     def test_rollover_session_records_durable_lifecycle_state_idempotently(self, engine):
         engine._config.new_session_retain_depth = 2
         from hermes_lcm.dag import SummaryNode
