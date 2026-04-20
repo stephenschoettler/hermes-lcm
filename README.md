@@ -125,7 +125,7 @@ Verify with `hermes plugins`:
 
 ```
 Plugins (1):
-  ✓ hermes-lcm v0.4.0 (6 tools)
+  ✓ hermes-lcm v0.6.0 (6 tools)
 
 Provider Plugins:
   Context Engine: lcm
