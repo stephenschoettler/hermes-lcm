@@ -421,3 +421,67 @@ def test_register_skips_slash_command_when_host_context_has_no_register_command(
     module.register(ctx)
 
     assert ctx.engine is not None
+
+
+def test_register_skips_lcm_slash_command_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("LCM_ENABLE_SLASH_COMMAND", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_disabled",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+            self.commands = {}
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, name, handler, description=""):
+            self.commands[name] = (handler, description)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert "lcm" not in ctx.commands
+
+
+def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.setenv("LCM_ENABLE_SLASH_COMMAND", "1")
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_enabled",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+            self.commands = {}
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, name, handler, description=""):
+            self.commands[name] = (handler, description)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert "lcm" in ctx.commands
