@@ -27,8 +27,10 @@ from .db_bootstrap import (
 )
 from .search_query import (
     AGE_DECAY_RATE,
+    compute_search_candidate_cap,
     compute_directness_rank_bonus_upper_bound,
     compute_directness_score,
+    compute_like_fallback_fetch_limit,
     compute_search_fetch_limit,
     contains_risky_fts_ascii,
     count_term_matches,
@@ -344,9 +346,11 @@ class SummaryDAG:
 
         order_by = _build_search_order_by(sort, "COALESCE(n.latest_at, n.created_at)")
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
+        candidate_cap = compute_search_candidate_cap(limit)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 2e-7
         offset = 0
+        scanned_rows = 0
         results: list[SummaryNode] = []
         source_match_cache: dict[int, bool] = {}
         while True:
@@ -367,6 +371,7 @@ class SummaryDAG:
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
                         (safe_query, fetch_limit, offset),
                     ).fetchall()
+                scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS node search failed, falling back to LIKE: %s", exc)
                 return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
@@ -393,8 +398,14 @@ class SummaryDAG:
             if best_unseen_primary > worst_visible_primary:
                 return results[:limit]
 
+            if scanned_rows >= candidate_cap:
+                return results[:limit]
+
             offset += len(rows)
-            fetch_limit *= 2
+            remaining = candidate_cap - scanned_rows
+            if remaining <= 0:
+                return results[:limit]
+            fetch_limit = min(fetch_limit * 2, remaining)
 
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
@@ -404,6 +415,7 @@ class SummaryDAG:
         phrases = extract_quoted_phrases(safe_query)
         if not terms:
             return []
+        fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
         where: list[str] = ["summary IS NOT NULL"]
         args: list[Any] = []
@@ -415,9 +427,13 @@ class SummaryDAG:
             like_clauses.append("summary LIKE ? ESCAPE '\\'")
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
+        fetch_limit = compute_like_fallback_fetch_limit(limit, terms, phrases)
+        args.append(fetch_limit)
 
         rows = self._conn.execute(
-            f"SELECT * FROM summary_nodes WHERE {' AND '.join(where)}",
+            f"""SELECT * FROM summary_nodes
+                WHERE {' AND '.join(where)}
+                LIMIT ?""",
             args,
         ).fetchall()
         collapse_risky_repeats = contains_risky_fts_ascii(query)
