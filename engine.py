@@ -631,20 +631,27 @@ class LCMEngine(ContextEngine):
             old_session_id and bound_session_id and old_session_id == bound_session_id
         )
 
-        if old_session_id:
+        if old_session_id and can_carry_over:
             self.on_session_end(old_session_id, previous_messages)
             self.on_session_reset()
+        elif old_session_id and not carry_over_context:
+            logger.warning(
+                "LCM rollover skipped old-session finalization: old_session_id=%s does not match bound session=%s",
+                old_session_id,
+                bound_session_id,
+            )
+        elif old_session_id and not can_carry_over:
+            logger.warning(
+                "LCM carry-over skipped: old_session_id=%s does not match bound session=%s",
+                old_session_id,
+                bound_session_id,
+            )
 
         self.on_session_start(new_session_id, conversation_id=conversation_id, **kwargs)
 
         if not carry_over_context:
             return 0
         if old_session_id and not can_carry_over:
-            logger.warning(
-                "LCM carry-over skipped: old_session_id=%s does not match bound session=%s",
-                old_session_id,
-                bound_session_id,
-            )
             return 0
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
