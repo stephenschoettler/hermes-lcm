@@ -2787,6 +2787,32 @@ class TestEngineTools:
         assert result["source_type"] == "externalized_payload"
         assert result["content"] == content
         assert result["tool_call_id"] == "call_big"
+        assert result["content_truncated"] is False
+
+    def test_handle_expand_externalized_ref_respects_max_tokens(self, tmp_path):
+        from hermes_lcm.tokens import count_tokens
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_payload_budget.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref, "max_tokens": 10}))
+
+        assert result["externalized_ref"] == ref
+        assert result["source_type"] == "externalized_payload"
+        assert result["content_truncated"] is True
+        assert count_tokens(result["content"]) <= 10
+        assert result["tool_call_id"] == "call_big"
 
     def test_compress_gc_rewrites_summarized_externalized_tool_results(self, tmp_path, monkeypatch):
         config = LCMConfig(
@@ -3077,6 +3103,35 @@ class TestEngineTools:
         assert result["node_ids"] == [node_id]
         assert result["matches"]
 
+    def test_handle_expand_query_rejects_non_numeric_limits(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?", "max_tokens": "invalid"},
+            )
+        )
+
+        assert result["error"] == "max_tokens must be an integer"
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?", "max_results": "invalid"},
+            )
+        )
+
+        assert result["error"] == "max_results must be an integer"
+
+    def test_handle_expand_query_rejects_non_numeric_node_ids(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"node_ids": ["not-a-number"], "prompt": "What was the plan?"},
+            )
+        )
+
+        assert result["error"] == "node_ids must contain only integers"
+
     def test_describe_and_expand_are_session_scoped(self, engine):
         node_id = engine._dag.add_node(
             SummaryNode(
@@ -3213,6 +3268,17 @@ class TestEngineTools:
 
         orphan_check = next(c for c in result["checks"] if c["check"] == "orphaned_dag_nodes")
         assert orphan_check["status"] == "warn"
+
+    def test_handle_doctor_fts_sync_is_session_scoped(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "session A"})
+        engine._store.append("other-session", {"role": "user", "content": "session B 1"})
+        engine._store.append("other-session", {"role": "assistant", "content": "session B 2"})
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        fts_check = next(c for c in result["checks"] if c["check"] == "fts_index_sync")
+        assert fts_check["status"] == "pass"
+        assert fts_check["detail"] == "1 session FTS rows, 1 session messages"
 
 
 class TestExtractionDuringCompress:
