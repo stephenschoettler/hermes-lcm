@@ -76,6 +76,29 @@ def _get_externalized_payload(engine: "LCMEngine", ref: str) -> dict[str, Any] |
     return payload
 
 
+def _truncate_text_to_token_budget(text: str, max_tokens: int) -> tuple[str, bool]:
+    from .tokens import count_tokens
+
+    if max_tokens <= 0 or not text:
+        return "", bool(text)
+
+    if count_tokens(text) <= max_tokens:
+        return text, False
+
+    low = 0
+    high = len(text)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = text[:mid]
+        if count_tokens(candidate) <= max_tokens:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best, True
+
+
 def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -388,10 +411,13 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     externalized_ref = str(args.get("externalized_ref") or "").strip()
+    max_tokens = int(args.get("max_tokens", 4000))
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
             return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+        content = payload.get("content", "")
+        truncated_content, content_truncated = _truncate_text_to_token_budget(content, max_tokens)
         return json.dumps(
             {
                 "externalized_ref": externalized_ref,
@@ -401,7 +427,8 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                 "session_id": payload.get("session_id", ""),
                 "content_chars": payload.get("content_chars", 0),
                 "content_bytes": payload.get("content_bytes", 0),
-                "content": payload.get("content", ""),
+                "content": truncated_content,
+                "content_truncated": content_truncated,
             }
         )
 
@@ -412,8 +439,6 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     node = _get_session_node(engine, node_id)
     if node is None:
         return json.dumps({"error": f"Node {node_id} not found in current session"})
-
-    max_tokens = args.get("max_tokens", 4000)
 
     if node.source_type == "messages":
         messages = _expand_message_sources(engine, node, max_tokens=max_tokens)
