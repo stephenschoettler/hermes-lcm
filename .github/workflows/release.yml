@@ -32,7 +32,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@c9b5d8f4b1be81f1a8146ea5ab0c2a2ae0f9a93b # v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body: ${{ steps.changelog.outputs.body }}
           generate_release_notes: false
