@@ -1120,7 +1120,7 @@ class LCMEngine(ContextEngine):
             tail_token_total = 0
             for msg in reversed(tail_messages):
                 msg_tokens = count_message_tokens(msg)
-                if used + tail_token_total + msg_tokens > assembly_cap and kept_tail_reversed:
+                if used + tail_token_total + msg_tokens > assembly_cap:
                     break
                 kept_tail_reversed.append(msg)
                 tail_token_total += msg_tokens
@@ -1301,12 +1301,15 @@ class LCMEngine(ContextEngine):
                 ):
                     return candidate
 
-        return self._assemble_context(
+        candidate = self._assemble_context(
             system_msg,
             tail_messages,
             assembly_cap_override=assembly_cap_override,
             include_lcm_note=False,
         )
+        if len(candidate) == 1 and tail_messages:
+            return [system_msg, tail_messages[-1]]
+        return candidate
 
     @staticmethod
     def _looks_like_active_summary_blob(content: str) -> bool:
