@@ -420,6 +420,39 @@ class MessageStore:
         ).fetchone()
         return row[0] if row else 0
 
+    def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
+        """Return raw source-bucket counts for diagnostics."""
+        where = ""
+        args: list[Any] = []
+        if session_id is not None:
+            where = "WHERE session_id = ?"
+            args.append(session_id)
+
+        query = f"""
+            SELECT COUNT(*) AS messages_total,
+                   COALESCE(SUM(CASE WHEN source = '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS normalized_unknown_messages,
+                   COALESCE(SUM(CASE WHEN source = '' THEN 1 ELSE 0 END), 0) AS legacy_blank_source_messages,
+                   COALESCE(SUM(CASE WHEN source != '' AND source != '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS attributed_messages
+            FROM messages
+            {where}
+            """
+        if args:
+            row = self._conn.execute(query, args).fetchone()
+        else:
+            row = self._conn.execute(query).fetchone()
+
+        messages_total = int(row[0] or 0) if row else 0
+        normalized_unknown = int(row[1] or 0) if row else 0
+        legacy_blank = int(row[2] or 0) if row else 0
+        attributed = int(row[3] or 0) if row else 0
+        return {
+            "messages_total": messages_total,
+            "attributed_messages": attributed,
+            "normalized_unknown_messages": normalized_unknown,
+            "legacy_blank_source_messages": legacy_blank,
+            "effective_unknown_messages": normalized_unknown + legacy_blank,
+        }
+
     def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
         if not store_ids:
             return None, None

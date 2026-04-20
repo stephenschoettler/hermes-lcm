@@ -450,15 +450,31 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
-    max_tokens = int(args.get("max_tokens", 2000))
-    max_results = int(args.get("max_results", 5))
+    def _parse_int_arg(name: str, default: int) -> tuple[int | None, str | None]:
+        raw_value = args.get(name, default)
+        try:
+            return int(raw_value), None
+        except (TypeError, ValueError):
+            return None, f"{name} must be an integer"
+
+    max_tokens, max_tokens_error = _parse_int_arg("max_tokens", 2000)
+    if max_tokens_error:
+        return json.dumps({"error": max_tokens_error})
+
+    max_results, max_results_error = _parse_int_arg("max_results", 5)
+    if max_results_error:
+        return json.dumps({"error": max_results_error})
+
     query = str(args.get("query") or "").strip()
     raw_node_ids = args.get("node_ids") or []
 
     nodes = []
     if raw_node_ids:
         for node_id in raw_node_ids:
-            node = _get_session_node(engine, int(node_id))
+            parsed_node_id, node_id_error = _parse_int_arg("node_ids", node_id)
+            if node_id_error:
+                return json.dumps({"error": "node_ids must contain only integers"})
+            node = _get_session_node(engine, parsed_node_id)
             if node is not None:
                 nodes.append(node)
     elif query:
@@ -537,7 +553,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     total_dag_tokens = sum(d["tokens"] for d in depths.values())
     total_source_tokens = sum(d["source_tokens"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
-    lifecycle = engine.get_status().get("lifecycle")
+    full_status = engine.get_status()
+    lifecycle = full_status.get("lifecycle")
+    source_lineage = full_status.get("source_lineage")
 
     return json.dumps({
         "session_id": session_id,
@@ -576,6 +594,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "ignored": engine._session_ignored,
             "stateless": engine._session_stateless,
         },
+        "source_lineage": source_lineage,
         "lifecycle": lifecycle,
     })
 
@@ -668,7 +687,26 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "detail": config_warnings if config_warnings else "all settings within normal ranges",
     })
 
-    # 5. Context pressure
+    # 5. Source-lineage hygiene
+    try:
+        source_stats = engine._store.get_source_stats()
+        legacy_blank_messages = source_stats["legacy_blank_source_messages"]
+        checks.append({
+            "check": "source_lineage_hygiene",
+            "status": "pass" if legacy_blank_messages == 0 else "warn",
+            "detail": {
+                **source_stats,
+                "normalization_mode": "backcompat-normalization",
+            },
+        })
+    except Exception as e:
+        checks.append({
+            "check": "source_lineage_hygiene",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 6. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         threshold_pct = round(c.context_threshold * 100, 1)

@@ -53,6 +53,26 @@ def test_lcm_status_explains_unbound_runtime_before_first_session(tmp_path):
     assert "note: no active Hermes session has initialized LCM in this process yet" in result
 
 
+def test_lcm_status_reports_source_lineage_breakdown(engine):
+    engine._store.append("test-session", {"role": "user", "content": "cli message"}, source="cli")
+    engine._store.append("test-session", {"role": "user", "content": "unknown message"})
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("test-session", "", "user", "legacy blank source", None, None, None, 1.0, 5, 0),
+    )
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("status", engine)
+
+    assert "source_messages_total: 3" in result
+    assert "source_attributed_messages: 1" in result
+    assert "source_unknown_messages: 1" in result
+    assert "source_legacy_blank_messages: 1" in result
+    assert "source_effective_unknown_messages: 2" in result
+
+
 def test_lcm_doctor_reports_health_checks(engine):
     result = handle_lcm_command("doctor", engine)
 
@@ -83,6 +103,25 @@ def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path
     assert "cleanup_candidates" in result
     assert "/lcm doctor clean" in result
     assert "/lcm backup" in result
+
+
+def test_lcm_doctor_reports_legacy_blank_source_observation_and_action(engine):
+    engine._store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
+    engine._store.append("sess-unknown", {"role": "user", "content": "unknown message"})
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        ("legacy-session", "", "user", "legacy blank source", None, None, None, 1.0, 5, 0),
+    )
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "source_lineage:" in result
+    assert "legacy_blank=1" in result
+    assert "effective_unknown=2" in result
+    assert "review legacy blank-source rows before any destructive cleanup" in result
 
 
 def test_lcm_help_on_unknown_subcommand(engine):
@@ -400,3 +439,67 @@ def test_register_skips_slash_command_when_host_context_has_no_register_command(
     module.register(ctx)
 
     assert ctx.engine is not None
+
+
+def test_register_skips_lcm_slash_command_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.delenv("LCM_ENABLE_SLASH_COMMAND", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_disabled",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+            self.commands = {}
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, name, handler, description=""):
+            self.commands[name] = (handler, description)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert "lcm" not in ctx.commands
+
+
+def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.setenv("LCM_ENABLE_SLASH_COMMAND", "1")
+
+    spec = importlib.util.spec_from_file_location(
+        "hermes_lcm_init_runtime_enabled",
+        str(Path(__file__).resolve().parent.parent / "__init__.py"),
+        submodule_search_locations=[str(Path(__file__).resolve().parent.parent)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+            self.commands = {}
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, name, handler, description=""):
+            self.commands[name] = (handler, description)
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert "lcm" in ctx.commands

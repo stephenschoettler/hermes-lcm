@@ -158,6 +158,7 @@ Environment variables (all optional):
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after `/new` (`-1` = all, `0` = none, `2` = keep d2+) |
+| `LCM_ENABLE_SLASH_COMMAND` | `false` | Opt-in registration for `/lcm` gateway slash commands (recommended only for trusted operator contexts) |
 
 The point-8 compaction knobs are intentionally opt-in. `cache_friendly_*` is a plugin-local prompt-stability heuristic, not a claim that Hermes currently passes true prompt-cache metrics into `hermes-lcm`.
 
@@ -262,7 +263,9 @@ That split is intentional:
 
 ## Gateway Slash Commands
 
-When Hermes host support for plugin slash commands is available, `hermes-lcm` also exposes a `/lcm` operator surface for quick diagnostics and safe maintenance prep from chat:
+When Hermes host support for plugin slash commands is available, `hermes-lcm` can expose a `/lcm` operator surface for quick diagnostics and safe maintenance prep from chat.
+
+This surface is **disabled by default** and requires `LCM_ENABLE_SLASH_COMMAND=1` (or `true/yes/on`) before registration.
 
 - `/lcm` or `/lcm status` — current session/runtime status
 - `/lcm doctor` — SQLite + FTS health checks and store/node totals
