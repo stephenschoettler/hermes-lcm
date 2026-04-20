@@ -3077,6 +3077,35 @@ class TestEngineTools:
         assert result["node_ids"] == [node_id]
         assert result["matches"]
 
+    def test_handle_expand_query_rejects_non_numeric_limits(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?", "max_tokens": "invalid"},
+            )
+        )
+
+        assert result["error"] == "max_tokens must be an integer"
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?", "max_results": "invalid"},
+            )
+        )
+
+        assert result["error"] == "max_results must be an integer"
+
+    def test_handle_expand_query_rejects_non_numeric_node_ids(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"node_ids": ["not-a-number"], "prompt": "What was the plan?"},
+            )
+        )
+
+        assert result["error"] == "node_ids must contain only integers"
+
     def test_describe_and_expand_are_session_scoped(self, engine):
         node_id = engine._dag.add_node(
             SummaryNode(

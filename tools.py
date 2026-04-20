@@ -450,15 +450,31 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
-    max_tokens = int(args.get("max_tokens", 2000))
-    max_results = int(args.get("max_results", 5))
+    def _parse_int_arg(name: str, default: int) -> tuple[int | None, str | None]:
+        raw_value = args.get(name, default)
+        try:
+            return int(raw_value), None
+        except (TypeError, ValueError):
+            return None, f"{name} must be an integer"
+
+    max_tokens, max_tokens_error = _parse_int_arg("max_tokens", 2000)
+    if max_tokens_error:
+        return json.dumps({"error": max_tokens_error})
+
+    max_results, max_results_error = _parse_int_arg("max_results", 5)
+    if max_results_error:
+        return json.dumps({"error": max_results_error})
+
     query = str(args.get("query") or "").strip()
     raw_node_ids = args.get("node_ids") or []
 
     nodes = []
     if raw_node_ids:
         for node_id in raw_node_ids:
-            node = _get_session_node(engine, int(node_id))
+            parsed_node_id, node_id_error = _parse_int_arg("node_ids", node_id)
+            if node_id_error:
+                return json.dumps({"error": "node_ids must contain only integers"})
+            node = _get_session_node(engine, parsed_node_id)
             if node is not None:
                 nodes.append(node)
     elif query:
