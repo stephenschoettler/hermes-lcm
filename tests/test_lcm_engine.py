@@ -1928,18 +1928,18 @@ class TestEngineTools:
 
     def test_handle_grep_source_filter_excludes_unrelated_summaries_in_mixed_source_session(self, engine):
         discord_store_id = engine._store.append(
-            "mixed-session",
+            "test-session",
             {"role": "user", "content": "docker logs from discord"},
             source="discord",
         )
         telegram_store_id = engine._store.append(
-            "mixed-session",
+            "test-session",
             {"role": "user", "content": "docker logs from telegram"},
             source="telegram",
         )
         engine._dag.add_node(
             SummaryNode(
-                session_id="mixed-session",
+                session_id="test-session",
                 depth=0,
                 summary="discord summary about docker logs",
                 token_count=10,
@@ -1951,7 +1951,7 @@ class TestEngineTools:
         )
         engine._dag.add_node(
             SummaryNode(
-                session_id="mixed-session",
+                session_id="test-session",
                 depth=0,
                 summary="telegram summary about docker logs",
                 token_count=10,
@@ -1971,7 +1971,7 @@ class TestEngineTools:
 
         assert any(item["type"] == "message" for item in result["results"])
         assert any(item["type"] == "summary" for item in result["results"])
-        assert all(item.get("session_id") == "mixed-session" for item in result["results"])
+        assert all(item.get("session_id") == "test-session" for item in result["results"])
         assert all(
             "telegram summary" not in item.get("snippet", "")
             for item in result["results"]
@@ -1985,13 +1985,13 @@ class TestEngineTools:
 
     def test_handle_grep_unknown_source_filter_matches_unknown_messages_and_summaries(self, engine):
         unknown_store_id = engine._store.append(
-            "unknown-session",
+            "test-session",
             {"role": "user", "content": "docker logs from unknown source"},
             source="unknown",
         )
         engine._dag.add_node(
             SummaryNode(
-                session_id="unknown-session",
+                session_id="test-session",
                 depth=0,
                 summary="unknown summary about docker logs",
                 token_count=10,
@@ -2012,7 +2012,7 @@ class TestEngineTools:
         assert result["source"] == "unknown"
         assert any(item["type"] == "message" for item in result["results"])
         assert any(item["type"] == "summary" for item in result["results"])
-        assert all(item.get("session_id") == "unknown-session" for item in result["results"])
+        assert all(item.get("session_id") == "test-session" for item in result["results"])
         assert all(item.get("source", "unknown") == "unknown" for item in result["results"] if item["type"] == "message")
         assert any(
             "unknown summary" in item.get("snippet", "")
