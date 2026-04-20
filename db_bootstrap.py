@@ -6,11 +6,17 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 
 from __future__ import annotations
 
+import logging
+import os
+import re
 import sqlite3
 from typing import Iterable, Sequence
 
+logger = logging.getLogger(__name__)
+
 SCHEMA_VERSION = 4
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+_MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 
 
 class ExternalContentFtsSpec:
@@ -218,8 +224,51 @@ def _drop_fts_table(conn: sqlite3.Connection, table_name: str) -> None:
         conn.execute(f"DROP TABLE IF EXISTS {quote_sql_identifier(shadow_name)}")
 
 
+def _extract_trigger_name(trigger_sql: str) -> str | None:
+    match = re.search(
+        r"CREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))",
+        trigger_sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
+
+
+def _drop_fts_triggers(conn: sqlite3.Connection, trigger_sqls: Sequence[str]) -> None:
+    for trigger_sql in trigger_sqls:
+        trigger_name = _extract_trigger_name(trigger_sql)
+        if trigger_name:
+            conn.execute(f"DROP TRIGGER IF EXISTS {quote_sql_identifier(trigger_name)}")
+
+
+def _drop_fts_artifacts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
+    _drop_fts_triggers(conn, spec.trigger_sqls)
+    _drop_fts_table(conn, spec.table_name)
+
+
+def _check_disk_space(db_path: str) -> bool:
+    try:
+        parent = os.path.dirname(os.path.abspath(db_path)) or "."
+        usage = os.statvfs(parent)
+        return usage.f_bavail * usage.f_frsize >= _MIN_DISK_SPACE_BYTES
+    except OSError:
+        return True
+
+
 def ensure_external_content_fts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
     if _fts_needs_rebuild(conn, spec):
+        db_path = conn.execute("PRAGMA database_list").fetchone()
+        if db_path:
+            db_file = db_path[2]
+            if db_file and not _check_disk_space(db_file):
+                logger.warning(
+                    "Low disk space for FTS rebuild of '%s' (%d MB needed), degrading to LIKE search",
+                    spec.table_name,
+                    _MIN_DISK_SPACE_BYTES // (1024 * 1024),
+                )
+                _drop_fts_artifacts(conn, spec)
+                return
         _drop_fts_table(conn, spec.table_name)
         conn.execute(
             f"""
