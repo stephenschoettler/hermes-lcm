@@ -132,6 +132,8 @@ class LCMConfig:
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)
     new_session_retain_depth: int = 2
+    # Safety gate: destructive `/lcm doctor clean apply` workflow is disabled by default.
+    doctor_clean_apply_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
@@ -196,6 +198,10 @@ class LCMConfig:
         c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
         c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)
+        c.doctor_clean_apply_enabled = _parse_bool_env(
+            "LCM_DOCTOR_CLEAN_APPLY_ENABLED",
+            c.doctor_clean_apply_enabled,
+        )
 
         raw_ignore = os.environ.get("LCM_IGNORE_SESSION_PATTERNS")
         if raw_ignore is not None:

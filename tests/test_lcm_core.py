@@ -681,6 +681,28 @@ class TestMessageStore:
         assert recency_results[0]["store_id"] == newer_weak
         assert relevance_results[0]["store_id"] == older_strong
 
+    def test_search_like_fallback_applies_sql_limit_for_messages(self, store):
+        for index in range(40):
+            store.append(
+                "sess1",
+                {"role": "user", "content": f"bulk message {index} 🚀"},
+            )
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            results = store.search("🚀", session_id="sess1", limit=5, sort="relevance")
+        finally:
+            store._conn.set_trace_callback(None)
+
+        assert len(results) == 5
+        like_sql = next(
+            statement
+            for statement in statements
+            if "FROM messages" in statement and "LIKE" in statement
+        )
+        assert "LIMIT " in like_sql
+
     def test_search_hyphenated_operator_queries_fall_back_cleanly(self, store):
         target = store.append(
             "sess1",
@@ -850,6 +872,29 @@ class TestMessageStore:
         top_50 = [result["store_id"] for result in store.search("vendoring", session_id="sess1", limit=50, sort="relevance")[:5]]
 
         assert top_5 == top_50
+
+    def test_search_relevance_caps_fts_batches_for_large_single_term_pool(self, store):
+        for _ in range(5_000):
+            store.append(
+                "sess1",
+                {
+                    "role": "assistant",
+                    "content": "vendoring",
+                },
+            )
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            _ = store.search("vendoring", session_id="sess1", limit=10, sort="relevance")
+        finally:
+            store._conn.set_trace_callback(None)
+
+        fts_selects = [
+            sql for sql in statements
+            if "FROM messages_fts" in sql and "LIMIT" in sql and "OFFSET" in sql
+        ]
+        assert len(fts_selects) <= 6
 
     def test_search_relevance_prefers_assistant_over_tool_on_similar_match(self, store):
         assistant_id = store.append(
@@ -1718,6 +1763,32 @@ class TestSummaryDAG:
         assert recency_results[0].node_id == newer_weak
         assert relevance_results[0].node_id == older_strong
 
+    def test_search_like_fallback_applies_sql_limit_for_summary_nodes(self, dag):
+        for index in range(40):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"bulk summary {index} 🚀",
+                token_count=4, source_ids=[index + 1], source_type="messages",
+                created_at=1_700_000_000 + index,
+                earliest_at=1_700_000_000 + index,
+                latest_at=1_700_000_000 + index,
+            ))
+
+        statements: list[str] = []
+        dag._conn.set_trace_callback(statements.append)
+        try:
+            results = dag.search("🚀", session_id="s1", limit=5, sort="relevance")
+        finally:
+            dag._conn.set_trace_callback(None)
+
+        assert len(results) == 5
+        like_sql = next(
+            statement
+            for statement in statements
+            if "FROM summary_nodes" in statement and "LIKE" in statement
+        )
+        assert "LIMIT " in like_sql
+
     def test_search_hyphenated_operator_queries_fall_back_cleanly(self, dag):
         target = dag.add_node(SummaryNode(
             session_id="s1", depth=0,
@@ -1836,6 +1907,30 @@ class TestSummaryDAG:
 
         assert [node.node_id for node in results[:1]] == [direct]
         assert direct in [node.node_id for node in results]
+
+    def test_search_relevance_caps_fts_batches_for_large_single_term_pool(self, dag):
+        for idx in range(5_000):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"Summary {idx}: vendoring",
+                token_count=10, source_ids=[idx + 1], source_type="messages",
+                created_at=1_700_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_000 + idx,
+            ))
+
+        statements: list[str] = []
+        dag._conn.set_trace_callback(statements.append)
+        try:
+            _ = dag.search("vendoring", session_id="s1", limit=10, sort="relevance")
+        finally:
+            dag._conn.set_trace_callback(None)
+
+        fts_selects = [
+            sql for sql in statements
+            if "FROM nodes_fts" in sql and "LIMIT" in sql and "OFFSET" in sql
+        ]
+        assert len(fts_selects) <= 6
 
     def test_search_relevance_prefers_direct_summary_over_risky_ascii_repetition_spam_in_like_fallback(self, dag):
         spammy = dag.add_node(SummaryNode(

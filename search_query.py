@@ -248,6 +248,11 @@ def compute_like_fallback_fetch_limit(limit: int, terms: List[str], phrases: Lis
     return compute_search_fetch_limit(limit, terms, phrases)
 
 
+def compute_search_candidate_cap(limit: int) -> int:
+    """Return a hard upper bound on candidate rows inspected per search call."""
+    return min(max(limit * 20, limit, 500), 5_000)
+
+
 AGE_DECAY_RATE = 0.001
 
 
