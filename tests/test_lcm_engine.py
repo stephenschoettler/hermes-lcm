@@ -1530,7 +1530,7 @@ class TestAssemblyGuardrails:
         assert "B" * 120 not in summary_blob
         assert "C" * 10 not in summary_blob
 
-    def test_max_assembly_tokens_keeps_newest_tail_message_even_if_it_alone_exceeds_cap(self, tmp_path, monkeypatch):
+    def test_max_assembly_tokens_drops_oversized_newest_tail_message(self, tmp_path, monkeypatch):
         import importlib
 
         config = LCMConfig(
@@ -1557,7 +1557,7 @@ class TestAssemblyGuardrails:
             ],
         )
 
-        assert [msg["content"] for msg in result[1:]] == ["b" * 60]
+        assert result[1:] == []
 
     def test_reserve_tokens_floor_warns_when_misconfigured(self, tmp_path, caplog):
         config = LCMConfig(
