@@ -614,12 +614,18 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
         fts_count = engine._store._conn.execute(
-            "SELECT COUNT(*) FROM messages_fts"
+            """
+            SELECT COUNT(*)
+            FROM messages_fts
+            JOIN messages ON messages_fts.rowid = messages.id
+            WHERE messages.session_id = ?
+            """,
+            (session_id,),
         ).fetchone()[0]
         checks.append({
             "check": "fts_index_sync",
             "status": "pass" if fts_count >= msg_count else "warn",
-            "detail": f"{fts_count} FTS rows, {msg_count} session messages",
+            "detail": f"{fts_count} session FTS rows, {msg_count} session messages",
         })
     except Exception as e:
         checks.append({

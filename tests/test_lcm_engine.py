@@ -3214,6 +3214,17 @@ class TestEngineTools:
         orphan_check = next(c for c in result["checks"] if c["check"] == "orphaned_dag_nodes")
         assert orphan_check["status"] == "warn"
 
+    def test_handle_doctor_fts_sync_is_session_scoped(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "session A"})
+        engine._store.append("other-session", {"role": "user", "content": "session B 1"})
+        engine._store.append("other-session", {"role": "assistant", "content": "session B 2"})
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        fts_check = next(c for c in result["checks"] if c["check"] == "fts_index_sync")
+        assert fts_check["status"] == "pass"
+        assert fts_check["detail"] == "1 session FTS rows, 1 session messages"
+
 
 class TestExtractionDuringCompress:
     """Integration test: extraction runs end-to-end through engine.compress()."""
