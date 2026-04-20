@@ -38,6 +38,7 @@ from .search_query import (
     extract_search_terms,
     normalize_search_sort,
     requires_like_fallback,
+    sanitize_fts5_query,
     should_apply_directness_rank_adjustment,
 )
 from .store import _normalize_source_value, _UNKNOWN_SOURCE
@@ -336,8 +337,9 @@ class SummaryDAG:
           session-level source presence
         - mixed-source nodes may match more than one ``source`` filter
         """
-        terms = extract_search_terms(query)
-        phrases = extract_quoted_phrases(query)
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
@@ -358,7 +360,7 @@ class SummaryDAG:
                            JOIN summary_nodes n ON n.node_id = fts.rowid
                            WHERE nodes_fts MATCH ? AND n.session_id = ?
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, session_id, fetch_limit, offset),
+                        (safe_query, session_id, fetch_limit, offset),
                     ).fetchall()
                 else:
                     rows = self._conn.execute(
@@ -366,7 +368,7 @@ class SummaryDAG:
                            JOIN summary_nodes n ON n.node_id = fts.rowid
                            WHERE nodes_fts MATCH ?
                            ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (query, fetch_limit, offset),
+                        (safe_query, fetch_limit, offset),
                     ).fetchall()
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
@@ -407,10 +409,12 @@ class SummaryDAG:
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
                      source: str | None = None) -> List[SummaryNode]:
-        terms = extract_search_terms(query)
-        phrases = extract_quoted_phrases(query)
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
         if not terms:
             return []
+        fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
         where: list[str] = ["summary IS NOT NULL"]
         args: list[Any] = []
@@ -422,9 +426,12 @@ class SummaryDAG:
             like_clauses.append("summary LIKE ? ESCAPE '\\'")
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
+        args.append(fetch_limit)
 
         rows = self._conn.execute(
-            f"SELECT * FROM summary_nodes WHERE {' AND '.join(where)}",
+            f"""SELECT * FROM summary_nodes
+                WHERE {' AND '.join(where)}
+                LIMIT ?""",
             args,
         ).fetchall()
         collapse_risky_repeats = contains_risky_fts_ascii(query)

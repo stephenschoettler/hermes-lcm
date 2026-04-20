@@ -33,6 +33,7 @@ from .search_query import (
     extract_search_terms,
     normalize_search_sort,
     requires_like_fallback,
+    sanitize_fts5_query,
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
@@ -420,6 +421,39 @@ class MessageStore:
         ).fetchone()
         return row[0] if row else 0
 
+    def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
+        """Return raw source-bucket counts for diagnostics."""
+        where = ""
+        args: list[Any] = []
+        if session_id is not None:
+            where = "WHERE session_id = ?"
+            args.append(session_id)
+
+        query = f"""
+            SELECT COUNT(*) AS messages_total,
+                   COALESCE(SUM(CASE WHEN source = '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS normalized_unknown_messages,
+                   COALESCE(SUM(CASE WHEN source = '' THEN 1 ELSE 0 END), 0) AS legacy_blank_source_messages,
+                   COALESCE(SUM(CASE WHEN source != '' AND source != '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS attributed_messages
+            FROM messages
+            {where}
+            """
+        if args:
+            row = self._conn.execute(query, args).fetchone()
+        else:
+            row = self._conn.execute(query).fetchone()
+
+        messages_total = int(row[0] or 0) if row else 0
+        normalized_unknown = int(row[1] or 0) if row else 0
+        legacy_blank = int(row[2] or 0) if row else 0
+        attributed = int(row[3] or 0) if row else 0
+        return {
+            "messages_total": messages_total,
+            "attributed_messages": attributed,
+            "normalized_unknown_messages": normalized_unknown,
+            "legacy_blank_source_messages": legacy_blank,
+            "effective_unknown_messages": normalized_unknown + legacy_blank,
+        }
+
     def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
         if not store_ids:
             return None, None
@@ -445,8 +479,9 @@ class MessageStore:
         - ``source='unknown'`` means the explicit unknown-source bucket, with
           legacy blank-source rows treated as equivalent for back-compat
         """
-        terms = extract_search_terms(query)
-        phrases = extract_quoted_phrases(query)
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
         if requires_like_fallback(query):
             return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
@@ -466,7 +501,7 @@ class MessageStore:
         while True:
             try:
                 where = ["messages_fts MATCH ?"]
-                args: list[Any] = [query]
+                args: list[Any] = [safe_query]
                 if session_id:
                     where.append("m.session_id = ?")
                     args.append(session_id)
@@ -525,10 +560,12 @@ class MessageStore:
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
                      source: str | None = None) -> List[Dict[str, Any]]:
-        terms = extract_search_terms(query)
-        phrases = extract_quoted_phrases(query)
+        safe_query = sanitize_fts5_query(query)
+        terms = extract_search_terms(safe_query)
+        phrases = extract_quoted_phrases(safe_query)
         if not terms:
             return []
+        fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
         where: list[str] = ["content IS NOT NULL"]
         args: list[Any] = []
@@ -544,9 +581,13 @@ class MessageStore:
             like_clauses.append("content LIKE ? ESCAPE '\\'")
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
+        args.append(fetch_limit)
 
         rows = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE {' AND '.join(where)}",
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                FROM messages
+                WHERE {' AND '.join(where)}
+                LIMIT ?""",
             args,
         ).fetchall()
         results: List[Dict[str, Any]] = []

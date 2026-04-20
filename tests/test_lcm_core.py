@@ -14,6 +14,8 @@ from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.escalation import _deterministic_truncate
 from hermes_lcm.lifecycle_state import LifecycleStateStore
+from hermes_lcm.db_bootstrap import ExternalContentFtsSpec, ensure_external_content_fts
+from hermes_lcm.search_query import sanitize_fts5_query
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
     compile_session_pattern,
@@ -249,6 +251,29 @@ class TestMessageStore:
 
         store.close()
 
+    def test_get_source_stats_reports_attributed_unknown_and_legacy_blank_counts(self, tmp_path):
+        db_path = tmp_path / "source-stats.db"
+        store = MessageStore(db_path)
+        store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
+        store.append("sess-unknown", {"role": "user", "content": "unknown message"})
+        store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy-session", "", "user", "legacy blank source", None, None, None, 1.0, 5, 0),
+        )
+        store._conn.commit()
+
+        stats = store.get_source_stats()
+
+        assert stats["messages_total"] == 3
+        assert stats["attributed_messages"] == 1
+        assert stats["normalized_unknown_messages"] == 1
+        assert stats["legacy_blank_source_messages"] == 1
+        assert stats["effective_unknown_messages"] == 2
+
+        store.close()
+
     def test_gc_externalized_tool_result_rewrites_content_and_updates_fts(self, store):
         placeholder = "[GC'd externalized tool output: tool_call_id=call_gc; ref=payload.json]"
         store_id = store.append(
@@ -399,6 +424,90 @@ class TestMessageStore:
         assert len(results) == 1
         assert results[0]["content"] == "docker fallback search still works"
         assert "fallback" in results[0]["snippet"].lower()
+
+    def test_search_like_fallback_sanitizes_fts_syntax_chars(self, store):
+        store.append("sess1", {"role": "user", "content": "vendoring external support stays plugin-only"})
+
+        results = store.search('"vendoring*', session_id="sess1")
+
+        assert len(results) == 1
+        assert results[0]["content"] == "vendoring external support stays plugin-only"
+
+    def test_search_like_fallback_splits_unbalanced_quote_terms(self, store):
+        store.append("sess1", {"role": "user", "content": "foo bar baz"})
+
+        results = store.search('foo"bar', session_id="sess1")
+
+        assert len(results) == 1
+        assert results[0]["content"] == "foo bar baz"
+
+    def test_search_uses_sanitized_terms_for_directness_scoring(self, store):
+        store.append("sess1", {"role": "user", "content": "vendoring external support stays plugin-only"})
+
+        results = store.search("vendoring*", session_id="sess1")
+
+        assert len(results) == 1
+        assert results[0]["_directness_score"] > 0
+
+    def test_search_sanitizes_fts_wildcards_without_prefix_matching(self, store):
+        store.append("sess1", {"role": "user", "content": "dockerization notes"})
+
+        results = store.search("docker*", session_id="sess1")
+
+        assert results == []
+
+    def test_init_low_disk_degrades_without_leaving_broken_message_fts_triggers(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "low-disk-broken-message-fts.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                source TEXT DEFAULT 'unknown',
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_estimate INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0
+            );
+            CREATE TRIGGER msg_fts_insert
+                AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content)
+                    VALUES (new.store_id, new.content);
+            END;
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '4');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr("hermes_lcm.db_bootstrap._check_disk_space", lambda _path: False)
+
+        store = MessageStore(db_path)
+        try:
+            store.append("sess1", {"role": "user", "content": "fallback remains writable"})
+
+            results = store.search("fallback", session_id="sess1")
+            trigger_names = {
+                row[0]
+                for row in store._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('msg_fts_insert', 'msg_fts_delete')"
+                ).fetchall()
+            }
+
+            assert len(results) == 1
+            assert results[0]["content"] == "fallback remains writable"
+            assert trigger_names == set()
+        finally:
+            store.close()
 
     def test_init_repairs_message_fts_drifted_row_count(self, tmp_path):
         db_path = tmp_path / "message-fts-drift.db"
@@ -571,6 +680,28 @@ class TestMessageStore:
 
         assert recency_results[0]["store_id"] == newer_weak
         assert relevance_results[0]["store_id"] == older_strong
+
+    def test_search_like_fallback_applies_sql_limit_for_messages(self, store):
+        for index in range(40):
+            store.append(
+                "sess1",
+                {"role": "user", "content": f"bulk message {index} 🚀"},
+            )
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            results = store.search("🚀", session_id="sess1", limit=5, sort="relevance")
+        finally:
+            store._conn.set_trace_callback(None)
+
+        assert len(results) == 5
+        like_sql = next(
+            statement
+            for statement in statements
+            if "FROM messages" in statement and "LIKE" in statement
+        )
+        assert "LIMIT " in like_sql
 
     def test_search_hyphenated_operator_queries_fall_back_cleanly(self, store):
         target = store.append(
@@ -1104,6 +1235,42 @@ class TestLifecycleStateStore:
         state.close()
 
 
+class TestDbBootstrapGuards:
+    def test_sanitize_fts5_query_preserves_balanced_phrase_quotes(self):
+        assert sanitize_fts5_query('"vendoring external" *') == '"vendoring external"'
+
+    def test_sanitize_fts5_query_breaks_unbalanced_quotes_into_separate_terms(self):
+        assert sanitize_fts5_query('foo"bar') == 'foo bar'
+
+    def test_ensure_external_content_fts_skips_rebuild_when_disk_is_low(self, tmp_path, monkeypatch):
+        conn = sqlite3.connect(tmp_path / "low-disk.db")
+        conn.executescript(
+            """
+            CREATE TABLE messages (
+                store_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT
+            );
+            INSERT INTO messages(content) VALUES ('fresh searchable message');
+            """
+        )
+        spec = ExternalContentFtsSpec(
+            table_name="messages_fts",
+            content_table="messages",
+            content_rowid="store_id",
+            indexed_column="content",
+            trigger_sqls=(),
+        )
+        monkeypatch.setattr("hermes_lcm.db_bootstrap._check_disk_space", lambda _path: False)
+
+        ensure_external_content_fts(conn, spec)
+
+        existing = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+        ).fetchone()
+        assert existing is None
+        conn.close()
+
+
 class TestSummaryDAG:
     @pytest.fixture
     def dag(self, tmp_path):
@@ -1282,6 +1449,109 @@ class TestSummaryDAG:
 
         assert len(results) == 1
         assert results[0].summary == "dag fallback search still works"
+
+    def test_search_like_fallback_sanitizes_fts_syntax_chars(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="vendoring external support stays plugin-only",
+            token_count=8, source_ids=[1], source_type="messages",
+        ))
+
+        results = dag.search('"vendoring*', session_id="s1")
+
+        assert len(results) == 1
+        assert results[0].summary == "vendoring external support stays plugin-only"
+
+    def test_search_like_fallback_splits_unbalanced_quote_terms(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="foo bar baz",
+            token_count=4, source_ids=[1], source_type="messages",
+        ))
+
+        results = dag.search('foo"bar', session_id="s1")
+
+        assert len(results) == 1
+        assert results[0].summary == "foo bar baz"
+
+    def test_search_sanitizes_fts_wildcards_without_prefix_matching(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="dockerization notes",
+            token_count=4, source_ids=[1], source_type="messages",
+        ))
+
+        results = dag.search("docker*", session_id="s1")
+
+        assert results == []
+
+    def test_search_uses_sanitized_terms_for_directness_scoring(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="vendoring external support stays plugin-only",
+            token_count=8, source_ids=[1], source_type="messages",
+        ))
+
+        results = dag.search("vendoring*", session_id="s1")
+
+        assert len(results) == 1
+        assert results[0].search_directness > 0
+
+    def test_init_low_disk_degrades_without_leaving_broken_nodes_fts_triggers(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "low-disk-broken-nodes-fts.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE summary_nodes (
+                node_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                depth INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                token_count INTEGER DEFAULT 0,
+                source_token_count INTEGER DEFAULT 0,
+                source_ids TEXT NOT NULL DEFAULT '[]',
+                source_type TEXT NOT NULL DEFAULT 'messages',
+                created_at REAL NOT NULL,
+                expand_hint TEXT DEFAULT ''
+            );
+            CREATE TRIGGER nodes_fts_insert
+                AFTER INSERT ON summary_nodes BEGIN
+                INSERT INTO nodes_fts(rowid, summary)
+                    VALUES (new.node_id, new.summary);
+            END;
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '4');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr("hermes_lcm.db_bootstrap._check_disk_space", lambda _path: False)
+
+        dag = SummaryDAG(db_path)
+        try:
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary="fallback dag stays writable",
+                token_count=5, source_ids=[1], source_type="messages",
+            ))
+
+            results = dag.search("fallback", session_id="s1")
+            trigger_names = {
+                row[0]
+                for row in dag._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('nodes_fts_insert', 'nodes_fts_delete')"
+                ).fetchall()
+            }
+
+            assert len(results) == 1
+            assert results[0].summary == "fallback dag stays writable"
+            assert trigger_names == set()
+        finally:
+            dag.close()
 
     def test_init_repairs_nodes_fts_drifted_row_count(self, tmp_path):
         db_path = tmp_path / "nodes-fts-drift.db"
@@ -1475,6 +1745,32 @@ class TestSummaryDAG:
 
         assert recency_results[0].node_id == newer_weak
         assert relevance_results[0].node_id == older_strong
+
+    def test_search_like_fallback_applies_sql_limit_for_summary_nodes(self, dag):
+        for index in range(40):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"bulk summary {index} 🚀",
+                token_count=4, source_ids=[index + 1], source_type="messages",
+                created_at=1_700_000_000 + index,
+                earliest_at=1_700_000_000 + index,
+                latest_at=1_700_000_000 + index,
+            ))
+
+        statements: list[str] = []
+        dag._conn.set_trace_callback(statements.append)
+        try:
+            results = dag.search("🚀", session_id="s1", limit=5, sort="relevance")
+        finally:
+            dag._conn.set_trace_callback(None)
+
+        assert len(results) == 5
+        like_sql = next(
+            statement
+            for statement in statements
+            if "FROM summary_nodes" in statement and "LIKE" in statement
+        )
+        assert "LIMIT " in like_sql
 
     def test_search_hyphenated_operator_queries_fall_back_cleanly(self, dag):
         target = dag.add_node(SummaryNode(
