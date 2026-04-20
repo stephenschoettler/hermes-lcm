@@ -571,6 +571,15 @@ def _doctor_retention_text(engine) -> str:
 
 
 def _doctor_clean_apply_text(engine) -> str:
+    if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
+        return "\n".join([
+            "LCM doctor clean apply",
+            "status: denied",
+            "error: destructive cleanup is disabled by default",
+            "note: set LCM_DOCTOR_CLEAN_APPLY_ENABLED=true only in trusted operator environments",
+            "note: no rows were deleted",
+        ])
+
     scan = _scan_clean_candidates(engine)
     if scan["error"]:
         return "\n".join([

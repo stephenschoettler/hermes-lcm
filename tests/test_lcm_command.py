@@ -267,6 +267,7 @@ def test_lcm_doctor_clean_apply_is_backup_first_and_deletes_safe_candidates(tmp_
     config = LCMConfig(
         database_path=str(tmp_path / "lcm_clean_apply.db"),
         ignore_session_patterns=["cron*"],
+        doctor_clean_apply_enabled=True,
     )
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
     engine._session_id = "live-session"
@@ -306,6 +307,7 @@ def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm_clean_apply_fail.db"),
         ignore_session_patterns=["cron*"],
+        doctor_clean_apply_enabled=True,
     )
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
     engine._session_id = "live-session"
@@ -324,6 +326,22 @@ def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
     assert "LCM doctor clean apply" in result
     assert "status: error" in result
     assert "backup failed" in result.lower()
+    assert len(engine._store.get_range("cron_20260414")) == 1
+
+
+def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_apply_denied.db"),
+        ignore_session_patterns=["cron*"],
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._store.append("cron_20260414", {"role": "user", "content": "scheduled report"}, token_estimate=12)
+
+    result = handle_lcm_command("doctor clean apply", engine)
+
+    assert "LCM doctor clean apply" in result
+    assert "status: denied" in result
+    assert "disabled by default" in result
     assert len(engine._store.get_range("cron_20260414")) == 1
 
 
