@@ -61,11 +61,6 @@ def _status_text(engine) -> str:
         **({"error": source_stats.get("error")} if source_stats.get("error") else {}),
     }
 
-    def _safe_scalar(conn, query: str) -> int | str:
-        try:
-            return int(conn.execute(query).fetchone()[0])
-        except Exception as exc:  # pragma: no cover - defensive
-            return f"error: {exc}"
 
     lines = [
         "LCM status",
@@ -92,13 +87,9 @@ def _status_text(engine) -> str:
             f"dag_nodes: {status.get('dag_nodes', 0)}",
         ])
     else:
-        lines.extend([
-            f"messages_total: {_safe_scalar(engine._store._conn, 'SELECT COUNT(*) FROM messages')}",
-            f"message_sessions_total: {_safe_scalar(engine._store._conn, 'SELECT COUNT(DISTINCT session_id) FROM messages')}",
-            f"summary_nodes_total: {_safe_scalar(engine._dag._conn, 'SELECT COUNT(*) FROM summary_nodes')}",
-            f"summary_node_sessions_total: {_safe_scalar(engine._dag._conn, 'SELECT COUNT(DISTINCT session_id) FROM summary_nodes')}",
-            "note: no active Hermes session has initialized LCM in this process yet — after a fresh restart, send one normal message first if you want live per-session runtime details",
-        ])
+        lines.append(
+            "note: no active Hermes session has initialized LCM in this process yet — after a fresh restart, send one normal message first if you want live per-session runtime details"
+        )
 
     if "ignore_session_patterns_source" in status:
         lines.append(

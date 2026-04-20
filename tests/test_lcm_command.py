@@ -48,8 +48,8 @@ def test_lcm_status_explains_unbound_runtime_before_first_session(tmp_path):
     assert "session_id: (unbound)" in result
     assert "session_platform: (unbound)" in result
     assert "threshold_tokens: (uninitialized)" in result
-    assert "message_sessions_total: 1" in result
-    assert "messages_total: 1" in result
+    assert "message_sessions_total:" not in result
+    assert "messages_total:" not in result
     assert "note: no active Hermes session has initialized LCM in this process yet" in result
 
 
