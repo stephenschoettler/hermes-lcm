@@ -22,8 +22,10 @@ from .db_bootstrap import (
 )
 from .search_query import (
     build_snippet,
+    compute_search_candidate_cap,
     compute_directness_rank_bonus_upper_bound,
     compute_directness_score,
+    compute_like_fallback_fetch_limit,
     compute_search_fetch_limit,
     contains_risky_fts_ascii,
     count_term_matches,
@@ -420,6 +422,39 @@ class MessageStore:
         ).fetchone()
         return row[0] if row else 0
 
+    def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
+        """Return raw source-bucket counts for diagnostics."""
+        where = ""
+        args: list[Any] = []
+        if session_id is not None:
+            where = "WHERE session_id = ?"
+            args.append(session_id)
+
+        query = f"""
+            SELECT COUNT(*) AS messages_total,
+                   COALESCE(SUM(CASE WHEN source = '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS normalized_unknown_messages,
+                   COALESCE(SUM(CASE WHEN source = '' THEN 1 ELSE 0 END), 0) AS legacy_blank_source_messages,
+                   COALESCE(SUM(CASE WHEN source != '' AND source != '{_UNKNOWN_SOURCE}' THEN 1 ELSE 0 END), 0) AS attributed_messages
+            FROM messages
+            {where}
+            """
+        if args:
+            row = self._conn.execute(query, args).fetchone()
+        else:
+            row = self._conn.execute(query).fetchone()
+
+        messages_total = int(row[0] or 0) if row else 0
+        normalized_unknown = int(row[1] or 0) if row else 0
+        legacy_blank = int(row[2] or 0) if row else 0
+        attributed = int(row[3] or 0) if row else 0
+        return {
+            "messages_total": messages_total,
+            "attributed_messages": attributed,
+            "normalized_unknown_messages": normalized_unknown,
+            "legacy_blank_source_messages": legacy_blank,
+            "effective_unknown_messages": normalized_unknown + legacy_blank,
+        }
+
     def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
         if not store_ids:
             return None, None
@@ -457,10 +492,12 @@ class MessageStore:
             _MESSAGE_ROLE_BIAS_SQL,
         )
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
+        candidate_cap = compute_search_candidate_cap(limit)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
         source_clause, source_args = _source_filter_clause("m.source", source)
         offset = 0
+        scanned_rows = 0
         results: list[Dict[str, Any]] = []
         while True:
             try:
@@ -484,6 +521,7 @@ class MessageStore:
                        ORDER BY {order_by} LIMIT ? OFFSET ?""",
                     args,
                 ).fetchall()
+                scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
                 return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
@@ -511,8 +549,14 @@ class MessageStore:
             if best_unseen_primary > worst_visible_primary:
                 return results[:limit]
 
+            if scanned_rows >= candidate_cap:
+                return results[:limit]
+
             offset += len(rows)
-            fetch_limit *= 2
+            remaining = candidate_cap - scanned_rows
+            if remaining <= 0:
+                return results[:limit]
+            fetch_limit = min(fetch_limit * 2, remaining)
 
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
@@ -522,6 +566,7 @@ class MessageStore:
         phrases = extract_quoted_phrases(safe_query)
         if not terms:
             return []
+        fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
         where: list[str] = ["content IS NOT NULL"]
         args: list[Any] = []
@@ -537,9 +582,14 @@ class MessageStore:
             like_clauses.append("content LIKE ? ESCAPE '\\'")
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
+        fetch_limit = compute_like_fallback_fetch_limit(limit, terms, phrases)
+        args.append(fetch_limit)
 
         rows = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE {' AND '.join(where)}",
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                FROM messages
+                WHERE {' AND '.join(where)}
+                LIMIT ?""",
             args,
         ).fetchall()
         results: List[Dict[str, Any]] = []

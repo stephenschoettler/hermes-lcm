@@ -684,8 +684,12 @@ class LCMEngine(ContextEngine):
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
         lifecycle_state = self._lifecycle.get_by_conversation(self._conversation_id)
+        status["engine"] = "lcm"
+        try:
+            status["source_lineage"] = self._store.get_source_stats(self._session_id or None)
+        except Exception as exc:  # pragma: no cover - defensive
+            status["source_lineage"] = {"error": str(exc)}
         if self._session_id:
-            status["engine"] = "lcm"
             status["store_messages"] = self._store.get_session_count(self._session_id)
             status["dag_nodes"] = len(self._dag.get_session_nodes(self._session_id))
             status["session_platform"] = self._session_platform

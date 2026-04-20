@@ -76,6 +76,29 @@ def _get_externalized_payload(engine: "LCMEngine", ref: str) -> dict[str, Any] |
     return payload
 
 
+def _truncate_text_to_token_budget(text: str, max_tokens: int) -> tuple[str, bool]:
+    from .tokens import count_tokens
+
+    if max_tokens <= 0 or not text:
+        return "", bool(text)
+
+    if count_tokens(text) <= max_tokens:
+        return text, False
+
+    low = 0
+    high = len(text)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = text[:mid]
+        if count_tokens(candidate) <= max_tokens:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    return best, True
+
+
 def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
     from .tokens import count_tokens
 
@@ -388,10 +411,13 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     externalized_ref = str(args.get("externalized_ref") or "").strip()
+    max_tokens = int(args.get("max_tokens", 4000))
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
             return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+        content = payload.get("content", "")
+        truncated_content, content_truncated = _truncate_text_to_token_budget(content, max_tokens)
         return json.dumps(
             {
                 "externalized_ref": externalized_ref,
@@ -401,7 +427,8 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                 "session_id": payload.get("session_id", ""),
                 "content_chars": payload.get("content_chars", 0),
                 "content_bytes": payload.get("content_bytes", 0),
-                "content": payload.get("content", ""),
+                "content": truncated_content,
+                "content_truncated": content_truncated,
             }
         )
 
@@ -412,8 +439,6 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     node = _get_session_node(engine, node_id)
     if node is None:
         return json.dumps({"error": f"Node {node_id} not found in current session"})
-
-    max_tokens = args.get("max_tokens", 4000)
 
     if node.source_type == "messages":
         messages = _expand_message_sources(engine, node, max_tokens=max_tokens)
@@ -450,15 +475,31 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
-    max_tokens = int(args.get("max_tokens", 2000))
-    max_results = int(args.get("max_results", 5))
+    def _parse_int_arg(name: str, default: int) -> tuple[int | None, str | None]:
+        raw_value = args.get(name, default)
+        try:
+            return int(raw_value), None
+        except (TypeError, ValueError):
+            return None, f"{name} must be an integer"
+
+    max_tokens, max_tokens_error = _parse_int_arg("max_tokens", 2000)
+    if max_tokens_error:
+        return json.dumps({"error": max_tokens_error})
+
+    max_results, max_results_error = _parse_int_arg("max_results", 5)
+    if max_results_error:
+        return json.dumps({"error": max_results_error})
+
     query = str(args.get("query") or "").strip()
     raw_node_ids = args.get("node_ids") or []
 
     nodes = []
     if raw_node_ids:
         for node_id in raw_node_ids:
-            node = _get_session_node(engine, int(node_id))
+            parsed_node_id, node_id_error = _parse_int_arg("node_ids", node_id)
+            if node_id_error:
+                return json.dumps({"error": "node_ids must contain only integers"})
+            node = _get_session_node(engine, parsed_node_id)
             if node is not None:
                 nodes.append(node)
     elif query:
@@ -537,7 +578,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     total_dag_tokens = sum(d["tokens"] for d in depths.values())
     total_source_tokens = sum(d["source_tokens"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
-    lifecycle = engine.get_status().get("lifecycle")
+    full_status = engine.get_status()
+    lifecycle = full_status.get("lifecycle")
+    source_lineage = full_status.get("source_lineage")
 
     return json.dumps({
         "session_id": session_id,
@@ -576,6 +619,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "ignored": engine._session_ignored,
             "stateless": engine._session_stateless,
         },
+        "source_lineage": source_lineage,
         "lifecycle": lifecycle,
     })
 
@@ -611,12 +655,18 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
         fts_count = engine._store._conn.execute(
-            "SELECT COUNT(*) FROM messages_fts"
+            """
+            SELECT COUNT(*)
+            FROM messages_fts
+            JOIN messages ON messages_fts.rowid = messages.store_id
+            WHERE messages.session_id = ?
+            """,
+            (session_id,),
         ).fetchone()[0]
         checks.append({
             "check": "fts_index_sync",
             "status": "pass" if fts_count >= msg_count else "warn",
-            "detail": f"{fts_count} FTS rows, {msg_count} session messages",
+            "detail": f"{fts_count} session FTS rows, {msg_count} session messages",
         })
     except Exception as e:
         checks.append({
@@ -668,7 +718,26 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "detail": config_warnings if config_warnings else "all settings within normal ranges",
     })
 
-    # 5. Context pressure
+    # 5. Source-lineage hygiene
+    try:
+        source_stats = engine._store.get_source_stats()
+        legacy_blank_messages = source_stats["legacy_blank_source_messages"]
+        checks.append({
+            "check": "source_lineage_hygiene",
+            "status": "pass" if legacy_blank_messages == 0 else "warn",
+            "detail": {
+                **source_stats,
+                "normalization_mode": "backcompat-normalization",
+            },
+        })
+    except Exception as e:
+        checks.append({
+            "check": "source_lineage_hygiene",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 6. Context pressure
     if engine.context_length > 0:
         usage_pct = round(engine.last_prompt_tokens / engine.context_length * 100, 1) if engine.context_length else 0
         threshold_pct = round(c.context_threshold * 100, 1)
