@@ -617,7 +617,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             """
             SELECT COUNT(*)
             FROM messages_fts
-            JOIN messages ON messages_fts.rowid = messages.id
+            JOIN messages ON messages_fts.rowid = messages.store_id
             WHERE messages.session_id = ?
             """,
             (session_id,),
