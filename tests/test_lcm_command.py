@@ -131,14 +131,15 @@ def test_lcm_doctor_retention_reports_old_heavy_sessions(tmp_path):
 
     assert "LCM doctor retention" in result
     assert "status: analysis-ready" in result
-    assert "sessions_analyzed: 2" in result
-    assert "stale_sessions_30d: 1" in result
-    assert "stale_sessions_90d: 1" in result
-    assert "retained_tokens_30d: 272" in result
-    assert "retained_tokens_90d: 272" in result
+    assert "sessions_analyzed: 1" in result
+    assert "stale_sessions_30d: 0" in result
+    assert "stale_sessions_90d: 0" in result
+    assert "retained_tokens_30d: 0" in result
+    assert "retained_tokens_90d: 0" in result
     assert "retention_candidates:" in result
-    assert "old-heavy | protected=no | messages=1 | nodes=1 | tokens=272" in result
     assert "live-session | protected=yes" in result
+    assert "old-heavy" not in result
+    assert "note: retention analysis is scoped to the active session only" in result
     assert "note: read-only analysis only — no rows were deleted" in result
 
 
@@ -165,10 +166,11 @@ def test_lcm_doctor_retention_counts_summary_only_sessions(tmp_path):
 
     result = handle_lcm_command("doctor retention", engine)
 
-    assert "sessions_analyzed: 1" in result
-    assert "stale_sessions_30d: 1" in result
-    assert "retained_tokens_30d: 37" in result
-    assert "summary-only | protected=no | messages=0 | nodes=1 | tokens=37" in result
+    assert "sessions_analyzed: 0" in result
+    assert "stale_sessions_30d: 0" in result
+    assert "retained_tokens_30d: 0" in result
+    assert "summary-only" not in result
+    assert "result: no stored sessions found for retention analysis" in result
 
 
 def test_lcm_doctor_retention_keeps_stale_sessions_visible_when_list_is_truncated(tmp_path):
@@ -189,8 +191,10 @@ def test_lcm_doctor_retention_keeps_stale_sessions_visible_when_list_is_truncate
 
     result = handle_lcm_command("doctor retention", engine)
 
-    assert "stale_sessions_30d: 1" in result
-    assert "stale-small | protected=no | messages=1 | nodes=0 | tokens=5" in result
+    assert "stale_sessions_30d: 0" in result
+    assert "sessions_analyzed: 0" in result
+    assert "stale-small" not in result
+    assert "result: no stored sessions found for retention analysis" in result
 
 
 def test_lcm_doctor_clean_reports_pattern_matched_junk_candidates(tmp_path):
