@@ -243,6 +243,11 @@ def compute_search_fetch_limit(limit: int, terms: List[str], phrases: List[str] 
     return base
 
 
+def compute_like_fallback_fetch_limit(limit: int, terms: List[str], phrases: List[str] | None = None) -> int:
+    """Bound LIKE fallback candidate rows before Python-side scoring/sorting."""
+    return compute_search_fetch_limit(limit, terms, phrases)
+
+
 AGE_DECAY_RATE = 0.001
 
 

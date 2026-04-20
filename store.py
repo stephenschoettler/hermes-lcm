@@ -24,6 +24,7 @@ from .search_query import (
     build_snippet,
     compute_directness_rank_bonus_upper_bound,
     compute_directness_score,
+    compute_like_fallback_fetch_limit,
     compute_search_fetch_limit,
     contains_risky_fts_ascii,
     count_term_matches,
@@ -570,9 +571,11 @@ class MessageStore:
             like_clauses.append("content LIKE ? ESCAPE '\\'")
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
+        fetch_limit = compute_like_fallback_fetch_limit(limit, terms, phrases)
+        args.append(fetch_limit)
 
         rows = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE {' AND '.join(where)}",
+            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE {' AND '.join(where)} LIMIT ?",
             args,
         ).fetchall()
         results: List[Dict[str, Any]] = []

@@ -704,6 +704,23 @@ class TestMessageStore:
         assert results[0]["store_id"] == target
         assert results[0]["snippet"]
 
+    def test_search_like_fallback_applies_sql_limit(self, store):
+        for idx in range(80):
+            store.append("sess1", {"role": "assistant", "content": f"plugin-only fallback load test {idx}"})
+
+        traced: list[str] = []
+        store._conn.set_trace_callback(traced.append)
+        try:
+            results = store.search("plugin-only", session_id="sess1", limit=2, sort="relevance")
+        finally:
+            store._conn.set_trace_callback(None)
+
+        assert len(results) == 2
+        assert any(
+            "FROM messages" in statement and "content LIKE" in statement and "LIMIT 20" in statement
+            for statement in traced
+        )
+
     def test_search_prefers_conversational_hits_over_tool_output_noise(self, store):
         user_id = store.append(
             "sess1",
@@ -1724,6 +1741,30 @@ class TestSummaryDAG:
 
         assert len(results) == 1
         assert results[0].node_id == target
+
+    def test_search_like_fallback_applies_sql_limit(self, dag):
+        for idx in range(80):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"plugin-only dag fallback load test {idx}",
+                token_count=8, source_ids=[idx + 10_000], source_type="messages",
+                created_at=1_700_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_000 + idx,
+            ))
+
+        traced: list[str] = []
+        dag._conn.set_trace_callback(traced.append)
+        try:
+            results = dag.search("plugin-only", session_id="s1", limit=2, sort="relevance")
+        finally:
+            dag._conn.set_trace_callback(None)
+
+        assert len(results) == 2
+        assert any(
+            "FROM summary_nodes" in statement and "summary LIKE" in statement and "LIMIT 20" in statement
+            for statement in traced
+        )
 
     def test_search_hybrid_clamps_future_timestamps_consistently(self, dag):
         now = time.time()
