@@ -22,6 +22,7 @@ from .db_bootstrap import (
 )
 from .search_query import (
     build_snippet,
+    compute_search_candidate_cap,
     compute_directness_rank_bonus_upper_bound,
     compute_directness_score,
     compute_search_fetch_limit,
@@ -455,10 +456,12 @@ class MessageStore:
             _MESSAGE_ROLE_BIAS_SQL,
         )
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
+        candidate_cap = compute_search_candidate_cap(limit)
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
         source_clause, source_args = _source_filter_clause("m.source", source)
         offset = 0
+        scanned_rows = 0
         results: list[Dict[str, Any]] = []
         while True:
             try:
@@ -482,6 +485,7 @@ class MessageStore:
                        ORDER BY {order_by} LIMIT ? OFFSET ?""",
                     args,
                 ).fetchall()
+                scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
                 return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
@@ -509,8 +513,14 @@ class MessageStore:
             if best_unseen_primary > worst_visible_primary:
                 return results[:limit]
 
+            if scanned_rows >= candidate_cap:
+                return results[:limit]
+
             offset += len(rows)
-            fetch_limit *= 2
+            remaining = candidate_cap - scanned_rows
+            if remaining <= 0:
+                return results[:limit]
+            fetch_limit = min(fetch_limit * 2, remaining)
 
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,

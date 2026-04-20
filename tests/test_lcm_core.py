@@ -725,6 +725,29 @@ class TestMessageStore:
 
         assert top_5 == top_50
 
+    def test_search_relevance_caps_fts_batches_for_large_single_term_pool(self, store):
+        for _ in range(5_000):
+            store.append(
+                "sess1",
+                {
+                    "role": "assistant",
+                    "content": "vendoring",
+                },
+            )
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            _ = store.search("vendoring", session_id="sess1", limit=10, sort="relevance")
+        finally:
+            store._conn.set_trace_callback(None)
+
+        fts_selects = [
+            sql for sql in statements
+            if "FROM messages_fts" in sql and "LIMIT" in sql and "OFFSET" in sql
+        ]
+        assert len(fts_selects) <= 6
+
     def test_search_relevance_prefers_assistant_over_tool_on_similar_match(self, store):
         assistant_id = store.append(
             "sess1",
@@ -1547,6 +1570,30 @@ class TestSummaryDAG:
 
         assert [node.node_id for node in results[:1]] == [direct]
         assert direct in [node.node_id for node in results]
+
+    def test_search_relevance_caps_fts_batches_for_large_single_term_pool(self, dag):
+        for idx in range(5_000):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"Summary {idx}: vendoring",
+                token_count=10, source_ids=[idx + 1], source_type="messages",
+                created_at=1_700_000_000 + idx,
+                earliest_at=1_700_000_000 + idx,
+                latest_at=1_700_000_000 + idx,
+            ))
+
+        statements: list[str] = []
+        dag._conn.set_trace_callback(statements.append)
+        try:
+            _ = dag.search("vendoring", session_id="s1", limit=10, sort="relevance")
+        finally:
+            dag._conn.set_trace_callback(None)
+
+        fts_selects = [
+            sql for sql in statements
+            if "FROM nodes_fts" in sql and "LIMIT" in sql and "OFFSET" in sql
+        ]
+        assert len(fts_selects) <= 6
 
     def test_search_relevance_prefers_direct_summary_over_risky_ascii_repetition_spam_in_like_fallback(self, dag):
         spammy = dag.add_node(SummaryNode(
