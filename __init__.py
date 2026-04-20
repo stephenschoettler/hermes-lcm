@@ -7,8 +7,16 @@ Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 """
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def register(ctx):
@@ -33,7 +41,8 @@ def register(ctx):
     ctx.register_context_engine(engine)
 
     register_command = getattr(ctx, "register_command", None)
-    if callable(register_command):
+    slash_enabled = _env_flag_enabled("LCM_ENABLE_SLASH_COMMAND", default=False)
+    if callable(register_command) and slash_enabled:
         from .command import handle_lcm_command
 
         register_command(
@@ -41,6 +50,8 @@ def register(ctx):
             lambda raw_args: handle_lcm_command(raw_args, engine),
             description="LCM status and diagnostics",
         )
+    elif callable(register_command):
+        logger.info("LCM slash command registration disabled (set LCM_ENABLE_SLASH_COMMAND=1 to enable /lcm)")
     else:
         logger.info("LCM slash command registration unavailable on this Hermes host; continuing without /lcm")
 
