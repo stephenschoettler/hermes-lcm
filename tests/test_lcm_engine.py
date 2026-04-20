@@ -2787,6 +2787,32 @@ class TestEngineTools:
         assert result["source_type"] == "externalized_payload"
         assert result["content"] == content
         assert result["tool_call_id"] == "call_big"
+        assert result["content_truncated"] is False
+
+    def test_handle_expand_externalized_ref_respects_max_tokens(self, tmp_path):
+        from hermes_lcm.tokens import count_tokens
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_payload_budget.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref, "max_tokens": 10}))
+
+        assert result["externalized_ref"] == ref
+        assert result["source_type"] == "externalized_payload"
+        assert result["content_truncated"] is True
+        assert count_tokens(result["content"]) <= 10
+        assert result["tool_call_id"] == "call_big"
 
     def test_compress_gc_rewrites_summarized_externalized_tool_results(self, tmp_path, monkeypatch):
         config = LCMConfig(
