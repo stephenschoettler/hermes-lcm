@@ -572,6 +572,28 @@ class TestMessageStore:
         assert recency_results[0]["store_id"] == newer_weak
         assert relevance_results[0]["store_id"] == older_strong
 
+    def test_search_like_fallback_applies_sql_limit_for_messages(self, store):
+        for index in range(40):
+            store.append(
+                "sess1",
+                {"role": "user", "content": f"bulk message {index} 🚀"},
+            )
+
+        statements: list[str] = []
+        store._conn.set_trace_callback(statements.append)
+        try:
+            results = store.search("🚀", session_id="sess1", limit=5, sort="relevance")
+        finally:
+            store._conn.set_trace_callback(None)
+
+        assert len(results) == 5
+        like_sql = next(
+            statement
+            for statement in statements
+            if "FROM messages" in statement and "LIKE" in statement
+        )
+        assert "LIMIT " in like_sql
+
     def test_search_hyphenated_operator_queries_fall_back_cleanly(self, store):
         target = store.append(
             "sess1",
@@ -1452,6 +1474,32 @@ class TestSummaryDAG:
 
         assert recency_results[0].node_id == newer_weak
         assert relevance_results[0].node_id == older_strong
+
+    def test_search_like_fallback_applies_sql_limit_for_summary_nodes(self, dag):
+        for index in range(40):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"bulk summary {index} 🚀",
+                token_count=4, source_ids=[index + 1], source_type="messages",
+                created_at=1_700_000_000 + index,
+                earliest_at=1_700_000_000 + index,
+                latest_at=1_700_000_000 + index,
+            ))
+
+        statements: list[str] = []
+        dag._conn.set_trace_callback(statements.append)
+        try:
+            results = dag.search("🚀", session_id="s1", limit=5, sort="relevance")
+        finally:
+            dag._conn.set_trace_callback(None)
+
+        assert len(results) == 5
+        like_sql = next(
+            statement
+            for statement in statements
+            if "FROM summary_nodes" in statement and "LIKE" in statement
+        )
+        assert "LIMIT " in like_sql
 
     def test_search_hyphenated_operator_queries_fall_back_cleanly(self, dag):
         target = dag.add_node(SummaryNode(
