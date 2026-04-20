@@ -18,18 +18,32 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          # Get the previous tag
-          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
-          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "${{ github.ref_name }}" ]; then
-            echo "body<<EOF" >> "$GITHUB_OUTPUT"
-            echo "Initial release." >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
+          CURRENT_TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$CURRENT_TAG" | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="$CURRENT_TAG"
           else
-            echo "body<<EOF" >> "$GITHUB_OUTPUT"
-            git log --pretty=format:"- %s (%h)" "$PREV_TAG".."${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-            echo "" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
+            RANGE="$PREV_TAG..$CURRENT_TAG"
           fi
+
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "Initial release." >> "$GITHUB_OUTPUT"
+          else
+            git log --pretty=format:"- %s (%h)" "$RANGE" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "## Contributors" >> "$GITHUB_OUTPUT"
+          if git shortlog -sn "$RANGE" | grep -q .; then
+            git shortlog -sn "$RANGE" | sed -E 's/^\s*([0-9]+)\s+(.+)$/- \2 (\1 commits)/' >> "$GITHUB_OUTPUT"
+          else
+            echo "- No contributors found" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
