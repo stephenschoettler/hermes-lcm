@@ -180,6 +180,34 @@ At runtime the tool list should include:
 - `lcm_status`
 - `lcm_doctor`
 
+## Troubleshooting signals
+
+### `hermes plugins` shows `lcm (not found)` but LCM tools still exist
+
+If all of these are true:
+
+- `plugins.enabled` contains `hermes-lcm`
+- `context.engine: lcm` is set
+- the runtime exposes LCM tools (or `/lcm` if enabled)
+
+then LCM itself is loaded.
+
+In that situation, a `Context Engine: lcm (not found)` line in `hermes plugins` is a **Hermes host discovery/UI issue**, not proof that `hermes-lcm` failed to load.
+
+Treat it as a host-side mismatch between the picker/status surface and the live runtime. The fix belongs in Hermes host discovery/UI, not in LCM storage or compaction logic.
+
+### `/lcm status` shows unbound / zero-looking session details right after restart
+
+Right after a fresh Hermes restart, `/lcm status` may show things like:
+
+- `session_id: (unbound)`
+- `session_platform: (unbound)`
+- `threshold_tokens: (uninitialized)`
+
+That means the current Hermes process has not yet bound LCM to a live session. It does **not** mean the database is empty or that LCM lost prior history.
+
+After restart, send one normal Hermes message first, then re-run `lcm_status` or `/lcm status` if you want live per-session fields such as `dag_nodes` and `store_messages`.
+
 ## Legacy install path
 
 Hermes still supports repo-shipped context engines under `plugins/context_engine/<name>/`, and older `hermes-lcm` installs may still live there.
@@ -233,6 +261,36 @@ Environment variables (all optional):
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Opt-in registration for `/lcm` gateway slash commands (recommended only for trusted operator contexts) |
 
 The point-8 compaction knobs are intentionally opt-in. `cache_friendly_*` is a plugin-local prompt-stability heuristic, not a claim that Hermes currently passes true prompt-cache metrics into `hermes-lcm`.
+
+### Threshold ownership when `context.engine: lcm` is active
+
+This is the easy place to get crossed wires.
+
+When Hermes is configured with:
+
+```yaml
+context:
+  engine: lcm
+```
+
+`hermes-lcm` becomes the active context engine for compaction decisions.
+
+That means:
+
+- `LCM_CONTEXT_THRESHOLD` is the threshold that LCM uses to decide when to compact
+- Hermes core `compression.threshold` belongs to the built-in `ContextCompressor`, not to LCM
+- Hermes core `compression.enabled` is still the global on/off gate for whether compaction is allowed at all, so leave it enabled when using LCM
+
+Practical rule:
+
+- if you want LCM to compact earlier or later, tune `LCM_CONTEXT_THRESHOLD`
+- do **not** expect changing Hermes `compression.threshold` to be the normal way to tune LCM behavior
+
+Important operator note:
+
+Some Hermes host builds still print the host-side compression percentage in startup/status surfaces even when LCM is the active engine. If that printed percentage disagrees with LCM, trust live LCM runtime status (`lcm_status` or `/lcm status`) after a normal message has initialized the session, not the startup banner text.
+
+If raising Hermes `compression.threshold` seems to change LCM behavior materially, that usually points to host-version confusion, a misleading host status surface, or another Hermes-side integration issue — not to the intended LCM threshold contract.
 
 ### Large tool-output handling
 
