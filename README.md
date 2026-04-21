@@ -387,9 +387,11 @@ No Hermes Agent checkout required — the test suite includes a lightweight ABC 
 
 Requires the **pluggable context engine slot** — an ABC (`ContextEngine`) in
 hermes-agent core that makes the `ContextCompressor` swappable via the plugin
-system. Config-driven selection via `context.engine` in config.yaml, with a
-`plugins/context_engine/` discovery directory. Same pattern as OpenClaw's
-`contextEngine` slot + `lossless-claw`.
+system. Config-driven selection still happens via `context.engine` in
+`config.yaml`, but standalone installs now come from the canonical general-plugin
+path `~/.hermes/plugins/hermes-lcm` rather than the older in-repo
+`plugins/context_engine/` layout. Same pattern as OpenClaw's `contextEngine`
+slot + `lossless-claw`.
 
 - **PR:** [NousResearch/hermes-agent#7464](https://github.com/NousResearch/hermes-agent/pull/7464) (supersedes [#6126](https://github.com/NousResearch/hermes-agent/pull/6126), [#5700](https://github.com/NousResearch/hermes-agent/pull/5700))
 - **Issue:** [NousResearch/hermes-agent#5701](https://github.com/NousResearch/hermes-agent/issues/5701) (closed by #7464)
