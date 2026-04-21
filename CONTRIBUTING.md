@@ -92,9 +92,10 @@ Do **not** claim behavior that is only partially implemented. If a filter, featu
 Default validation for code changes:
 
 ```bash
-pytest tests/test_lcm_core.py tests/test_lcm_engine.py -q
+pytest tests/test_lcm_core.py tests/test_lcm_engine.py tests/test_packaging_install.py -q
 pytest -q
 python -m compileall -q .
+bash -n scripts/install.sh scripts/update.sh
 git diff --check
 ```
 
@@ -102,6 +103,16 @@ If your PR only touches a narrow surface area, include the focused command too. 
 
 ```bash
 pytest tests/test_lcm_command.py -q
+```
+
+Packaging or install-flow changes should also verify the standalone user-plugin path:
+
+```bash
+export HERMES_HOME=/tmp/hermes-lcm-smoke
+mkdir -p "$HERMES_HOME/plugins"
+git clone https://github.com/stephenschoettler/hermes-lcm "$HERMES_HOME/plugins/hermes-lcm"
+# then enable `hermes-lcm` in plugins.enabled and set context.engine: lcm
+hermes plugins
 ```
 
 If you skip part of the default validation, explain why in the PR body.
