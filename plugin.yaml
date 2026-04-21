@@ -1,5 +1,5 @@
 name: hermes-lcm
-version: 0.6.0
+version: 0.7.0
 description: "Lossless Context Management — standalone Hermes plugin with a DAG-based context engine that never loses a message"
 author: "Voltropy / Hermes Community"
 provides_tools:
