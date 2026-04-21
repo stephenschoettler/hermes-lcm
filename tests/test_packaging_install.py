@@ -1,8 +1,6 @@
 from pathlib import Path
 import subprocess
 
-import yaml
-
 
 def _install_repo_as_user_plugin(tmp_path: Path) -> Path:
     repo_root = Path(__file__).resolve().parent.parent
@@ -11,12 +9,11 @@ def _install_repo_as_user_plugin(tmp_path: Path) -> Path:
     plugin_dir.parent.mkdir(parents=True, exist_ok=True)
     plugin_dir.symlink_to(repo_root, target_is_directory=True)
     (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "plugins": {"enabled": ["hermes-lcm"]},
-                "context": {"engine": "lcm"},
-            }
-        ),
+        "plugins:\n"
+        "  enabled:\n"
+        "    - hermes-lcm\n"
+        "context:\n"
+        "  engine: lcm\n",
         encoding="utf-8",
     )
     return hermes_home
