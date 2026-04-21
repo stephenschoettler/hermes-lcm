@@ -81,47 +81,87 @@ That is why LCM positioning should focus on **retrieval quality, autonomy, and d
 
 ## Install
 
-```bash
-# Clone into the context engine plugin directory
-git clone https://github.com/stephenschoettler/hermes-lcm \
-  ~/.hermes/hermes-agent/plugins/context_engine/lcm
-
-# Or for a specific profile
-git clone https://github.com/stephenschoettler/hermes-lcm \
-  ~/.hermes/profiles/myprofile/hermes-agent/plugins/context_engine/lcm
-```
-
-## Update
+Canonical install path: clone `hermes-lcm` as a **general user plugin**.
 
 ```bash
-cd ~/.hermes/hermes-agent/plugins/context_engine/lcm && git pull
+git clone https://github.com/stephenschoettler/hermes-lcm \
+  ~/.hermes/plugins/hermes-lcm
 ```
 
-Restart Hermes after updating.
+For a profile-specific install:
 
-> **Note:** Context engines must be installed under `plugins/context_engine/<name>/`,
-> not `plugins/<name>/`. The general `~/.hermes/plugins/` directory is for tools,
-> hooks, and CLI extensions — context engines are discovered separately.
-
-Restart Hermes. Activate the engine — either via the interactive UI or config file:
-
-**Option A — `hermes plugins` UI:**
-
-```
-hermes plugins
+```bash
+git clone https://github.com/stephenschoettler/hermes-lcm \
+  ~/.hermes/profiles/myprofile/plugins/hermes-lcm
 ```
 
-The composite plugins screen shows provider categories at the bottom.
-Select **Context Engine** and pick `lcm` from the radiolist.
+Or, from an existing checkout, install a symlink with the helper script:
 
-**Option B — config.yaml:**
+```bash
+./scripts/install.sh
+# Optional profile-aware install:
+HERMES_PROFILE=myprofile ./scripts/install.sh
+```
+
+## Activation
+
+This install path uses **two names**:
+
+- plugin manifest name: `hermes-lcm`
+- runtime context engine name: `lcm`
+
+Your config must include both:
 
 ```yaml
+plugins:
+  enabled:
+    - hermes-lcm
+
 context:
   engine: lcm
 ```
 
-Verify with `hermes plugins`:
+Why both matter:
+
+- `plugins.enabled` loads the standalone plugin from `~/.hermes/plugins/hermes-lcm`
+- `context.engine: lcm` selects the registered context engine at runtime
+
+## Update
+
+If you cloned directly into the final plugin directory:
+
+```bash
+cd ~/.hermes/plugins/hermes-lcm && git pull --ff-only
+```
+
+For a profile-specific install:
+
+```bash
+cd ~/.hermes/profiles/myprofile/plugins/hermes-lcm && git pull --ff-only
+```
+
+If you used the helper scripts from a separate checkout:
+
+```bash
+./scripts/update.sh
+```
+
+Restart Hermes after updating.
+
+## Verification
+
+Run:
+
+```bash
+hermes plugins
+```
+
+Expected signals:
+
+- the plugin list includes `hermes-lcm`
+- the selected context engine is `lcm`
+
+Typical output looks like:
 
 ```
 Plugins (1):
@@ -129,6 +169,38 @@ Plugins (1):
 
 Provider Plugins:
   Context Engine: lcm
+```
+
+At runtime the tool list should include:
+
+- `lcm_grep`
+- `lcm_describe`
+- `lcm_expand`
+- `lcm_expand_query`
+- `lcm_status`
+- `lcm_doctor`
+
+## Legacy install path
+
+Hermes still supports repo-shipped context engines under `plugins/context_engine/<name>/`, and older `hermes-lcm` installs may still live there.
+
+That path is now a compatibility fallback, not the preferred install model. The standalone general-plugin path above is canonical because it survives Hermes updates cleanly.
+
+If you are migrating an older install, move the checkout and then enable the plugin explicitly:
+
+```bash
+mv ~/.hermes/hermes-agent/plugins/context_engine/lcm ~/.hermes/plugins/hermes-lcm
+```
+
+Then make sure your config includes:
+
+```yaml
+plugins:
+  enabled:
+    - hermes-lcm
+
+context:
+  engine: lcm
 ```
 
 ## Configuration
