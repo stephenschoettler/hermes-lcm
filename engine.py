@@ -536,13 +536,29 @@ class LCMEngine(ContextEngine):
         if self._has_raw_backlog_debt():
             self._lifecycle.clear_debt(self._conversation_id)
 
-    def on_session_start(self, session_id: str, **kwargs) -> None:
-        self._session_id = session_id
-        self._session_platform = str(kwargs.get("platform") or "")
-        self._ingest_cursor = 0
+    def _reset_session_scoped_runtime_state(self) -> None:
+        self.compression_count = 0
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
         self._last_compacted_store_id = 0
+        self._ingest_cursor = 0
+        self._context_probed = False
+        self._context_probe_persistable = False
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+
+    def on_session_start(self, session_id: str, **kwargs) -> None:
+        previous_session_id = self._session_id
+        if previous_session_id and previous_session_id != session_id:
+            self._reset_session_scoped_runtime_state()
+        else:
+            self._ingest_cursor = 0
+            self._last_compacted_store_id = 0
+            self._last_overflow_recovery_failed = False
+            self._last_condensation_suppressed_reason = ""
+        self._session_id = session_id
+        self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
