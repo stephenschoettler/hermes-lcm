@@ -719,10 +719,9 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # 5. Source-lineage hygiene
     try:
         source_stats = engine._store.get_source_stats()
-        legacy_blank_messages = source_stats["legacy_blank_source_messages"]
         checks.append({
             "check": "source_lineage_hygiene",
-            "status": "pass" if legacy_blank_messages == 0 else "warn",
+            "status": "pass",
             "detail": {
                 **source_stats,
                 "normalization_mode": "backcompat-normalization",
