@@ -252,7 +252,7 @@ Environment variables (all optional):
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Character threshold above which tool results are externalized |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH` | `~/.hermes/lcm-large-outputs` | Override storage directory for externalized payloads |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Opt-in rewrite of already-externalized summarized tool-result transcript rows to compact GC placeholders |
-| `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization. Direct provider prefixes such as `cerebras/gpt-oss-120b` route as `provider=cerebras`, `model=gpt-oss-120b`; aggregator model slugs such as `meta-llama/...` stay model-only. |
+| `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization. The explicit direct prefix `cerebras/gpt-oss-120b` routes as `provider=cerebras`, `model=gpt-oss-120b`; aggregator model slugs such as `meta-llama/...` and `anthropic/...` stay model-only. |
 | `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis. Supports the same provider-prefixed routing as `LCM_SUMMARY_MODEL`. |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |

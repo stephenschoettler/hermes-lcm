@@ -11,30 +11,11 @@ class ModelRoute:
     model: str
 
 
-# Conservative allowlist: only split prefixes that are intended to be Hermes
-# provider IDs in LCM overrides. Do not infer from arbitrary model namespaces,
-# because aggregator slugs such as ``meta-llama/...`` and ``google/...`` must
-# remain model-only overrides.
-_PROVIDER_PREFIXES = frozenset(
-    {
-        "alibaba",
-        "anthropic",
-        "arcee",
-        "cerebras",
-        "deepseek",
-        "gemini",
-        "kimi-for-coding",
-        "minimax",
-        "minimax-cn",
-        "nous",
-        "nvidia",
-        "openrouter",
-        "stepfun",
-        "xai",
-        "xiaomi",
-        "zai",
-    }
-)
+# Conservative allowlist: only split prefixes explicitly supported by LCM
+# overrides. Do not infer from arbitrary provider names, because many Hermes
+# provider IDs are also valid OpenRouter model namespaces, for example
+# ``anthropic/...``, ``deepseek/...``, ``google/...``, and ``x-ai/...``.
+_PROVIDER_PREFIXES = frozenset({"cerebras"})
 
 
 def parse_lcm_model_override(value: str | None) -> ModelRoute:

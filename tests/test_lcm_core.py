@@ -51,6 +51,14 @@ class TestModelRouting:
         assert route.provider is None
         assert route.model == "google/gemini-3-flash-preview"
 
+    def test_anthropic_namespace_slug_stays_model_only(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override("anthropic/claude-sonnet-4.5")
+
+        assert route.provider is None
+        assert route.model == "anthropic/claude-sonnet-4.5"
+
 
 class TestProviderPrefixedAuxiliaryCalls:
     def _fake_response(self, content="ok"):
