@@ -11,6 +11,7 @@ import inspect
 import logging
 from typing import List, Optional
 
+from .model_routing import apply_lcm_model_route
 from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -27,8 +28,7 @@ def _call_llm_for_summary(prompt: str, max_tokens: int,
             "temperature": 0.3,
             "max_tokens": max_tokens,
         }
-        if model:
-            call_kwargs["model"] = model
+        apply_lcm_model_route(call_kwargs, model)
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)

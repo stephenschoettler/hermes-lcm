@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,116 @@ from hermes_lcm.session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+
+
+class TestModelRouting:
+    def test_provider_prefixed_direct_model_is_split(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override("cerebras/gpt-oss-120b")
+
+        assert route.provider == "cerebras"
+        assert route.model == "gpt-oss-120b"
+
+    def test_openrouter_organization_slug_stays_model_only(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override("meta-llama/Llama-3.3-70B-Instruct")
+
+        assert route.provider is None
+        assert route.model == "meta-llama/Llama-3.3-70B-Instruct"
+
+    def test_google_namespace_slug_stays_model_only(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override("google/gemini-3-flash-preview")
+
+        assert route.provider is None
+        assert route.model == "google/gemini-3-flash-preview"
+
+
+class TestProviderPrefixedAuxiliaryCalls:
+    def _fake_response(self, content="ok"):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    def test_summary_call_passes_provider_and_stripped_model(self, monkeypatch):
+        import agent.auxiliary_client as auxiliary_client
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+
+        result = _call_llm_for_summary("summarize", 200, model="cerebras/gpt-oss-120b")
+
+        assert result == "summary"
+        assert seen["provider"] == "cerebras"
+        assert seen["model"] == "gpt-oss-120b"
+
+    def test_summary_call_keeps_openrouter_slug_as_model_only(self, monkeypatch):
+        import agent.auxiliary_client as auxiliary_client
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+
+        _call_llm_for_summary("summarize", 200, model="meta-llama/Llama-3.3-70B-Instruct")
+
+        assert "provider" not in seen
+        assert seen["model"] == "meta-llama/Llama-3.3-70B-Instruct"
+
+    def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
+        import agent.auxiliary_client as auxiliary_client
+        from hermes_lcm.extraction import _call_extraction_llm
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("- decision")
+
+        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+
+        result = _call_extraction_llm("extract", model="cerebras/gpt-oss-120b")
+
+        assert result == "- decision"
+        assert seen["provider"] == "cerebras"
+        assert seen["model"] == "gpt-oss-120b"
+
+    def test_expansion_call_passes_provider_and_stripped_model(self, monkeypatch):
+        import agent.auxiliary_client as auxiliary_client
+        from hermes_lcm.tools import _synthesize_expansion_answer
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("answer")
+
+        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+
+        result = _synthesize_expansion_answer(
+            prompt="question",
+            context_blocks=[{"content": "context"}],
+            model="cerebras/gpt-oss-120b",
+            max_tokens=300,
+            timeout=12,
+        )
+
+        assert result == "answer"
+        assert seen["provider"] == "cerebras"
+        assert seen["model"] == "gpt-oss-120b"
 
 
 class TestConfig:

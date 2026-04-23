@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .model_routing import apply_lcm_model_route
+
 logger = logging.getLogger(__name__)
 
 _MEDIA_DATA_URI_RE = re.compile(
@@ -52,8 +54,7 @@ def _call_extraction_llm(prompt: str, model: str = "",
             "temperature": 0.2,
             "max_tokens": 2000,
         }
-        if model:
-            call_kwargs["model"] = model
+        apply_lcm_model_route(call_kwargs, model)
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
