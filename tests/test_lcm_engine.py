@@ -96,6 +96,27 @@ class TestEngineABC:
         assert engine.compression_count == 0
         assert engine.last_prompt_tokens == 0
 
+    def test_on_session_start_resets_session_scoped_runtime_when_binding_new_session(self, engine):
+        engine.compression_count = 5
+        engine.last_prompt_tokens = 9999
+        engine.last_completion_tokens = 333
+        engine.last_total_tokens = 10332
+        engine._last_compacted_store_id = 42
+        engine._ingest_cursor = 7
+        engine._context_probed = True
+        engine._context_probe_persistable = True
+        engine.on_session_start("fresh-session", platform="telegram", context_length=200000)
+
+        assert engine._session_id == "fresh-session"
+        assert engine.compression_count == 0
+        assert engine.last_prompt_tokens == 0
+        assert engine.last_completion_tokens == 0
+        assert engine.last_total_tokens == 0
+        assert engine._last_compacted_store_id == 0
+        assert engine._ingest_cursor == 0
+        assert engine._context_probed is False
+        assert engine._context_probe_persistable is False
+
     def test_get_status(self, engine):
         status = engine.get_status()
         assert status["engine"] == "lcm"
