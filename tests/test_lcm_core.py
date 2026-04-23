@@ -2,10 +2,11 @@
 
 import json
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -57,8 +58,12 @@ class TestProviderPrefixedAuxiliaryCalls:
             choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
         )
 
+    def _install_fake_auxiliary_client(self, monkeypatch, fake_call_llm):
+        auxiliary_client = ModuleType("agent.auxiliary_client")
+        auxiliary_client.call_llm = fake_call_llm
+        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary_client)
+
     def test_summary_call_passes_provider_and_stripped_model(self, monkeypatch):
-        import agent.auxiliary_client as auxiliary_client
         from hermes_lcm.escalation import _call_llm_for_summary
 
         seen = {}
@@ -67,7 +72,7 @@ class TestProviderPrefixedAuxiliaryCalls:
             seen.update(kwargs)
             return self._fake_response("summary")
 
-        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
 
         result = _call_llm_for_summary("summarize", 200, model="cerebras/gpt-oss-120b")
 
@@ -76,7 +81,6 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert seen["model"] == "gpt-oss-120b"
 
     def test_summary_call_keeps_openrouter_slug_as_model_only(self, monkeypatch):
-        import agent.auxiliary_client as auxiliary_client
         from hermes_lcm.escalation import _call_llm_for_summary
 
         seen = {}
@@ -85,7 +89,7 @@ class TestProviderPrefixedAuxiliaryCalls:
             seen.update(kwargs)
             return self._fake_response("summary")
 
-        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
 
         _call_llm_for_summary("summarize", 200, model="meta-llama/Llama-3.3-70B-Instruct")
 
@@ -93,7 +97,6 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert seen["model"] == "meta-llama/Llama-3.3-70B-Instruct"
 
     def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
-        import agent.auxiliary_client as auxiliary_client
         from hermes_lcm.extraction import _call_extraction_llm
 
         seen = {}
@@ -102,7 +105,7 @@ class TestProviderPrefixedAuxiliaryCalls:
             seen.update(kwargs)
             return self._fake_response("- decision")
 
-        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
 
         result = _call_extraction_llm("extract", model="cerebras/gpt-oss-120b")
 
@@ -111,7 +114,6 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert seen["model"] == "gpt-oss-120b"
 
     def test_expansion_call_passes_provider_and_stripped_model(self, monkeypatch):
-        import agent.auxiliary_client as auxiliary_client
         from hermes_lcm.tools import _synthesize_expansion_answer
 
         seen = {}
@@ -120,7 +122,7 @@ class TestProviderPrefixedAuxiliaryCalls:
             seen.update(kwargs)
             return self._fake_response("answer")
 
-        monkeypatch.setattr(auxiliary_client, "call_llm", fake_call_llm)
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
 
         result = _synthesize_expansion_answer(
             prompt="question",
