@@ -120,7 +120,7 @@ def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path
     assert "/lcm backup" in result
 
 
-def test_lcm_doctor_reports_legacy_blank_source_observation_and_action(engine):
+def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):
     engine._store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
     engine._store.append("sess-unknown", {"role": "user", "content": "unknown message"})
     engine._store._conn.execute(
@@ -133,10 +133,12 @@ def test_lcm_doctor_reports_legacy_blank_source_observation_and_action(engine):
 
     result = handle_lcm_command("doctor", engine)
 
+    assert "status: ok" in result
     assert "source_lineage:" in result
     assert "legacy_blank=1" in result
     assert "effective_unknown=2" in result
-    assert "review legacy blank-source rows before any destructive cleanup" in result
+    assert "recommended_actions:\n- none" in result
+    assert "review legacy blank-source rows before any destructive cleanup" not in result
 
 
 def test_lcm_help_on_unknown_subcommand(engine):

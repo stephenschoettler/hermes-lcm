@@ -3280,6 +3280,22 @@ class TestEngineTools:
         assert "config_validation" in check_names
         assert all(c["status"] == "pass" for c in result["checks"])
 
+    def test_handle_doctor_treats_legacy_blank_source_rows_as_healthy(self, engine):
+        engine._store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy-session", "", "user", "legacy blank source", None, None, None, 1.0, 5, 0),
+        )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        assert result["overall"] == "healthy"
+        lineage_check = next(c for c in result["checks"] if c["check"] == "source_lineage_hygiene")
+        assert lineage_check["status"] == "pass"
+        assert lineage_check["detail"]["legacy_blank_source_messages"] == 1
+
     def test_handle_doctor_warns_on_bad_config(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_doctor.db"),

@@ -488,8 +488,9 @@ def _doctor_text(engine) -> str:
     if source_stats.get("error"):
         observations.append(f"source_lineage_error: {source_stats['error']}")
     if source_stats["legacy_blank_source_messages"]:
-        recommended_actions.append("review legacy blank-source rows before any destructive cleanup or migration step")
-        recommended_actions.append("treat `source=unknown` as the back-compat filter until legacy blank-source rows are normalized")
+        observations.append(
+            "legacy blank-source rows are normalized as `source=unknown` for back-compat filters"
+        )
 
     if clean_scan.get("protected_count"):
         observations.append(
