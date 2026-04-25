@@ -495,8 +495,9 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     nodes = []
     if raw_node_ids:
         for node_id in raw_node_ids:
-            parsed_node_id, node_id_error = _parse_int_arg("node_ids", node_id)
-            if node_id_error:
+            try:
+                parsed_node_id = int(node_id)
+            except (TypeError, ValueError):
                 return json.dumps({"error": "node_ids must contain only integers"})
             node = _get_session_node(engine, parsed_node_id)
             if node is not None:

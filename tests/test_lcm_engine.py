@@ -3371,6 +3371,37 @@ class TestEngineTools:
 
         assert result["error"] == "node_ids must contain only integers"
 
+    def test_handle_expand_query_accepts_valid_integer_node_ids(self, engine, monkeypatch):
+        engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Docker rollout summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            return "Expansion answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"node_ids": [node_id], "prompt": "What was the plan?"},
+            )
+        )
+
+        assert "error" not in result, f"unexpected error: {result.get('error')}"
+        assert result["answer"] == "Expansion answer"
+        assert result["node_ids"] == [node_id]
+
     def test_describe_and_expand_are_session_scoped(self, engine):
         node_id = engine._dag.add_node(
             SummaryNode(
