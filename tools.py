@@ -13,6 +13,7 @@ from .externalize import (
     load_externalized_payload,
 )
 from .extraction import sanitize_pre_compaction_content
+from .model_routing import apply_lcm_model_route
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 
 if TYPE_CHECKING:
@@ -231,8 +232,7 @@ def _synthesize_expansion_answer(
         "max_tokens": max_tokens,
         "timeout": timeout,
     }
-    if model:
-        call_kwargs["model"] = model
+    apply_lcm_model_route(call_kwargs, model)
     response = call_llm(**call_kwargs)
     content = response.choices[0].message.content
     if not isinstance(content, str):

@@ -252,8 +252,8 @@ Environment variables (all optional):
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Character threshold above which tool results are externalized |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH` | `~/.hermes/lcm-large-outputs` | Override storage directory for externalized payloads |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Opt-in rewrite of already-externalized summarized tool-result transcript rows to compact GC placeholders |
-| `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization |
-| `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis |
+| `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization. Slash-bearing aggregator model slugs such as `meta-llama/...`, `anthropic/...`, and unresolved `cerebras/...` stay model-only. |
+| `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis. Uses the same routing rules as `LCM_SUMMARY_MODEL`. |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
@@ -261,6 +261,8 @@ Environment variables (all optional):
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Opt-in registration for `/lcm` gateway slash commands (recommended only for trusted operator contexts) |
 
 The point-8 compaction knobs are intentionally opt-in. `cache_friendly_*` is a plugin-local prompt-stability heuristic, not a claim that Hermes currently passes true prompt-cache metrics into `hermes-lcm`.
+
+Provider-prefixed LCM model overrides are conservative. `cerebras/gpt-oss-120b` routes as `provider=cerebras`, `model=gpt-oss-120b` only when the Hermes host can resolve `cerebras` as a built-in provider or as a named custom provider in `providers:` / `custom_providers`. If not, it remains `model=cerebras/gpt-oss-120b` so aggregator-style slugs do not accidentally become unknown direct providers.
 
 ### Threshold ownership when `context.engine: lcm` is active
 
