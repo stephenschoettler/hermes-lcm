@@ -27,10 +27,24 @@ from hermes_lcm.session_patterns import (
 
 
 class TestModelRouting:
-    def test_provider_prefixed_direct_model_is_split(self):
+    def test_provider_prefixed_model_stays_model_only_when_provider_unresolved(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
-        route = parse_lcm_model_override("cerebras/gpt-oss-120b")
+        route = parse_lcm_model_override(
+            "cerebras/gpt-oss-120b",
+            provider_resolver=lambda _provider: False,
+        )
+
+        assert route.provider is None
+        assert route.model == "cerebras/gpt-oss-120b"
+
+    def test_provider_prefixed_direct_model_is_split_when_provider_resolves(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override(
+            "cerebras/gpt-oss-120b",
+            provider_resolver=lambda provider: provider == "cerebras",
+        )
 
         assert route.provider == "cerebras"
         assert route.model == "gpt-oss-120b"
@@ -71,7 +85,47 @@ class TestProviderPrefixedAuxiliaryCalls:
         auxiliary_client.call_llm = fake_call_llm
         monkeypatch.setitem(sys.modules, "agent.auxiliary_client", auxiliary_client)
 
+    def _install_fake_cerebras_provider(self, monkeypatch):
+        hermes_cli = ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+
+        runtime_provider = ModuleType("hermes_cli.runtime_provider")
+
+        def fake_get_named_custom_provider(provider):
+            if provider == "cerebras":
+                return {"name": "cerebras", "base_url": "https://api.cerebras.ai/v1"}
+            return None
+
+        runtime_provider._get_named_custom_provider = fake_get_named_custom_provider
+
+        auth = ModuleType("hermes_cli.auth")
+        auth.PROVIDER_REGISTRY = {}
+
+        hermes_cli.runtime_provider = runtime_provider
+        hermes_cli.auth = auth
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
     def test_summary_call_passes_provider_and_stripped_model(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        self._install_fake_cerebras_provider(monkeypatch)
+
+        result = _call_llm_for_summary("summarize", 200, model="cerebras/gpt-oss-120b")
+
+        assert result == "summary"
+        assert seen["provider"] == "cerebras"
+        assert seen["model"] == "gpt-oss-120b"
+
+    def test_summary_call_keeps_unresolved_direct_slug_model_only(self, monkeypatch):
         from hermes_lcm.escalation import _call_llm_for_summary
 
         seen = {}
@@ -85,8 +139,8 @@ class TestProviderPrefixedAuxiliaryCalls:
         result = _call_llm_for_summary("summarize", 200, model="cerebras/gpt-oss-120b")
 
         assert result == "summary"
-        assert seen["provider"] == "cerebras"
-        assert seen["model"] == "gpt-oss-120b"
+        assert "provider" not in seen
+        assert seen["model"] == "cerebras/gpt-oss-120b"
 
     def test_summary_call_keeps_openrouter_slug_as_model_only(self, monkeypatch):
         from hermes_lcm.escalation import _call_llm_for_summary
@@ -114,6 +168,7 @@ class TestProviderPrefixedAuxiliaryCalls:
             return self._fake_response("- decision")
 
         self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        self._install_fake_cerebras_provider(monkeypatch)
 
         result = _call_extraction_llm("extract", model="cerebras/gpt-oss-120b")
 
@@ -131,6 +186,7 @@ class TestProviderPrefixedAuxiliaryCalls:
             return self._fake_response("answer")
 
         self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        self._install_fake_cerebras_provider(monkeypatch)
 
         result = _synthesize_expansion_answer(
             prompt="question",
