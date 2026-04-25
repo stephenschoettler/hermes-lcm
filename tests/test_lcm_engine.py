@@ -28,6 +28,93 @@ def engine(tmp_path):
     return e
 
 
+class TestEscalationStripReasoning:
+    """Regression tests for thinking-model reasoning-tag stripping in
+    escalation._call_llm_for_summary. Some thinking models (MiniMax-M2.7,
+    GLM-5.1, Qwen QwQ, DeepSeek R1) inline reasoning inside <think>...</think>
+    blocks within message.content; without stripping, the reasoning text gets
+    persisted as the summary node and confuses downstream lcm_expand_query."""
+
+    def test_strip_reasoning_blocks_handles_each_supported_tag(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        cases = [
+            ("<think>internal reasoning</think>final summary", "final summary"),
+            ("<thinking>plan</thinking>actual content", "actual content"),
+            ("<reasoning>scratch</reasoning>output", "output"),
+            ("<thought>idea</thought>summary text", "summary text"),
+            ("<REASONING_SCRATCHPAD>foo</REASONING_SCRATCHPAD>bar", "bar"),
+            ("multi\n<think>line\nblock</think>\nrest", "multi\n\nrest"),
+            ("plain text without tags", "plain text without tags"),
+            ("", ""),
+        ]
+        for raw, expected in cases:
+            got = _strip_reasoning_blocks(raw)
+            assert got == expected, f"input={raw!r} expected={expected!r} got={got!r}"
+
+    def test_strip_reasoning_blocks_is_idempotent(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        once = _strip_reasoning_blocks("<think>foo</think>bar")
+        twice = _strip_reasoning_blocks(once)
+        assert once == twice == "bar"
+
+    def test_strip_reasoning_blocks_handles_multiple_blocks(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        raw = "<think>a</think>visible1<think>b</think>visible2"
+        assert _strip_reasoning_blocks(raw) == "visible1visible2"
+
+    def test_strip_reasoning_blocks_preserves_content_with_unrelated_angle_brackets(self):
+        from hermes_lcm.escalation import _strip_reasoning_blocks
+
+        raw = "Decision: x < y, and config <foo> stays"
+        assert _strip_reasoning_blocks(raw) == raw
+
+    def test_call_llm_for_summary_strips_reasoning_from_response(self, monkeypatch):
+        """Integration: when the auxiliary LLM returns reasoning-contaminated
+        content, _call_llm_for_summary returns the stripped summary text."""
+        import hermes_lcm.escalation as esc
+
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        contaminated = (
+            "<think>The user asks me to compress this into bullet points. "
+            "I should focus on decisions, files, errors, current state...</think>"
+            "Summary: docker rollout completed. Auth migration pending review."
+        )
+
+        def fake_call_llm(**kwargs):
+            return _FakeResponse(contaminated)
+
+        # Patch the import inside _call_llm_for_summary by monkeypatching the
+        # module the function imports from at call time.
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "call_llm", fake_call_llm)
+
+        result = esc._call_llm_for_summary(
+            prompt="please summarize",
+            max_tokens=200,
+            model="any",
+            timeout=10.0,
+        )
+
+        assert result is not None
+        assert "<think>" not in result
+        assert "</think>" not in result
+        assert "Summary: docker rollout completed" in result
+
+
 class TestEngineABC:
     def test_is_context_engine(self, engine):
         assert isinstance(engine, ContextEngine)
