@@ -115,6 +115,52 @@ class TestEscalationStripReasoning:
         assert "Summary: docker rollout completed" in result
 
 
+    def test_synthesize_expansion_answer_strips_reasoning_from_response(self, monkeypatch):
+        """Integration: lcm_expand_query routes through
+        tools._synthesize_expansion_answer, which is a separate LLM call path
+        from _call_llm_for_summary. Both must strip reasoning blocks before
+        returning, otherwise expand_query answers leak the model's internal
+        reasoning back to the caller."""
+        import hermes_lcm.tools as tools_mod
+
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        contaminated = (
+            "<think>The user is asking what was discussed. Let me look at the "
+            "context blocks and synthesize an answer...</think>"
+            "We discussed the docker rollout plan and auth migration."
+        )
+
+        def fake_call_llm(**kwargs):
+            return _FakeResponse(contaminated)
+
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "call_llm", fake_call_llm)
+
+        result = tools_mod._synthesize_expansion_answer(
+            prompt="What was discussed?",
+            context_blocks=[{"role": "user", "content": "ignored in fake"}],
+            model="any",
+            max_tokens=200,
+            timeout=10.0,
+        )
+
+        assert result is not None
+        assert "<think>" not in result
+        assert "</think>" not in result
+        assert "We discussed the docker rollout plan" in result
+
+
 class TestEngineABC:
     def test_is_context_engine(self, engine):
         assert isinstance(engine, ContextEngine)

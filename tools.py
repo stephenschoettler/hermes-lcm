@@ -237,7 +237,8 @@ def _synthesize_expansion_answer(
     content = response.choices[0].message.content
     if not isinstance(content, str):
         content = str(content) if content else ""
-    return content.strip()
+    from .escalation import _strip_reasoning_blocks
+    return _strip_reasoning_blocks(content).strip()
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
