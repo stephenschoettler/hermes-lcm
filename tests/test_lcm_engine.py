@@ -35,6 +35,20 @@ class TestEscalationStripReasoning:
     blocks within message.content; without stripping, the reasoning text gets
     persisted as the summary node and confuses downstream lcm_expand_query."""
 
+    def _install_fake_auxiliary_client(self, monkeypatch, fake_call_llm):
+        """Install a minimal agent.auxiliary_client module for CI, where the
+        hermes-agent package is only stubbed enough for ContextEngine tests."""
+        import sys
+        import types
+
+        agent_mod = sys.modules.get("agent") or types.ModuleType("agent")
+        aux_mod = types.ModuleType("agent.auxiliary_client")
+        aux_mod.call_llm = fake_call_llm
+        agent_mod.auxiliary_client = aux_mod
+        monkeypatch.setitem(sys.modules, "agent", agent_mod)
+        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", aux_mod)
+        return aux_mod
+
     def test_strip_reasoning_blocks_handles_each_supported_tag(self):
         from hermes_lcm.escalation import _strip_reasoning_blocks
 
@@ -97,10 +111,9 @@ class TestEscalationStripReasoning:
         def fake_call_llm(**kwargs):
             return _FakeResponse(contaminated)
 
-        # Patch the import inside _call_llm_for_summary by monkeypatching the
+        # Patch the import inside _call_llm_for_summary by providing the
         # module the function imports from at call time.
-        import agent.auxiliary_client as aux
-        monkeypatch.setattr(aux, "call_llm", fake_call_llm)
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
 
         result = esc._call_llm_for_summary(
             prompt="please summarize",
@@ -144,8 +157,7 @@ class TestEscalationStripReasoning:
         def fake_call_llm(**kwargs):
             return _FakeResponse(contaminated)
 
-        import agent.auxiliary_client as aux
-        monkeypatch.setattr(aux, "call_llm", fake_call_llm)
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
 
         result = tools_mod._synthesize_expansion_answer(
             prompt="What was discussed?",
@@ -193,8 +205,7 @@ class TestEscalationStripReasoning:
         def fake_call_llm(**kwargs):
             return _FakeResponse(contaminated)
 
-        import agent.auxiliary_client as aux
-        monkeypatch.setattr(aux, "call_llm", fake_call_llm)
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
 
         result = extr._call_extraction_llm(
             prompt="extract decisions",
