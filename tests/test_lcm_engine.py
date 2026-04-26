@@ -161,6 +161,53 @@ class TestEscalationStripReasoning:
         assert "We discussed the docker rollout plan" in result
 
 
+    def test_call_extraction_llm_strips_reasoning_from_response(self, monkeypatch):
+        """Integration: pre-compaction extraction routes through
+        extraction._call_extraction_llm, the third LLM call path on top of
+        _call_llm_for_summary (escalation) and _synthesize_expansion_answer
+        (tools). All three must strip reasoning blocks before returning,
+        otherwise the daily extraction .md file ends up with the model's
+        internal reasoning instead of clean bullet points."""
+        import hermes_lcm.extraction as extr
+
+        class _FakeMessage:
+            def __init__(self, content):
+                self.content = content
+
+        class _FakeChoice:
+            def __init__(self, content):
+                self.message = _FakeMessage(content)
+
+        class _FakeResponse:
+            def __init__(self, content):
+                self.choices = [_FakeChoice(content)]
+
+        contaminated = (
+            "<think>Let me extract the relevant information from this "
+            "conversation segment. Decisions made: ... Let me format these "
+            "as clean bullet points.</think>"
+            "- Decision: ship docker rollout on 2026-07-22\n"
+            "- Action: Yvonne files FCC paperwork by 2026-06-30"
+        )
+
+        def fake_call_llm(**kwargs):
+            return _FakeResponse(contaminated)
+
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "call_llm", fake_call_llm)
+
+        result = extr._call_extraction_llm(
+            prompt="extract decisions",
+            model="any",
+            timeout=10.0,
+        )
+
+        assert result is not None
+        assert "<think>" not in result
+        assert "</think>" not in result
+        assert "Decision: ship docker rollout" in result
+
+
 class TestEngineABC:
     def test_is_context_engine(self, engine):
         assert isinstance(engine, ContextEngine)

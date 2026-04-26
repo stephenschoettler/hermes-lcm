@@ -60,7 +60,8 @@ def _call_extraction_llm(prompt: str, model: str = "",
         content = response.choices[0].message.content
         if not isinstance(content, str):
             content = str(content) if content else ""
-        return content.strip()
+        from .escalation import _strip_reasoning_blocks
+        return _strip_reasoning_blocks(content).strip()
     except Exception as e:
         logger.debug("Extraction LLM call failed: %s", e)
         return None
