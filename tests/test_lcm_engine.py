@@ -1397,6 +1397,82 @@ class TestSessionRollover:
         assert status["lifecycle"]["last_rollover_at"] is not None
         assert status["lifecycle"]["last_reset_at"] is None
 
+    def test_compression_boundary_mismatch_resets_session_scoped_state(self, engine):
+        engine.on_session_start("bound-session", platform="telegram", context_length=200000)
+        engine.compression_count = 3
+        engine.last_prompt_tokens = 900
+        engine.last_completion_tokens = 12
+        engine.last_total_tokens = 912
+        engine._last_compacted_store_id = 42
+        engine._ingest_cursor = 7
+        old_conversation_id = engine._conversation_id
+
+        engine.on_session_start(
+            "new-session",
+            boundary_reason="compression",
+            old_session_id="different-old-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "new-session"
+        assert engine._conversation_id != old_conversation_id
+        assert engine.compression_count == 0
+        assert engine.last_prompt_tokens == 0
+        assert engine.last_completion_tokens == 0
+        assert engine.last_total_tokens == 0
+        assert engine._last_compacted_store_id == 0
+        assert engine._ingest_cursor == 0
+
+    def test_compression_boundary_reassigns_externalized_payload_session_metadata(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_compression_externalized.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine.on_session_start("old-session", platform="telegram", context_length=200000)
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        payload_file = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json"))
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_big; "
+            f"chars={len(content)}; bytes={len(content.encode('utf-8'))}; ref={payload_file.name}]"
+        )
+        store_id = engine._store.append(
+            "old-session",
+            {"role": "tool", "tool_call_id": "call_big", "content": placeholder},
+            token_estimate=17,
+            source="telegram",
+        )
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-session",
+            depth=0,
+            summary="Externalized tool-output summary",
+            token_count=10,
+            source_token_count=17,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        assert json.loads(payload_file.read_text())["session_id"] == "old-session"
+
+        engine.on_session_start(
+            "new-session",
+            boundary_reason="compression",
+            old_session_id="old-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert json.loads(payload_file.read_text())["session_id"] == "new-session"
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+        assert result["expanded"][0]["externalized"]["session_id"] == "new-session"
+        assert result["expanded"][0]["externalized"]["tool_call_id"] == "call_big"
+
     def test_rollover_session_records_durable_lifecycle_state_idempotently(self, engine):
         engine._config.new_session_retain_depth = 2
         from hermes_lcm.dag import SummaryNode

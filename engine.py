@@ -21,6 +21,7 @@ from .externalize import (
     build_transcript_gc_placeholder,
     maybe_externalize_tool_output,
     find_externalized_payload_for_message,
+    reassign_externalized_payloads,
 )
 from .extraction import (
     extract_before_compaction,
@@ -595,12 +596,19 @@ class LCMEngine(ContextEngine):
             )
             moved_messages = self._store.reassign_session_messages(old_session_id, session_id)
             moved_nodes = self._dag.reassign_session_nodes(old_session_id, session_id)
+            moved_payloads = reassign_externalized_payloads(
+                old_session_id,
+                session_id,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
             logger.debug(
-                "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes",
+                "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes, %d externalized payloads",
                 old_session_id,
                 session_id,
                 moved_messages,
                 moved_nodes,
+                moved_payloads,
             )
         elif old_session_id:
             logger.warning(
@@ -608,6 +616,14 @@ class LCMEngine(ContextEngine):
                 old_session_id,
                 previous_session_id,
             )
+            self._reset_session_scoped_runtime_state()
+            self._apply_session_start_metadata(session_id, kwargs)
+            self._bind_lifecycle_state(
+                session_id,
+                conversation_id=kwargs.get("conversation_id"),
+            )
+            self._log_session_filter_diagnostics()
+            return
 
         self._apply_session_start_metadata(session_id, kwargs)
         self._bind_lifecycle_state(session_id, conversation_id=conversation_id)

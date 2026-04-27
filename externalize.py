@@ -95,6 +95,46 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     return summary
 
 
+def reassign_externalized_payloads(
+    old_session_id: str,
+    new_session_id: str,
+    *,
+    config,
+    hermes_home: str = "",
+) -> int:
+    """Move externalized payload session metadata across a logical session boundary."""
+    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+        return 0
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    if not storage_dir.exists() or not storage_dir.is_dir():
+        return 0
+
+    moved = 0
+    for path in storage_dir.glob("*.json"):
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (payload.get("session_id") or "") != old_session_id:
+            continue
+        payload["session_id"] = new_session_id
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        try:
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.replace(path)
+        except OSError as exc:
+            logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        moved += 1
+    return moved
+
+
 def find_externalized_payload_for_message(
     content: str,
     *,
