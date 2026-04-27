@@ -548,15 +548,7 @@ class LCMEngine(ContextEngine):
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
 
-    def on_session_start(self, session_id: str, **kwargs) -> None:
-        previous_session_id = self._session_id
-        if previous_session_id and previous_session_id != session_id:
-            self._reset_session_scoped_runtime_state()
-        else:
-            self._ingest_cursor = 0
-            self._last_compacted_store_id = 0
-            self._last_overflow_recovery_failed = False
-            self._last_condensation_suppressed_reason = ""
+    def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
@@ -568,6 +560,83 @@ class LCMEngine(ContextEngine):
             self.threshold_tokens = int(
                 self.context_length * self._config.context_threshold
             )
+
+    def _continue_compression_boundary(
+        self,
+        session_id: str,
+        old_session_id: str,
+        kwargs: Dict[str, Any],
+    ) -> None:
+        previous_session_id = self._session_id
+        prior_state = self._lifecycle.get_by_session(old_session_id)
+        conversation_id = (
+            kwargs.get("conversation_id")
+            or self._conversation_id
+            or (prior_state.conversation_id if prior_state else None)
+            or old_session_id
+            or session_id
+        )
+        frontier = max(
+            int(self._last_compacted_store_id or 0),
+            int(prior_state.current_frontier_store_id if prior_state else 0),
+        )
+        can_reassign = bool(
+            old_session_id
+            and session_id
+            and old_session_id != session_id
+            and (not previous_session_id or previous_session_id == old_session_id)
+        )
+
+        if can_reassign:
+            self._lifecycle.finalize_session(
+                conversation_id,
+                old_session_id,
+                frontier_store_id=frontier,
+            )
+            moved_messages = self._store.reassign_session_messages(old_session_id, session_id)
+            moved_nodes = self._dag.reassign_session_nodes(old_session_id, session_id)
+            logger.debug(
+                "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes",
+                old_session_id,
+                session_id,
+                moved_messages,
+                moved_nodes,
+            )
+        elif old_session_id:
+            logger.warning(
+                "LCM compression boundary skipped carry-over: old_session_id=%s does not match bound session=%s",
+                old_session_id,
+                previous_session_id,
+            )
+
+        self._apply_session_start_metadata(session_id, kwargs)
+        self._bind_lifecycle_state(session_id, conversation_id=conversation_id)
+        if frontier > 0:
+            state = self._lifecycle.advance_frontier(
+                self._conversation_id,
+                session_id,
+                frontier,
+            )
+            if state is not None:
+                self._last_compacted_store_id = state.current_frontier_store_id
+        self._log_session_filter_diagnostics()
+
+    def on_session_start(self, session_id: str, **kwargs) -> None:
+        boundary_reason = str(kwargs.get("boundary_reason") or "")
+        old_session_id = str(kwargs.get("old_session_id") or "")
+        if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            self._continue_compression_boundary(session_id, old_session_id, kwargs)
+            return
+
+        previous_session_id = self._session_id
+        if previous_session_id and previous_session_id != session_id:
+            self._reset_session_scoped_runtime_state()
+        else:
+            self._ingest_cursor = 0
+            self._last_compacted_store_id = 0
+            self._last_overflow_recovery_failed = False
+            self._last_condensation_suppressed_reason = ""
+        self._apply_session_start_metadata(session_id, kwargs)
         self._bind_lifecycle_state(
             session_id,
             conversation_id=kwargs.get("conversation_id"),
@@ -699,6 +768,14 @@ class LCMEngine(ContextEngine):
 
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
+        status.update({
+            "compression_count": self.compression_count,
+            "last_prompt_tokens": self.last_prompt_tokens,
+            "last_completion_tokens": self.last_completion_tokens,
+            "last_total_tokens": self.last_total_tokens,
+            "context_length": self.context_length,
+            "threshold_tokens": self.threshold_tokens,
+        })
         lifecycle_state = self._lifecycle.get_by_conversation(self._conversation_id)
         status["engine"] = "lcm"
         try:

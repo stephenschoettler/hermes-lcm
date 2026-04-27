@@ -303,6 +303,17 @@ class MessageStore:
                 ids.append(cur.lastrowid)
         return ids
 
+    def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
+        """Move all persisted messages from one session_id to another."""
+        if not old_session_id or not new_session_id or old_session_id == new_session_id:
+            return 0
+        cur = self._conn.execute(
+            "UPDATE messages SET session_id = ? WHERE session_id = ?",
+            (new_session_id, old_session_id),
+        )
+        self._conn.commit()
+        return cur.rowcount if cur.rowcount is not None else 0
+
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         cur = self._conn.execute(
