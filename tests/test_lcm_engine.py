@@ -555,6 +555,49 @@ class TestEngineCompress:
         finally:
             engine_module.summarize_with_escalation = original_fn
 
+    def test_compress_leaf_node_tracks_source_ids_for_content_part_messages(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_content_parts.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("content-parts-session", platform="cli", context_length=200000)
+
+        def mock_summary(**kwargs):
+            return "Content parts summary.\nExpand for details about: content parts", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        compacted_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "question text inside content parts"},
+                    {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "answer text inside content parts"}],
+            },
+        ]
+        fresh_tail = [
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+        ]
+        messages = [{"role": "system", "content": "sys"}] + compacted_messages + fresh_tail
+
+        result = instance.compress(messages)
+
+        nodes = instance._dag.get_session_nodes("content-parts-session")
+        stored_rows = instance._store.get_session_messages("content-parts-session")
+        expected_store_ids = [row["store_id"] for row in stored_rows[1:3]]
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == expected_store_ids
+        assert instance._last_compacted_store_id == expected_store_ids[-1]
+        assert result[-2:] == fresh_tail
+
     def test_condensed_parent_node_tracks_child_source_window(self, engine, monkeypatch):
         child_windows = [
             (1_700_000_010, 1_700_000_020),
