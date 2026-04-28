@@ -363,6 +363,36 @@ class TestMessageStore:
         assert len(ids) == 3
         assert ids[0] < ids[1] < ids[2]
 
+    def test_append_batch_accepts_content_parts(self, store):
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello from content parts"},
+                    {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+                ],
+            }
+        ]
+
+        ids = store.append_batch("sess1", msgs, [7], source="telegram")
+
+        retrieved = store.get(ids[0])
+        assert isinstance(retrieved["content"], str)
+        assert "hello from content parts" in retrieved["content"]
+        results = store.search("hello", session_id="sess1")
+        assert [result["store_id"] for result in results] == ids
+
+    def test_append_accepts_content_parts(self, store):
+        sid = store.append(
+            "sess1",
+            {"role": "assistant", "content": [{"type": "text", "text": "assistant part text"}]},
+            token_estimate=3,
+        )
+
+        retrieved = store.get(sid)
+        assert isinstance(retrieved["content"], str)
+        assert "assistant part text" in retrieved["content"]
+
     def test_get_range(self, store):
         msgs = [{"role": "user", "content": f"msg {i}"} for i in range(10)]
         ids = store.append_batch("sess1", msgs)

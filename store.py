@@ -56,6 +56,18 @@ def _normalize_source_value(source: str | None) -> str:
     return normalized or _UNKNOWN_SOURCE
 
 
+def _normalize_content_value(content: Any) -> str | None:
+    """Return a SQLite-safe text value for message content."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(content)
+
+
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
     normalized = _normalize_source_value(source) if source is not None else ""
     if not normalized:
@@ -256,7 +268,7 @@ class MessageStore:
                 session_id,
                 _normalize_source_value(source),
                 msg.get("role", "unknown"),
-                msg.get("content"),
+                _normalize_content_value(msg.get("content")),
                 msg.get("tool_call_id"),
                 tc_json,
                 msg.get("tool_name"),
@@ -291,7 +303,7 @@ class MessageStore:
                         session_id,
                         _normalize_source_value(source),
                         msg.get("role", "unknown"),
-                        msg.get("content"),
+                        _normalize_content_value(msg.get("content")),
                         msg.get("tool_call_id"),
                         tc_json,
                         msg.get("tool_name"),
