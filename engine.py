@@ -35,7 +35,8 @@ from .session_patterns import (
     matches_session_pattern,
 )
 from .lifecycle_state import LifecycleStateStore
-from .store import MessageStore, _normalize_content_value
+from .message_content import normalize_content_value
+from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -943,7 +944,7 @@ class LCMEngine(ContextEngine):
         store_idx = 0
         for msg in messages:
             role = msg.get("role", "")
-            content = _normalize_content_value(msg.get("content")) or ""
+            content = normalize_content_value(msg.get("content")) or ""
             probe_idx = store_idx
             while probe_idx < len(candidates):
                 stored = candidates[probe_idx]

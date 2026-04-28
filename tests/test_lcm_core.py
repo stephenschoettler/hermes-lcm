@@ -333,6 +333,20 @@ class TestTokens:
         msg = {"role": "user", "content": "hello world this is a test"}
         assert count_message_tokens(msg) > 0
 
+    def test_count_message_tokens_normalizes_content_parts(self):
+        content = [
+            {"type": "text", "text": "hello from content parts " * 50},
+            {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+        ]
+        msg = {"role": "user", "content": content}
+        normalized_msg = {
+            "role": "user",
+            "content": json.dumps(content, ensure_ascii=False, sort_keys=True),
+        }
+
+        assert count_message_tokens(msg) == count_message_tokens(normalized_msg)
+        assert count_message_tokens(msg) > 100
+
     def test_count_messages_tokens(self):
         msgs = [
             {"role": "user", "content": "hello"},

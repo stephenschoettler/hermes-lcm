@@ -6,6 +6,8 @@ Uses tiktoken when available, falls back to char-based estimate.
 import logging
 from typing import Any, Dict, List
 
+from .message_content import normalize_content_value
+
 logger = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN = 4
@@ -43,7 +45,7 @@ def count_tokens(text: str) -> int:
 def count_message_tokens(msg: Dict[str, Any]) -> int:
     """Estimate tokens for a single OpenAI-format message."""
     total = 4  # role + overhead
-    content = msg.get("content") or ""
+    content = normalize_content_value(msg.get("content")) or ""
     total += count_tokens(content)
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):

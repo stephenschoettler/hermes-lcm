@@ -38,6 +38,7 @@ from .search_query import (
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
+from .message_content import normalize_content_value as _normalize_content_value
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -54,18 +55,6 @@ _UNKNOWN_SOURCE = "unknown"
 def _normalize_source_value(source: str | None) -> str:
     normalized = (source or "").strip()
     return normalized or _UNKNOWN_SOURCE
-
-
-def _normalize_content_value(content: Any) -> str | None:
-    """Return a SQLite-safe text value for message content."""
-    if content is None:
-        return None
-    if isinstance(content, str):
-        return content
-    try:
-        return json.dumps(content, ensure_ascii=False, sort_keys=True)
-    except (TypeError, ValueError):
-        return str(content)
 
 
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
