@@ -238,8 +238,7 @@ class SummaryDAG:
             (session_id, min_depth),
         )
         deleted = cur.rowcount
-        if deleted:
-            self._conn.commit()
+        self._conn.commit()
         return deleted
 
     def delete_session_nodes(self, session_id: str) -> int:
@@ -249,8 +248,7 @@ class SummaryDAG:
             (session_id,),
         )
         deleted = cur.rowcount
-        if deleted:
-            self._conn.commit()
+        self._conn.commit()
         return deleted
 
     def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:
@@ -264,8 +262,7 @@ class SummaryDAG:
             (new_session_id, old_session_id),
         )
         moved = cur.rowcount
-        if moved:
-            self._conn.commit()
+        self._conn.commit()
         return moved
 
     # -- Read ---------------------------------------------------------------

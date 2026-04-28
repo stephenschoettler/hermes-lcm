@@ -1470,6 +1470,30 @@ class TestSummaryDAG:
     def dag(self, tmp_path):
         return SummaryDAG(tmp_path / "test.db")
 
+    def _assert_write_lock_obtainable(self, db_path):
+        conn = sqlite3.connect(db_path, timeout=0.1)
+        conn.execute("PRAGMA busy_timeout=100")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_noop_write_helpers_do_not_leave_database_locked(self, tmp_path):
+        db_path = tmp_path / "noop-write-lock.db"
+        dag = SummaryDAG(db_path)
+
+        assert dag.reassign_session_nodes("missing-old", "missing-new") == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        assert dag.delete_session_nodes("missing-session") == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        assert dag.delete_below_depth("missing-session", 1) == 0
+        self._assert_write_lock_obtainable(db_path)
+
+        dag.close()
+
     def test_add_and_get(self, dag):
         node = SummaryNode(
             session_id="s1", depth=0,
