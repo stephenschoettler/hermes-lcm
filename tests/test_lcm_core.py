@@ -1433,6 +1433,73 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_init_upgrades_existing_lifecycle_table_with_rotation_columns(self, tmp_path):
+        db_path = tmp_path / "legacy-lifecycle-rotation.db"
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            INSERT INTO metadata(key, value) VALUES ('schema_version', '4');
+
+            CREATE TABLE lcm_migration_state (
+                step_name TEXT PRIMARY KEY,
+                completed_at REAL NOT NULL
+            );
+
+            CREATE TABLE lcm_lifecycle_state (
+                conversation_id TEXT PRIMARY KEY,
+                current_session_id TEXT,
+                last_finalized_session_id TEXT,
+                current_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+                last_finalized_frontier_store_id INTEGER NOT NULL DEFAULT 0,
+                debt_kind TEXT,
+                debt_size_estimate INTEGER NOT NULL DEFAULT 0,
+                current_bound_at REAL,
+                last_finalized_at REAL,
+                debt_updated_at REAL,
+                last_maintenance_attempt_at REAL,
+                updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+            );
+
+            INSERT INTO lcm_lifecycle_state(
+                conversation_id,
+                current_session_id,
+                last_finalized_session_id,
+                current_frontier_store_id,
+                last_finalized_frontier_store_id,
+                debt_kind,
+                debt_size_estimate,
+                current_bound_at,
+                last_finalized_at,
+                debt_updated_at,
+                last_maintenance_attempt_at,
+                updated_at
+            ) VALUES ('conv', 'sess', NULL, 7, 0, NULL, 0, 1.0, NULL, NULL, NULL, 2.0);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        state = LifecycleStateStore(db_path)
+        loaded = state.get_by_session("sess")
+
+        assert loaded is not None
+        assert loaded.current_session_id == "sess"
+        assert loaded.current_frontier_store_id == 7
+        assert loaded.last_rollover_at is None
+        assert loaded.last_reset_at is None
+
+        columns = {
+            row[1]
+            for row in state._conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
+        }
+        assert {"last_rollover_at", "last_reset_at"} <= columns
+
+        state.close()
+
     def test_record_debt_and_clear_debt(self, tmp_path):
         state = LifecycleStateStore(tmp_path / "lifecycle-debt.db")
         bound = state.bind_session("sess-1")

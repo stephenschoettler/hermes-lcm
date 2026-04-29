@@ -122,6 +122,10 @@ def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_maintenance_attempt_at REAL"
         )
+    if "last_rollover_at" not in columns:
+        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_rollover_at REAL")
+    if "last_reset_at" not in columns:
+        conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL")
 
 
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
