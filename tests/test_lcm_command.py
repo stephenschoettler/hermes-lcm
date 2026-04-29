@@ -389,6 +389,56 @@ def test_lcm_doctor_clean_apply_aborts_if_backup_fails(tmp_path, monkeypatch):
     assert len(engine._store.get_range("cron_20260414")) == 1
 
 
+def test_lcm_doctor_clean_apply_rolls_back_if_delete_fails_after_backup(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_clean_apply_rollback.db"),
+        ignore_session_patterns=["cron*"],
+        doctor_clean_apply_enabled=True,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session")
+
+    store_id = engine._store.append("cron_20260414", {"role": "user", "content": "scheduled report"}, token_estimate=12)
+    engine._dag.add_node(SummaryNode(
+        session_id="cron_20260414",
+        depth=0,
+        summary="scheduled report summary",
+        token_count=5,
+        source_token_count=12,
+        source_ids=[store_id],
+        source_type="messages",
+        created_at=1.0,
+    ))
+    engine._lifecycle.bind_session("cron_20260414")
+    engine._lifecycle.finalize_session("cron_20260414", "cron_20260414", frontier_store_id=store_id)
+    engine._store._conn.execute(
+        """
+        CREATE TRIGGER fail_cron_node_delete
+        BEFORE DELETE ON summary_nodes
+        WHEN old.session_id = 'cron_20260414'
+        BEGIN
+            SELECT RAISE(ABORT, 'node delete failed');
+        END
+        """
+    )
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor clean apply", engine)
+
+    assert "LCM doctor clean apply" in result
+    assert "status: error" in result
+    assert "node delete failed" in result
+    assert "cleanup apply rolled back" in result
+    backup_line = next(line for line in result.splitlines() if line.startswith("backup_path: "))
+    assert Path(backup_line.split(": ", 1)[1]).exists()
+    assert len(engine._store.get_range("cron_20260414")) == 1
+    assert len(engine._dag.get_session_nodes("cron_20260414")) == 1
+    assert engine._lifecycle.get_by_conversation("cron_20260414") is not None
+
+
 def test_lcm_doctor_clean_apply_denied_by_default(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm_clean_apply_denied.db"),

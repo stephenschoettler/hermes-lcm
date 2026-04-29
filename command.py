@@ -618,6 +618,76 @@ def _doctor_retention_text(engine) -> str:
     return "\n".join(lines)
 
 
+def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[str, int]:
+    """Delete cleanup candidates in one SQLite transaction.
+
+    All LCM tables live in the same SQLite database, but the store, DAG, and
+    lifecycle helpers use separate connections and commit internally. Cleanup
+    apply is destructive, so do the coordinated deletes on one connection to
+    avoid half-cleaned state if a later table delete fails.
+    """
+    conn = engine._store._conn
+    protected_session_ids = {getattr(engine, "_session_id", "")}
+    protected_session_ids = {str(s) for s in protected_session_ids if s}
+    session_ids = {str(s) for s in session_ids if s and str(s) not in protected_session_ids}
+    if not session_ids:
+        return {
+            "messages_deleted": 0,
+            "nodes_deleted": 0,
+            "lifecycle_deleted": 0,
+            "lifecycle_skipped": 0,
+        }
+
+    placeholders = ",".join("?" for _ in session_ids)
+    params = tuple(sorted(session_ids))
+    lifecycle_rows = conn.execute(
+        """
+        SELECT conversation_id, current_session_id, last_finalized_session_id
+        FROM lcm_lifecycle_state
+        """
+    ).fetchall()
+    lifecycle_delete_conversation_ids: list[str] = []
+    lifecycle_skipped = 0
+    for conversation_id, current_session_id, last_finalized_session_id in lifecycle_rows:
+        refs = {
+            str(value)
+            for value in (current_session_id, last_finalized_session_id)
+            if value
+        }
+        if not refs or not (refs & session_ids):
+            continue
+        if refs & protected_session_ids:
+            lifecycle_skipped += 1
+            continue
+        if refs <= session_ids:
+            lifecycle_delete_conversation_ids.append(str(conversation_id))
+            continue
+        lifecycle_skipped += 1
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        msg_cur = conn.execute(f"DELETE FROM messages WHERE session_id IN ({placeholders})", params)
+        node_cur = conn.execute(f"DELETE FROM summary_nodes WHERE session_id IN ({placeholders})", params)
+        lifecycle_deleted = 0
+        for conversation_id in lifecycle_delete_conversation_ids:
+            cur = conn.execute(
+                "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            lifecycle_deleted += cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "messages_deleted": msg_cur.rowcount if msg_cur.rowcount is not None else 0,
+        "nodes_deleted": node_cur.rowcount if node_cur.rowcount is not None else 0,
+        "lifecycle_deleted": lifecycle_deleted,
+        "lifecycle_skipped": lifecycle_skipped,
+    }
+
+
 def _doctor_clean_apply_text(engine) -> str:
     if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
         return "\n".join([
@@ -658,12 +728,18 @@ def _doctor_clean_apply_text(engine) -> str:
         ])
 
     session_ids = {item["session_id"] for item in candidates}
-    messages_deleted = sum(engine._store.delete_session_messages(session_id) for session_id in session_ids)
-    nodes_deleted = sum(engine._dag.delete_session_nodes(session_id) for session_id in session_ids)
-    lifecycle_deleted, lifecycle_skipped = engine._lifecycle.delete_safe_rows_for_sessions(
-        session_ids,
-        protected_session_ids={getattr(engine, "_session_id", "")},
-    )
+    try:
+        deleted = _delete_clean_candidates_atomically(engine, session_ids)
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM doctor clean apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"backup_path: {backup['backup_path']}",
+            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+            f"error: cleanup apply failed: {exc}",
+            "note: cleanup apply rolled back; restore from the backup if you need to inspect pre-apply state",
+        ])
 
     return "\n".join([
         "LCM doctor clean apply",
@@ -672,10 +748,10 @@ def _doctor_clean_apply_text(engine) -> str:
         f"backup_path: {backup['backup_path']}",
         f"backup_size: {_fmt_size(int(backup['backup_size']))}",
         f"candidate_sessions: {len(candidates)}",
-        f"messages_deleted: {messages_deleted}",
-        f"nodes_deleted: {nodes_deleted}",
-        f"lifecycle_rows_deleted: {lifecycle_deleted}",
-        f"lifecycle_rows_skipped: {lifecycle_skipped}",
+        f"messages_deleted: {deleted['messages_deleted']}",
+        f"nodes_deleted: {deleted['nodes_deleted']}",
+        f"lifecycle_rows_deleted: {deleted['lifecycle_deleted']}",
+        f"lifecycle_rows_skipped: {deleted['lifecycle_skipped']}",
         "note: backup created before cleanup apply",
     ])
 
