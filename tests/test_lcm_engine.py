@@ -470,6 +470,73 @@ class TestEngineCompress:
             messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
         return messages
 
+    def test_compression_serialization_skips_empty_assistant_and_heartbeat_noise(self, engine):
+        messages = [
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": "ACK"},
+            {"role": "assistant", "content": "[heartbeat]"},
+            {"role": "user", "content": "keep this real user content"},
+            {"role": "assistant", "content": "keep this real assistant content"},
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "keep this real user content" in serialized
+        assert "[ASSISTANT]: keep this real assistant content" in serialized
+        assert serialized.count("[ASSISTANT]:") == 1
+        assert "[ASSISTANT]: ACK" not in serialized
+        assert "[ASSISTANT]: [heartbeat]" not in serialized
+
+    def test_compression_serialization_keeps_assistant_text_but_drops_orphaned_tool_calls(self, engine):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I can still explain the plan without a completed tool call.",
+                "tool_calls": [
+                    {
+                        "id": "call_missing",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\": \"rm -rf noisy-orphan\"}"},
+                    }
+                ],
+            }
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "I can still explain the plan" in serialized
+        assert "terminal(" not in serialized
+        assert "noisy-orphan" not in serialized
+
+    def test_compression_serialization_keeps_matched_tool_pairs_and_drops_orphaned_results(self, engine):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I will inspect the repo.",
+                "tool_calls": [
+                    {
+                        "id": "call_ok",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\": \"README.md\"}"},
+                    },
+                    {
+                        "id": "call_missing",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\": \"stale orphan args\"}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_ok", "content": "README says hello"},
+            {"role": "tool", "tool_call_id": "legacy_standalone", "content": "standalone legacy payload should remain canonical history"},
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "read_file(" in serialized
+        assert "README says hello" in serialized
+        assert "standalone legacy payload" in serialized
+        assert "stale orphan args" not in serialized
+
     def test_compress_short_conversation_noop(self, engine):
         """Short conversations should pass through unchanged."""
         messages = [

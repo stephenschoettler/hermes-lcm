@@ -42,6 +42,55 @@ from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
 
+_SYNTHETIC_ASSISTANT_NOISE = {
+    "ack",
+    "acknowledged",
+    "heartbeat",
+    "heartbeat ack",
+    "keepalive",
+    "keep alive",
+    "pong",
+}
+
+
+def _tool_call_id(tool_call: Any) -> str:
+    if not isinstance(tool_call, dict):
+        return ""
+    value = tool_call.get("id") or tool_call.get("tool_call_id")
+    return str(value).strip() if value else ""
+
+
+def _assistant_tool_call_ids(messages: List[Dict[str, Any]]) -> set[str]:
+    call_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tool_call in msg.get("tool_calls") or []:
+            call_id = _tool_call_id(tool_call)
+            if call_id:
+                call_ids.add(call_id)
+    return call_ids
+
+
+def _matched_tool_call_ids(messages: List[Dict[str, Any]]) -> set[str]:
+    assistant_call_ids = _assistant_tool_call_ids(messages)
+    tool_result_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "tool":
+            tool_call_id = str(msg.get("tool_call_id") or "").strip()
+            if tool_call_id:
+                tool_result_ids.add(tool_call_id)
+    return assistant_call_ids & tool_result_ids
+
+
+def _is_synthetic_assistant_noise(content: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (content or "").strip()).lower()
+    if not normalized:
+        return True
+    normalized = normalized.strip("`*_ ")
+    bracketless = normalized.strip("[](){} ")
+    return normalized in _SYNTHETIC_ASSISTANT_NOISE or bracketless in _SYNTHETIC_ASSISTANT_NOISE
+
 
 class LCMEngine(ContextEngine):
     """Lossless Context Management engine.
@@ -1048,13 +1097,15 @@ class LCMEngine(ContextEngine):
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
         parts = []
+        assistant_tool_ids = _assistant_tool_call_ids(messages)
+        matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
             content = msg.get("content") or ""
             content = sanitize_pre_compaction_content(content)
 
             if role == "tool":
-                tool_id = msg.get("tool_call_id", "")
+                tool_id = str(msg.get("tool_call_id") or "").strip()
                 externalized = maybe_externalize_tool_output(
                     content,
                     tool_call_id=tool_id,
@@ -1070,12 +1121,20 @@ class LCMEngine(ContextEngine):
                 continue
 
             if role == "assistant":
+                tool_calls = msg.get("tool_calls", [])
+                matched_tool_calls = [
+                    tc for tc in tool_calls
+                    if not _tool_call_id(tc) or _tool_call_id(tc) in matched_tool_ids
+                ]
+                if _is_synthetic_assistant_noise(content):
+                    if not matched_tool_calls:
+                        continue
+                    content = ""
                 if len(content) > 3000:
                     content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
-                tool_calls = msg.get("tool_calls", [])
-                if tool_calls:
+                if matched_tool_calls:
                     tc_parts = []
-                    for tc in tool_calls:
+                    for tc in matched_tool_calls:
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
                             name = fn.get("name", "?")
