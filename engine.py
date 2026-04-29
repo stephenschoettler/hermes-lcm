@@ -174,6 +174,9 @@ class LCMEngine(ContextEngine):
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
         self._logged_filter_config = False
+        self._pending_reset_session_id: str = ""
+        self._pending_reset_conversation_id: str = ""
+        self._pending_reset_frontier_store_id: int = 0
 
     @property
     def name(self) -> str:
@@ -562,6 +565,34 @@ class LCMEngine(ContextEngine):
             self._last_compacted_store_id,
         )
 
+    def _clear_pending_reset_boundary(self) -> None:
+        self._pending_reset_session_id = ""
+        self._pending_reset_conversation_id = ""
+        self._pending_reset_frontier_store_id = 0
+
+    def _finalize_pending_reset_boundary(self, session_id: str) -> None:
+        if not self._pending_reset_session_id:
+            return
+        if self._pending_reset_session_id != session_id:
+            self._clear_pending_reset_boundary()
+            return
+        if not self._pending_reset_conversation_id:
+            self._clear_pending_reset_boundary()
+            return
+        state = self._lifecycle.get_by_conversation(self._pending_reset_conversation_id)
+        frontier_store_id = self._pending_reset_frontier_store_id
+        if state is not None and state.current_session_id == session_id:
+            frontier_store_id = max(
+                frontier_store_id,
+                int(state.current_frontier_store_id or 0),
+            )
+        self._lifecycle.finalize_session(
+            self._pending_reset_conversation_id,
+            self._pending_reset_session_id,
+            frontier_store_id=frontier_store_id,
+        )
+        self._clear_pending_reset_boundary()
+
     def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = len(messages)
         fresh_tail_start = max(0, n - self._config.fresh_tail_count)
@@ -682,6 +713,12 @@ class LCMEngine(ContextEngine):
         frontier = max(
             int(self._last_compacted_store_id or 0),
             int(source_state.current_frontier_store_id if source_state else 0),
+            int(
+                self._pending_reset_frontier_store_id
+                if self._pending_reset_session_id
+                and self._pending_reset_session_id in {source_session_id, old_session_id, previous_session_id}
+                else 0
+            ),
         )
         can_reassign = bool(
             source_session_id
@@ -717,12 +754,14 @@ class LCMEngine(ContextEngine):
                 old_session_id,
                 previous_session_id,
             )
+            self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
             self._apply_session_start_metadata(session_id, kwargs)
             self._bind_lifecycle_state(
                 session_id,
                 conversation_id=kwargs.get("conversation_id"),
             )
+            self._clear_pending_reset_boundary()
             self._log_session_filter_diagnostics()
             return
 
@@ -736,6 +775,7 @@ class LCMEngine(ContextEngine):
             )
             if state is not None:
                 self._last_compacted_store_id = state.current_frontier_store_id
+        self._clear_pending_reset_boundary()
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
@@ -747,8 +787,10 @@ class LCMEngine(ContextEngine):
 
         previous_session_id = self._session_id
         if previous_session_id and previous_session_id != session_id:
+            self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
         else:
+            self._clear_pending_reset_boundary()
             self._ingest_cursor = 0
             self._last_compacted_store_id = 0
             self._last_overflow_recovery_failed = False
@@ -770,6 +812,9 @@ class LCMEngine(ContextEngine):
         )
 
     def on_session_reset(self) -> None:
+        self._pending_reset_session_id = self._session_id
+        self._pending_reset_conversation_id = self._conversation_id
+        self._pending_reset_frontier_store_id = self._last_compacted_store_id
         super().on_session_reset()
         self._lifecycle.record_reset(self._conversation_id)
         self._reset_session_scoped_runtime_state()
@@ -822,11 +867,30 @@ class LCMEngine(ContextEngine):
         4. optionally move retained summaries into the new session
         """
         previous_messages = previous_messages or []
+        boundary_reason = str(kwargs.get("boundary_reason") or "")
         conversation_id = self._conversation_id or old_session_id or new_session_id
         bound_session_id = self._session_id
         can_carry_over = bool(
             old_session_id and bound_session_id and old_session_id == bound_session_id
         )
+
+        if boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
+            before_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
+            if can_carry_over:
+                self.on_session_end(old_session_id, previous_messages)
+            else:
+                logger.warning(
+                    "LCM compression rollover old_session_id=%s does not match bound session=%s; using boundary handler fallback",
+                    old_session_id,
+                    bound_session_id,
+                )
+            self.on_session_start(
+                new_session_id,
+                old_session_id=old_session_id,
+                **kwargs,
+            )
+            after_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
+            return len(after_node_ids - before_node_ids)
 
         if old_session_id and can_carry_over:
             self.on_session_end(old_session_id, previous_messages)

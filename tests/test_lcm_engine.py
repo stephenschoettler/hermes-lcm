@@ -1470,6 +1470,110 @@ class TestSessionRollover:
         assert engine._dag.get_session_nodes("s2") == []
         assert engine._session_id == "s3"
 
+    def test_rollover_session_current_session_retrieval_uses_new_session_after_carry_over(self, engine):
+        engine._config.new_session_retain_depth = 2
+        engine.on_session_start("old-retrieval", platform="cli", context_length=200000)
+        old_store_id = engine._store.append(
+            "old-retrieval",
+            {"role": "user", "content": "phoenix raw old-only context"},
+            token_estimate=9,
+            source="cli",
+        )
+        retained_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-retrieval",
+            depth=2,
+            summary="phoenix retained rollover summary",
+            token_count=7,
+            source_token_count=9,
+            source_ids=[old_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        pruned_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-retrieval",
+            depth=0,
+            summary="phoenix pruned rollover summary",
+            token_count=7,
+            source_token_count=9,
+            source_ids=[old_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+
+        moved = engine.rollover_session(
+            "old-retrieval",
+            "new-retrieval",
+            previous_messages=[],
+            platform="cli",
+            context_length=200000,
+        )
+
+        assert moved == 1
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "phoenix", "session_scope": "current", "sort": "relevance", "limit": 10},
+        ))
+        assert result["session_scope"] == "current"
+        assert result["total_results"] == 1
+        assert result["results"] == [
+            {
+                "type": "summary",
+                "depth": "d2",
+                "node_id": retained_node_id,
+                "session_id": "new-retrieval",
+                "snippet": "phoenix retained rollover summary",
+                "token_count": 7,
+                "expand_hint": "",
+                "earliest_at": None,
+                "latest_at": None,
+            }
+        ]
+        assert engine._dag.get_node(pruned_node_id) is None
+        assert engine._store.get_session_count("old-retrieval") == 1
+        assert engine._store.get_session_count("new-retrieval") == 0
+
+    def test_rollover_session_compression_boundary_keeps_depth_zero_nodes(self, engine):
+        engine._config.new_session_retain_depth = 2
+        engine.on_session_start("compress-rollover-old", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "compress-rollover-old",
+            {"role": "user", "content": "compression rollover keeps depth zero"},
+            token_estimate=13,
+            source="telegram",
+        )
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id="compress-rollover-old",
+            depth=0,
+            summary="compression rollover depth zero summary",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        moved = engine.rollover_session(
+            "compress-rollover-old",
+            "compress-rollover-new",
+            previous_messages=[],
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert moved == 1
+        assert engine._session_id == "compress-rollover-new"
+        assert engine._conversation_id == old_conversation_id
+        assert engine._store.get_session_count("compress-rollover-old") == 0
+        assert engine._store.get_session_count("compress-rollover-new") == 1
+        assert engine._dag.get_session_nodes("compress-rollover-old") == []
+        new_nodes = engine._dag.get_session_nodes("compress-rollover-new")
+        assert [node.node_id for node in new_nodes] == [node_id]
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+        assert expanded["expanded"][0]["content"] == "compression rollover keeps depth zero"
+
     def test_rollover_session_skips_carry_over_when_old_session_is_not_bound(self, engine):
         engine._config.new_session_retain_depth = 2
 
@@ -1741,6 +1845,174 @@ class TestSessionRollover:
         assert state_repeat.current_session_id == "s2"
         assert state_repeat.last_finalized_session_id == "s1"
         assert engine._lifecycle.row_count() == 1
+
+    def test_legacy_reset_then_start_finalizes_old_lifecycle_before_new_bind(self, engine):
+        engine.on_session_start("legacy-old", platform="cli", context_length=200000)
+        store_id = engine._store.append(
+            "legacy-old",
+            {"role": "user", "content": "legacy host context before /new"},
+            token_estimate=17,
+            source="cli",
+        )
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        # Older Hermes hosts may not call rollover_session(...) yet. They can
+        # still call the older lifecycle pair: reset current state, then bind a
+        # fresh session. LCM must not leave the old conversation marked current.
+        engine.on_session_reset()
+        engine.on_session_start("legacy-new", platform="cli", context_length=200000)
+
+        old_state = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert old_state is not None
+        assert old_state.current_session_id is None
+        assert old_state.last_finalized_session_id == "legacy-old"
+        assert old_state.last_finalized_frontier_store_id == store_id
+        assert old_state.last_reset_at is not None
+
+        new_state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert new_state is not None
+        assert new_state.conversation_id == "legacy-new"
+        assert new_state.current_session_id == "legacy-new"
+        assert new_state.last_finalized_session_id is None
+        assert engine._lifecycle.row_count() == 2
+
+    def test_same_session_reset_keeps_lifecycle_current_and_allows_future_frontier_updates(self, engine):
+        engine.on_session_start("same-session", platform="cli", context_length=200000)
+        first_store_id = engine._store.append(
+            "same-session",
+            {"role": "user", "content": "before reset"},
+            token_estimate=7,
+            source="cli",
+        )
+        engine._last_compacted_store_id = first_store_id
+
+        engine.on_session_reset()
+        after_reset = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert after_reset is not None
+        assert after_reset.current_session_id == "same-session"
+        assert after_reset.last_finalized_session_id is None
+        assert after_reset.last_reset_at is not None
+
+        second_store_id = engine._store.append(
+            "same-session",
+            {"role": "assistant", "content": "after reset"},
+            token_estimate=9,
+            source="cli",
+        )
+        engine._last_compacted_store_id = second_store_id
+        engine._persist_frontier_marker()
+
+        after_frontier = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert after_frontier is not None
+        assert after_frontier.current_session_id == "same-session"
+        assert after_frontier.current_frontier_store_id == second_store_id
+
+    def test_same_session_reset_then_later_new_session_preserves_latest_frontier(self, engine):
+        engine.on_session_start("same-then-new", platform="cli", context_length=200000)
+        first_store_id = engine._store.append(
+            "same-then-new",
+            {"role": "user", "content": "before reset"},
+            token_estimate=7,
+            source="cli",
+        )
+        engine._last_compacted_store_id = first_store_id
+        old_conversation_id = engine._conversation_id
+
+        engine.on_session_reset()
+        second_store_id = engine._store.append(
+            "same-then-new",
+            {"role": "assistant", "content": "same session continued after reset"},
+            token_estimate=11,
+            source="cli",
+        )
+        engine._last_compacted_store_id = second_store_id
+        engine._persist_frontier_marker()
+
+        engine.on_session_start("eventual-new", platform="cli", context_length=200000)
+
+        old_state = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert old_state is not None
+        assert old_state.current_session_id is None
+        assert old_state.last_finalized_session_id == "same-then-new"
+        assert old_state.last_finalized_frontier_store_id == second_store_id
+        assert engine._pending_reset_session_id == ""
+
+    def test_reset_before_compression_boundary_does_not_leave_stale_pending_reset(self, engine):
+        engine.on_session_start("compress-old", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "compress-old",
+            {"role": "user", "content": "compression boundary after reset"},
+            token_estimate=13,
+            source="telegram",
+        )
+        engine._dag.add_node(SummaryNode(
+            session_id="compress-old",
+            depth=0,
+            summary="compression summary",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+
+        engine.on_session_reset()
+        assert engine._pending_reset_session_id == "compress-old"
+
+        engine.on_session_start(
+            "compress-new",
+            boundary_reason="compression",
+            old_session_id="compress-old",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._pending_reset_session_id == ""
+        status = engine.get_status()
+        assert status["lifecycle"]["current_session_id"] == "compress-new"
+        assert status["lifecycle"]["last_finalized_session_id"] == "compress-old"
+        assert status["lifecycle"]["last_finalized_frontier_store_id"] == store_id
+
+    def test_reset_before_compression_boundary_mismatch_finalizes_pending_old_session(self, engine):
+        engine.on_session_start("bound-after-reset", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "bound-after-reset",
+            {"role": "user", "content": "pending reset before mismatch"},
+            token_estimate=13,
+            source="telegram",
+        )
+        engine._dag.add_node(SummaryNode(
+            session_id="bound-after-reset",
+            depth=0,
+            summary="will be pruned on reset",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        engine.on_session_reset()
+        assert engine._pending_reset_session_id == "bound-after-reset"
+
+        engine.on_session_start(
+            "new-after-mismatch",
+            boundary_reason="compression",
+            old_session_id="stale-host-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        old_state = engine._lifecycle.get_by_conversation(old_conversation_id)
+        assert old_state is not None
+        assert old_state.current_session_id is None
+        assert old_state.last_finalized_session_id == "bound-after-reset"
+        assert old_state.last_finalized_frontier_store_id == store_id
+        assert engine._pending_reset_session_id == ""
 
     def test_on_session_start_recovers_durable_lifecycle_state_after_restart(self, engine, monkeypatch):
         engine.on_session_start("active-session", platform="cli", context_length=200000)
