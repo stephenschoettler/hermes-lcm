@@ -28,6 +28,29 @@ def engine(tmp_path):
     return e
 
 
+def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
+    engine.update_from_response({
+        "prompt_tokens": 1050,
+        "completion_tokens": 120,
+        "total_tokens": 1170,
+        "input_tokens": 600,
+        "output_tokens": 120,
+        "cache_read_tokens": 400,
+        "cache_write_tokens": 50,
+        "reasoning_tokens": 30,
+    })
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["cache_metrics_available"] is True
+    assert payload["last_input_tokens"] == 600
+    assert payload["last_output_tokens"] == 120
+    assert payload["last_cache_read_tokens"] == 400
+    assert payload["last_cache_write_tokens"] == 50
+    assert payload["last_reasoning_tokens"] == 30
+    assert payload["cache_read_ratio"] == 0.381
+
+
 class TestEscalationStripReasoning:
     """Regression tests for thinking-model reasoning-tag stripping in
     escalation._call_llm_for_summary. Some thinking models (MiniMax-M2.7,
@@ -282,16 +305,38 @@ class TestEngineABC:
 
     def test_session_reset(self, engine):
         engine.compression_count = 5
-        engine.last_prompt_tokens = 9999
+        engine.update_from_response({
+            "prompt_tokens": 1050,
+            "completion_tokens": 120,
+            "total_tokens": 1170,
+            "input_tokens": 600,
+            "output_tokens": 120,
+            "cache_read_tokens": 400,
+            "cache_write_tokens": 50,
+            "reasoning_tokens": 30,
+        })
         engine.on_session_reset()
         assert engine.compression_count == 0
         assert engine.last_prompt_tokens == 0
+        assert engine.last_input_tokens == 0
+        assert engine.last_output_tokens == 0
+        assert engine.last_cache_read_tokens == 0
+        assert engine.last_cache_write_tokens == 0
+        assert engine.last_reasoning_tokens == 0
+        assert engine.cache_metrics_available is False
 
     def test_on_session_start_resets_session_scoped_runtime_when_binding_new_session(self, engine):
         engine.compression_count = 5
-        engine.last_prompt_tokens = 9999
-        engine.last_completion_tokens = 333
-        engine.last_total_tokens = 10332
+        engine.update_from_response({
+            "prompt_tokens": 9999,
+            "completion_tokens": 333,
+            "total_tokens": 10332,
+            "input_tokens": 9000,
+            "output_tokens": 333,
+            "cache_read_tokens": 777,
+            "cache_write_tokens": 88,
+            "reasoning_tokens": 44,
+        })
         engine._last_compacted_store_id = 42
         engine._ingest_cursor = 7
         engine._context_probed = True
@@ -303,6 +348,12 @@ class TestEngineABC:
         assert engine.last_prompt_tokens == 0
         assert engine.last_completion_tokens == 0
         assert engine.last_total_tokens == 0
+        assert engine.last_input_tokens == 0
+        assert engine.last_output_tokens == 0
+        assert engine.last_cache_read_tokens == 0
+        assert engine.last_cache_write_tokens == 0
+        assert engine.last_reasoning_tokens == 0
+        assert engine.cache_metrics_available is False
         assert engine._last_compacted_store_id == 0
         assert engine._ingest_cursor == 0
         assert engine._context_probed is False

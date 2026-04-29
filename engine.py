@@ -107,6 +107,12 @@ class LCMEngine(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        self.last_cache_read_tokens = 0
+        self.last_cache_write_tokens = 0
+        self.last_reasoning_tokens = 0
+        self.cache_metrics_available = False
         self.compression_count = 0
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
@@ -127,9 +133,25 @@ class LCMEngine(ContextEngine):
     # -- ContextEngine required methods ------------------------------------
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.last_total_tokens = usage.get("total_tokens", 0)
+        self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
+
+        cache_keys = {"cache_read_tokens", "cache_write_tokens"}
+        self.cache_metrics_available = any(key in usage for key in cache_keys)
+        self.last_input_tokens = int(usage.get("input_tokens", self.last_prompt_tokens) or 0)
+        self.last_output_tokens = int(
+            usage.get("output_tokens", self.last_completion_tokens) or 0
+        )
+        self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
+        self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
+        self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+
+    @property
+    def cache_read_ratio(self) -> float:
+        if self.last_prompt_tokens <= 0:
+            return 0.0
+        return self.last_cache_read_tokens / self.last_prompt_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._session_ignored or self._session_stateless:
@@ -543,6 +565,12 @@ class LCMEngine(ContextEngine):
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        self.last_cache_read_tokens = 0
+        self.last_cache_write_tokens = 0
+        self.last_reasoning_tokens = 0
+        self.cache_metrics_available = False
         self._last_compacted_store_id = 0
         self._ingest_cursor = 0
         self._context_probed = False
@@ -695,12 +723,7 @@ class LCMEngine(ContextEngine):
     def on_session_reset(self) -> None:
         super().on_session_reset()
         self._lifecycle.record_reset(self._conversation_id)
-        self._last_compacted_store_id = 0
-        self._ingest_cursor = 0
-        self._context_probed = False
-        self._context_probe_persistable = False
-        self._last_overflow_recovery_failed = False
-        self._last_condensation_suppressed_reason = ""
+        self._reset_session_scoped_runtime_state()
 
         # Retain DAG nodes across sessions based on config.
         #   -1  → keep all nodes
@@ -813,6 +836,13 @@ class LCMEngine(ContextEngine):
             "last_prompt_tokens": self.last_prompt_tokens,
             "last_completion_tokens": self.last_completion_tokens,
             "last_total_tokens": self.last_total_tokens,
+            "last_input_tokens": self.last_input_tokens,
+            "last_output_tokens": self.last_output_tokens,
+            "last_cache_read_tokens": self.last_cache_read_tokens,
+            "last_cache_write_tokens": self.last_cache_write_tokens,
+            "last_reasoning_tokens": self.last_reasoning_tokens,
+            "cache_metrics_available": self.cache_metrics_available,
+            "cache_read_ratio": round(self.cache_read_ratio, 4),
             "context_length": self.context_length,
             "threshold_tokens": self.threshold_tokens,
         })

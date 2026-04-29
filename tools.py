@@ -588,6 +588,13 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "context_length": engine.context_length,
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
+        "last_input_tokens": engine.last_input_tokens,
+        "last_output_tokens": engine.last_output_tokens,
+        "last_cache_read_tokens": engine.last_cache_read_tokens,
+        "last_cache_write_tokens": engine.last_cache_write_tokens,
+        "last_reasoning_tokens": engine.last_reasoning_tokens,
+        "cache_metrics_available": engine.cache_metrics_available,
+        "cache_read_ratio": round(engine.cache_read_ratio, 4),
         "store": {
             "messages": store_messages,
             "estimated_tokens": store_tokens,

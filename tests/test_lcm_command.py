@@ -33,8 +33,54 @@ def test_lcm_status_default_reports_current_session(engine):
     assert "LCM status" in result
     assert "engine: lcm" in result
     assert "session_id: test-session" in result
+    assert "cache_metrics_available: no" in result
+    assert "last_cache_read_tokens: 0" in result
+    assert "last_cache_write_tokens: 0" in result
     assert "store_messages: 0" in result
     assert "dag_nodes: 0" in result
+
+
+def test_lcm_status_reports_cache_usage_metrics_when_host_provides_them(engine):
+    engine.update_from_response({
+        "prompt_tokens": 1050,
+        "completion_tokens": 120,
+        "total_tokens": 1170,
+        "input_tokens": 600,
+        "output_tokens": 120,
+        "cache_read_tokens": 400,
+        "cache_write_tokens": 50,
+        "reasoning_tokens": 30,
+    })
+
+    result = handle_lcm_command("status", engine)
+
+    assert "cache_metrics_available: yes" in result
+    assert "last_input_tokens: 600" in result
+    assert "last_output_tokens: 120" in result
+    assert "last_cache_read_tokens: 400" in result
+    assert "last_cache_write_tokens: 50" in result
+    assert "last_reasoning_tokens: 30" in result
+    assert "cache_read_ratio: 38.1%" in result
+
+
+def test_update_from_response_treats_zero_cache_keys_as_available(engine):
+    engine.update_from_response({
+        "prompt_tokens": 600,
+        "completion_tokens": 120,
+        "total_tokens": 720,
+        "input_tokens": 600,
+        "output_tokens": 120,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+    })
+
+    status = engine.get_status()
+
+    assert status["cache_metrics_available"] is True
+    assert status["last_cache_read_tokens"] == 0
+    assert status["last_cache_write_tokens"] == 0
+    assert status["cache_read_ratio"] == 0.0
 
 
 def test_lcm_status_does_not_leak_prior_session_compaction_count_after_rebind(engine):
