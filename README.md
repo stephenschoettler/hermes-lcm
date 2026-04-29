@@ -332,6 +332,13 @@ That means patterns like `cron:*` can catch Hermes cron sessions today, while pl
 | `lcm_status` | Quick health overview — compression count, store size, DAG depth distribution, context usage, and active config. |
 | `lcm_doctor` | Run diagnostics — database integrity, FTS index sync, orphaned nodes, config validation, context pressure. |
 
+### Operator slash commands
+
+If `LCM_ENABLE_SLASH_COMMAND=true`, trusted operator contexts can use `/lcm` slash commands for diagnostics and maintenance:
+
+- `/lcm doctor repair` — read-only SQLite/FTS diagnostics for message and summary search indexes. Reports whether `messages_fts` or `nodes_fts` need repair without rebuilding anything.
+- `/lcm doctor repair apply` — backup-first SQLite/FTS repair. Creates a timestamped database backup, then rebuilds/repairs the message and summary FTS indexes without deleting source `messages` or `summary_nodes` rows.
+
 ### Retrieval contract: `session_scope` × `source`
 
 `hermes-lcm` treats `session_scope` and `source` as independent filters:

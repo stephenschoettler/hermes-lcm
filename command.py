@@ -7,7 +7,10 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+from .db_bootstrap import external_content_fts_needs_repair, repair_external_content_fts
+from .dag import build_nodes_fts_spec
 from .session_patterns import build_session_match_keys, matches_session_pattern
+from .store import build_message_fts_spec
 
 
 def _fmt_bool(value: Any) -> str:
@@ -38,6 +41,8 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor clean: best-effort scan of obvious junk/noise session candidates without deleting anything",
         "- /lcm doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
+        "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
+        "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
         "- /lcm doctor retention: read-only retention analysis for stored session footprint and age",
         "- /lcm backup: create a timestamped SQLite backup before any future cleanup workflow",
         "- /lcm help: show this help",
@@ -371,6 +376,106 @@ def _backup_database(engine) -> dict[str, Any]:
         "backup_path": backup_path,
         "backup_size": backup_size,
     }
+
+
+def _scan_fts_repair(engine) -> dict[str, Any]:
+    checks: dict[str, dict[str, Any]] = {}
+    specs = {
+        "messages_fts": build_message_fts_spec(),
+        "nodes_fts": build_nodes_fts_spec(),
+    }
+    conn = engine._store._conn
+    for label, spec in specs.items():
+        try:
+            needs_repair = external_content_fts_needs_repair(conn, spec)
+            content_count = int(conn.execute(
+                f"SELECT COUNT(*) FROM {spec.content_table}"
+            ).fetchone()[0])
+            try:
+                fts_count = int(conn.execute(f"SELECT COUNT(*) FROM {spec.table_name}").fetchone()[0])
+            except sqlite3.Error:
+                fts_count = None
+            checks[label] = {
+                "ok": not needs_repair,
+                "needs_repair": needs_repair,
+                "content_rows": content_count,
+                "fts_rows": fts_count,
+                "error": None,
+            }
+        except Exception as exc:  # pragma: no cover - defensive
+            checks[label] = {
+                "ok": False,
+                "needs_repair": True,
+                "content_rows": None,
+                "fts_rows": None,
+                "error": str(exc),
+            }
+    return {
+        "checks": checks,
+        "needs_repair": any(item["needs_repair"] for item in checks.values()),
+    }
+
+
+def _doctor_repair_text(engine) -> str:
+    scan = _scan_fts_repair(engine)
+    lines = [
+        "LCM doctor repair",
+        f"status: {'repair-needed' if scan['needs_repair'] else 'ok'}",
+    ]
+    for label, item in scan["checks"].items():
+        state = "repair-needed" if item["needs_repair"] else "ok"
+        lines.append(f"{label}: {state}")
+        if item["error"]:
+            lines.append(f"{label}_error: {item['error']}")
+        else:
+            lines.append(f"{label}_content_rows: {item['content_rows']}")
+            lines.append(f"{label}_fts_rows: {item['fts_rows']}")
+    lines.append("note: read-only scan only — no FTS tables were repaired")
+    if scan["needs_repair"]:
+        lines.append("note: use `/lcm doctor repair apply` to create a backup and repair FTS indexes")
+    return "\n".join(lines)
+
+
+def _doctor_repair_apply_text(engine) -> str:
+    backup = _backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "LCM doctor repair apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"error: backup failed: {backup['error']}",
+            "note: repair apply aborted before any FTS tables were repaired",
+        ])
+
+    conn = engine._store._conn
+    try:
+        messages_result = repair_external_content_fts(conn, build_message_fts_spec())
+        nodes_result = repair_external_content_fts(conn, build_nodes_fts_spec())
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM doctor repair apply",
+            "status: error",
+            f"database_path: {backup['db_path']}",
+            f"backup_path: {backup['backup_path']}",
+            f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+            f"error: FTS repair failed: {exc}",
+            "note: backup was created before repair apply",
+        ])
+
+    return "\n".join([
+        "LCM doctor repair apply",
+        "status: ok",
+        f"database_path: {backup['db_path']}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size: {_fmt_size(int(backup['backup_size']))}",
+        f"messages_fts_rebuilt: {_fmt_bool(messages_result['rebuilt'])}",
+        f"messages_fts_triggers_recreated: {_fmt_bool(messages_result['triggers_recreated'])}",
+        f"messages_fts_degraded: {_fmt_bool(messages_result['degraded'])}",
+        f"nodes_fts_rebuilt: {_fmt_bool(nodes_result['rebuilt'])}",
+        f"nodes_fts_triggers_recreated: {_fmt_bool(nodes_result['triggers_recreated'])}",
+        f"nodes_fts_degraded: {_fmt_bool(nodes_result['degraded'])}",
+        "note: backup created before repair apply",
+    ])
 
 
 def _doctor_text(engine) -> str:
@@ -718,11 +823,15 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
             return _doctor_text(engine)
         if len(rest) == 1 and rest[0].lower() == "clean":
             return _doctor_clean_text(engine)
+        if len(rest) == 1 and rest[0].lower() == "repair":
+            return _doctor_repair_text(engine)
         if len(rest) == 1 and rest[0].lower() == "retention":
             return _doctor_retention_text(engine)
         if len(rest) == 2 and rest[0].lower() == "clean" and rest[1].lower() == "apply":
             return _doctor_clean_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, and `retention` as extra subcommands.")
+        if len(rest) == 2 and rest[0].lower() == "repair" and rest[1].lower() == "apply":
+            return _doctor_repair_apply_text(engine)
+        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `repair`, `repair apply`, and `retention` as extra subcommands.")
 
     if head == "backup":
         if rest:

@@ -156,6 +156,40 @@ def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
     return rank_value
 
 
+def build_message_fts_spec() -> ExternalContentFtsSpec:
+    return ExternalContentFtsSpec(
+        table_name="messages_fts",
+        content_table="messages",
+        content_rowid="store_id",
+        indexed_column="content",
+        trigger_sqls=(
+            """
+            CREATE TRIGGER IF NOT EXISTS msg_fts_insert
+                AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content)
+                    VALUES (new.store_id, new.content);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS msg_fts_delete
+                AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                    VALUES('delete', old.store_id, old.content);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS msg_fts_update
+                AFTER UPDATE OF content ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                    VALUES('delete', old.store_id, old.content);
+                INSERT INTO messages_fts(rowid, content)
+                    VALUES (new.store_id, new.content);
+            END;
+            """,
+        ),
+    )
+
+
 class MessageStore:
     """SQLite-backed immutable message store."""
 
@@ -194,37 +228,7 @@ class MessageStore:
         """)
         ensure_external_content_fts(
             self._conn,
-            ExternalContentFtsSpec(
-                table_name="messages_fts",
-                content_table="messages",
-                content_rowid="store_id",
-                indexed_column="content",
-                trigger_sqls=(
-                    """
-                    CREATE TRIGGER IF NOT EXISTS msg_fts_insert
-                        AFTER INSERT ON messages BEGIN
-                        INSERT INTO messages_fts(rowid, content)
-                            VALUES (new.store_id, new.content);
-                    END;
-                    """,
-                    """
-                    CREATE TRIGGER IF NOT EXISTS msg_fts_delete
-                        AFTER DELETE ON messages BEGIN
-                        INSERT INTO messages_fts(messages_fts, rowid, content)
-                            VALUES('delete', old.store_id, old.content);
-                    END;
-                    """,
-                    """
-                    CREATE TRIGGER IF NOT EXISTS msg_fts_update
-                        AFTER UPDATE OF content ON messages BEGIN
-                        INSERT INTO messages_fts(messages_fts, rowid, content)
-                            VALUES('delete', old.store_id, old.content);
-                        INSERT INTO messages_fts(rowid, content)
-                            VALUES (new.store_id, new.content);
-                    END;
-                    """,
-                ),
-            ),
+            build_message_fts_spec(),
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_column()

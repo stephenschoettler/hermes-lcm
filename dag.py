@@ -105,6 +105,31 @@ def _fts_primary_value(node: "SummaryNode", sort: str | None) -> float:
     return rank_value
 
 
+def build_nodes_fts_spec() -> ExternalContentFtsSpec:
+    return ExternalContentFtsSpec(
+        table_name="nodes_fts",
+        content_table="summary_nodes",
+        content_rowid="node_id",
+        indexed_column="summary",
+        trigger_sqls=(
+            """
+            CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
+                AFTER INSERT ON summary_nodes BEGIN
+                INSERT INTO nodes_fts(rowid, summary)
+                    VALUES (new.node_id, new.summary);
+            END;
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS nodes_fts_delete
+                AFTER DELETE ON summary_nodes BEGIN
+                INSERT INTO nodes_fts(nodes_fts, rowid, summary)
+                    VALUES('delete', old.node_id, old.summary);
+            END;
+            """,
+        ),
+    )
+
+
 @dataclass
 class SummaryNode:
     """A single node in the summary DAG."""
@@ -160,28 +185,7 @@ class SummaryDAG:
         """)
         ensure_external_content_fts(
             self._conn,
-            ExternalContentFtsSpec(
-                table_name="nodes_fts",
-                content_table="summary_nodes",
-                content_rowid="node_id",
-                indexed_column="summary",
-                trigger_sqls=(
-                    """
-                    CREATE TRIGGER IF NOT EXISTS nodes_fts_insert
-                        AFTER INSERT ON summary_nodes BEGIN
-                        INSERT INTO nodes_fts(rowid, summary)
-                            VALUES (new.node_id, new.summary);
-                    END;
-                    """,
-                    """
-                    CREATE TRIGGER IF NOT EXISTS nodes_fts_delete
-                        AFTER DELETE ON summary_nodes BEGIN
-                        INSERT INTO nodes_fts(nodes_fts, rowid, summary)
-                            VALUES('delete', old.node_id, old.summary);
-                    END;
-                    """,
-                ),
-            ),
+            build_nodes_fts_spec(),
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_window_columns()

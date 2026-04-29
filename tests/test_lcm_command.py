@@ -152,9 +152,127 @@ def test_lcm_help_on_unknown_subcommand(engine):
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, and `retention`" in result
+    assert "currently supports `clean`, `clean apply`, `repair`, `repair apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
+    assert "/lcm doctor repair" in result
+    assert "/lcm doctor repair apply" in result
     assert "/lcm doctor retention" in result
+
+
+def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_repair_drift.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._store.append("live-session", {"role": "user", "content": "repairable message search"}, token_estimate=4)
+    engine._dag.add_node(SummaryNode(
+        session_id="live-session",
+        depth=0,
+        summary="repairable summary search",
+        token_count=5,
+        source_token_count=4,
+        source_ids=[1],
+        source_type="messages",
+        created_at=1.0,
+    ))
+    engine._store._conn.execute("DROP TRIGGER msg_fts_insert")
+    engine._store._conn.execute("DROP TRIGGER nodes_fts_insert")
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor repair", engine)
+
+    assert "LCM doctor repair" in result
+    assert "status: repair-needed" in result
+    assert "messages_fts: repair-needed" in result
+    assert "nodes_fts: repair-needed" in result
+    assert "note: read-only scan only — no FTS tables were repaired" in result
+    remaining_triggers = {
+        row[0]
+        for row in engine._store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name IN ('msg_fts_insert', 'nodes_fts_insert')"
+        ).fetchall()
+    }
+    assert remaining_triggers == set()
+
+
+def test_lcm_doctor_repair_dry_run_works_with_read_only_database(tmp_path):
+    db_path = tmp_path / "lcm_repair_readonly.db"
+    config = LCMConfig(database_path=str(db_path))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._store.append("live-session", {"role": "user", "content": "readonly message search"}, token_estimate=4)
+    engine._dag.add_node(SummaryNode(
+        session_id="live-session",
+        depth=0,
+        summary="readonly summary search",
+        token_count=5,
+        source_token_count=4,
+        source_ids=[1],
+        source_type="messages",
+        created_at=1.0,
+    ))
+    engine._store.close()
+    engine._dag.close()
+    engine._lifecycle.close()
+
+    ro_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    class FakeStore:
+        _conn = ro_conn
+
+    class FakeEngine:
+        _store = FakeStore()
+
+    try:
+        result = handle_lcm_command("doctor repair", FakeEngine())
+    finally:
+        ro_conn.close()
+
+    assert "LCM doctor repair" in result
+    assert "status: ok" in result
+    assert "messages_fts: ok" in result
+    assert "nodes_fts: ok" in result
+    assert "repair-needed" not in result
+    assert "note: read-only scan only — no FTS tables were repaired" in result
+
+
+def test_lcm_doctor_repair_apply_is_backup_first_and_rebuilds_fts(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_repair_apply.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._store.append("live-session", {"role": "user", "content": "repair apply message search"}, token_estimate=4)
+    engine._dag.add_node(SummaryNode(
+        session_id="live-session",
+        depth=0,
+        summary="repair apply summary search",
+        token_count=5,
+        source_token_count=4,
+        source_ids=[1],
+        source_type="messages",
+        created_at=1.0,
+    ))
+    engine._store._conn.execute("DELETE FROM messages_fts")
+    engine._store._conn.execute("DELETE FROM nodes_fts")
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor repair apply", engine)
+
+    assert "LCM doctor repair apply" in result
+    assert "status: ok" in result
+    backup_line = next(line for line in result.splitlines() if line.startswith("backup_path: "))
+    backup_path = Path(backup_line.split(": ", 1)[1])
+    assert backup_path.exists()
+    assert "messages_fts_rebuilt: yes" in result
+    assert "nodes_fts_rebuilt: yes" in result
+    assert engine._store._conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == 1
+    assert engine._store._conn.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0] == 1
+    assert len(engine._store.search("message", session_id="live-session")) == 1
+    assert len(engine._dag.search("summary", session_id="live-session")) == 1
 
 
 def test_lcm_doctor_retention_reports_old_heavy_sessions(tmp_path):
