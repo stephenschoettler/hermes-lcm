@@ -1574,6 +1574,51 @@ class TestSessionRollover:
         expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
         assert expanded["expanded"][0]["content"] == "compression rollover keeps depth zero"
 
+    def test_rollover_session_compression_boundary_respects_disabled_carry_over(self, engine):
+        engine._config.new_session_retain_depth = 2
+        engine.on_session_start("compress-no-carry-old", platform="telegram", context_length=200000)
+        store_id = engine._store.append(
+            "compress-no-carry-old",
+            {"role": "user", "content": "do not leak compression carry over"},
+            token_estimate=13,
+            source="telegram",
+        )
+        retained_node_id = engine._dag.add_node(SummaryNode(
+            session_id="compress-no-carry-old",
+            depth=2,
+            summary="do not leak retained summary",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+        old_conversation_id = engine._conversation_id
+
+        moved = engine.rollover_session(
+            "compress-no-carry-old",
+            "compress-no-carry-new",
+            previous_messages=[],
+            carry_over_context=False,
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert moved == 0
+        assert engine._session_id == "compress-no-carry-new"
+        assert engine._conversation_id == old_conversation_id
+        assert engine._store.get_session_count("compress-no-carry-old") == 1
+        assert engine._store.get_session_count("compress-no-carry-new") == 0
+        assert [node.node_id for node in engine._dag.get_session_nodes("compress-no-carry-old")] == [retained_node_id]
+        assert engine._dag.get_session_nodes("compress-no-carry-new") == []
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "leak", "session_scope": "current", "sort": "relevance", "limit": 10},
+        ))
+        assert result["total_results"] == 0
+
     def test_rollover_session_skips_carry_over_when_old_session_is_not_bound(self, engine):
         engine._config.new_session_retain_depth = 2
 

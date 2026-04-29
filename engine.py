@@ -874,7 +874,7 @@ class LCMEngine(ContextEngine):
             old_session_id and bound_session_id and old_session_id == bound_session_id
         )
 
-        if boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
+        if carry_over_context and boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
             before_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
             if can_carry_over:
                 self.on_session_end(old_session_id, previous_messages)

@@ -327,7 +327,7 @@ That means patterns like `cron:*` can catch Hermes cron sessions today, while pl
 
 - **Manual `/new`** should call `rollover_session(old_session_id, new_session_id, ...)`. This finalizes the old physical session, records reset/rollover lifecycle state, binds the new physical session, and applies `LCM_NEW_SESSION_RETAIN_DEPTH` before carrying retained summary nodes forward.
 - **Compression-created session splits** should call `on_session_start(new_session_id, boundary_reason="compression", old_session_id=old_session_id, ...)`. Compression is a continuation of the same logical conversation, so LCM preserves the conversation id and carries all current DAG/message state forward, including depth-0 nodes.
-- For host compatibility, `rollover_session(..., boundary_reason="compression")` is also treated as a compression continuation, not as manual `/new` pruning.
+- For host compatibility, `rollover_session(..., boundary_reason="compression")` is also treated as a compression continuation when `carry_over_context` is enabled, not as manual `/new` pruning. If an integration explicitly passes `carry_over_context=False`, no prior-session messages or DAG nodes are moved into the new session.
 - Older hosts that only call `on_session_reset()` followed later by `on_session_start(new_session_id, ...)` are supported by delayed reset-boundary finalization: same-session reset stays current, while a later fresh bind finalizes the previous lifecycle row with the latest known frontier.
 
 ## Agent Tools
