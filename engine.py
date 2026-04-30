@@ -625,6 +625,10 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_session_ids
 
+    def _active_auxiliary_session_ids(self) -> set[str]:
+        with self._auxiliary_session_lock:
+            return set(self._auxiliary_session_ids)
+
     def _thread_context_stateless(self) -> bool:
         return bool(self._thread_context_session_id())
 
@@ -705,16 +709,58 @@ class LCMEngine(ContextEngine):
         if not row:
             return False
         child_parent_id, child_started_at, child_ended_at, actual_parent_id, parent_ended_at = row
-        if child_parent_id != parent_session_id or actual_parent_id != parent_session_id:
+        if child_ended_at is not None or actual_parent_id is None:
             return False
-        if child_ended_at is not None:
-            return False
+
+        active_auxiliary_ids = self._active_auxiliary_session_ids()
+        if child_parent_id in active_auxiliary_ids:
+            return True
+        if child_parent_id != parent_session_id:
+            return self._session_has_active_auxiliary_ancestor(
+                str(child_parent_id or ""),
+                active_auxiliary_ids,
+                path,
+            )
         if parent_ended_at is None:
             return True
         try:
             return float(child_started_at or 0) < float(parent_ended_at)
         except (TypeError, ValueError):
             return False
+
+    def _session_has_active_auxiliary_ancestor(
+        self,
+        session_id: str,
+        active_auxiliary_ids: set[str],
+        state_db_path: Path,
+    ) -> bool:
+        if not session_id or not active_auxiliary_ids or not state_db_path.exists():
+            return False
+        visited: set[str] = set()
+        current = session_id
+        try:
+            uri = state_db_path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                for _ in range(32):
+                    if not current or current in visited:
+                        return False
+                    if current in active_auxiliary_ids:
+                        return True
+                    visited.add(current)
+                    row = conn.execute(
+                        "SELECT parent_session_id FROM sessions WHERE id = ? LIMIT 1",
+                        (current,),
+                    ).fetchone()
+                    if not row:
+                        return False
+                    current = str(row[0] or "")
+            finally:
+                conn.close()
+        except Exception as exc:  # pragma: no cover - defensive against host DB drift
+            logger.debug("LCM auxiliary ancestor probe failed: %s", exc)
+            return False
+        return False
 
     def _clear_pending_reset_boundary(self) -> None:
         self._pending_reset_session_id = ""

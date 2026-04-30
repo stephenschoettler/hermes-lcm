@@ -2219,6 +2219,90 @@ class TestSessionRollover:
         assert engine._store.get_session_count("background-review-a") == 0
         assert engine._store.get_session_count("background-review-b") == 0
 
+    def test_auxiliary_descendant_session_does_not_rebind_shared_engine(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-a', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-followup', 'background-review-a', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_descendant.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "background-review-a",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == "background-review-a"
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+
+        engine.on_session_start(
+            "background-review-followup",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == "background-review-followup"
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert engine._thread_context_has_auxiliary_session("background-review-followup")
+        assert engine._thread_context_stateless()
+
+        engine.should_compress_preflight([
+            {"role": "user", "content": "descendant auxiliary must stay stateless"},
+        ])
+
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-followup") == 0
+
+        engine.on_session_end(
+            "background-review-followup",
+            [{"role": "user", "content": "followup end must not persist"}],
+        )
+
+        assert engine._thread_context_session_id() == "background-review-a"
+        assert engine._thread_context_stateless()
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert not engine._thread_context_has_auxiliary_session("background-review-followup")
+
+        engine.on_session_end(
+            "background-review-a",
+            [{"role": "user", "content": "parent auxiliary end must not persist"}],
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-followup") == 0
+
     def test_auxiliary_child_end_is_ignored_across_threads(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
