@@ -609,7 +609,8 @@ class LCMEngine(ContextEngine):
             return session_id in self._auxiliary_session_ids
 
     def _thread_context_stateless(self) -> bool:
-        return bool(self._thread_context_session_id())
+        session_id = self._thread_context_session_id()
+        return bool(session_id and self._thread_context_has_auxiliary_session(session_id))
 
     def _mark_thread_context_stateless(self, session_id: str) -> None:
         with self._auxiliary_session_lock:

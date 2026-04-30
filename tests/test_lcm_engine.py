@@ -2085,6 +2085,7 @@ class TestSessionRollover:
         )
 
         assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_stateless()
 
         errors = []
 
@@ -2104,8 +2105,72 @@ class TestSessionRollover:
         assert not thread.is_alive()
         assert errors == []
         assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_stateless()
         assert engine._store.get_session_count("background-review-session") == 0
         assert engine._session_id == "foreground-session"
+
+    def test_inactive_auxiliary_marker_does_not_keep_thread_stateless(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_inactive_marker.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "background-review-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        assert engine._thread_context_session_id() == "background-review-session"
+        assert engine._thread_context_stateless()
+
+        errors = []
+
+        def end_auxiliary_child():
+            try:
+                engine.on_session_end("background-review-session", [])
+            except Exception as exc:  # pragma: no cover - assertion helper
+                errors.append(exc)
+
+        thread = threading.Thread(target=end_auxiliary_child)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert engine._thread_context_session_id() == "background-review-session"
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_stateless()
+
+        messages = [{"role": "user", "content": "foreground must persist after child ended"}]
+        engine.should_compress_preflight(messages)
+
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
 
     def test_historical_child_session_is_not_treated_as_live_auxiliary(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
