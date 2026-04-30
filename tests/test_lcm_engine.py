@@ -1976,6 +1976,101 @@ class TestSessionRollover:
         assert engine._store.get_session_count("background-review-session") == 0
         assert not engine._thread_context_has_auxiliary_session("background-review-session")
 
+    def test_auxiliary_compression_boundary_does_not_reassign_foreground_state(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-continuation', 'background-review-session', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_store_id = engine._store.append(
+            "foreground-session",
+            {"role": "user", "content": "foreground must not move into child continuation"},
+            token_estimate=13,
+            source="telegram",
+        )
+        foreground_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-session",
+            depth=0,
+            summary="foreground must stay foreground",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[foreground_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = foreground_store_id
+        foreground_conversation_id = engine._conversation_id
+
+        engine.on_session_start(
+            "background-review-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+
+        engine.on_session_start(
+            "background-review-continuation",
+            boundary_reason="compression",
+            old_session_id="background-review-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._conversation_id == foreground_conversation_id
+        assert engine._thread_context_session_id() == "background-review-continuation"
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_has_auxiliary_session("background-review-continuation")
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-continuation") == 0
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-session")
+        ] == [foreground_node_id]
+        assert engine._dag.get_session_nodes("background-review-continuation") == []
+
+        engine.on_session_end(
+            "background-review-session",
+            [{"role": "user", "content": "old child end must not persist"}],
+        )
+        engine.on_session_end(
+            "background-review-continuation",
+            [{"role": "user", "content": "new child end must not persist"}],
+        )
+
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
+
     def test_multiple_auxiliary_child_sessions_are_tracked_independently(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()

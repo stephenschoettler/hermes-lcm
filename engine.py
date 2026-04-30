@@ -929,6 +929,14 @@ class LCMEngine(ContextEngine):
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self._session_id
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            if self._thread_context_has_auxiliary_session(old_session_id):
+                self._mark_thread_context_stateless(session_id)
+                logger.info(
+                    "LCM auxiliary session %s compressed to %s — keeping boundary stateless",
+                    old_session_id,
+                    session_id,
+                )
+                return
             self._clear_thread_context_stateless()
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
