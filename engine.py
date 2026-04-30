@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -208,6 +210,7 @@ class LCMEngine(ContextEngine):
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
+        self._thread_context = threading.local()
 
     @property
     def name(self) -> str:
@@ -237,7 +240,7 @@ class LCMEngine(ContextEngine):
         return self.last_cache_read_tokens / self.last_prompt_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        if self._session_ignored or self._session_stateless:
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
@@ -248,7 +251,7 @@ class LCMEngine(ContextEngine):
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        if self._session_ignored or self._session_stateless:
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
         if self._session_id and messages:
             try:
@@ -392,11 +395,11 @@ class LCMEngine(ContextEngine):
         if not messages:
             return messages
 
-        if self._session_ignored or self._session_stateless:
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             logger.debug(
                 "LCM compress bypassed for %s session %s",
-                "ignored" if self._session_ignored else "stateless",
-                self._session_id or "(unknown)",
+                "auxiliary" if self._thread_context_stateless() else "ignored" if self._session_ignored else "stateless",
+                self._thread_context_session_id() or self._session_id or "(unknown)",
             )
             return messages
 
@@ -595,6 +598,84 @@ class LCMEngine(ContextEngine):
             self._session_id,
             self._last_compacted_store_id,
         )
+
+    def _thread_context_session_id(self) -> str:
+        return str(getattr(self._thread_context, "auxiliary_session_id", "") or "")
+
+    def _thread_context_stateless(self) -> bool:
+        return bool(self._thread_context_session_id())
+
+    def _mark_thread_context_stateless(self, session_id: str) -> None:
+        self._thread_context.auxiliary_session_id = session_id
+
+    def _clear_thread_context_stateless(self, session_id: str = "") -> None:
+        current = self._thread_context_session_id()
+        if current and (not session_id or current == session_id):
+            self._thread_context.auxiliary_session_id = ""
+
+    def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
+        kwargs = kwargs or {}
+        hermes_home = str(kwargs.get("hermes_home") or self._hermes_home or "")
+        if hermes_home:
+            return Path(hermes_home).expanduser() / "state.db"
+        return Path(self._store.db_path).parent / "state.db"
+
+    def _is_live_auxiliary_child_session(
+        self,
+        session_id: str,
+        parent_session_id: str,
+        kwargs: Dict[str, Any],
+    ) -> bool:
+        """Return True when a same-process child agent should not rebind LCM.
+
+        Hermes background review and other auxiliary agents can be recorded in
+        state.db as children of the foreground session while that parent is
+        still live. When Hermes shares one mutable plugin context-engine
+        instance across those agents, rebinding to the live child would steal
+        the foreground session's LCM state. Compression continuations are not
+        live children: the parent is ended before the continuation is created
+        and newer hosts also pass boundary_reason="compression".
+        """
+        if not session_id or not parent_session_id or session_id == parent_session_id:
+            return False
+        path = self._state_db_path(kwargs)
+        if not path.exists():
+            return False
+        try:
+            uri = path.resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT
+                        child.parent_session_id,
+                        child.started_at,
+                        parent.id,
+                        parent.ended_at
+                    FROM sessions AS child
+                    LEFT JOIN sessions AS parent
+                        ON parent.id = child.parent_session_id
+                    WHERE child.id = ?
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception as exc:  # pragma: no cover - defensive against host DB drift
+            logger.debug("LCM auxiliary child session probe failed: %s", exc)
+            return False
+        if not row:
+            return False
+        child_parent_id, child_started_at, actual_parent_id, parent_ended_at = row
+        if child_parent_id != parent_session_id or actual_parent_id != parent_session_id:
+            return False
+        if parent_ended_at is None:
+            return True
+        try:
+            return float(child_started_at or 0) < float(parent_ended_at)
+        except (TypeError, ValueError):
+            return False
 
     def _clear_pending_reset_boundary(self) -> None:
         self._pending_reset_session_id = ""
@@ -834,6 +915,15 @@ class LCMEngine(ContextEngine):
             return
 
         previous_session_id = self._session_id
+        if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
+            self._mark_thread_context_stateless(session_id)
+            logger.info(
+                "LCM session %s is a live child of bound session %s — treating it as auxiliary/stateless in this thread",
+                session_id,
+                previous_session_id,
+            )
+            return
+        self._clear_thread_context_stateless(session_id)
         if previous_session_id and previous_session_id != session_id:
             self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
@@ -851,6 +941,9 @@ class LCMEngine(ContextEngine):
         self._log_session_filter_diagnostics()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        if self._thread_context_session_id() == session_id:
+            self._clear_thread_context_stateless(session_id)
+            return
         # Ensure all messages are persisted
         self._ingest_messages(messages)
         self._lifecycle.finalize_session(
@@ -971,7 +1064,9 @@ class LCMEngine(ContextEngine):
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
-        if messages and self._session_id and not (self._session_ignored or self._session_stateless):
+        if messages and self._session_id and not (
+            self._session_ignored or self._session_stateless or self._thread_context_stateless()
+        ):
             try:
                 self._ingest_messages(messages)
             except Exception as e:

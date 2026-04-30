@@ -1735,6 +1735,98 @@ class TestSessionRollover:
         assert engine._dag.get_session_nodes("attacker-new") == []
         assert engine._session_id == "attacker-new"
 
+    def test_live_auxiliary_child_session_does_not_rebind_shared_engine(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_auxiliary_child.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_store_id = engine._store.append(
+            "foreground-session",
+            {"role": "user", "content": "foreground context must stay bound"},
+            token_estimate=17,
+            source="telegram",
+        )
+        foreground_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-session",
+            depth=0,
+            summary="foreground summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[foreground_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = foreground_store_id
+        foreground_conversation_id = engine._conversation_id
+
+        engine.on_session_start(
+            "background-review-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._conversation_id == foreground_conversation_id
+        assert engine._lifecycle.get_by_conversation(
+            foreground_conversation_id
+        ).current_session_id == "foreground-session"
+
+        background_messages = [
+            {"role": "user", "content": "background review must not enter LCM"},
+            {"role": "assistant", "content": "Nothing to save."},
+        ]
+        assert engine.should_compress_preflight(background_messages) is False
+        assert engine.compress(background_messages) == background_messages
+        engine.on_session_end("background-review-session", background_messages)
+
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-session")
+        ] == [foreground_node_id]
+
+        engine.on_session_start(
+            "foreground-continuation",
+            boundary_reason="compression",
+            old_session_id="foreground-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-continuation"
+        assert engine._conversation_id == foreground_conversation_id
+        assert engine._store.get_session_count("foreground-continuation") == 1
+        assert engine._dag.get_session_nodes("foreground-session") == []
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-continuation")
+        ] == [foreground_node_id]
+
     def test_compression_boundary_continues_logical_session_without_resetting_state(self, engine):
         engine.on_session_start("old-session", platform="telegram", context_length=200000)
         store_id = engine._store.append(
