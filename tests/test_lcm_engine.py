@@ -1549,6 +1549,43 @@ class TestSessionRollover:
         )
         return frame
 
+    def test_on_session_end_fails_open_when_ingest_store_is_locked(self, engine, monkeypatch, caplog):
+        engine.on_session_start("test-session", platform="discord")
+
+        def locked_ingest(messages):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(engine, "_ingest_messages", locked_ingest)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
+        assert "LCM session-end ingest/finalize skipped due to SQLite lock" in caplog.text
+
+    def test_on_session_end_fails_open_when_finalize_store_is_locked(self, engine, monkeypatch, caplog):
+        engine.on_session_start("test-session", platform="discord")
+
+        def locked_finalize(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(engine._lifecycle, "finalize_session", locked_finalize)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
+        assert "LCM session-end ingest/finalize skipped due to SQLite lock" in caplog.text
+
+    def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
+        engine.on_session_start("test-session", platform="discord")
+
+        def broken_ingest(messages):
+            raise RuntimeError("not a lock")
+
+        monkeypatch.setattr(engine, "_ingest_messages", broken_ingest)
+
+        with pytest.raises(RuntimeError, match="not a lock"):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
     def test_rollover_session_rebinds_engine_and_carries_retained_nodes(self, engine):
         engine._config.new_session_retain_depth = 2
         from hermes_lcm.dag import SummaryNode

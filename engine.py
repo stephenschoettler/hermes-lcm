@@ -117,6 +117,19 @@ def _git_runtime_identity(root: Path) -> dict[str, Any]:
     }
 
 
+def _is_sqlite_locked_error(exc: BaseException) -> bool:
+    """Return True when an exception chain represents SQLite lock contention."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if isinstance(current, sqlite3.Error) and "locked" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 _SYNTHETIC_ASSISTANT_NOISE = {
     "ack",
     "acknowledged",
@@ -1241,13 +1254,22 @@ class LCMEngine(ContextEngine):
             if current_thread_session_id == session_id:
                 self._clear_thread_context_stateless(session_id)
             return
-        # Ensure all messages are persisted
-        self._ingest_messages(messages)
-        self._lifecycle.finalize_session(
-            self._conversation_id,
-            session_id,
-            frontier_store_id=self._last_compacted_store_id,
-        )
+        try:
+            # Ensure all messages are persisted
+            self._ingest_messages(messages)
+            self._lifecycle.finalize_session(
+                self._conversation_id,
+                session_id,
+                frontier_store_id=self._last_compacted_store_id,
+            )
+        except Exception as exc:
+            if _is_sqlite_locked_error(exc):
+                logger.warning(
+                    "LCM session-end ingest/finalize skipped due to SQLite lock: %s",
+                    exc,
+                )
+                return
+            raise
 
     def on_session_reset(self) -> None:
         self._pending_reset_session_id = self._session_id
