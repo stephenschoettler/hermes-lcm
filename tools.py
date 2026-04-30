@@ -419,22 +419,27 @@ def _collect_context_blocks_for_node(
     *,
     hydrate_externalized_content: bool = False,
 ) -> list[dict[str, Any]]:
+    from .tokens import count_tokens
+
+    summary, summary_truncated = _truncate_text_to_token_budget(node.summary, max_tokens)
     blocks: list[dict[str, Any]] = [
         {
             "type": "summary",
             "node_id": node.node_id,
             "depth": node.depth,
-            "summary": node.summary,
+            "summary": summary,
+            "summary_truncated": summary_truncated,
             "expand_hint": node.expand_hint,
             "token_count": node.token_count,
         }
     ]
+    remaining_tokens = max(0, max_tokens - count_tokens(summary))
 
     if node.source_type == "messages":
         messages, pagination = _expand_message_sources(
             engine,
             node,
-            max_tokens=max_tokens,
+            max_tokens=remaining_tokens,
             hydrate_externalized_content=hydrate_externalized_content,
         )
         if messages or pagination.get("has_more"):
@@ -446,7 +451,7 @@ def _collect_context_blocks_for_node(
             }
             blocks.append(block)
     elif node.source_type == "nodes":
-        children, pagination = _expand_child_nodes(engine, node, max_tokens=max_tokens)
+        children, pagination = _expand_child_nodes(engine, node, max_tokens=remaining_tokens)
         if children or pagination.get("has_more"):
             blocks.append(
                 {
@@ -465,7 +470,9 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
 
     total = 0
     for block in blocks:
-        if block.get("type") == "messages":
+        if block.get("type") == "summary":
+            total += count_tokens(str(block.get("summary") or ""))
+        elif block.get("type") == "messages":
             total += sum(count_tokens(str(message.get("content") or "")) for message in block.get("messages", []))
         elif block.get("type") == "child_nodes":
             total += sum(count_tokens(str(child.get("summary") or "")) for child in block.get("children", []))
@@ -833,7 +840,17 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
 
     context_pagination = []
     for block in context_blocks:
-        pagination = block.get("pagination") if isinstance(block, dict) else None
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "summary" and block.get("summary_truncated"):
+            context_pagination.append(
+                {
+                    "node_id": block.get("node_id"),
+                    "type": "summary",
+                    "summary_truncated": True,
+                }
+            )
+        pagination = block.get("pagination")
         if pagination:
             context_pagination.append(
                 {
@@ -843,7 +860,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
                 }
             )
     context_truncated = any(
-        bool(item.get("pagination", {}).get("has_more"))
+        bool(item.get("summary_truncated")) or bool(item.get("pagination", {}).get("has_more"))
         for item in context_pagination
     )
 

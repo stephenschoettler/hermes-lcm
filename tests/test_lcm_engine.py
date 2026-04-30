@@ -6542,7 +6542,54 @@ class TestEngineTools:
         assert "SECOND NODE RAW DETAIL" not in context_json
         assert result["context_truncated"] is True
         assert any(
-            item["node_id"] == second_node_id and item["pagination"]["has_more"]
+            item["node_id"] == second_node_id and item.get("pagination", {}).get("has_more")
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_counts_summary_blocks_against_context_budget(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "raw detail should wait behind summary budget"},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary=("long summary filler " * 80) + "UNBUDGETED SUMMARY TAIL",
+                token_count=200,
+                source_token_count=20,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What fits?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 5,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "UNBUDGETED SUMMARY TAIL" not in context_json
+        assert "raw detail should wait" not in context_json
+        assert captured["context_blocks"][0]["summary_truncated"] is True
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == node_id and item["type"] == "summary"
             for item in result["context_pagination"]
         )
 

@@ -256,7 +256,7 @@ Environment variables (all optional):
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Opt-in rewrite of already-externalized summarized tool-result transcript rows to compact GC placeholders |
 | `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization. Slash-bearing aggregator model slugs such as `meta-llama/...`, `anthropic/...`, and unresolved `cerebras/...` stay model-only. |
 | `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis. Uses the same routing rules as `LCM_SUMMARY_MODEL`. |
-| `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Raw/source context budget fed to the auxiliary LLM for `lcm_expand_query` before returning a bounded answer |
+| `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Summary/raw/source context budget fed to the auxiliary LLM for `lcm_expand_query` before returning a bounded answer |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
@@ -367,7 +367,7 @@ For `lcm_expand(externalized_ref=...)`:
 For `lcm_expand_query`:
 
 - `max_tokens` is the bounded answer budget returned to the main agent
-- `context_max_tokens` is the larger fresh context budget used to expand raw/source material for the auxiliary LLM before synthesis
+- `context_max_tokens` is the larger fresh context budget used to expand summaries and raw/source material for the auxiliary LLM before synthesis
 - default `context_max_tokens` comes from `LCM_EXPANSION_CONTEXT_TOKENS`, currently `32000`
 - if the auxiliary context still cannot cover all raw sources, the response reports `context_truncated` and `context_pagination` so the main agent can fall back to explicit `lcm_expand` pages
 
