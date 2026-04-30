@@ -600,18 +600,33 @@ class LCMEngine(ContextEngine):
         )
 
     def _thread_context_session_id(self) -> str:
-        return str(getattr(self._thread_context, "auxiliary_session_id", "") or "")
+        return str(getattr(self._thread_context, "current_auxiliary_session_id", "") or "")
+
+    def _thread_context_auxiliary_session_ids(self) -> set[str]:
+        ids = getattr(self._thread_context, "auxiliary_session_ids", None)
+        if ids is None:
+            ids = set()
+            self._thread_context.auxiliary_session_ids = ids
+        return ids
+
+    def _thread_context_has_auxiliary_session(self, session_id: str) -> bool:
+        return session_id in self._thread_context_auxiliary_session_ids()
 
     def _thread_context_stateless(self) -> bool:
         return bool(self._thread_context_session_id())
 
     def _mark_thread_context_stateless(self, session_id: str) -> None:
-        self._thread_context.auxiliary_session_id = session_id
+        self._thread_context_auxiliary_session_ids().add(session_id)
+        self._thread_context.current_auxiliary_session_id = session_id
 
     def _clear_thread_context_stateless(self, session_id: str = "") -> None:
         current = self._thread_context_session_id()
         if current and (not session_id or current == session_id):
-            self._thread_context.auxiliary_session_id = ""
+            self._thread_context.current_auxiliary_session_id = ""
+
+    def _unmark_thread_context_auxiliary_session(self, session_id: str) -> None:
+        self._thread_context_auxiliary_session_ids().discard(session_id)
+        self._clear_thread_context_stateless(session_id)
 
     def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
         kwargs = kwargs or {}
@@ -942,8 +957,8 @@ class LCMEngine(ContextEngine):
         self._log_session_filter_diagnostics()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        if self._thread_context_session_id() == session_id:
-            self._clear_thread_context_stateless(session_id)
+        if self._thread_context_has_auxiliary_session(session_id):
+            self._unmark_thread_context_auxiliary_session(session_id)
             return
         # Ensure all messages are persisted
         self._ingest_messages(messages)
