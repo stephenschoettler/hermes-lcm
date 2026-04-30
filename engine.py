@@ -601,26 +601,48 @@ class LCMEngine(ContextEngine):
             self._last_compacted_store_id,
         )
 
+    def _thread_context_auxiliary_stack(self) -> list[str]:
+        stack = getattr(self._thread_context, "auxiliary_session_stack", None)
+        if stack is None:
+            current = str(getattr(self._thread_context, "current_auxiliary_session_id", "") or "")
+            stack = [current] if current else []
+            self._thread_context.auxiliary_session_stack = stack
+        return stack
+
+    def _sync_thread_context_current_auxiliary(self) -> list[str]:
+        stack = self._thread_context_auxiliary_stack()
+        with self._auxiliary_session_lock:
+            active_ids = set(self._auxiliary_session_ids)
+        stack[:] = [session_id for session_id in stack if session_id in active_ids]
+        self._thread_context.current_auxiliary_session_id = stack[-1] if stack else ""
+        return stack
+
     def _thread_context_session_id(self) -> str:
-        return str(getattr(self._thread_context, "current_auxiliary_session_id", "") or "")
+        stack = self._sync_thread_context_current_auxiliary()
+        return stack[-1] if stack else ""
 
     def _thread_context_has_auxiliary_session(self, session_id: str) -> bool:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_session_ids
 
     def _thread_context_stateless(self) -> bool:
-        session_id = self._thread_context_session_id()
-        return bool(session_id and self._thread_context_has_auxiliary_session(session_id))
+        return bool(self._thread_context_session_id())
 
     def _mark_thread_context_stateless(self, session_id: str) -> None:
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.add(session_id)
+        stack = self._thread_context_auxiliary_stack()
+        stack[:] = [existing for existing in stack if existing != session_id]
+        stack.append(session_id)
         self._thread_context.current_auxiliary_session_id = session_id
 
     def _clear_thread_context_stateless(self, session_id: str = "") -> None:
-        current = self._thread_context_session_id()
-        if current and (not session_id or current == session_id):
-            self._thread_context.current_auxiliary_session_id = ""
+        stack = self._thread_context_auxiliary_stack()
+        if session_id:
+            stack[:] = [existing for existing in stack if existing != session_id]
+        else:
+            stack.clear()
+        self._sync_thread_context_current_auxiliary()
 
     def _unmark_thread_context_auxiliary_session(self, session_id: str) -> None:
         with self._auxiliary_session_lock:

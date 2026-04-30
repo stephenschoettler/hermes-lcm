@@ -2142,6 +2142,83 @@ class TestSessionRollover:
         assert engine._store.get_session_count("background-review-b") == 0
         assert engine._store.get_session_count("foreground-session") == 0
 
+    def test_nested_auxiliary_child_end_restores_previous_thread_marker(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-a', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-b', 'foreground-session', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_nested_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "background-review-a",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "background-review-b",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_session_id() == "background-review-b"
+        assert engine._thread_context_stateless()
+
+        engine.on_session_end(
+            "background-review-b",
+            [{"role": "user", "content": "nested child b must not persist"}],
+        )
+
+        assert engine._thread_context_session_id() == "background-review-a"
+        assert engine._thread_context_stateless()
+        assert engine._thread_context_has_auxiliary_session("background-review-a")
+        assert not engine._thread_context_has_auxiliary_session("background-review-b")
+
+        engine.should_compress_preflight([
+            {"role": "user", "content": "continuing child a must still be stateless"},
+        ])
+
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-b") == 0
+
+        engine.on_session_end(
+            "background-review-a",
+            [{"role": "user", "content": "nested child a must not persist"}],
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("background-review-a") == 0
+        assert engine._store.get_session_count("background-review-b") == 0
+
     def test_auxiliary_child_end_is_ignored_across_threads(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
@@ -2257,7 +2334,7 @@ class TestSessionRollover:
 
         assert not thread.is_alive()
         assert errors == []
-        assert engine._thread_context_session_id() == "background-review-session"
+        assert engine._thread_context_session_id() == ""
         assert not engine._thread_context_has_auxiliary_session("background-review-session")
         assert not engine._thread_context_stateless()
 
