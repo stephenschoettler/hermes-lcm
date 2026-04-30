@@ -6865,6 +6865,93 @@ class TestEngineTools:
             for item in result["context_pagination"]
         )
 
+    def test_handle_expand_query_counts_externalized_transcript_content_against_context_budget(self, tmp_path, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        captured = {}
+
+        def fake_count_tokens(text):
+            return len(str(text or ""))
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_expand_query_externalized_transcript_budget.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=2,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        content = "PAYLOAD"
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_ext", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+        transcript_content = (
+            f"[GC'd externalized tool output: tool_call_id=call_ext; chars={len(content)}; ref={ref}]"
+            + (" transcript filler" * 20)
+        )
+        first_store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_ext", "content": transcript_content},
+        )
+        first_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="",
+                token_count=0,
+                source_token_count=200,
+                source_ids=[first_store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+        second_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "SECOND_RAW_DETAIL"},
+        )
+        second_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="",
+                token_count=0,
+                source_token_count=20,
+                source_ids=[second_store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What details fit?",
+                    "node_ids": [first_node_id, second_node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 30,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "transcript_content" in context_json
+        assert "SECOND_RAW_DETAIL" not in context_json
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == second_node_id
+            and item["type"] == "messages"
+            and item.get("pagination", {}).get("has_more") is True
+            and item.get("expand_args") == {"node_id": second_node_id, "source_offset": 0, "content_offset": 0}
+            for item in result["context_pagination"]
+        )
+
     def test_handle_expand_query_hydrates_externalized_payload_content_for_auxiliary_context(self, tmp_path, monkeypatch):
         captured = {}
 

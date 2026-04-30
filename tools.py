@@ -478,7 +478,9 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
         if block.get("type") == "summary":
             total += count_tokens(str(block.get("summary") or ""))
         elif block.get("type") == "messages":
-            total += sum(count_tokens(str(message.get("content") or "")) for message in block.get("messages", []))
+            for message in block.get("messages", []):
+                total += count_tokens(str(message.get("content") or ""))
+                total += count_tokens(str(message.get("transcript_content") or ""))
         elif block.get("type") == "child_nodes":
             total += sum(count_tokens(str(child.get("summary") or "")) for child in block.get("children", []))
     return total

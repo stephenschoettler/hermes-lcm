@@ -198,7 +198,7 @@ LCM_EXPAND_QUERY = {
             },
             "context_max_tokens": {
                 "type": "integer",
-                "description": "Expanded summary/raw/child-source fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
+                "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
                 "default": 32000,
             },
         },
