@@ -1884,7 +1884,7 @@ class TestSessionRollover:
             node.node_id for node in engine._dag.get_session_nodes("foreground-continuation")
         ] == [foreground_node_id]
 
-    def test_auxiliary_child_with_explicit_parent_id_does_not_need_state_db_row(self, tmp_path):
+    def test_auxiliary_child_with_explicit_parent_id_and_aux_frame_does_not_need_state_db_row(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
         state_db = hermes_home / "state.db"
@@ -1904,6 +1904,22 @@ class TestSessionRollover:
         conn.commit()
         conn.close()
 
+        class ExplicitParentAuxFrame:
+            def __init__(self, session_id: str, parent_session_id: str):
+                self.session_id = session_id
+                self._parent_session_id = parent_session_id
+                self.enabled_toolsets = ["memory", "skills"]
+                self.log_prefix = ""
+
+            def on_session_start(self, lcm_engine: LCMEngine) -> None:
+                lcm_engine.on_session_start(
+                    self.session_id,
+                    hermes_home=str(hermes_home),
+                    platform="telegram",
+                    context_length=200000,
+                    parent_session_id=self._parent_session_id,
+                )
+
         config = LCMConfig(database_path=str(tmp_path / "lcm_aux_explicit_parent.db"))
         engine = LCMEngine(config=config, hermes_home=str(hermes_home))
         engine.on_session_start(
@@ -1912,20 +1928,14 @@ class TestSessionRollover:
             platform="telegram",
             context_length=200000,
         )
-        engine.on_session_start(
-            "background-review-session",
-            hermes_home=str(hermes_home),
-            platform="telegram",
-            context_length=200000,
-            parent_session_id="foreground-session",
-        )
+        child = ExplicitParentAuxFrame("background-review-session", "foreground-session")
+        child.on_session_start(engine)
 
         assert engine._session_id == "foreground-session"
         assert engine._thread_context_session_id() == ""
         assert engine._thread_context_has_auxiliary_session("background-review-session")
-        child = self.HostAgentFrame("background-review-session", "foreground-session", hermes_home)
-        child.should_compress_preflight(engine, [
-            {"role": "user", "content": "explicit parent child must stay stateless"},
+        self.HostAgentFrame("background-review-session", "foreground-session", hermes_home).should_compress_preflight(engine, [
+            {"role": "user", "content": "explicit parent aux-frame child must stay stateless"},
         ])
         assert engine._store.get_session_count("foreground-session") == 0
         assert engine._store.get_session_count("background-review-session") == 0
@@ -2285,6 +2295,51 @@ class TestSessionRollover:
         assert engine._store.get_session_count("foreground-session") == 0
         assert engine._store.get_session_count("foreground-branch-session") == 1
 
+    def test_explicit_parent_id_without_aux_frame_or_live_row_rebinds_foreground_branch(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_explicit_missing_row_branch.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "foreground-branch-session",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+            parent_session_id="foreground-session",
+        )
+
+        assert engine._session_id == "foreground-branch-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("foreground-branch-session")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "explicit parent missing row branch should persist"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 0
+        assert engine._store.get_session_count("foreground-branch-session") == 1
+
     def test_auxiliary_lineage_does_not_poison_reused_root_session_id(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
@@ -2382,6 +2437,91 @@ class TestSessionRollover:
         messages.append({"role": "assistant", "content": "reused root frame final"})
         frame.on_session_end(engine, messages)
         assert engine._store.get_session_count("reused-session") == 2
+
+    def test_auxiliary_lineage_does_not_poison_reused_root_parent_branches(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('reused-parent', NULL, 10.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('reused-child-state', 'reused-parent', 11.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_reused_aux_parent_branch.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        self._start_host_child(
+            engine,
+            hermes_home,
+            "reused-parent",
+            "foreground-session",
+        )
+        assert engine._has_auxiliary_lineage_session("reused-parent")
+        assert engine._thread_context_has_auxiliary_session("reused-parent")
+
+        # If that id later becomes a real foreground/root session, the old
+        # auxiliary lineage must not poison real child branches under it.
+        engine.on_session_start(
+            "reused-parent",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+        assert engine._session_id == "reused-parent"
+        assert not engine._thread_context_has_auxiliary_session("reused-parent")
+
+        engine.on_session_start(
+            "reused-child-state",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+        )
+        assert engine._session_id == "reused-child-state"
+        assert not engine._thread_context_has_auxiliary_session("reused-child-state")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "state-db child of reused parent persists"},
+        ])
+        assert engine._store.get_session_count("reused-child-state") == 1
+
+        engine.on_session_start(
+            "reused-parent",
+            hermes_home=str(hermes_home),
+            platform="cli",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "reused-child-explicit",
+            hermes_home=str(hermes_home),
+            platform="tui",
+            context_length=200000,
+            parent_session_id="reused-parent",
+        )
+        assert engine._session_id == "reused-child-explicit"
+        assert not engine._thread_context_has_auxiliary_session("reused-child-explicit")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "explicit child of reused parent persists"},
+        ])
+        assert engine._store.get_session_count("reused-child-explicit") == 1
 
     def test_auxiliary_lineage_does_not_block_reused_root_compression_boundary(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
@@ -2894,7 +3034,7 @@ class TestSessionRollover:
         assert engine._session_id == "foreground-session"
         assert engine._conversation_id == foreground_conversation_id
         assert engine._thread_context_session_id() == ""
-        assert engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
         assert engine._thread_context_has_auxiliary_session("background-review-continuation")
         assert engine._store.get_session_count("foreground-session") == 1
         assert engine._store.get_session_count("background-review-continuation") == 0
@@ -2917,6 +3057,87 @@ class TestSessionRollover:
         assert engine._store.get_session_count("background-review-continuation") == 0
         assert not engine._thread_context_has_auxiliary_session("background-review-session")
         assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
+
+    def test_auxiliary_compression_boundary_retires_old_child_if_old_end_is_missing(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-continuation', 'background-review-session', 3.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_aux_handoff_missing_old_end.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        child = self._start_host_child(
+            engine,
+            hermes_home,
+            "background-review-session",
+            "foreground-session",
+        )
+        child.should_compress_preflight(engine, [
+            {"role": "user", "content": "old child work must stay stateless"},
+        ])
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+
+        engine.on_session_start(
+            "background-review-continuation",
+            boundary_reason="compression",
+            old_session_id="background-review-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-session"
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._thread_context_has_auxiliary_session("background-review-continuation")
+        continuation = self.HostAgentFrame(
+            "background-review-continuation",
+            "background-review-session",
+            hermes_home,
+        )
+        continuation.should_compress_preflight(engine, [
+            {"role": "user", "content": "new child work must stay stateless"},
+        ])
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
+
+        continuation.on_session_end(engine, [
+            {"role": "user", "content": "new child end must not persist"},
+        ])
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_stateless()
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert not engine._thread_context_has_auxiliary_session("background-review-continuation")
+        engine.should_compress_preflight([
+            {"role": "user", "content": "foreground persists after child compression handoff"},
+        ])
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._store.get_session_count("background-review-continuation") == 0
 
     def test_auxiliary_compression_boundary_after_child_end_stays_auxiliary(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
