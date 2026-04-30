@@ -368,8 +368,16 @@ class TestEngineABC:
         assert "session_search" in describe_schema["description"]
         assert "current session" in expand_schema["description"].lower()
         assert "session_search" in expand_schema["description"]
+        expand_props = expand_schema["parameters"]["properties"]
+        assert "source_offset" in expand_props
+        assert "source_limit" in expand_props
+        assert "content_offset" in expand_props
+        assert "pagination" in expand_props["source_offset"]["description"].lower()
         assert "current session" in expand_query_schema["description"].lower()
         assert "session_search" in expand_query_schema["description"]
+        expand_query_props = expand_query_schema["parameters"]["properties"]
+        assert "context_max_tokens" in expand_query_props
+        assert "fresh context budget" in expand_query_props["context_max_tokens"]["description"]
 
     def test_readme_matches_current_session_retrieval_contract(self):
         readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text()
@@ -377,6 +385,10 @@ class TestEngineABC:
         assert "session_scope=\"all\"" not in readme
         assert "current-session recall" in readme
         assert "session_search" in readme
+        assert "Lossless raw recovery contract" in readme
+        assert "source_offset" in readme
+        assert "content_offset" in readme
+        assert "LCM_EXPANSION_CONTEXT_TOKENS" in readme
 
     def test_should_compress(self, engine):
         assert not engine.should_compress(1000)
@@ -5979,6 +5991,232 @@ class TestEngineTools:
         assert "session_id" in result
         assert "store_message_count" in result
 
+    def test_handle_expand_paginates_message_sources_with_cursor_metadata(self, engine):
+        store_ids = [
+            engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"raw page message {idx}"},
+            )
+            for idx in range(5)
+        ]
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Paged raw source summary",
+                token_count=10,
+                source_token_count=50,
+                source_ids=store_ids,
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": node_id, "source_offset": 1, "source_limit": 2, "max_tokens": 1000},
+            )
+        )
+
+        assert [item["store_id"] for item in result["expanded"]] == store_ids[1:3]
+        assert [item["source_index"] for item in result["expanded"]] == [1, 2]
+        assert result["pagination"] == {
+            "source_offset": 1,
+            "content_offset": 0,
+            "source_limit": 2,
+            "returned_sources": 2,
+            "total_sources": 5,
+            "next_source_offset": 3,
+            "next_content_offset": 0,
+            "has_more": True,
+            "remaining_sources": 2,
+        }
+
+    def test_handle_expand_paginates_oversized_message_content_without_losing_raw_tail(self, engine):
+        from hermes_lcm.tokens import count_tokens
+
+        content = "alpha " * 400
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": content},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Oversized raw message summary",
+                token_count=10,
+                source_token_count=count_tokens(content),
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        first = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": node_id, "max_tokens": 20},
+            )
+        )
+
+        first_item = first["expanded"][0]
+        assert first_item["store_id"] == store_id
+        assert first_item["content_offset"] == 0
+        assert first_item["content_truncated"] is True
+        assert count_tokens(first_item["content"]) <= 20
+        assert first["pagination"]["has_more"] is True
+        assert first["pagination"]["next_source_offset"] == 0
+        assert first["pagination"]["next_content_offset"] > 0
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "node_id": node_id,
+                    "source_offset": first["pagination"]["next_source_offset"],
+                    "content_offset": first["pagination"]["next_content_offset"],
+                    "max_tokens": 20,
+                },
+            )
+        )
+
+        assert second["expanded"][0]["content_offset"] == first["pagination"]["next_content_offset"]
+        assert second["expanded"][0]["content"] == content[first["pagination"]["next_content_offset"]:][:len(second["expanded"][0]["content"])]
+
+    def test_handle_expand_paginates_child_node_sources(self, engine):
+        child_ids = []
+        for idx in range(3):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"child node raw {idx}"},
+            )
+            child_ids.append(
+                engine._dag.add_node(
+                    SummaryNode(
+                        session_id="test-session",
+                        depth=0,
+                        summary=f"child summary {idx}",
+                        token_count=10,
+                        source_token_count=10,
+                        source_ids=[store_id],
+                        source_type="messages",
+                        created_at=idx,
+                    )
+                )
+            )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="parent summary",
+                token_count=10,
+                source_token_count=30,
+                source_ids=child_ids,
+                source_type="nodes",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": parent_id, "source_offset": 1, "source_limit": 1},
+            )
+        )
+
+        assert result["source_type"] == "nodes"
+        assert [item["node_id"] for item in result["expanded"]] == [child_ids[1]]
+        assert result["expanded"][0]["source_index"] == 1
+        assert result["pagination"]["has_more"] is True
+        assert result["pagination"]["next_source_offset"] == 2
+
+    def test_handle_expand_child_node_pagination_preserves_source_id_order(self, engine):
+        newer_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="newer child in source order first",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[],
+                source_type="messages",
+                created_at=2,
+            )
+        )
+        older_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="older child in source order second",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="parent summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[newer_id, older_id],
+                source_type="nodes",
+                created_at=3,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {"node_id": parent_id, "source_offset": 0, "source_limit": 1},
+            )
+        )
+
+        assert [item["node_id"] for item in result["expanded"]] == [newer_id]
+        assert result["expanded"][0]["source_index"] == 0
+
+    def test_handle_expand_child_node_sources_respect_max_tokens(self, engine):
+        child_ids = []
+        for idx in range(2):
+            child_ids.append(
+                engine._dag.add_node(
+                    SummaryNode(
+                        session_id="test-session",
+                        depth=0,
+                        summary=(f"child {idx} " * 80),
+                        token_count=160,
+                        source_token_count=160,
+                        source_ids=[],
+                        source_type="messages",
+                        created_at=idx,
+                    )
+                )
+            )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="parent summary",
+                token_count=10,
+                source_token_count=320,
+                source_ids=child_ids,
+                source_type="nodes",
+                created_at=3,
+            )
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": parent_id, "max_tokens": 5}))
+
+        assert len(result["expanded"]) == 1
+        assert result["expanded"][0]["summary_truncated"] is True
+        assert result["pagination"]["has_more"] is True
+        assert result["pagination"]["next_source_offset"] == 1
+
     def test_handle_expand_includes_externalized_metadata_for_large_tool_result_sources(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_externalized_expand.db"),
@@ -6166,6 +6404,202 @@ class TestEngineTools:
         assert result["content_truncated"] is True
         assert count_tokens(result["content"]) <= 10
         assert result["tool_call_id"] == "call_big"
+
+    def test_handle_expand_externalized_ref_uses_content_offset_cursor(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_payload_cursor.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "RESULT:\n" + ("abcdef" * 2000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_big", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        first = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref, "max_tokens": 10}))
+        assert first["has_more"] is True
+        assert first["next_content_offset"] > 0
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "externalized_ref": ref,
+                    "content_offset": first["next_content_offset"],
+                    "max_tokens": 10,
+                },
+            )
+        )
+
+        assert second["content_offset"] == first["next_content_offset"]
+        assert second["content"] == content[first["next_content_offset"]:][:len(second["content"])]
+
+    def test_handle_expand_query_uses_independent_context_budget_for_auxiliary_retrieval(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            captured["max_tokens"] = max_tokens
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        first_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "first filler " * 80},
+        )
+        second_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "SECOND RAW DETAIL survives auxiliary context expansion"},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Summary mentioning second raw detail",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[first_store_id, second_store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What detail survived?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 500,
+                },
+            )
+        )
+
+        assert result["answer"] == "bounded answer"
+        assert captured["max_tokens"] == 5
+        context_json = json.dumps(captured["context_blocks"])
+        assert "SECOND RAW DETAIL" in context_json
+
+    def test_handle_expand_query_applies_context_budget_globally_across_nodes(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        first_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "first filler " * 80},
+        )
+        first_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="first summary",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[first_store_id],
+                source_type="messages",
+                created_at=2,
+            )
+        )
+        second_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "SECOND NODE RAW DETAIL should require another page"},
+        )
+        second_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="second summary without raw detail",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[second_store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw details exist?",
+                    "node_ids": [first_node_id, second_node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 1,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "SECOND NODE RAW DETAIL" not in context_json
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == second_node_id and item["pagination"]["has_more"]
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_hydrates_externalized_payload_content_for_auxiliary_context(self, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_expand_query_externalized.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        content = "EXTERNALIZED RAW DETAIL survives for auxiliary retrieval " + ("abcdef" * 100)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_ext", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+        placeholder = f"[GC'd externalized tool output: tool_call_id=call_ext; chars={len(content)}; ref={ref}]"
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_ext", "content": placeholder},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="externalized payload summary",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What externalized detail exists?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 500,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "EXTERNALIZED RAW DETAIL" in context_json
+        assert "externalized_payload" in context_json
+        assert result["context_truncated"] is False
 
     def test_compress_gc_rewrites_summarized_externalized_tool_results(self, tmp_path, monkeypatch):
         config = LCMConfig(
