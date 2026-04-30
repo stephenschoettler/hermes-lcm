@@ -152,6 +152,11 @@ def _slice_content_for_response(content: str, max_tokens: int, content_offset: i
     content = content or ""
     content_offset = min(max(0, content_offset), len(content))
     sliced, _ = _truncate_text_to_token_budget(content[content_offset:], max_tokens)
+    if not sliced and content_offset < len(content):
+        # A tiny token budget can fail to fit even the next character. Return one
+        # character anyway so callers make deterministic, lossless cursor progress
+        # instead of receiving has_more=true with the same content_offset forever.
+        sliced = content[content_offset:content_offset + 1]
     next_content_offset = content_offset + len(sliced)
     has_more = next_content_offset < len(content)
     return {

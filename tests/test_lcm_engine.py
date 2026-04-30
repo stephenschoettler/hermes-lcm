@@ -6085,6 +6085,109 @@ class TestEngineTools:
         assert second["expanded"][0]["content_offset"] == first["pagination"]["next_content_offset"]
         assert second["expanded"][0]["content"] == content[first["pagination"]["next_content_offset"]:][:len(second["expanded"][0]["content"])]
 
+    def test_handle_expand_advances_content_cursor_when_budget_cannot_fit_character(self, engine, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        def fake_count_tokens(text):
+            return 0 if not text else len(text) + 1
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        content = "abcdef"
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": content},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Tiny budget raw message summary",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        first = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id, "max_tokens": 1}))
+
+        assert first["expanded"][0]["content"] == "a"
+        assert first["expanded"][0]["content_offset"] == 0
+        assert first["expanded"][0]["next_content_offset"] == 1
+        assert first["pagination"]["has_more"] is True
+        assert first["pagination"]["next_source_offset"] == 0
+        assert first["pagination"]["next_content_offset"] == 1
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "node_id": node_id,
+                    "source_offset": first["pagination"]["next_source_offset"],
+                    "content_offset": first["pagination"]["next_content_offset"],
+                    "max_tokens": 1,
+                },
+            )
+        )
+
+        assert second["expanded"][0]["content"] == "b"
+        assert second["expanded"][0]["content_offset"] == 1
+        assert second["pagination"]["next_content_offset"] == 2
+
+    def test_handle_expand_query_advances_content_cursor_when_context_budget_cannot_fit_character(self, engine, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        captured = {}
+
+        def fake_count_tokens(text):
+            return 0 if not text else len(text) + 1
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "abcdef"},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="",
+                token_count=0,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw detail?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 1,
+                },
+            )
+        )
+
+        message_block = next(block for block in captured["context_blocks"] if block["type"] == "messages")
+        assert message_block["messages"][0]["content"] == "a"
+        assert message_block["messages"][0]["next_content_offset"] == 1
+        assert result["context_truncated"] is True
+        assert any(
+            item["node_id"] == node_id
+            and item.get("pagination", {}).get("next_content_offset") == 1
+            for item in result["context_pagination"]
+        )
+
     def test_handle_expand_paginates_child_node_sources(self, engine):
         child_ids = []
         for idx in range(3):
@@ -6437,6 +6540,49 @@ class TestEngineTools:
 
         assert second["content_offset"] == first["next_content_offset"]
         assert second["content"] == content[first["next_content_offset"]:][:len(second["content"])]
+
+    def test_handle_expand_externalized_ref_advances_content_cursor_when_budget_cannot_fit_character(self, tmp_path, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        def fake_count_tokens(text):
+            return 0 if not text else len(text) + 1
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_externalized_payload_tiny_cursor.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=2,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        content = "abcdef"
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_tiny", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+
+        first = json.loads(engine.handle_tool_call("lcm_expand", {"externalized_ref": ref, "max_tokens": 1}))
+
+        assert first["content"] == "a"
+        assert first["content_offset"] == 0
+        assert first["next_content_offset"] == 1
+        assert first["has_more"] is True
+
+        second = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand",
+                {
+                    "externalized_ref": ref,
+                    "content_offset": first["next_content_offset"],
+                    "max_tokens": 1,
+                },
+            )
+        )
+
+        assert second["content"] == "b"
+        assert second["content_offset"] == 1
+        assert second["next_content_offset"] == 2
 
     def test_handle_expand_query_uses_independent_context_budget_for_auxiliary_retrieval(self, engine, monkeypatch):
         captured = {}
