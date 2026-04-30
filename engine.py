@@ -923,7 +923,7 @@ class LCMEngine(ContextEngine):
                 previous_session_id,
             )
             return
-        self._clear_thread_context_stateless(session_id)
+        self._clear_thread_context_stateless()
         if previous_session_id and previous_session_id != session_id:
             self._finalize_pending_reset_boundary(previous_session_id)
             self._reset_session_scoped_runtime_state()
