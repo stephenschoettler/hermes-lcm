@@ -121,7 +121,7 @@ class LCMConfig:
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
-    # Summary/raw/source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
+    # Summary/raw/child-source context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
 
     # -- Timeouts ---

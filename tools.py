@@ -847,23 +847,79 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     for block in context_blocks:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "summary" and block.get("summary_truncated"):
+        block_type = block.get("type")
+        if block_type == "summary" and block.get("summary_truncated"):
             context_pagination.append(
                 {
                     "node_id": block.get("node_id"),
                     "type": "summary",
                     "summary_truncated": True,
+                    "expand_args": {"node_id": block.get("node_id")},
                 }
             )
+            continue
+
+        if block_type == "child_nodes":
+            for child in block.get("children", []):
+                if child.get("summary_truncated"):
+                    child_node_id = child.get("node_id")
+                    context_pagination.append(
+                        {
+                            "node_id": block.get("node_id"),
+                            "type": "child_summary",
+                            "child_node_id": child_node_id,
+                            "source_index": child.get("source_index"),
+                            "summary_truncated": True,
+                            "expand_args": {"node_id": child_node_id},
+                        }
+                    )
+
         pagination = block.get("pagination")
-        if pagination:
-            context_pagination.append(
-                {
-                    "node_id": block.get("node_id"),
-                    "type": block.get("type"),
-                    "pagination": pagination,
-                }
+        if not pagination or not pagination.get("has_more"):
+            continue
+
+        item = {
+            "node_id": block.get("node_id"),
+            "type": block_type,
+            "pagination": pagination,
+        }
+        if block_type == "messages":
+            truncated_message = next(
+                (message for message in block.get("messages", []) if message.get("content_truncated")),
+                None,
             )
+            if truncated_message:
+                item["source_index"] = truncated_message.get("source_index")
+                item["content_source"] = truncated_message.get("content_source")
+                externalized = truncated_message.get("externalized") or {}
+                externalized_ref = externalized.get("ref")
+                if externalized_ref:
+                    item["externalized_ref"] = externalized_ref
+                    item["tool_call_id"] = externalized.get("tool_call_id")
+                if truncated_message.get("content_source") == "externalized_payload" and externalized_ref:
+                    item["expand_args"] = {
+                        "externalized_ref": externalized_ref,
+                        "content_offset": pagination.get("next_content_offset") or 0,
+                    }
+                else:
+                    item["expand_args"] = {
+                        "node_id": block.get("node_id"),
+                        "source_offset": pagination.get("next_source_offset") or 0,
+                        "content_offset": pagination.get("next_content_offset") or 0,
+                    }
+            else:
+                item["expand_args"] = {
+                    "node_id": block.get("node_id"),
+                    "source_offset": pagination.get("next_source_offset") or 0,
+                    "content_offset": pagination.get("next_content_offset") or 0,
+                }
+        elif block_type == "child_nodes":
+            item["expand_args"] = {
+                "node_id": block.get("node_id"),
+                "source_offset": pagination.get("next_source_offset") or 0,
+            }
+        context_pagination.append(item)
+
     context_truncated = any(
         bool(item.get("summary_truncated")) or bool(item.get("pagination", {}).get("has_more"))
         for item in context_pagination

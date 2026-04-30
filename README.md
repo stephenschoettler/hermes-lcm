@@ -367,9 +367,10 @@ For `lcm_expand(externalized_ref=...)`:
 For `lcm_expand_query`:
 
 - `max_tokens` is the bounded answer budget returned to the main agent
-- `context_max_tokens` is the larger fresh context budget used to expand summaries and raw/source material for the auxiliary LLM before synthesis
-- default `context_max_tokens` comes from `LCM_EXPANSION_CONTEXT_TOKENS`, currently `32000`
-- if the auxiliary context still cannot cover all raw sources, the response reports `context_truncated` and `context_pagination` so the main agent can fall back to explicit `lcm_expand` pages
+- `context_max_tokens` is the larger fresh context budget used to expand summaries, raw messages, child summaries, and externalized payload content for the auxiliary LLM before synthesis
+- default `context_max_tokens` comes from `LCM_EXPANSION_CONTEXT_TOKENS`, currently `32000`, but never below the requested answer `max_tokens`
+- if the auxiliary context still cannot cover all summary/raw/child-source context, the response reports `context_truncated` and `context_pagination` so the main agent can fall back to explicit pages or deeper expansion
+- `context_pagination` entries include `expand_args` for the intended follow-up: node/source cursors use `lcm_expand(node_id=...)`, externalized payload truncation uses `lcm_expand(externalized_ref=...)`, and truncated child summaries point at the child `node_id` to expand next
 
 This keeps normal retrieval safe while making larger raw spans practically recoverable instead of silently disappearing behind a cap.
 

@@ -6739,6 +6739,132 @@ class TestEngineTools:
             for item in result["context_pagination"]
         )
 
+    def test_handle_expand_query_reports_last_child_summary_truncation_in_context_pagination(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        child_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary=("child summary detail " * 80) + "CHILD SUMMARY TAIL",
+                token_count=200,
+                source_token_count=200,
+                source_ids=[],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="",
+                token_count=0,
+                source_token_count=200,
+                source_ids=[child_id],
+                source_type="nodes",
+                created_at=1,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What child details fit?",
+                    "node_ids": [parent_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 5,
+                },
+            )
+        )
+
+        context_json = json.dumps(captured["context_blocks"])
+        assert "CHILD SUMMARY TAIL" not in context_json
+        child_block = next(block for block in captured["context_blocks"] if block["type"] == "child_nodes")
+        assert child_block["children"][0]["summary_truncated"] is True
+        assert result["context_truncated"] is True
+        assert any(
+            item["type"] == "child_summary"
+            and item["node_id"] == parent_id
+            and item["child_node_id"] == child_id
+            and item["summary_truncated"] is True
+            and item["expand_args"] == {"node_id": child_id}
+            for item in result["context_pagination"]
+        )
+
+    def test_handle_expand_query_externalized_truncation_returns_ref_in_context_pagination(self, tmp_path, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "bounded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_expand_query_externalized_truncated.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        content = "EXTERNALIZED RAW DETAIL " + ("abcdef" * 1000)
+        engine._serialize_messages([
+            {"role": "tool", "tool_call_id": "call_ext", "content": content}
+        ])
+        ref = next((tmp_path / "hermes" / "lcm-large-outputs").glob("*.json")).name
+        placeholder = f"[GC'd externalized tool output: tool_call_id=call_ext; chars={len(content)}; ref={ref}]"
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_ext", "content": placeholder},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="externalized payload summary",
+                token_count=10,
+                source_token_count=200,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What externalized detail exists?",
+                    "node_ids": [node_id],
+                    "max_tokens": 5,
+                    "context_max_tokens": 20,
+                },
+            )
+        )
+
+        message_block = next(block for block in captured["context_blocks"] if block["type"] == "messages")
+        assert message_block["messages"][0]["content_source"] == "externalized_payload"
+        assert message_block["messages"][0]["content_truncated"] is True
+        assert result["context_truncated"] is True
+        assert any(
+            item["type"] == "messages"
+            and item["node_id"] == node_id
+            and item["content_source"] == "externalized_payload"
+            and item["externalized_ref"] == ref
+            and item["pagination"]["has_more"] is True
+            and item["expand_args"] == {
+                "externalized_ref": ref,
+                "content_offset": item["pagination"]["next_content_offset"],
+            }
+            for item in result["context_pagination"]
+        )
+
     def test_handle_expand_query_hydrates_externalized_payload_content_for_auxiliary_context(self, tmp_path, monkeypatch):
         captured = {}
 
