@@ -126,6 +126,27 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     }.issubset(tool_names)
 
 
+def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails(tmp_path, monkeypatch):
+    module_name = "hermes_lcm_packaging_entrypoint_git_probe_failure"
+    _register_plugin_engine(module_name)
+    engine_module = sys.modules[f"{module_name}.engine"]
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+
+    def fail_git(*args, **kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(engine_module.subprocess, "run", fail_git)
+
+    identity = engine_module._git_runtime_identity(checkout)
+
+    assert identity["plugin_git_commit"] == ""
+    assert identity["plugin_git_branch"] == ""
+    assert identity["plugin_git_dirty"] is None
+    assert identity["plugin_git_remote"] == ""
+
+
 def test_plugin_entrypoint_registration_is_repeatable_and_returns_lcm_engine():
     engine = _register_plugin_engine("hermes_lcm_packaging_entrypoint_repeat")
 

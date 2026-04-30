@@ -89,7 +89,7 @@ def _git_runtime_identity(root: Path) -> dict[str, Any]:
             "plugin_git_remote": "",
         }
 
-    def _git(*args: str) -> str:
+    def _git(*args: str) -> str | None:
         try:
             result = subprocess.run(
                 ["git", "-C", str(root), *args],
@@ -100,17 +100,17 @@ def _git_runtime_identity(root: Path) -> dict[str, Any]:
             )
         except (OSError, subprocess.SubprocessError) as exc:
             logger.debug("LCM git identity probe failed at %s: %s", root, exc)
-            return ""
+            return None
         if result.returncode != 0:
-            return ""
+            return None
         return result.stdout.strip()
 
     dirty_output = _git("status", "--porcelain", "--untracked-files=no")
     return {
-        "plugin_git_commit": _git("rev-parse", "HEAD"),
-        "plugin_git_branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
-        "plugin_git_dirty": bool(dirty_output),
-        "plugin_git_remote": _git("config", "--get", "remote.origin.url"),
+        "plugin_git_commit": _git("rev-parse", "HEAD") or "",
+        "plugin_git_branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "",
+        "plugin_git_dirty": None if dirty_output is None else bool(dirty_output),
+        "plugin_git_remote": _git("config", "--get", "remote.origin.url") or "",
     }
 
 
