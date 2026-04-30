@@ -147,6 +147,33 @@ def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails
     assert identity["plugin_git_remote"] == ""
 
 
+def test_git_runtime_identity_reports_untracked_files_as_dirty(tmp_path, monkeypatch):
+    module_name = "hermes_lcm_packaging_entrypoint_git_untracked_dirty"
+    _register_plugin_engine(module_name)
+    engine_module = sys.modules[f"{module_name}.engine"]
+
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+
+    def fake_git(args, **kwargs):
+        if "status" in args:
+            assert "--untracked-files=no" not in args
+            return subprocess.CompletedProcess(args, 0, stdout="?? scratch.txt\n", stderr="")
+        if args[-2:] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
+        if args[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
+        if args[-4:] == ["config", "--get", "remote.origin.url"]:
+            return subprocess.CompletedProcess(args, 0, stdout="https://github.com/example/repo.git\n", stderr="")
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(engine_module.subprocess, "run", fake_git)
+
+    identity = engine_module._git_runtime_identity(checkout)
+
+    assert identity["plugin_git_dirty"] is True
+
+
 def test_plugin_entrypoint_registration_is_repeatable_and_returns_lcm_engine():
     engine = _register_plugin_engine("hermes_lcm_packaging_entrypoint_repeat")
 

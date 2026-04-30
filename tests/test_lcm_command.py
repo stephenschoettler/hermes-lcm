@@ -140,6 +140,9 @@ def test_lcm_status_reports_source_lineage_breakdown(engine):
 
     result = handle_lcm_command("status", engine)
 
+    assert "plugin_git_commit:" in result
+    assert "plugin_git_branch:" in result
+    assert "plugin_git_dirty:" in result
     assert "source_messages_total: 3" in result
     assert "source_attributed_messages: 1" in result
     assert "source_unknown_messages: 1" in result

@@ -105,7 +105,7 @@ def _git_runtime_identity(root: Path) -> dict[str, Any]:
             return None
         return result.stdout.strip()
 
-    dirty_output = _git("status", "--porcelain", "--untracked-files=no")
+    dirty_output = _git("status", "--porcelain")
     return {
         "plugin_git_commit": _git("rev-parse", "HEAD") or "",
         "plugin_git_branch": _git("rev-parse", "--abbrev-ref", "HEAD") or "",
