@@ -130,6 +130,15 @@ def test_get_status_exposes_runtime_identity_for_loaded_plugin_tree(tmp_path):
     assert identity["lifecycle_last_finalized_session_id"] == ""
 
 
+
+
+def test_lcm_doctor_json_includes_runtime_identity(engine):
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+    assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
+    assert payload["runtime_identity"]["plugin_version"] == "0.7.1"
+    assert "plugin_git_commit" in payload["runtime_identity"]
+
 class TestEscalationStripReasoning:
     """Regression tests for thinking-model reasoning-tag stripping in
     escalation._call_llm_for_summary. Some thinking models (MiniMax-M2.7,

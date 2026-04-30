@@ -180,6 +180,8 @@ At runtime the tool list should include:
 - `lcm_status`
 - `lcm_doctor`
 
+For source checkouts, `lcm_status`, `/lcm status`, `lcm_doctor`, and `/lcm doctor` also report the loaded plugin path plus best-effort git identity fields such as `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`. Use those fields to confirm which checkout a running Hermes process actually loaded before assuming an update or symlink change is active.
+
 ## Troubleshooting signals
 
 ### `hermes plugins` shows `lcm (not found)` but LCM tools still exist

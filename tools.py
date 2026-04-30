@@ -850,5 +850,6 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
 
     return json.dumps({
         "overall": overall,
+        "runtime_identity": engine.get_runtime_identity(),
         "checks": checks,
     })

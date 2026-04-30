@@ -630,6 +630,7 @@ def _doctor_source_apply_text(engine) -> str:
 
 def _doctor_text(engine) -> str:
     db_path = Path(engine._store.db_path)
+    runtime_identity = engine.get_runtime_identity()
     store_conn = engine._store._conn
     dag_conn = engine._dag._conn
 
@@ -792,6 +793,13 @@ def _doctor_text(engine) -> str:
     lines = [
         "LCM doctor",
         f"status: {doctor_status}",
+        f"plugin_name: {runtime_identity.get('plugin_name', '(unknown)')}",
+        f"plugin_version: {runtime_identity.get('plugin_version', '(unknown)')}",
+        f"plugin_path: {runtime_identity.get('plugin_path', '(unknown)')}",
+        f"module_path: {runtime_identity.get('module_path', '(unknown)')}",
+        f"plugin_git_commit: {runtime_identity.get('plugin_git_commit') or '(unavailable)'}",
+        f"plugin_git_branch: {runtime_identity.get('plugin_git_branch') or '(unavailable)'}",
+        f"plugin_git_dirty: {runtime_identity.get('plugin_git_dirty') if runtime_identity.get('plugin_git_dirty') is not None else '(unavailable)'}",
         f"database_path: {db_path}",
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",

@@ -109,6 +109,11 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     assert identity["plugin_version"] == "0.7.1"
     assert Path(identity["plugin_path"]) == repo_root
     assert identity["database_path_source"] in {"config.database_path", "hermes_home", "default_home"}
+    assert identity["plugin_git_commit"]
+    assert identity["plugin_git_commit"] == subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
+    ).strip()
+    assert "plugin_git_dirty" in identity
 
     tool_names = {schema["name"] for schema in engine.get_tool_schemas()}
     assert {

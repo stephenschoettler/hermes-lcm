@@ -149,11 +149,16 @@ def test_lcm_status_reports_source_lineage_breakdown(engine):
 
 def test_lcm_doctor_reports_health_checks(engine):
     result = handle_lcm_command("doctor", engine)
+    repo_root = Path(__file__).resolve().parent.parent
 
     assert "LCM doctor" in result
     assert "sqlite_integrity: ok" in result
     assert "messages_fts: ok" in result
     assert "nodes_fts: ok" in result
+    assert "plugin_name: hermes-lcm" in result
+    assert "plugin_version: 0.7.1" in result
+    assert f"plugin_path: {repo_root}" in result
+    assert "plugin_git_commit:" in result
 
 
 def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path):
