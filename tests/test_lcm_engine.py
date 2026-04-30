@@ -3,6 +3,7 @@
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -2045,6 +2046,113 @@ class TestSessionRollover:
         assert engine._store.get_session_count("background-review-a") == 0
         assert engine._store.get_session_count("background-review-b") == 0
         assert engine._store.get_session_count("foreground-session") == 0
+
+    def test_auxiliary_child_end_is_ignored_across_threads(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_cross_thread_aux.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "background-review-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_has_auxiliary_session("background-review-session")
+
+        errors = []
+
+        def end_auxiliary_child():
+            try:
+                engine.on_session_end(
+                    "background-review-session",
+                    [{"role": "user", "content": "cross-thread child end must not persist"}],
+                )
+            except Exception as exc:  # pragma: no cover - assertion helper
+                errors.append(exc)
+
+        thread = threading.Thread(target=end_auxiliary_child)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert not engine._thread_context_has_auxiliary_session("background-review-session")
+        assert engine._store.get_session_count("background-review-session") == 0
+        assert engine._session_id == "foreground-session"
+
+    def test_historical_child_session_is_not_treated_as_live_auxiliary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, 10.0);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('historical-child-session', 'foreground-session', 2.0, 3.0);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_historical_child.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.on_session_start(
+            "historical-child-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert not engine._thread_context_has_auxiliary_session("historical-child-session")
+        assert engine._session_id == "historical-child-session"
+        messages = [
+            {"role": "user", "content": "historical child resume should persist normally"},
+        ]
+        engine.should_compress_preflight(messages)
+
+        assert engine._store.get_session_count("historical-child-session") == 1
 
     def test_compression_boundary_continues_logical_session_without_resetting_state(self, engine):
         engine.on_session_start("old-session", platform="telegram", context_length=200000)

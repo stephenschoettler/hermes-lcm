@@ -211,6 +211,8 @@ class LCMEngine(ContextEngine):
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
         self._thread_context = threading.local()
+        self._auxiliary_session_ids: set[str] = set()
+        self._auxiliary_session_lock = threading.RLock()
 
     @property
     def name(self) -> str:
@@ -602,21 +604,16 @@ class LCMEngine(ContextEngine):
     def _thread_context_session_id(self) -> str:
         return str(getattr(self._thread_context, "current_auxiliary_session_id", "") or "")
 
-    def _thread_context_auxiliary_session_ids(self) -> set[str]:
-        ids = getattr(self._thread_context, "auxiliary_session_ids", None)
-        if ids is None:
-            ids = set()
-            self._thread_context.auxiliary_session_ids = ids
-        return ids
-
     def _thread_context_has_auxiliary_session(self, session_id: str) -> bool:
-        return session_id in self._thread_context_auxiliary_session_ids()
+        with self._auxiliary_session_lock:
+            return session_id in self._auxiliary_session_ids
 
     def _thread_context_stateless(self) -> bool:
         return bool(self._thread_context_session_id())
 
     def _mark_thread_context_stateless(self, session_id: str) -> None:
-        self._thread_context_auxiliary_session_ids().add(session_id)
+        with self._auxiliary_session_lock:
+            self._auxiliary_session_ids.add(session_id)
         self._thread_context.current_auxiliary_session_id = session_id
 
     def _clear_thread_context_stateless(self, session_id: str = "") -> None:
@@ -625,7 +622,8 @@ class LCMEngine(ContextEngine):
             self._thread_context.current_auxiliary_session_id = ""
 
     def _unmark_thread_context_auxiliary_session(self, session_id: str) -> None:
-        self._thread_context_auxiliary_session_ids().discard(session_id)
+        with self._auxiliary_session_lock:
+            self._auxiliary_session_ids.discard(session_id)
         self._clear_thread_context_stateless(session_id)
 
     def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
@@ -665,6 +663,7 @@ class LCMEngine(ContextEngine):
                     SELECT
                         child.parent_session_id,
                         child.started_at,
+                        child.ended_at,
                         parent.id,
                         parent.ended_at
                     FROM sessions AS child
@@ -682,8 +681,10 @@ class LCMEngine(ContextEngine):
             return False
         if not row:
             return False
-        child_parent_id, child_started_at, actual_parent_id, parent_ended_at = row
+        child_parent_id, child_started_at, child_ended_at, actual_parent_id, parent_ended_at = row
         if child_parent_id != parent_session_id or actual_parent_id != parent_session_id:
+            return False
+        if child_ended_at is not None:
             return False
         if parent_ended_at is None:
             return True
