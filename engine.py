@@ -910,11 +910,12 @@ class LCMEngine(ContextEngine):
     def on_session_start(self, session_id: str, **kwargs) -> None:
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
+        previous_session_id = self._session_id
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
+            self._clear_thread_context_stateless()
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
-        previous_session_id = self._session_id
         if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
             self._mark_thread_context_stateless(session_id)
             logger.info(

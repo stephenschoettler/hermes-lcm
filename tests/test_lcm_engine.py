@@ -1886,6 +1886,88 @@ class TestSessionRollover:
         assert engine._store.get_session_count("next-normal-session") == 1
         assert engine._store.get_session_count("background-review-session") == 0
 
+    def test_stale_auxiliary_thread_marker_clears_before_compression_boundary(self, tmp_path):
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        state_db = hermes_home / "state.db"
+        conn = sqlite3.connect(state_db)
+        conn.executescript(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL
+            );
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('foreground-session', NULL, 1.0, NULL);
+            INSERT INTO sessions(id, parent_session_id, started_at, ended_at)
+            VALUES ('background-review-session', 'foreground-session', 2.0, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm_stale_aux_boundary.db"))
+        engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+        engine.on_session_start(
+            "foreground-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+        foreground_store_id = engine._store.append(
+            "foreground-session",
+            {"role": "user", "content": "foreground context crosses boundary"},
+            token_estimate=17,
+            source="telegram",
+        )
+        foreground_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-session",
+            depth=0,
+            summary="foreground boundary summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[foreground_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = foreground_store_id
+        foreground_conversation_id = engine._conversation_id
+
+        engine.on_session_start(
+            "background-review-session",
+            hermes_home=str(hermes_home),
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_session_id() == "background-review-session"
+        assert engine._session_id == "foreground-session"
+
+        engine.on_session_start(
+            "foreground-continuation",
+            boundary_reason="compression",
+            old_session_id="foreground-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._thread_context_session_id() == ""
+        assert engine._session_id == "foreground-continuation"
+        assert engine._conversation_id == foreground_conversation_id
+        assert [
+            node.node_id for node in engine._dag.get_session_nodes("foreground-continuation")
+        ] == [foreground_node_id]
+
+        messages = [
+            {"role": "user", "content": "post-boundary foreground ingestion returns"},
+        ]
+        engine.should_compress_preflight(messages)
+
+        assert engine._store.get_session_count("foreground-continuation") == 2
+        assert engine._store.get_session_count("background-review-session") == 0
+
     def test_compression_boundary_continues_logical_session_without_resetting_state(self, engine):
         engine.on_session_start("old-session", platform="telegram", context_length=200000)
         store_id = engine._store.append(
