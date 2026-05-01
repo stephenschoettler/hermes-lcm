@@ -256,6 +256,7 @@ Environment variables (all optional):
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Opt-in rewrite of already-externalized summarized tool-result transcript rows to compact GC placeholders |
 | `LCM_SUMMARY_MODEL` | *(auxiliary)* | Override model for summarization. Slash-bearing aggregator model slugs such as `meta-llama/...`, `anthropic/...`, and unresolved `cerebras/...` stay model-only. |
 | `LCM_EXPANSION_MODEL` | *(summary model / auxiliary)* | Override model for `lcm_expand_query` synthesis. Uses the same routing rules as `LCM_SUMMARY_MODEL`. |
+| `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Summary/raw/source context budget fed to the auxiliary LLM for `lcm_expand_query` before returning a bounded answer |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for a single model-backed summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for `lcm_expand_query` answer synthesis |
 | `LCM_DATABASE_PATH` | `~/.hermes/lcm.db` | SQLite database path (auto profile-scoped) |
@@ -338,10 +339,40 @@ That means patterns like `cron:*` can catch Hermes cron sessions today, while pl
 |------|-------------|
 | `lcm_grep` | Search raw messages AND summaries for the active/current session. Use this for intra-session recall after compaction. For earlier separate sessions or broad cross-session history, use `session_search`. |
 | `lcm_describe` | Inspect current-session DAG structure or an `externalized_ref` payload preview without loading full payload content. No node_id/externalized_ref = session overview. |
-| `lcm_expand` | Recover original content from a current-session summary node, or open a stored `externalized_ref` payload directly. |
-| `lcm_expand_query` | Answer a question from expanded LCM context for the active/current session using either a query or explicit node_ids. For cross-session recall, use `session_search` first. |
+| `lcm_expand` | Recover original content from a current-session summary node, or open a stored `externalized_ref` payload directly. Bounded by default, pageable via source/content cursors. |
+| `lcm_expand_query` | Answer a question from expanded LCM context for the active/current session using either a query or explicit node_ids. It can use a larger fresh auxiliary context budget while still returning a bounded answer. For cross-session recall, use `session_search` first. |
 | `lcm_status` | Quick health overview — compression count, store size, DAG depth distribution, context usage, active config, and read-only lifecycle/session fragmentation stats. |
 | `lcm_doctor` | Run diagnostics — database integrity, FTS index sync, orphaned nodes, lifecycle/session fragmentation, config validation, context pressure. |
+
+### Lossless raw recovery contract
+
+`lcm_expand` and `lcm_expand_query` are intentionally bounded at the tool-response boundary so one retrieval call cannot flood the main agent context. “Lossless” therefore means two things together:
+
+1. raw content is stored with stable source lineage
+2. raw content can be recovered in deterministic bounded spans
+
+For `lcm_expand(node_id=...)`:
+
+- `source_offset` selects the first immediate source to return from the summary node's source list
+- `source_limit` limits how many immediate sources are returned in that page
+- `content_offset` continues inside one oversized raw message when the previous response could not fit the whole item under `max_tokens`
+- responses include `pagination.has_more`, `pagination.next_source_offset`, and `pagination.next_content_offset`
+- child-node expansion uses the same source cursor shape, so an agent can page lower-level summaries before drilling further
+
+For `lcm_expand(externalized_ref=...)`:
+
+- `content_offset` continues inside the externalized payload
+- responses include `has_more` and `next_content_offset`
+
+For `lcm_expand_query`:
+
+- `max_tokens` is the bounded answer budget returned to the main agent
+- `context_max_tokens` is the larger fresh context budget used to expand summaries, raw messages, child summaries, externalized transcript markers, and externalized payload content for the auxiliary LLM before synthesis
+- default `context_max_tokens` comes from `LCM_EXPANSION_CONTEXT_TOKENS`, currently `32000`, but never below the requested answer `max_tokens`
+- if the auxiliary context still cannot cover all summary/raw/child-source context, the response reports `context_truncated` and `context_pagination` so the main agent can fall back to explicit pages or deeper expansion
+- `context_pagination` entries include `expand_args` for the intended follow-up: node/source cursors use `lcm_expand(node_id=...)`, externalized payload truncation uses `lcm_expand(externalized_ref=...)`, and truncated child summaries point at the child `node_id` to expand next
+
+This keeps normal retrieval safe while making larger raw spans practically recoverable instead of silently disappearing behind a cap.
 
 ### Operator slash commands
 

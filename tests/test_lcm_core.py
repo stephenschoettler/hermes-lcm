@@ -228,6 +228,7 @@ class TestConfig:
         assert c.stateless_session_patterns_source == "default"
         assert c.summary_model == ""
         assert c.expansion_model == ""
+        assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
         assert c.expansion_timeout_ms == 120_000
 
@@ -237,6 +238,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_IGNORE_SESSION_PATTERNS", "cron:*,subagent:**")
         monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "telegram:*, cli:debug")
         monkeypatch.setenv("LCM_EXPANSION_MODEL", "openai/gpt-5.4-mini")
+        monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "64000")
         monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
         monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_ENABLED", "1")
@@ -259,6 +261,7 @@ class TestConfig:
         assert c.ignore_session_patterns_source == "env"
         assert c.stateless_session_patterns_source == "env"
         assert c.expansion_model == "openai/gpt-5.4-mini"
+        assert c.expansion_context_tokens == 64_000
         assert c.summary_timeout_ms == 45_000
         assert c.expansion_timeout_ms == 90_000
         assert c.dynamic_leaf_chunk_enabled is True
@@ -280,6 +283,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "bad-float")
         monkeypatch.setenv("LCM_MAX_ASSEMBLY_TOKENS", "nope")
         monkeypatch.setenv("LCM_RESERVE_TOKENS_FLOOR", "still-nope")
+        monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "nah")
 
         c = LCMConfig.from_env()
 
@@ -288,6 +292,7 @@ class TestConfig:
         assert c.context_threshold == 0.75
         assert c.max_assembly_tokens == 0
         assert c.reserve_tokens_floor == 0
+        assert c.expansion_context_tokens == 32_000
 
 
 class TestSessionPatterns:

@@ -121,6 +121,8 @@ class LCMConfig:
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
+    # Serialized summary/raw/child-source/externalized context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
+    expansion_context_tokens: int = 32_000
 
     # -- Timeouts ---
     summary_timeout_ms: int = 60_000
@@ -194,6 +196,7 @@ class LCMConfig:
         )
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
+        c.expansion_context_tokens = _int("LCM_EXPANSION_CONTEXT_TOKENS", c.expansion_context_tokens)
         c.summary_timeout_ms = _int("LCM_SUMMARY_TIMEOUT_MS", c.summary_timeout_ms)
         c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)

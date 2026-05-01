@@ -133,42 +133,177 @@ def _truncate_text_to_token_budget(text: str, max_tokens: int) -> tuple[str, boo
     return best, True
 
 
-def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
+def _parse_int_value(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_non_negative_int(value: Any, default: int) -> int:
+    return max(0, _parse_int_value(value, default))
+
+
+def _parse_positive_int(value: Any, default: int) -> int:
+    return max(1, _parse_int_value(value, default))
+
+
+def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
+    content = content or ""
+    content_offset = min(max(0, content_offset), len(content))
+    sliced, _ = _truncate_text_to_token_budget(content[content_offset:], max_tokens)
+    if not sliced and content_offset < len(content):
+        # A tiny token budget can fail to fit even the next character. Return one
+        # character anyway so callers make deterministic, lossless cursor progress
+        # instead of receiving has_more=true with the same content_offset forever.
+        sliced = content[content_offset:content_offset + 1]
+    next_content_offset = content_offset + len(sliced)
+    has_more = next_content_offset < len(content)
+    return {
+        "content": sliced,
+        "content_chars": len(content),
+        "content_offset": content_offset,
+        "content_returned_chars": len(sliced),
+        "content_truncated": has_more,
+        "next_content_offset": next_content_offset if has_more else 0,
+        "has_more": has_more,
+    }
+
+
+def _full_content_slice(content: str, content_offset: int = 0) -> dict[str, Any]:
+    content = content or ""
+    content_offset = min(max(0, content_offset), len(content))
+    sliced = content[content_offset:]
+    return {
+        "content": sliced,
+        "content_chars": len(content),
+        "content_offset": content_offset,
+        "content_returned_chars": len(sliced),
+        "content_truncated": False,
+        "next_content_offset": 0,
+        "has_more": False,
+    }
+
+
+def _is_compact_externalized_marker(content: str, ref: str | None) -> bool:
+    if not ref or not content:
+        return False
+    if len(content) > 512:
+        return False
+    return content.startswith("[Externalized tool output:") or content.startswith("[GC'd externalized tool output:")
+
+
+def _pagination_payload(
+    *,
+    total_sources: int,
+    source_offset: int,
+    content_offset: int,
+    source_limit: int,
+    returned_sources: int,
+    next_source_offset: int | None,
+    next_content_offset: int,
+    has_more: bool,
+) -> dict[str, Any]:
+    if not has_more:
+        next_source_offset = None
+        next_content_offset = 0
+    remaining_sources = 0
+    if has_more and next_source_offset is not None:
+        remaining_sources = max(0, total_sources - next_source_offset)
+    return {
+        "source_offset": source_offset,
+        "content_offset": content_offset,
+        "source_limit": source_limit,
+        "returned_sources": returned_sources,
+        "total_sources": total_sources,
+        "next_source_offset": next_source_offset,
+        "next_content_offset": next_content_offset,
+        "has_more": has_more,
+        "remaining_sources": remaining_sources,
+    }
+
+
+def _expand_message_sources(
+    engine: "LCMEngine",
+    node,
+    max_tokens: int,
+    *,
+    source_offset: int = 0,
+    source_limit: int | None = None,
+    content_offset: int = 0,
+    hydrate_externalized_content: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from .tokens import count_tokens
 
-    stored_by_id = engine._store.get_batch(node.source_ids)
+    total_sources = len(node.source_ids)
+    source_offset = min(max(0, source_offset), total_sources)
+    remaining_source_count = max(0, total_sources - source_offset)
+    if source_limit is None:
+        source_limit = remaining_source_count
+    else:
+        source_limit = min(max(0, source_limit), remaining_source_count)
+    content_offset = max(0, content_offset)
+    source_ids = node.source_ids[source_offset:source_offset + source_limit]
+    stored_by_id = engine._store.get_batch(source_ids)
 
-    messages = []
+    messages: list[dict[str, Any]] = []
     budget_used = 0
-    for store_id in node.source_ids:
+    next_source_offset: int | None = source_offset
+    next_content_offset = content_offset
+    has_more = source_offset < total_sources
+
+    for relative_index, store_id in enumerate(source_ids):
+        source_index = source_offset + relative_index
+        remaining_tokens = max_tokens - budget_used
+        if remaining_tokens <= 0:
+            next_source_offset = source_index
+            next_content_offset = 0
+            has_more = True
+            break
         stored = stored_by_id.get(store_id)
         if not stored or stored.get("session_id") != engine._session_id:
+            next_source_offset = source_index + 1
+            next_content_offset = 0
+            has_more = next_source_offset < total_sources
             continue
-        content = stored.get("content", "")
-        msg_tokens = count_tokens(content)
-        if budget_used + msg_tokens > max_tokens and messages:
-            messages.append(
-                {
-                    "note": f"Truncated — {len(node.source_ids) - len(messages)} more messages available",
-                }
-            )
-            break
+        transcript_content = stored.get("content", "")
+        content = transcript_content
+        content_source = "message"
+        externalized = None
+        ref = extract_externalized_ref(transcript_content)
+        if ref:
+            externalized = _get_externalized_payload(engine, ref)
+        if hydrate_externalized_content and externalized is not None:
+            content = externalized.get("content", "")
+            content_source = "externalized_payload"
+        effective_content_offset = content_offset if source_index == source_offset else 0
+        if not hydrate_externalized_content and _is_compact_externalized_marker(content, ref):
+            sliced = _full_content_slice(content, effective_content_offset)
+        else:
+            sliced = _slice_content_for_response(content, remaining_tokens, effective_content_offset)
         expanded = {
             "store_id": stored["store_id"],
+            "source_index": source_index,
             "role": stored["role"],
-            "content": content[:2000] if len(content) > 2000 else content,
+            "content": sliced["content"],
+            "content_chars": sliced["content_chars"],
+            "content_offset": sliced["content_offset"],
+            "content_returned_chars": sliced["content_returned_chars"],
+            "content_truncated": sliced["content_truncated"],
+            "next_content_offset": sliced["next_content_offset"],
+            "content_source": content_source,
         }
+        if content_source == "externalized_payload":
+            expanded["transcript_content"] = transcript_content
         if stored.get("role") == "tool":
-            ref = extract_externalized_ref(content)
-            if ref:
-                externalized = _get_externalized_payload(engine, ref)
-                if externalized is not None:
-                    externalized.pop("content", None)
-                    expanded["externalized"] = externalized
+            if externalized is not None:
+                externalized_summary = dict(externalized)
+                externalized_summary.pop("content", None)
+                expanded["externalized"] = externalized_summary
             if "externalized" not in expanded:
-                lookup_candidates = [content]
-                sanitized_content = sanitize_pre_compaction_content(content)
-                if sanitized_content != content:
+                lookup_candidates = [transcript_content]
+                sanitized_content = sanitize_pre_compaction_content(transcript_content)
+                if sanitized_content != transcript_content:
                     lookup_candidates.insert(0, sanitized_content)
                 for candidate in lookup_candidates:
                     externalized = find_externalized_payload_for_message(
@@ -182,58 +317,173 @@ def _expand_message_sources(engine: "LCMEngine", node, max_tokens: int) -> list[
                         expanded["externalized"] = externalized
                         break
         messages.append(expanded)
-        budget_used += msg_tokens
-    return messages
+        budget_used += count_tokens(sliced["content"])
+        if sliced["has_more"]:
+            next_source_offset = source_index
+            next_content_offset = sliced["next_content_offset"]
+            has_more = True
+            break
+        next_source_offset = source_index + 1
+        next_content_offset = 0
+        has_more = next_source_offset < total_sources
+    else:
+        has_more = (source_offset + source_limit) < total_sources
+        next_source_offset = source_offset + source_limit if has_more else None
+        next_content_offset = 0
+
+    pagination = _pagination_payload(
+        total_sources=total_sources,
+        source_offset=source_offset,
+        content_offset=content_offset,
+        source_limit=source_limit,
+        returned_sources=len(messages),
+        next_source_offset=next_source_offset,
+        next_content_offset=next_content_offset,
+        has_more=has_more,
+    )
+    return messages, pagination
 
 
-def _expand_child_nodes(engine: "LCMEngine", node) -> list[dict[str, Any]]:
-    children = [child for child in engine._dag.get_source_nodes(node) if child.session_id == engine._session_id]
-    return [
-        {
-            "node_id": child.node_id,
-            "depth": child.depth,
-            "summary": child.summary[:1000],
-            "token_count": child.token_count,
-            "expand_hint": child.expand_hint,
-        }
-        for child in children
-    ]
+def _expand_child_nodes(
+    engine: "LCMEngine",
+    node,
+    max_tokens: int | None = None,
+    *,
+    source_offset: int = 0,
+    source_limit: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    from .tokens import count_tokens
+
+    total_sources = len(node.source_ids)
+    source_offset = min(max(0, source_offset), total_sources)
+    remaining_source_count = max(0, total_sources - source_offset)
+    if source_limit is None:
+        source_limit = remaining_source_count
+    else:
+        source_limit = min(max(0, source_limit), remaining_source_count)
+    selected_source_ids = node.source_ids[source_offset:source_offset + source_limit]
+    children: list[tuple[int, Any]] = []
+    for relative_index, child_id in enumerate(selected_source_ids):
+        child = engine._dag.get_node(child_id)
+        if child is None or child.session_id != engine._session_id:
+            continue
+        children.append((source_offset + relative_index, child))
+
+    expanded: list[dict[str, Any]] = []
+    budget_used = 0
+    next_source_offset: int | None = None
+    has_more = (source_offset + source_limit) < total_sources
+    for source_index, child in children:
+        summary = child.summary
+        summary_truncated = False
+        if max_tokens is not None:
+            remaining_tokens = max_tokens - budget_used
+            if remaining_tokens <= 0:
+                next_source_offset = source_index
+                has_more = True
+                break
+            summary, summary_truncated = _truncate_text_to_token_budget(summary, remaining_tokens)
+        expanded.append(
+            {
+                "node_id": child.node_id,
+                "source_index": source_index,
+                "depth": child.depth,
+                "summary": summary[:1000] if max_tokens is None else summary,
+                "summary_truncated": summary_truncated or (max_tokens is None and len(child.summary) > 1000),
+                "token_count": child.token_count,
+                "source_token_count": child.source_token_count,
+                "expand_hint": child.expand_hint,
+            }
+        )
+        budget_used += count_tokens(summary)
+        if summary_truncated:
+            next_source_offset = source_index + 1
+            has_more = next_source_offset < total_sources
+            break
+        next_source_offset = source_index + 1
+
+    if has_more and next_source_offset is None:
+        next_source_offset = source_offset + source_limit
+
+    return expanded, _pagination_payload(
+        total_sources=total_sources,
+        source_offset=source_offset,
+        content_offset=0,
+        source_limit=source_limit,
+        returned_sources=len(expanded),
+        next_source_offset=next_source_offset,
+        next_content_offset=0,
+        has_more=has_more,
+    )
 
 
-def _collect_context_blocks_for_node(engine: "LCMEngine", node, max_tokens: int) -> list[dict[str, Any]]:
+def _collect_context_blocks_for_node(
+    engine: "LCMEngine",
+    node,
+    max_tokens: int,
+    *,
+    hydrate_externalized_content: bool = False,
+) -> list[dict[str, Any]]:
+    from .tokens import count_tokens
+
+    summary, summary_truncated = _truncate_text_to_token_budget(node.summary, max_tokens)
     blocks: list[dict[str, Any]] = [
         {
             "type": "summary",
             "node_id": node.node_id,
             "depth": node.depth,
-            "summary": node.summary,
+            "summary": summary,
+            "summary_truncated": summary_truncated,
             "expand_hint": node.expand_hint,
             "token_count": node.token_count,
         }
     ]
+    remaining_tokens = max(0, max_tokens - count_tokens(summary))
 
     if node.source_type == "messages":
-        messages = _expand_message_sources(engine, node, max_tokens=max_tokens)
-        if messages:
-            blocks.append(
-                {
-                    "type": "messages",
-                    "node_id": node.node_id,
-                    "messages": messages,
-                }
-            )
+        messages, pagination = _expand_message_sources(
+            engine,
+            node,
+            max_tokens=remaining_tokens,
+            hydrate_externalized_content=hydrate_externalized_content,
+        )
+        if messages or pagination.get("has_more"):
+            block = {
+                "type": "messages",
+                "node_id": node.node_id,
+                "messages": messages,
+                "pagination": pagination,
+            }
+            blocks.append(block)
     elif node.source_type == "nodes":
-        children = _expand_child_nodes(engine, node)
-        if children:
+        children, pagination = _expand_child_nodes(engine, node, max_tokens=remaining_tokens)
+        if children or pagination.get("has_more"):
             blocks.append(
                 {
                     "type": "child_nodes",
                     "node_id": node.node_id,
                     "children": children,
+                    "pagination": pagination,
                 }
             )
 
     return blocks
+
+
+def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
+    from .tokens import count_tokens
+
+    total = 0
+    for block in blocks:
+        if block.get("type") == "summary":
+            total += count_tokens(str(block.get("summary") or ""))
+        elif block.get("type") == "messages":
+            for message in block.get("messages", []):
+                total += count_tokens(str(message.get("content") or ""))
+                total += count_tokens(str(message.get("transcript_content") or ""))
+        elif block.get("type") == "child_nodes":
+            total += sum(count_tokens(str(child.get("summary") or "")) for child in block.get("children", []))
+    return total
 
 
 def _synthesize_expansion_answer(
@@ -445,13 +695,17 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     externalized_ref = str(args.get("externalized_ref") or "").strip()
-    max_tokens = int(args.get("max_tokens", 4000))
+    max_tokens = _parse_positive_int(args.get("max_tokens", 4000), 4000)
+    source_offset = _parse_non_negative_int(args.get("source_offset", 0), 0)
+    source_limit_arg = args.get("source_limit")
+    source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
+    content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
             return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
         content = payload.get("content", "")
-        truncated_content, content_truncated = _truncate_text_to_token_budget(content, max_tokens)
+        sliced = _slice_content_for_response(content, max_tokens, content_offset)
         return json.dumps(
             {
                 "externalized_ref": externalized_ref,
@@ -459,10 +713,14 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                 "kind": payload.get("kind", "tool_result"),
                 "tool_call_id": payload.get("tool_call_id", ""),
                 "session_id": payload.get("session_id", ""),
-                "content_chars": payload.get("content_chars", 0),
+                "content_chars": payload.get("content_chars", len(content)),
                 "content_bytes": payload.get("content_bytes", 0),
-                "content": truncated_content,
-                "content_truncated": content_truncated,
+                "content": sliced["content"],
+                "content_offset": sliced["content_offset"],
+                "content_returned_chars": sliced["content_returned_chars"],
+                "content_truncated": sliced["content_truncated"],
+                "next_content_offset": sliced["next_content_offset"],
+                "has_more": sliced["has_more"],
             }
         )
 
@@ -475,24 +733,39 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": f"Node {node_id} not found in current session"})
 
     if node.source_type == "messages":
-        messages = _expand_message_sources(engine, node, max_tokens=max_tokens)
+        messages, pagination = _expand_message_sources(
+            engine,
+            node,
+            max_tokens=max_tokens,
+            source_offset=source_offset,
+            source_limit=source_limit,
+            content_offset=content_offset,
+        )
         return json.dumps(
             {
                 "node_id": node_id,
                 "depth": node.depth,
                 "source_type": "messages",
                 "expanded": messages,
+                "pagination": pagination,
             }
         )
 
     if node.source_type == "nodes":
-        children = _expand_child_nodes(engine, node)
+        children, pagination = _expand_child_nodes(
+            engine,
+            node,
+            max_tokens=max_tokens,
+            source_offset=source_offset,
+            source_limit=source_limit,
+        )
         return json.dumps(
             {
                 "node_id": node_id,
                 "depth": node.depth,
                 "source_type": "nodes",
                 "expanded": children,
+                "pagination": pagination,
             }
         )
 
@@ -519,6 +792,12 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     max_tokens, max_tokens_error = _parse_int_arg("max_tokens", 2000)
     if max_tokens_error:
         return json.dumps({"error": max_tokens_error})
+    max_tokens = max(1, max_tokens)
+    context_default = max(max_tokens, int(getattr(engine._config, "expansion_context_tokens", 32_000) or 32_000))
+    context_max_tokens, context_max_tokens_error = _parse_int_arg("context_max_tokens", context_default)
+    if context_max_tokens_error:
+        return json.dumps({"error": context_max_tokens_error})
+    context_max_tokens = max(1, context_max_tokens)
 
     max_results, max_results_error = _parse_int_arg("max_results", 5)
     if max_results_error:
@@ -554,8 +833,99 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         )
 
     context_blocks = []
+    context_budget_used = 0
     for node in nodes[:max_results]:
-        context_blocks.extend(_collect_context_blocks_for_node(engine, node, max_tokens=max_tokens))
+        remaining_context_tokens = max(0, context_max_tokens - context_budget_used)
+        node_blocks = _collect_context_blocks_for_node(
+            engine,
+            node,
+            max_tokens=remaining_context_tokens,
+            hydrate_externalized_content=True,
+        )
+        context_blocks.extend(node_blocks)
+        context_budget_used += _context_content_token_count(node_blocks)
+
+    context_pagination = []
+    for block in context_blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "summary" and block.get("summary_truncated"):
+            context_pagination.append(
+                {
+                    "node_id": block.get("node_id"),
+                    "type": "summary",
+                    "summary_truncated": True,
+                    "expand_args": {"node_id": block.get("node_id")},
+                }
+            )
+            continue
+
+        if block_type == "child_nodes":
+            for child in block.get("children", []):
+                if child.get("summary_truncated"):
+                    child_node_id = child.get("node_id")
+                    context_pagination.append(
+                        {
+                            "node_id": block.get("node_id"),
+                            "type": "child_summary",
+                            "child_node_id": child_node_id,
+                            "source_index": child.get("source_index"),
+                            "summary_truncated": True,
+                            "expand_args": {"node_id": child_node_id},
+                        }
+                    )
+
+        pagination = block.get("pagination")
+        if not pagination or not pagination.get("has_more"):
+            continue
+
+        item = {
+            "node_id": block.get("node_id"),
+            "type": block_type,
+            "pagination": pagination,
+        }
+        if block_type == "messages":
+            truncated_message = next(
+                (message for message in block.get("messages", []) if message.get("content_truncated")),
+                None,
+            )
+            if truncated_message:
+                item["source_index"] = truncated_message.get("source_index")
+                item["content_source"] = truncated_message.get("content_source")
+                externalized = truncated_message.get("externalized") or {}
+                externalized_ref = externalized.get("ref")
+                if externalized_ref:
+                    item["externalized_ref"] = externalized_ref
+                    item["tool_call_id"] = externalized.get("tool_call_id")
+                if truncated_message.get("content_source") == "externalized_payload" and externalized_ref:
+                    item["expand_args"] = {
+                        "externalized_ref": externalized_ref,
+                        "content_offset": pagination.get("next_content_offset") or 0,
+                    }
+                else:
+                    item["expand_args"] = {
+                        "node_id": block.get("node_id"),
+                        "source_offset": pagination.get("next_source_offset") or 0,
+                        "content_offset": pagination.get("next_content_offset") or 0,
+                    }
+            else:
+                item["expand_args"] = {
+                    "node_id": block.get("node_id"),
+                    "source_offset": pagination.get("next_source_offset") or 0,
+                    "content_offset": pagination.get("next_content_offset") or 0,
+                }
+        elif block_type == "child_nodes":
+            item["expand_args"] = {
+                "node_id": block.get("node_id"),
+                "source_offset": pagination.get("next_source_offset") or 0,
+            }
+        context_pagination.append(item)
+
+    context_truncated = any(
+        bool(item.get("summary_truncated")) or bool(item.get("pagination", {}).get("has_more"))
+        for item in context_pagination
+    )
 
     selected_nodes = nodes[:max_results]
     matches = [
@@ -576,6 +946,10 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "error": reason,
             "degraded": True,
             "model": model,
+            "max_tokens": max_tokens,
+            "context_max_tokens": context_max_tokens,
+            "context_truncated": context_truncated,
+            "context_pagination": context_pagination,
             "node_ids": node_ids,
             "matches": matches,
         }
@@ -611,6 +985,10 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "query": query,
             "answer": answer,
             "model": model,
+            "max_tokens": max_tokens,
+            "context_max_tokens": context_max_tokens,
+            "context_truncated": context_truncated,
+            "context_pagination": context_pagination,
             "node_ids": node_ids,
             "matches": matches,
         }

@@ -90,9 +90,11 @@ LCM_EXPAND = {
         "Recover the original detail behind a current session summary node, or open an "
         "externalized payload ref directly. Given a node_id, returns the "
         "source messages or lower-depth summaries that were compacted into "
-        "that node. Given externalized_ref, returns the stored payload "
-        "content plus metadata. Use after lcm_describe to drill into "
-        "specific parts of the active conversation or large externalized "
+        "that node. Output is bounded by default, but raw recovery is pageable: "
+        "use source_offset/source_limit to page immediate sources and content_offset "
+        "to continue an oversized message or externalized payload. Given externalized_ref, "
+        "returns the stored payload content plus cursor metadata. Use after lcm_describe "
+        "to drill into specific parts of the active conversation or large externalized "
         "tool output. For cross-session recall, prefer session_search first."
     ),
     "parameters": {
@@ -110,6 +112,20 @@ LCM_EXPAND = {
                 "type": "integer",
                 "description": "Token budget for returned content (default 4000)",
                 "default": 4000,
+            },
+            "source_offset": {
+                "type": "integer",
+                "description": "Zero-based pagination offset into the node's immediate source list (messages or child nodes). Use pagination.next_source_offset to continue.",
+                "default": 0,
+            },
+            "source_limit": {
+                "type": "integer",
+                "description": "Maximum number of immediate sources to return from source_offset. Output still respects max_tokens.",
+            },
+            "content_offset": {
+                "type": "integer",
+                "description": "Character offset used to continue an oversized raw message or externalized payload. Use next_content_offset from the previous response.",
+                "default": 0,
             },
         },
         "required": [],
@@ -177,8 +193,13 @@ LCM_EXPAND_QUERY = {
             },
             "max_tokens": {
                 "type": "integer",
-                "description": "Max answer tokens for synthesis (default 2000)",
+                "description": "Max answer tokens for bounded synthesis returned to the main agent (default 2000)",
                 "default": 2000,
+            },
+            "context_max_tokens": {
+                "type": "integer",
+                "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
+                "default": 32000,
             },
         },
         "required": ["prompt"],
