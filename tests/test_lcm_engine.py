@@ -1560,7 +1560,7 @@ class TestSessionRollover:
         with caplog.at_level(logging.WARNING):
             engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
 
-        assert "LCM session-end ingest/finalize skipped due to SQLite lock" in caplog.text
+        assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
 
     def test_on_session_end_fails_open_when_finalize_store_is_locked(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
@@ -1573,7 +1573,29 @@ class TestSessionRollover:
         with caplog.at_level(logging.WARNING):
             engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
 
-        assert "LCM session-end ingest/finalize skipped due to SQLite lock" in caplog.text
+        assert "LCM session-end lifecycle finalization skipped due to SQLite lock" in caplog.text
+
+    def test_on_session_end_returns_quickly_under_real_sqlite_writer_lock(self, engine, caplog):
+        engine.on_session_start("test-session", platform="discord")
+        engine._store._conn.execute("PRAGMA busy_timeout=750")
+        engine._lifecycle._conn.execute("PRAGMA busy_timeout=750")
+
+        locker = sqlite3.connect(str(engine._store.db_path), timeout=1.0, isolation_level=None)
+        locker.execute("PRAGMA journal_mode=WAL")
+        locker.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            with caplog.at_level(logging.WARNING):
+                engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+            elapsed = time.monotonic() - started
+        finally:
+            locker.execute("ROLLBACK")
+            locker.close()
+
+        assert elapsed < 0.3
+        assert engine._store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
+        assert engine._lifecycle._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
+        assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
 
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
