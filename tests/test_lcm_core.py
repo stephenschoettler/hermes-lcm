@@ -27,6 +27,27 @@ from hermes_lcm.session_patterns import (
 
 
 class TestModelRouting:
+    def _install_fake_provider_modules(self, monkeypatch, *, named_custom=None, registry=None):
+        hermes_cli = ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+
+        runtime_provider = ModuleType("hermes_cli.runtime_provider")
+        named_custom = named_custom or {}
+
+        def fake_get_named_custom_provider(provider):
+            return named_custom.get(provider)
+
+        runtime_provider._get_named_custom_provider = fake_get_named_custom_provider
+
+        auth = ModuleType("hermes_cli.auth")
+        auth.PROVIDER_REGISTRY = registry or {}
+
+        hermes_cli.runtime_provider = runtime_provider
+        hermes_cli.auth = auth
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
     def test_provider_prefixed_model_stays_model_only_when_provider_unresolved(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
@@ -53,12 +74,54 @@ class TestModelRouting:
         from hermes_lcm.model_routing import parse_lcm_model_override
 
         route = parse_lcm_model_override(
-            "openai-codex/gpt-5.4-mini",
-            provider_resolver=lambda provider: provider == "openai-codex",
+            "my-provider/model-a",
+            provider_resolver=lambda provider: provider == "my-provider",
         )
 
-        assert route.provider == "openai-codex"
-        assert route.model == "gpt-5.4-mini"
+        assert route.provider == "my-provider"
+        assert route.model == "model-a"
+
+    def test_canonical_provider_name_stays_model_only_even_if_custom_config_exists(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"openai-codex": {"base_url": "https://example.invalid/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("openai-codex/gpt-5.4-mini")
+
+        assert route.provider is None
+        assert route.model == "openai-codex/gpt-5.4-mini"
+
+    def test_custom_prefixed_canonical_provider_stays_model_only(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"custom:openai-codex": {"base_url": "https://example.invalid/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("custom:openai-codex/gpt-5.4-mini")
+
+        assert route.provider is None
+        assert route.model == "custom:openai-codex/gpt-5.4-mini"
+
+    def test_config_backed_non_canonical_custom_provider_is_split(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"my-provider": {"base_url": "https://example.invalid/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("my-provider/model-a")
+
+        assert route.provider == "my-provider"
+        assert route.model == "model-a"
 
     def test_openrouter_organization_slug_stays_model_only(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
