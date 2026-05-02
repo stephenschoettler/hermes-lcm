@@ -7634,10 +7634,35 @@ class TestEngineTools:
         assert result["overall"] == "healthy"
         check_names = [c["check"] for c in result["checks"]]
         assert "database_integrity" in check_names
+        assert "messages_fts_integrity" in check_names
+        assert "nodes_fts_integrity" in check_names
         assert "fts_index_sync" in check_names
         assert "orphaned_dag_nodes" in check_names
         assert "config_validation" in check_names
         assert all(c["status"] == "pass" for c in result["checks"])
+
+    def test_handle_doctor_reports_fts_integrity_failures_separately(self, engine, monkeypatch):
+        def fake_fts_integrity(_conn, spec):
+            if spec.table_name == "nodes_fts":
+                return {
+                    "status": "fail",
+                    "detail": "malformed inverted index for FTS5 table main.nodes_fts",
+                }
+            return {"status": "pass", "detail": "ok"}
+
+        monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", fake_fts_integrity)
+
+        result = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+
+        checks = {check["check"]: check for check in result["checks"]}
+        assert result["overall"] == "unhealthy"
+        assert checks["database_integrity"]["status"] == "pass"
+        assert checks["messages_fts_integrity"]["status"] == "pass"
+        assert checks["nodes_fts_integrity"] == {
+            "check": "nodes_fts_integrity",
+            "status": "fail",
+            "detail": "malformed inverted index for FTS5 table main.nodes_fts",
+        }
 
     def test_handle_doctor_treats_legacy_blank_source_rows_as_healthy(self, engine):
         for source in (None, "", "   ", "\t\n"):

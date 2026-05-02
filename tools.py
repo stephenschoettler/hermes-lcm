@@ -13,9 +13,12 @@ from .externalize import (
     find_externalized_payload_for_message,
     load_externalized_payload,
 )
+from .dag import build_nodes_fts_spec
+from .db_bootstrap import check_external_content_fts_integrity
 from .extraction import sanitize_pre_compaction_content
 from .model_routing import apply_lcm_model_route
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
+from .store import build_message_fts_spec
 
 if TYPE_CHECKING:
     from .engine import LCMEngine
@@ -1105,6 +1108,27 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "status": "fail",
             "detail": str(e),
         })
+
+    # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
+    # inverted indexes point at the exact table and repair path.
+    for check_name, conn, spec in (
+        ("messages_fts_integrity", engine._store._conn, build_message_fts_spec()),
+        ("nodes_fts_integrity", engine._dag._conn, build_nodes_fts_spec()),
+    ):
+        try:
+            fts_integrity = check_external_content_fts_integrity(conn, spec)
+            status = fts_integrity["status"]
+            checks.append({
+                "check": check_name,
+                "status": "warn" if status == "unchecked" else status,
+                "detail": fts_integrity["detail"],
+            })
+        except Exception as e:
+            checks.append({
+                "check": check_name,
+                "status": "fail",
+                "detail": str(e),
+            })
 
     # 2. FTS index sync
     try:

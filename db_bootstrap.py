@@ -221,14 +221,49 @@ def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalConten
 def _fts_needs_rebuild(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
     if _fts_needs_rebuild_structural(conn, spec):
         return True
+    return check_external_content_fts_integrity(conn, spec)["status"] == "fail"
+
+
+def check_external_content_fts_integrity(
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+) -> dict[str, str]:
+    """Run SQLite's FTS5 integrity-check for an external-content table.
+
+    FTS5 exposes this as a special INSERT command. Wrap it in a savepoint and
+    roll it back so diagnostics can verify the index without leaving any state
+    behind on the shared connection.
+    """
+
+    if _fts_needs_rebuild_structural(conn, spec):
+        return {"status": "fail", "detail": "structural repair needed"}
+
+    savepoint = f"lcm_fts_integrity_{spec.table_name}"
+    savepoint_sql = quote_sql_identifier(savepoint)
     try:
+        conn.execute(f"SAVEPOINT {savepoint_sql}")
         conn.execute(
             f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
         )
-    except sqlite3.DatabaseError:
-        return True
+    except sqlite3.DatabaseError as exc:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint_sql}")
+            conn.execute(f"RELEASE {savepoint_sql}")
+        except sqlite3.DatabaseError:
+            pass
+        detail = str(exc)
+        lowered = detail.lower()
+        if "readonly" in lowered or "read-only" in lowered:
+            return {"status": "unchecked", "detail": detail}
+        return {"status": "fail", "detail": detail}
 
-    return False
+    try:
+        conn.execute(f"ROLLBACK TO {savepoint_sql}")
+        conn.execute(f"RELEASE {savepoint_sql}")
+    except sqlite3.DatabaseError as exc:
+        return {"status": "fail", "detail": str(exc)}
+
+    return {"status": "pass", "detail": "ok"}
 
 
 def _drop_fts_table(conn: sqlite3.Connection, table_name: str) -> None:
