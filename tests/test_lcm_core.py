@@ -49,6 +49,17 @@ class TestModelRouting:
         assert route.provider == "cerebras"
         assert route.model == "gpt-oss-120b"
 
+    def test_custom_provider_prefixed_model_is_split_when_provider_resolves(self):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        route = parse_lcm_model_override(
+            "openai-codex/gpt-5.4-mini",
+            provider_resolver=lambda provider: provider == "openai-codex",
+        )
+
+        assert route.provider == "openai-codex"
+        assert route.model == "gpt-5.4-mini"
+
     def test_openrouter_organization_slug_stays_model_only(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
 

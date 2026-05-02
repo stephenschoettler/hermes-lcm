@@ -15,10 +15,11 @@ class ModelRoute:
 ProviderResolver = Callable[[str], bool]
 
 
-# Conservative allowlist: only split prefixes explicitly supported by LCM
-# overrides. Do not infer from arbitrary provider names, because many Hermes
-# provider IDs are also valid OpenRouter model namespaces, for example
-# ``anthropic/...``, ``deepseek/...``, ``google/...``, and ``x-ai/...``.
+# Conservative allowlist for built-in provider registry fallbacks. Named custom
+# providers from the Hermes config are always safe to split; registry-only
+# providers still need an allowlist because many provider IDs are also valid
+# OpenRouter model namespaces, for example ``anthropic/...``, ``google/...``
+# and ``x-ai/...``.
 _PROVIDER_PREFIXES = frozenset({"cerebras"})
 
 
@@ -35,7 +36,7 @@ def _provider_route_is_resolvable(provider: str) -> bool:
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
 
-        return provider in PROVIDER_REGISTRY
+        return provider in _PROVIDER_PREFIXES and provider in PROVIDER_REGISTRY
     except Exception:
         return False
 
@@ -47,9 +48,10 @@ def parse_lcm_model_override(
 ) -> ModelRoute:
     """Parse an LCM model override into explicit provider/model routing.
 
-    Values whose first path segment is both allowlisted and resolvable by the
-    Hermes host are split into ``provider=<prefix>`` and ``model=<rest>``.
-    Other values, even when they contain ``/``, remain model-only overrides.
+    Values whose first path segment is resolvable by the Hermes host are split
+    into ``provider=<prefix>`` and ``model=<rest>``. The default resolver only
+    treats named custom providers (plus conservative registry allowlist entries)
+    as resolvable so OpenRouter-style model slugs remain model-only overrides.
     """
     model = (value or "").strip()
     if not model:
@@ -59,7 +61,7 @@ def parse_lcm_model_override(
     provider = provider.strip().lower()
     rest = rest.strip()
     can_resolve_provider = provider_resolver or _provider_route_is_resolvable
-    if sep and provider in _PROVIDER_PREFIXES and rest and can_resolve_provider(provider):
+    if sep and rest and can_resolve_provider(provider):
         return ModelRoute(provider=provider, model=rest)
 
     return ModelRoute(provider=None, model=model)
