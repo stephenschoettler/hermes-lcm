@@ -766,6 +766,11 @@ class LCMEngine(ContextEngine):
             ", forced overflow recovery" if force_overflow else "",
         )
 
+        # ── Tool-pair guardrail (same as _assemble_context) ──
+        # compress() output is consumed directly by the main loop in some
+        # edge cases (e.g. forced overflow recovery bypassing _assemble_context).
+        compressed = self._sanitize_tool_pairs(compressed)
+
         return compressed
 
     # -- ContextEngine optional methods ------------------------------------
@@ -2138,6 +2143,66 @@ class LCMEngine(ContextEngine):
 
         return "\n\n".join(parts)
 
+    # -- Internal: tool-pair sanitization ------------------------------------
+
+    def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Fix orphaned tool_call / tool_result pairs in assembled context.
+
+        Two failure modes:
+        1. A tool result references a call_id whose assistant tool_call was
+           removed (summarized/compacted). The API rejects this with
+           "No tool call found for function call output with call_id ...".
+        2. An assistant message has tool_calls whose results were dropped.
+           The API rejects this because every tool_call must be followed by
+           a tool result with the matching call_id.
+
+        This method removes orphaned results and inserts stub results for
+        orphaned calls so the message list is always well-formed — matching
+        the approach used by the built-in ContextCompressor.
+        """
+        surviving_call_ids: set = _assistant_tool_call_ids(messages)
+        result_call_ids: set = set()
+        for msg in messages:
+            if msg.get("role") == "tool":
+                cid = str(msg.get("tool_call_id") or "").strip()
+                if cid:
+                    result_call_ids.add(cid)
+
+        # 1. Remove tool results whose call_id has no matching assistant tool_call
+        orphaned_results = result_call_ids - surviving_call_ids
+        if orphaned_results:
+            messages = [
+                m for m in messages
+                if not (m.get("role") == "tool" and str(m.get("tool_call_id") or "").strip() in orphaned_results)
+            ]
+            logger.info(
+                "LCM tool-pair guardrail: removed %d orphaned tool result(s)",
+                len(orphaned_results),
+            )
+
+        # 2. Add stub results for assistant tool_calls whose results were dropped
+        missing_results = surviving_call_ids - result_call_ids
+        if missing_results:
+            patched: List[Dict[str, Any]] = []
+            for msg in messages:
+                patched.append(msg)
+                if msg.get("role") == "assistant":
+                    for tc in msg.get("tool_calls") or []:
+                        cid = _tool_call_id(tc)
+                        if cid in missing_results:
+                            patched.append({
+                                "role": "tool",
+                                "content": "[Result from earlier conversation — see context summary above]",
+                                "tool_call_id": cid,
+                            })
+            messages = patched
+            logger.info(
+                "LCM tool-pair guardrail: added %d stub tool result(s)",
+                len(missing_results),
+            )
+
+        return messages
+
     # -- Internal: condensation --------------------------------------------
 
     def _should_allow_follow_on_condensation(
@@ -2346,6 +2411,13 @@ class LCMEngine(ContextEngine):
         # Fresh tail
         result.extend(tail_selected)
 
+        # ── Tool-pair guardrail ──
+        # Regression fix: after LCM compression, the assembled active context
+        # may contain orphan tool results (call_id with no matching assistant
+        # tool_call) or assistant tool_calls with missing results. Both violate
+        # the OpenAI message format contract and cause 400 errors from providers.
+        result = self._sanitize_tool_pairs(result)
+
         return result
 
     def _finalize_forced_overflow_result(
@@ -2486,7 +2558,7 @@ class LCMEngine(ContextEngine):
             include_lcm_note=False,
         )
         if len(candidate) == 1 and tail_messages:
-            return [system_msg, tail_messages[-1]]
+            return self._sanitize_tool_pairs([system_msg, tail_messages[-1]])
         return candidate
 
     @staticmethod
