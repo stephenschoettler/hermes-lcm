@@ -538,6 +538,8 @@ class MessageStore:
 
         Retrieval contract:
         - ``session_id`` limits which sessions are eligible
+        - ``session_id=None`` means all sessions; an empty string is treated as
+          a literal session id
         - ``source`` limits which raw rows inside those sessions are eligible
         - ``source='unknown'`` means the explicit unknown-source bucket, with
           legacy blank-source rows treated as equivalent for back-compat
@@ -565,7 +567,7 @@ class MessageStore:
             try:
                 where = ["messages_fts MATCH ?"]
                 args: list[Any] = [safe_query]
-                if session_id:
+                if session_id is not None:
                     where.append("m.session_id = ?")
                     args.append(session_id)
                 if source_clause:
@@ -632,7 +634,7 @@ class MessageStore:
 
         where: list[str] = ["content IS NOT NULL"]
         args: list[Any] = []
-        if session_id:
+        if session_id is not None:
             where.append("session_id = ?")
             args.append(session_id)
         source_clause, source_args = _source_filter_clause("source", source)

@@ -504,6 +504,27 @@ class TestMessageStore:
         results = store.search("docker", session_id="sess1")
         assert len(results) >= 1
 
+    def test_search_empty_session_id_does_not_search_all_sessions(self, store):
+        store.append("sess1", {"role": "user", "content": "deploy docker from session one"})
+        store.append("sess2", {"role": "user", "content": "deploy docker from session two"})
+
+        scoped_results = store.search("docker", session_id="")
+        all_results = store.search("docker", session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {result["session_id"] for result in all_results} == {"sess1", "sess2"}
+
+    def test_search_like_fallback_empty_session_id_does_not_search_all_sessions(self, store):
+        store.append("sess1", {"role": "user", "content": "foo bar baz session one"})
+        store.append("sess2", {"role": "user", "content": "foo bar baz session two"})
+        store._conn.execute("DROP TABLE messages_fts")
+
+        scoped_results = store.search('foo"bar', session_id="")
+        all_results = store.search('foo"bar', session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {result["session_id"] for result in all_results} == {"sess1", "sess2"}
+
     def test_source_stored_and_filterable(self, store):
         store.append("sess1", {"role": "user", "content": "docker in cli"}, source="cli")
         store.append("sess2", {"role": "user", "content": "docker in discord"}, source="discord")
@@ -1917,6 +1938,43 @@ class TestSummaryDAG:
         ))
         results = dag.search("Docker", session_id="s1")
         assert len(results) >= 1
+
+    def test_search_empty_session_id_does_not_search_all_sessions(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="Docker containers for session one",
+            token_count=10, source_ids=[1], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s2", depth=0,
+            summary="Docker containers for session two",
+            token_count=10, source_ids=[2], source_type="messages",
+        ))
+
+        scoped_results = dag.search("Docker", session_id="")
+        all_results = dag.search("Docker", session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {node.session_id for node in all_results} == {"s1", "s2"}
+
+    def test_search_like_fallback_empty_session_id_does_not_search_all_sessions(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="foo bar baz session one",
+            token_count=10, source_ids=[1], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s2", depth=0,
+            summary="foo bar baz session two",
+            token_count=10, source_ids=[2], source_type="messages",
+        ))
+        dag._conn.execute("DROP TABLE nodes_fts")
+
+        scoped_results = dag.search('foo"bar', session_id="")
+        all_results = dag.search('foo"bar', session_id=None, limit=10)
+
+        assert scoped_results == []
+        assert {node.session_id for node in all_results} == {"s1", "s2"}
 
     def test_init_repairs_malformed_nodes_fts_and_sets_schema_version(self, tmp_path):
         db_path = tmp_path / "legacy-dag.db"

@@ -5240,6 +5240,19 @@ class TestEngineTools:
         result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
         assert "results" in result
 
+    def test_handle_grep_unbound_current_session_does_not_search_all_sessions(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "unbound-current-session.db"))
+        instance = LCMEngine(config=config)
+        assert instance._session_id == ""
+        instance._store.append("session-a", {"role": "user", "content": "docker from session a"})
+        instance._store.append("session-b", {"role": "user", "content": "docker from session b"})
+
+        result = json.loads(instance.handle_tool_call("lcm_grep", {"query": "docker", "limit": 10}))
+
+        assert result["session_scope"] == "current"
+        assert result["total_results"] == 0
+        assert result["results"] == []
+
     def test_handle_grep_reports_sort_mode(self, engine):
         engine._store.append(
             "test-session",

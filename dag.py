@@ -335,6 +335,8 @@ class SummaryDAG:
 
         Retrieval contract:
         - ``session_id`` limits which sessions are eligible
+        - ``session_id=None`` means all sessions; an empty string is treated as
+          a literal session id
         - ``source`` filters summaries by descendant raw-message lineage, not by
           session-level source presence
         - mixed-source nodes may match more than one ``source`` filter
@@ -356,7 +358,7 @@ class SummaryDAG:
         source_match_cache: dict[int, bool] = {}
         while True:
             try:
-                if session_id:
+                if session_id is not None:
                     rows = self._conn.execute(
                         f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                            JOIN summary_nodes n ON n.node_id = fts.rowid
@@ -420,7 +422,7 @@ class SummaryDAG:
 
         where: list[str] = ["summary IS NOT NULL"]
         args: list[Any] = []
-        if session_id:
+        if session_id is not None:
             where.append("session_id = ?")
             args.append(session_id)
         like_clauses = []
