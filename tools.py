@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
@@ -151,13 +152,16 @@ def _parse_positive_int(value: Any, default: int) -> int:
     return max(1, _parse_int_value(value, default))
 
 
-_LCM_GREP_VALID_SCOPES = ("current", "all", "session")
-_LCM_GREP_VALID_ROLES = ("user", "assistant", "tool")
+_LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
+_LCM_GREP_VALID_ROLES = frozenset({"user", "assistant", "tool"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
 
 
 def _parse_iso8601_arg(name: str, value: Any) -> tuple[float | None, str | None]:
     """Parse an ISO 8601 string (or numeric Unix timestamp) into Unix seconds.
+
+    Naive datetimes (no ``Z`` and no offset) are rejected so cross-machine
+    time-window filters stay reproducible regardless of host timezone.
 
     Returns ``(timestamp_or_none, error_or_none)``. ``None`` for ``value``
     means the caller did not supply the argument and is not an error.
@@ -173,12 +177,16 @@ def _parse_iso8601_arg(name: str, value: Any) -> tuple[float | None, str | None]
     text = value.strip()
     if not text:
         return None, None
-    from datetime import datetime
     normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None, f"{name} is not a valid ISO 8601 timestamp"
+    if parsed.tzinfo is None:
+        return None, (
+            f"{name} must include a timezone (Z or +HH:MM); "
+            "naive datetimes are rejected to keep filters reproducible across machines"
+        )
     return parsed.timestamp(), None
 
 
@@ -575,7 +583,11 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if not query:
         return json.dumps({"error": "No query provided"})
 
-    requested_limit = _parse_positive_int(args.get("limit", 10), 10)
+    raw_limit_arg = args.get("limit", 10)
+    parsed_limit = _parse_int_value(raw_limit_arg, 10)
+    if parsed_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    requested_limit = parsed_limit
     limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
     sort = normalize_search_sort(args.get("sort"))
     source_limit = max(limit * 4, limit, 20)
@@ -596,17 +608,35 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             "error": f"role must be one of {list(_LCM_GREP_VALID_ROLES)}",
         })
 
-    time_from, time_from_error = _parse_iso8601_arg("time_from", args.get("time_from"))
+    raw_time_from_arg = args.get("time_from")
+    raw_time_to_arg = args.get("time_to")
+    time_from, time_from_error = _parse_iso8601_arg("time_from", raw_time_from_arg)
     if time_from_error:
         return json.dumps({"error": time_from_error})
-    time_to, time_to_error = _parse_iso8601_arg("time_to", args.get("time_to"))
+    time_to, time_to_error = _parse_iso8601_arg("time_to", raw_time_to_arg)
     if time_to_error:
         return json.dumps({"error": time_to_error})
+    if time_from is not None and time_to is not None and time_from > time_to:
+        return json.dumps({
+            "error": "time_from must be less than or equal to time_to",
+        })
 
     if requested_session_scope == "current":
         if explicit_session_id:
             return json.dumps({
                 "error": "session_id is only valid with session_scope=session",
+            })
+        # Defensive guard: when no current session is bound, the underlying
+        # truthiness-based filter in MessageStore.search/SummaryDAG.search
+        # would silently widen to all sessions. That is a pre-existing data-
+        # layer bug; here we explicitly refuse to leak cross-session results
+        # under the documented current-session contract.
+        if not engine._session_id:
+            return json.dumps({
+                "error": (
+                    "session_scope=current has no active session bound; "
+                    "use session_scope=all or session_scope=session with an explicit session_id"
+                ),
             })
         search_session_id: str | None = engine._session_id
         session_scope = "current"
@@ -634,6 +664,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         )
 
     current_session_id = engine._session_id
+    has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
 
     try:
@@ -656,7 +687,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "role": hit["role"],
                     "timestamp": timestamp_value,
                     "snippet": hit.get("snippet", hit.get("content", "")[:200]),
-                    "from_current_session": hit["session_id"] == current_session_id,
+                    "from_current_session": has_current_session and hit["session_id"] == current_session_id,
                     "_sort_ts": timestamp_value,
                     "_sort_rank": hit.get("search_rank"),
                     "_sort_directness": hit.get("_directness_score") or 0.0,
@@ -684,7 +715,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                 "expand_hint": node.expand_hint,
                 "earliest_at": node.earliest_at,
                 "latest_at": node.latest_at,
-                "from_current_session": node.session_id == current_session_id,
+                "from_current_session": has_current_session and node.session_id == current_session_id,
                 "_sort_ts": node.latest_at or node.created_at,
                 "_sort_rank": node.search_rank,
                 "_sort_directness": node.search_directness or 0.0,
@@ -745,9 +776,12 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         response["role"] = role_filter
         response["role_filter_applies"] = "messages_only"
     if time_from is not None:
-        response["time_from"] = time_from
+        # Echo the caller's original argument so the response shape matches the
+        # schema-declared input type (ISO 8601 string when given as a string;
+        # numeric Unix seconds when given numerically).
+        response["time_from"] = raw_time_from_arg if not isinstance(raw_time_from_arg, str) else raw_time_from_arg.strip()
     if time_to is not None:
-        response["time_to"] = time_to
+        response["time_to"] = raw_time_to_arg if not isinstance(raw_time_to_arg, str) else raw_time_to_arg.strip()
     if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
     if requested_session_scope not in _LCM_GREP_VALID_SCOPES:
@@ -892,22 +926,24 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     if raw_store_id_arg is not None:
         try:
             store_id = int(raw_store_id_arg)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return json.dumps({"error": "store_id must be an integer"})
         stored = engine._store.get(store_id)
         if stored is None:
             return json.dumps({"error": f"Message store_id {store_id} not found"})
         transcript_content = stored.get("content", "") or ""
         sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset)
+        engine_session_id = engine._session_id
+        stored_session_id = stored.get("session_id", "")
         result: Dict[str, Any] = {
             "store_id": store_id,
             "source_type": "raw_message",
-            "session_id": stored.get("session_id", ""),
+            "session_id": stored_session_id,
             "source": stored.get("source") or "",
             "role": stored.get("role"),
             "timestamp": stored.get("timestamp", 0),
             "tool_call_id": stored.get("tool_call_id") or "",
-            "from_current_session": stored.get("session_id") == engine._session_id,
+            "from_current_session": bool(engine_session_id) and stored_session_id == engine_session_id,
             "content": sliced["content"],
             "content_chars": sliced["content_chars"],
             "content_offset": sliced["content_offset"],
@@ -919,16 +955,22 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         # Surface externalized-payload metadata when the row references one. Content
         # is not hydrated by default, mirroring the existing _expand_message_sources
         # default. Externalized lookup remains session-scoped (per the existing
-        # _get_externalized_payload contract).
+        # _get_externalized_payload contract); cross-session rows surface only the
+        # ref string, with a hint pointing at the same-session expansion path.
         ref = extract_externalized_ref(transcript_content)
         if ref:
             result["externalized_ref"] = ref
-            if stored.get("session_id") == engine._session_id:
+            if bool(engine_session_id) and stored_session_id == engine_session_id:
                 payload = _get_externalized_payload(engine, ref)
                 if payload is not None:
                     payload_summary = dict(payload)
                     payload_summary.pop("content", None)
                     result["externalized"] = payload_summary
+            else:
+                result["externalized_note"] = (
+                    "Externalized payload metadata is session-scoped; "
+                    "cross-session ref is surfaced for traceability only and cannot be expanded in this version."
+                )
         return json.dumps(result)
 
     node_id = raw_node_id_arg

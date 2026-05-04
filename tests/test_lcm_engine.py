@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -7988,8 +7989,6 @@ class TestHandleGrepCrossSession:
         assert result["limit_clamped_from"] == 5000
 
     def test_time_from_in_future_excludes_all(self, engine):
-        from datetime import datetime, timezone, timedelta
-
         engine._store.append("test-session", {"role": "user", "content": "docker plan"})
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         result = json.loads(
@@ -7999,18 +7998,64 @@ class TestHandleGrepCrossSession:
             )
         )
         assert result["total_results"] == 0
-        assert "time_from" in result
+        # time_from is echoed back as the original input string, not as a float
+        assert result["time_from"] == future
 
     def test_time_to_in_past_excludes_all(self, engine):
-        from datetime import datetime, timezone, timedelta
-
         engine._store.append("test-session", {"role": "user", "content": "docker plan"})
         past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         result = json.loads(
             engine.handle_tool_call("lcm_grep", {"query": "docker", "time_to": past})
         )
         assert result["total_results"] == 0
-        assert "time_to" in result
+        assert result["time_to"] == past
+
+    def test_inverted_time_range_returns_error(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        now = datetime.now(timezone.utc)
+        time_from = (now + timedelta(hours=1)).isoformat()
+        time_to = (now - timedelta(hours=1)).isoformat()
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "time_from": time_from, "time_to": time_to},
+            )
+        )
+        assert "error" in result
+        assert "time_from" in result["error"] and "time_to" in result["error"]
+
+    def test_naive_iso8601_time_is_rejected(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "time_from": "2026-01-01T00:00:00"},
+            )
+        )
+        assert "error" in result
+        assert "timezone" in result["error"].lower() or "naive" in result["error"].lower()
+
+    def test_limit_zero_returns_error(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": 0})
+        )
+        assert "error" in result
+        assert "limit" in result["error"]
+
+    def test_limit_negative_returns_error(self, engine):
+        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(
+            engine.handle_tool_call("lcm_grep", {"query": "docker", "limit": -5})
+        )
+        assert "error" in result
+
+    def test_empty_engine_session_under_current_scope_returns_error(self, engine):
+        engine._session_id = ""
+        engine._store.append("some-session", {"role": "user", "content": "docker plan"})
+        result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
+        assert "error" in result
+        assert "no active session" in result["error"].lower() or "session_scope" in result["error"]
 
     def test_invalid_time_from_returns_error(self, engine):
         result = json.loads(
@@ -8243,6 +8288,28 @@ class TestHandleExpandStoreId:
         )
         assert "error" in result
         assert "current session" in result["error"].lower()
+
+    def test_store_id_cross_session_externalized_ref_surfaced_with_note(self, engine):
+        # Seed a foreign-session tool message that references an externalized
+        # payload. The ref string follows the produced-placeholder shape so
+        # extract_externalized_ref will pick it up.
+        placeholder = (
+            "[Externalized tool output: tool_call_id=call_abc; "
+            "chars=1234; bytes=5678; ref=foreign_payload_ref.json]"
+        )
+        store_id = engine._store.append(
+            "old-session",
+            {"role": "tool", "content": placeholder, "tool_call_id": "call_abc"},
+        )
+        result = json.loads(engine.handle_tool_call("lcm_expand", {"store_id": store_id}))
+        assert result["source_type"] == "raw_message"
+        assert result["from_current_session"] is False
+        assert result["externalized_ref"] == "foreign_payload_ref.json"
+        # Cross-session payload metadata is intentionally omitted; an explanatory
+        # note is surfaced so callers don't treat the bare ref as expandable.
+        assert "externalized" not in result
+        assert "externalized_note" in result
+        assert "session-scoped" in result["externalized_note"].lower()
 
     def test_grep_then_expand_round_trip_cross_session(self, engine):
         store_id = engine._store.append(

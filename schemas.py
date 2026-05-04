@@ -152,8 +152,10 @@ LCM_EXPAND = {
                 "description": (
                     "Raw message store_id to fetch. Works across sessions, so a store_id surfaced by "
                     "a cross-session lcm_grep result can be expanded directly. Returns the message's "
-                    "content paged by content_offset; if the row references an externalized payload, "
-                    "the ref is surfaced but content is not hydrated."
+                    "content paged by content_offset. If the row references an externalized payload, "
+                    "the ref is surfaced via 'externalized_ref'; payload metadata and content are "
+                    "session-scoped, so a cross-session row also includes 'externalized_note' "
+                    "explaining that the ref is for traceability only and cannot be expanded in this version."
                 ),
             },
             "max_tokens": {
