@@ -3,11 +3,13 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Search the current session's conversation history — raw messages AND summaries across all depths — "
-        "to recover details from earlier in the active conversation, even if those turns were compacted. "
-        "Prefer this for intra-session recall. If the user is asking about an earlier separate conversation "
-        "or broad cross-session history, prefer session_search instead. Returns matches with depth labels "
-        "showing where each result lives."
+        "Search the LCM database for past conversation content (raw messages AND summaries across all depths) "
+        "to recover details from the active session or, when explicitly scoped, from other sessions in the "
+        "plugin-local LCM database (including history imported from OpenClaw or lossless-claw). "
+        "Default scope is current-session only; broader scopes must be requested explicitly. "
+        "Cross-session summary hits are returned as snippets but cannot be expanded by node_id in this version "
+        "(they carry cross_session_expand_supported=false); use lcm_expand with the result's store_id for raw-message "
+        "expansion across sessions. For Hermes-tracked session history outside the LCM database, use session_search."
     ),
     "parameters": {
         "type": "object",
@@ -22,7 +24,10 @@ LCM_GREP = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max results to return (default 10)",
+                "description": (
+                    "Max results to return (default 10, hard upper bound 200). "
+                    "Values above the cap are clamped and reported via limit_clamped_from in the response."
+                ),
                 "default": 10,
             },
             "sort": {
@@ -36,12 +41,23 @@ LCM_GREP = {
             },
             "session_scope": {
                 "type": "string",
-                "enum": ["current"],
+                "enum": ["current", "all", "session"],
                 "description": (
-                    "Current-session only. Cross-session recall should use session_search instead; "
-                    "unsupported values are ignored and reported in the tool result."
+                    "Scope of the search across the plugin-local LCM database. "
+                    "'current' (default) restricts to the active session and preserves historical behavior. "
+                    "'all' searches every session in the local LCM database. "
+                    "'session' restricts to the session_id supplied via the session_id parameter. "
+                    "Cross-session search returns snippets and message store_ids; cross-session summary node expansion is deferred. "
+                    "For Hermes-tracked session history outside the LCM database, use session_search."
                 ),
                 "default": "current",
+            },
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "When session_scope='session', the explicit session id to restrict the search to. "
+                    "Must not be supplied with session_scope='current' or session_scope='all'."
+                ),
             },
             "source": {
                 "type": "string",
@@ -49,6 +65,27 @@ LCM_GREP = {
                     "Optional source/platform filter (for example cli, discord, telegram). "
                     "Applies directly to raw messages and to summaries via descendant source lineage. "
                     "Use 'unknown' for explicit unknown-source content."
+                ),
+            },
+            "role": {
+                "type": "string",
+                "enum": ["user", "assistant", "tool"],
+                "description": (
+                    "Optional role filter. Applies to message hits only; summary hits are returned unfiltered "
+                    "(role does not exist on summary nodes). The response echoes role_filter_applies='messages_only' when this is set."
+                ),
+            },
+            "time_from": {
+                "type": "string",
+                "description": (
+                    "Optional inclusive ISO 8601 lower bound for message timestamps and summary latest_at. "
+                    "Examples: '2026-01-01T00:00:00Z' or '2026-01-01T00:00:00+00:00'."
+                ),
+            },
+            "time_to": {
+                "type": "string",
+                "description": (
+                    "Optional inclusive ISO 8601 upper bound for message timestamps and summary latest_at."
                 ),
             },
         },
