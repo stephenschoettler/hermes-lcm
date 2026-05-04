@@ -124,26 +124,37 @@ LCM_DESCRIBE = {
 LCM_EXPAND = {
     "name": "lcm_expand",
     "description": (
-        "Recover the original detail behind a current session summary node, or open an "
-        "externalized payload ref directly. Given a node_id, returns the "
-        "source messages or lower-depth summaries that were compacted into "
-        "that node. Output is bounded by default, but raw recovery is pageable: "
-        "use source_offset/source_limit to page immediate sources and content_offset "
-        "to continue an oversized message or externalized payload. Given externalized_ref, "
-        "returns the stored payload content plus cursor metadata. Use after lcm_describe "
-        "to drill into specific parts of the active conversation or large externalized "
-        "tool output. For cross-session recall, prefer session_search first."
+        "Recover the original detail behind a summary node, externalized payload, or raw message. "
+        "Mode selection (exactly one): node_id (current session only) returns the source messages "
+        "or lower-depth summaries that were compacted into a summary node; externalized_ref "
+        "(current session only) returns a stored externalized payload's content; store_id returns "
+        "a single raw message by store_id and works across sessions, suitable for drilling into "
+        "cross-session lcm_grep results. Output is bounded by max_tokens; raw recovery is pageable "
+        "via content_offset (and source_offset/source_limit for node_id mode). For Hermes-tracked "
+        "session history outside the LCM database, prefer session_search."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "node_id": {
                 "type": "integer",
-                "description": "Summary node ID to expand",
+                "description": (
+                    "Summary node ID to expand. Current-session only — cross-session DAG expansion "
+                    "is not supported in this version."
+                ),
             },
             "externalized_ref": {
                 "type": "string",
-                "description": "Optional externalized payload ref filename to expand instead of a summary node.",
+                "description": "Externalized payload ref filename to expand instead of a summary node. Current-session only.",
+            },
+            "store_id": {
+                "type": "integer",
+                "description": (
+                    "Raw message store_id to fetch. Works across sessions, so a store_id surfaced by "
+                    "a cross-session lcm_grep result can be expanded directly. Returns the message's "
+                    "content paged by content_offset; if the row references an externalized payload, "
+                    "the ref is surfaced but content is not hydrated."
+                ),
             },
             "max_tokens": {
                 "type": "integer",
@@ -152,16 +163,16 @@ LCM_EXPAND = {
             },
             "source_offset": {
                 "type": "integer",
-                "description": "Zero-based pagination offset into the node's immediate source list (messages or child nodes). Use pagination.next_source_offset to continue.",
+                "description": "Zero-based pagination offset into the node's immediate source list (node_id mode only).",
                 "default": 0,
             },
             "source_limit": {
                 "type": "integer",
-                "description": "Maximum number of immediate sources to return from source_offset. Output still respects max_tokens.",
+                "description": "Maximum number of immediate sources to return from source_offset (node_id mode only). Output still respects max_tokens.",
             },
             "content_offset": {
                 "type": "integer",
-                "description": "Character offset used to continue an oversized raw message or externalized payload. Use next_content_offset from the previous response.",
+                "description": "Character offset used to continue an oversized raw message, externalized payload, or store_id-mode message. Use next_content_offset from the previous response.",
                 "default": 0,
             },
         },
