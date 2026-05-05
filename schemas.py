@@ -3,13 +3,13 @@
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
-        "Search the LCM database for past conversation content (raw messages AND summaries across all depths) "
-        "to recover details from the active session or, when explicitly scoped, from other sessions in the "
-        "plugin-local LCM database (including history imported from OpenClaw or lossless-claw). "
-        "Default scope is current-session only; broader scopes must be requested explicitly. "
-        "Cross-session summary hits are returned as snippets but cannot be expanded by node_id in this version "
-        "(they carry cross_session_expand_supported=false); use lcm_expand with the result's store_id for raw-message "
-        "expansion across sessions. For Hermes-tracked session history outside the LCM database, use session_search."
+        "Search the plugin-local LCM database for past conversation content. "
+        "Default scope is the active session and returns both raw messages and summary nodes across all depths. "
+        "Broader scopes ('all' or 'session') must be requested explicitly and exist for bounded archive recovery "
+        "over rows already present in lcm.db, including externally backfilled rows that may carry source strings "
+        "such as openclaw-lcm:* . In broader scopes only raw-message hits are returned; cross-session summary "
+        "node expansion is intentionally deferred. Use lcm_expand(store_id=...) on a cross-session message hit "
+        "to drill into its full content. For Hermes-tracked session history outside the LCM database, use session_search."
     ),
     "parameters": {
         "type": "object",
@@ -65,27 +65,6 @@ LCM_GREP = {
                     "Optional source/platform filter (for example cli, discord, telegram). "
                     "Applies directly to raw messages and to summaries via descendant source lineage. "
                     "Use 'unknown' for explicit unknown-source content."
-                ),
-            },
-            "role": {
-                "type": "string",
-                "enum": ["user", "assistant", "tool"],
-                "description": (
-                    "Optional role filter. Applies to message hits only; summary hits are returned unfiltered "
-                    "(role does not exist on summary nodes). The response echoes role_filter_applies='messages_only' when this is set."
-                ),
-            },
-            "time_from": {
-                "type": "string",
-                "description": (
-                    "Optional inclusive ISO 8601 lower bound for message timestamps and summary latest_at. "
-                    "Examples: '2026-01-01T00:00:00Z' or '2026-01-01T00:00:00+00:00'."
-                ),
-            },
-            "time_to": {
-                "type": "string",
-                "description": (
-                    "Optional inclusive ISO 8601 upper bound for message timestamps and summary latest_at."
                 ),
             },
         },

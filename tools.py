@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
@@ -153,41 +152,7 @@ def _parse_positive_int(value: Any, default: int) -> int:
 
 
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
-_LCM_GREP_VALID_ROLES = frozenset({"user", "assistant", "tool"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
-
-
-def _parse_iso8601_arg(name: str, value: Any) -> tuple[float | None, str | None]:
-    """Parse an ISO 8601 string (or numeric Unix timestamp) into Unix seconds.
-
-    Naive datetimes (no ``Z`` and no offset) are rejected so cross-machine
-    time-window filters stay reproducible regardless of host timezone.
-
-    Returns ``(timestamp_or_none, error_or_none)``. ``None`` for ``value``
-    means the caller did not supply the argument and is not an error.
-    """
-    if value is None:
-        return None, None
-    if isinstance(value, bool):
-        return None, f"{name} must be an ISO 8601 string"
-    if isinstance(value, (int, float)):
-        return float(value), None
-    if not isinstance(value, str):
-        return None, f"{name} must be an ISO 8601 string"
-    text = value.strip()
-    if not text:
-        return None, None
-    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
-    try:
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None, f"{name} is not a valid ISO 8601 timestamp"
-    if parsed.tzinfo is None:
-        return None, (
-            f"{name} must include a timezone (Z or +HH:MM); "
-            "naive datetimes are rejected to keep filters reproducible across machines"
-        )
-    return parsed.timestamp(), None
 
 
 def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
@@ -567,13 +532,15 @@ def _synthesize_expansion_answer(
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
-    """Search raw messages + summaries with optional cross-session scoping and filters.
+    """Search raw messages + summaries with optional cross-session scoping.
 
-    Default scope is the current session, preserving historical behavior. Callers may
-    explicitly request ``session_scope='all'`` (every session in the local LCM
-    database) or ``session_scope='session'`` (a single ``session_id``). Optional
-    ``role`` and ``time_from``/``time_to`` filters narrow results further. ``limit``
-    is clamped to ``_LCM_GREP_HARD_LIMIT_CAP`` regardless of input.
+    Default scope is the current session, preserving historical behavior and returning
+    both raw-message and summary-node hits. Callers may explicitly request
+    ``session_scope='all'`` (every session in the local LCM database) or
+    ``session_scope='session'`` (a single ``session_id``); broader scopes return
+    raw-message hits only and exist for bounded archive recovery over rows already
+    present in ``lcm.db``. ``limit`` is clamped to ``_LCM_GREP_HARD_LIMIT_CAP``
+    regardless of input.
     """
     engine = _require_engine(kwargs)
     if engine is None:
@@ -599,45 +566,14 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     )
     source = str(args.get("source") or "").strip() or None
 
-    raw_role_arg = args.get("role")
-    role_filter = (
-        str(raw_role_arg).strip().lower() if raw_role_arg is not None else ""
-    ) or None
-    if role_filter is not None and role_filter not in _LCM_GREP_VALID_ROLES:
-        return json.dumps({
-            "error": f"role must be one of {list(_LCM_GREP_VALID_ROLES)}",
-        })
-
-    raw_time_from_arg = args.get("time_from")
-    raw_time_to_arg = args.get("time_to")
-    time_from, time_from_error = _parse_iso8601_arg("time_from", raw_time_from_arg)
-    if time_from_error:
-        return json.dumps({"error": time_from_error})
-    time_to, time_to_error = _parse_iso8601_arg("time_to", raw_time_to_arg)
-    if time_to_error:
-        return json.dumps({"error": time_to_error})
-    if time_from is not None and time_to is not None and time_from > time_to:
-        return json.dumps({
-            "error": "time_from must be less than or equal to time_to",
-        })
-
     if requested_session_scope == "current":
         if explicit_session_id:
             return json.dumps({
                 "error": "session_id is only valid with session_scope=session",
             })
-        # Defensive guard: when no current session is bound, the underlying
-        # truthiness-based filter in MessageStore.search/SummaryDAG.search
-        # would silently widen to all sessions. That is a pre-existing data-
-        # layer bug; here we explicitly refuse to leak cross-session results
-        # under the documented current-session contract.
-        if not engine._session_id:
-            return json.dumps({
-                "error": (
-                    "session_scope=current has no active session bound; "
-                    "use session_scope=all or session_scope=session with an explicit session_id"
-                ),
-            })
+        # MessageStore.search and SummaryDAG.search treat session_id="" as a
+        # literal scoped filter, so an unbound engine searching scope=current
+        # returns zero results rather than leaking cross-session matches.
         search_session_id: str | None = engine._session_id
         session_scope = "current"
     elif requested_session_scope == "all":
@@ -655,7 +591,10 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         search_session_id = explicit_session_id
         session_scope = "session"
     else:
-        # Preserve historical behavior for unknown scopes: stay current and report.
+        # Preserve historical behavior for unknown scopes: route through the
+        # current-session path and report. The data-layer empty-string scoping
+        # contract keeps an unbound engine from leaking cross-session matches
+        # here too.
         search_session_id = engine._session_id
         session_scope = "current"
         logger.warning(
@@ -696,54 +635,40 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     except Exception as exc:
         logger.warning("Message search failed: %s", exc)
 
-    try:
-        node_hits = engine._dag.search(
-            query,
-            session_id=search_session_id,
-            limit=source_limit,
-            sort=sort,
-            source=source,
-        )
-        for node in node_hits:
-            entry: Dict[str, Any] = {
-                "type": "summary",
-                "depth": f"d{node.depth}",
-                "node_id": node.node_id,
-                "session_id": node.session_id,
-                "snippet": node.summary[:300],
-                "token_count": node.token_count,
-                "expand_hint": node.expand_hint,
-                "earliest_at": node.earliest_at,
-                "latest_at": node.latest_at,
-                "from_current_session": has_current_session and node.session_id == current_session_id,
-                "_sort_ts": node.latest_at or node.created_at,
-                "_sort_rank": node.search_rank,
-                "_sort_directness": node.search_directness or 0.0,
-            }
-            if session_scope != "current" and node.session_id != current_session_id:
-                # Cross-session DAG expansion is intentionally deferred. Mark
-                # these hits so callers do not attempt node_id-based expansion.
-                entry["cross_session_expand_supported"] = False
-            results.append(entry)
-    except Exception as exc:
-        logger.warning("Node search failed: %s", exc)
-
-    if role_filter is not None:
-        # Role applies to message hits; summary hits have no role field.
-        results = [
-            result for result in results
-            if result.get("type") != "message" or result.get("role") == role_filter
-        ]
-
-    if time_from is not None or time_to is not None:
-        def _within_window(result: Dict[str, Any]) -> bool:
-            ts = float(result.get("_sort_ts") or 0)
-            if time_from is not None and ts < time_from:
-                return False
-            if time_to is not None and ts > time_to:
-                return False
-            return True
-        results = [result for result in results if _within_window(result)]
+    # Summary-node search is intentionally current-session only. Cross-session
+    # DAG expansion is deferred; returning summary hits without an expansion
+    # contract would push this tool toward a memory-system shape rather than
+    # a plugin-local archive search. Raw-message hits remain expandable across
+    # sessions via lcm_expand(store_id=...).
+    if session_scope == "current":
+        try:
+            node_hits = engine._dag.search(
+                query,
+                session_id=search_session_id,
+                limit=source_limit,
+                sort=sort,
+                source=source,
+            )
+            for node in node_hits:
+                results.append(
+                    {
+                        "type": "summary",
+                        "depth": f"d{node.depth}",
+                        "node_id": node.node_id,
+                        "session_id": node.session_id,
+                        "snippet": node.summary[:300],
+                        "token_count": node.token_count,
+                        "expand_hint": node.expand_hint,
+                        "earliest_at": node.earliest_at,
+                        "latest_at": node.latest_at,
+                        "from_current_session": True,
+                        "_sort_ts": node.latest_at or node.created_at,
+                        "_sort_rank": node.search_rank,
+                        "_sort_directness": node.search_directness or 0.0,
+                    }
+                )
+        except Exception as exc:
+            logger.warning("Node search failed: %s", exc)
 
     if sort == "hybrid":
         max_message_directness = max(
@@ -772,16 +697,6 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     }
     if session_scope == "session":
         response["session_id"] = explicit_session_id
-    if role_filter is not None:
-        response["role"] = role_filter
-        response["role_filter_applies"] = "messages_only"
-    if time_from is not None:
-        # Echo the caller's original argument so the response shape matches the
-        # schema-declared input type (ISO 8601 string when given as a string;
-        # numeric Unix seconds when given numerically).
-        response["time_from"] = raw_time_from_arg if not isinstance(raw_time_from_arg, str) else raw_time_from_arg.strip()
-    if time_to is not None:
-        response["time_to"] = raw_time_to_arg if not isinstance(raw_time_to_arg, str) else raw_time_to_arg.strip()
     if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
         response["limit_clamped_from"] = requested_limit
     if requested_session_scope not in _LCM_GREP_VALID_SCOPES:

@@ -248,19 +248,20 @@ for earlier separate sessions or broad cross-session history.
 
 | Tool | Use |
 |------|-----|
-| `lcm_grep` | Search current-session raw messages and summaries. Use `session_search` for earlier separate sessions or broad cross-session recall. |
+| `lcm_grep` | Search current-session raw messages and summaries. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only. Use `session_search` for earlier separate sessions or broad cross-session recall. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
-| `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. |
+| `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
 
 ### Retrieval contract
 
-LCM retrieval tools are current-session tools. `session_scope` is kept for
-schema compatibility and currently accepts only `current`; unsupported values
-are ignored and reported in the tool result. Use Hermes `session_search` for
-earlier sessions.
+LCM retrieval tools default to current-session scope. `lcm_grep` accepts
+`session_scope='all'` or `session_scope='session'` as an explicit opt-in for
+bounded archive search over rows already present in `lcm.db` (raw-message hits
+only); use Hermes `session_search` for broad cross-session history outside the
+LCM database.
 
 Within the current session, `source` filters raw rows directly and filters
 summary nodes by descendant raw-message source lineage. `unknown` is a real

@@ -5,7 +5,6 @@ import logging
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -355,23 +354,30 @@ class TestEngineABC:
         assert grep_props["session_scope"]["enum"] == ["current", "all", "session"]
         assert "session_id" in grep_props
         assert "session_scope='session'" in grep_props["session_id"]["description"]
-        assert "role" in grep_props
-        assert grep_props["role"]["enum"] == ["user", "assistant", "tool"]
-        assert "time_from" in grep_props
-        assert "ISO 8601" in grep_props["time_from"]["description"]
-        assert "time_to" in grep_props
+        # role/time_from/time_to filters are intentionally absent in this
+        # version; they need to be pushed into the search layer before being
+        # exposed again. See follow-up issue tracking that work.
+        assert "role" not in grep_props
+        assert "time_from" not in grep_props
+        assert "time_to" not in grep_props
         assert "source" in grep_props
         assert "descendant source lineage" in grep_props["source"]["description"]
         assert "unknown" in grep_props["source"]["description"]
-        assert "current-session" in grep_schema["description"].lower() or "current session" in grep_schema["description"].lower()
+        # The default scope still steers callers to the active session.
+        description_lower = grep_schema["description"].lower()
+        assert (
+            "current-session" in description_lower
+            or "current session" in description_lower
+            or "active session" in description_lower
+        )
         assert "session_search" in grep_schema["description"]
         # The schema now documents the broader scopes — assert by enumerating them in the
         # session_scope description rather than enforcing the legacy current-only wording.
         scope_description = grep_props["session_scope"]["description"]
         assert "all" in scope_description and "session" in scope_description and "current" in scope_description
         assert "session_search" in scope_description
-        # cross-session summary expansion is intentionally deferred — top-level description should mention it.
-        assert "cross_session_expand_supported" in grep_schema["description"]
+        # Cross-session search is positioned as plugin-local archive recovery, not memory.
+        assert "archive" in grep_schema["description"].lower() or "plugin-local" in grep_schema["description"].lower()
 
         describe_schema = next(s for s in schemas if s["name"] == "lcm_describe")
         expand_schema = next(s for s in schemas if s["name"] == "lcm_expand")
@@ -397,12 +403,18 @@ class TestEngineABC:
 
     def test_readme_documents_session_scope_contract(self):
         readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text()
-        # cross-session opt-in is now documented explicitly
+        # cross-session opt-in is now documented as bounded archive recovery
         assert "session_scope='all'" in readme
         assert "session_scope='session'" in readme
         assert "current-session recall" in readme
         assert "session_search" in readme
-        assert "cross_session_expand_supported" in readme
+        # The reframed positioning steers callers away from a memory-system
+        # reading and toward bounded archive recovery over rows already in lcm.db.
+        assert "archive" in readme.lower() or "externally backfilled" in readme.lower()
+        # No implied importer language: anchor the use case on rows already in
+        # lcm.db, not on an official OpenClaw/lossless-claw importer.
+        assert "imported from OpenClaw" not in readme
+        assert "imported from lossless-claw" not in readme
         assert "Lossless raw recovery contract" in readme
         assert "source_offset" in readme
         assert "content_offset" in readme
@@ -7988,53 +8000,6 @@ class TestHandleGrepCrossSession:
         assert result["limit"] == 200
         assert result["limit_clamped_from"] == 5000
 
-    def test_time_from_in_future_excludes_all(self, engine):
-        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
-        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-        result = json.loads(
-            engine.handle_tool_call(
-                "lcm_grep",
-                {"query": "docker", "time_from": future},
-            )
-        )
-        assert result["total_results"] == 0
-        # time_from is echoed back as the original input string, not as a float
-        assert result["time_from"] == future
-
-    def test_time_to_in_past_excludes_all(self, engine):
-        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
-        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-        result = json.loads(
-            engine.handle_tool_call("lcm_grep", {"query": "docker", "time_to": past})
-        )
-        assert result["total_results"] == 0
-        assert result["time_to"] == past
-
-    def test_inverted_time_range_returns_error(self, engine):
-        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
-        now = datetime.now(timezone.utc)
-        time_from = (now + timedelta(hours=1)).isoformat()
-        time_to = (now - timedelta(hours=1)).isoformat()
-        result = json.loads(
-            engine.handle_tool_call(
-                "lcm_grep",
-                {"query": "docker", "time_from": time_from, "time_to": time_to},
-            )
-        )
-        assert "error" in result
-        assert "time_from" in result["error"] and "time_to" in result["error"]
-
-    def test_naive_iso8601_time_is_rejected(self, engine):
-        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
-        result = json.loads(
-            engine.handle_tool_call(
-                "lcm_grep",
-                {"query": "docker", "time_from": "2026-01-01T00:00:00"},
-            )
-        )
-        assert "error" in result
-        assert "timezone" in result["error"].lower() or "naive" in result["error"].lower()
-
     def test_limit_zero_returns_error(self, engine):
         engine._store.append("test-session", {"role": "user", "content": "docker plan"})
         result = json.loads(
@@ -8050,77 +8015,31 @@ class TestHandleGrepCrossSession:
         )
         assert "error" in result
 
-    def test_empty_engine_session_under_current_scope_returns_error(self, engine):
+    def test_empty_engine_session_with_unknown_scope_does_not_leak(self, engine):
+        # Regression: unknown session_scope previously fell through to engine._session_id
+        # and returned multi-session rows when the engine was unbound. The fix in #104
+        # makes empty session_id a literal scoped filter at the data layer; the unknown-
+        # scope fallback now routes through current-session and naturally returns zero
+        # results instead of leaking. Mirrors the maintainer's repro from PR #102 review.
         engine._session_id = ""
-        engine._store.append("some-session", {"role": "user", "content": "docker plan"})
-        result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
-        assert "error" in result
-        assert "no active session" in result["error"].lower() or "session_scope" in result["error"]
-
-    def test_invalid_time_from_returns_error(self, engine):
-        result = json.loads(
-            engine.handle_tool_call(
-                "lcm_grep", {"query": "docker", "time_from": "not-a-real-timestamp"}
-            )
-        )
-        assert "error" in result
-        assert "time_from" in result["error"]
-
-    def test_time_zulu_suffix_accepted(self, engine):
-        engine._store.append("test-session", {"role": "user", "content": "docker plan"})
+        engine._store.append("session-a", {"role": "user", "content": "docker from a"})
+        engine._store.append("session-b", {"role": "user", "content": "docker from b"})
         result = json.loads(
             engine.handle_tool_call(
                 "lcm_grep",
-                {"query": "docker", "time_from": "2000-01-01T00:00:00Z"},
+                {"query": "docker", "session_scope": "bogus", "limit": 10},
             )
         )
-        assert "error" not in result
-        assert result["total_results"] >= 1
+        assert result["session_scope"] == "current"
+        assert result["ignored_session_scope"] == "bogus"
+        assert result["total_results"] == 0
+        assert result["results"] == []
 
-    def test_role_filter_keeps_only_matching_role(self, engine):
-        engine._store.append("test-session", {"role": "user", "content": "docker user line"})
-        engine._store.append("test-session", {"role": "assistant", "content": "docker assistant line"})
-
-        result = json.loads(
-            engine.handle_tool_call("lcm_grep", {"query": "docker", "role": "assistant"})
-        )
-        assert result["role"] == "assistant"
-        assert result["role_filter_applies"] == "messages_only"
-        roles_seen = {hit["role"] for hit in result["results"] if hit["type"] == "message"}
-        assert roles_seen == {"assistant"}
-
-    def test_role_filter_does_not_drop_summary_hits(self, engine):
-        engine._store.append("test-session", {"role": "user", "content": "docker user only"})
-        engine._dag.add_node(
-            SummaryNode(
-                session_id="test-session",
-                depth=0,
-                summary="summary about docker",
-                token_count=5,
-                source_token_count=5,
-                source_ids=[1],
-                source_type="messages",
-                created_at=time.time(),
-            )
-        )
-        result = json.loads(
-            engine.handle_tool_call("lcm_grep", {"query": "docker", "role": "tool"})
-        )
-        # No tool-role messages, so all message hits are filtered out, but the
-        # summary hit (which has no role) remains.
-        types_seen = {hit["type"] for hit in result["results"]}
-        assert "summary" in types_seen
-        assert "message" not in types_seen
-
-    def test_invalid_role_returns_error(self, engine):
-        result = json.loads(
-            engine.handle_tool_call("lcm_grep", {"query": "docker", "role": "moderator"})
-        )
-        assert "error" in result
-        assert "role" in result["error"]
-
-    def test_cross_session_summary_hit_marked_non_expandable(self, engine):
-        engine._store.append("old-session", {"role": "user", "content": "docker old"})
+    def test_cross_session_scope_returns_only_message_hits(self, engine):
+        # Cross-session scope intentionally restricts to raw-message hits.
+        # Summary nodes from foreign sessions are excluded entirely (deferred
+        # until a real cross-session DAG-expansion contract exists).
+        engine._store.append("old-session", {"role": "user", "content": "docker old message"})
         engine._dag.add_node(
             SummaryNode(
                 session_id="old-session",
@@ -8136,13 +8055,16 @@ class TestHandleGrepCrossSession:
         result = json.loads(
             engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
         )
-        summary_hits = [hit for hit in result["results"] if hit["type"] == "summary"]
-        assert summary_hits, "expected at least one summary hit"
-        for hit in summary_hits:
-            if hit["session_id"] != "test-session":
-                assert hit.get("cross_session_expand_supported") is False
+        types_seen = {hit["type"] for hit in result["results"]}
+        assert "message" in types_seen
+        assert "summary" not in types_seen
+        # No summary hits means no cross_session_expand_supported marker is needed.
+        for hit in result["results"]:
+            assert "cross_session_expand_supported" not in hit
 
-    def test_current_session_summary_hit_does_not_carry_non_expandable_marker(self, engine):
+    def test_current_scope_still_returns_summary_hits(self, engine):
+        # Regression: removing cross-session summary hits must not affect
+        # current-session DAG search behavior.
         engine._store.append("test-session", {"role": "user", "content": "docker current"})
         engine._dag.add_node(
             SummaryNode(
@@ -8156,16 +8078,9 @@ class TestHandleGrepCrossSession:
                 created_at=time.time(),
             )
         )
-        result = json.loads(
-            engine.handle_tool_call("lcm_grep", {"query": "docker", "session_scope": "all"})
-        )
-        summary_hits = [
-            hit for hit in result["results"]
-            if hit["type"] == "summary" and hit["session_id"] == "test-session"
-        ]
-        assert summary_hits
-        for hit in summary_hits:
-            assert "cross_session_expand_supported" not in hit
+        result = json.loads(engine.handle_tool_call("lcm_grep", {"query": "docker"}))
+        types_seen = {hit["type"] for hit in result["results"]}
+        assert "summary" in types_seen
 
     def test_source_filter_combined_with_scope_all(self, engine):
         engine._store.append("test-session", {"role": "user", "content": "docker via cli"}, source="cli")
