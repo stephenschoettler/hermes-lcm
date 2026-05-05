@@ -281,6 +281,29 @@ be recovered in deterministic pages.
 - `lcm_expand(externalized_ref=...)` pages payload content with `content_offset`
 - `lcm_expand_query` uses `context_max_tokens` for auxiliary context and reports truncation/pagination hints when needed
 
+### lossless-claw/OpenClaw import utility
+
+`hermes-lcm` includes an opt-in operator script for backfilling raw message rows from a lossless-claw/OpenClaw LCM SQLite database into the local hermes-lcm SQLite store:
+
+```bash
+python scripts/import_lossless_claw.py \
+  --source-db ~/.openclaw/path/to/lcm.db \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy
+```
+
+The script is intentionally conservative:
+
+- dry-run is the default; pass `--apply` to write
+- run it against an explicit target DB path, preferably while Hermes is stopped for that profile
+- writes create a timestamped target DB backup first when the target already exists
+- only raw messages are imported; summary DAG import is out of scope
+- imported rows keep explicit provenance in `session_id` and `source`, for example `openclaw-lcm:agent:sammy:telegram:direct:...`
+- reruns are idempotent for the same `--import-id`
+- no OpenClaw secrets, config, or general memory data are imported
+
+This is a local archive migration path. It does not make LCM a general memory provider, and it does not change the current-session retrieval contract for agent tools.
+
 ## Slash Commands
 
 Slash commands are disabled by default. Enable them only in trusted operator
