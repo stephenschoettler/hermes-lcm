@@ -298,8 +298,10 @@ The script is intentionally conservative:
 - run it against an explicit target DB path, preferably while Hermes is stopped for that profile
 - writes create a timestamped target DB backup first when the target already exists
 - only raw messages are imported; summary DAG import is out of scope
-- imported rows keep explicit provenance in `session_id` and `source`, for example `openclaw-lcm:agent:sammy:telegram:direct:...`
-- reruns are idempotent for the same `--import-id`
+- imported rows keep explicit provenance in `session_id` and `source`, for example `openclaw-lcm:agent:sammy:<source-session>`
+- the default provenance identity is the concrete source `conversations.session_id`, preserving source conversation boundaries even when many conversations share one `session_key`
+- pass `--session-identity session_key` only when you intentionally want conversations with the same source session key grouped into one imported LCM session
+- reruns are idempotent for the same `--import-id`; the default `import_id` is path-derived, so pass a stable `--import-id` if you may import the same copied DB from different paths
 - no OpenClaw secrets, config, or general memory data are imported
 
 This is a local archive migration path. It does not make LCM a general memory provider, and it does not change the current-session retrieval contract for agent tools.

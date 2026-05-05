@@ -89,6 +89,82 @@ def create_lossless_source(db_path: Path) -> None:
     conn.close()
 
 
+def add_shared_session_key_conversation(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """INSERT INTO conversations
+           (conversation_id, session_id, session_key, title, created_at, updated_at)
+           VALUES (2, 'runtime-session-2', 'telegram:direct:503782402:conversation:88',
+                   'Second direct', '2026-04-20 12:01:00', '2026-04-20 12:01:00')"""
+    )
+    conn.execute(
+        """INSERT INTO messages
+           (message_id, conversation_id, seq, role, content, token_count, created_at)
+           VALUES (12, 2, 1, 'user', 'hello from second conversation', 5, '2026-04-20 12:01:01')"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_import_preserves_concrete_session_ids_when_session_key_is_shared(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_shared_session_key_conversation(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="fixture-import",
+        apply=True,
+    )
+
+    assert result.imported == 3
+    db = sqlite3.connect(target_db)
+    imported_sessions = db.execute(
+        """SELECT DISTINCT session_id
+           FROM messages
+           WHERE source != 'existing-source'
+           ORDER BY session_id"""
+    ).fetchall()
+    db.close()
+
+    assert imported_sessions == [
+        ("openclaw-lcm:agent:sammy:runtime-session-1",),
+        ("openclaw-lcm:agent:sammy:runtime-session-2",),
+    ]
+
+
+def test_import_can_group_by_session_key_when_explicitly_requested(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_shared_session_key_conversation(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="fixture-import",
+        session_identity="session_key",
+        apply=True,
+    )
+
+    assert result.imported == 3
+    db = sqlite3.connect(target_db)
+    imported_sessions = db.execute("SELECT DISTINCT session_id FROM messages").fetchall()
+    db.close()
+
+    assert imported_sessions == [
+        ("openclaw-lcm:agent:sammy:telegram:direct:503782402:conversation:88",),
+    ]
+
+
 def test_dry_run_does_not_create_target_db(tmp_path: Path):
     importer = load_importer_module()
     source_db = tmp_path / "lossless.db"
@@ -153,7 +229,7 @@ def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path
     ).fetchall()
     conn.close()
 
-    expected_session = "openclaw-lcm:agent:sammy:telegram:direct:503782402:conversation:88"
+    expected_session = "openclaw-lcm:agent:sammy:runtime-session-1"
     assert rows[0][0] == expected_session
     assert rows[0][1] == expected_session
     assert rows[0][2] == "user"

@@ -40,6 +40,9 @@ from hermes_lcm.store import MessageStore, _normalize_source_value  # noqa: E402
 from hermes_lcm.tokens import count_message_tokens  # noqa: E402
 
 
+VALID_SESSION_IDENTITIES = frozenset({"session_id", "session_key"})
+
+
 @dataclass(frozen=True)
 class ImportCandidate:
     source_message_id: int
@@ -159,6 +162,29 @@ def _safe_segment(value: Any, fallback: str) -> str:
 
 def _target_source(namespace: str, agent: str, source_session: str) -> str:
     return f"{_safe_segment(namespace, 'openclaw-lcm')}:agent:{_safe_segment(agent, 'unknown')}:{source_session}"
+
+
+def _resolve_source_session(
+    row: sqlite3.Row,
+    *,
+    conversation_id: int,
+    session_identity: str,
+) -> str:
+    if session_identity not in VALID_SESSION_IDENTITIES:
+        raise ValueError(
+            "session_identity must be one of "
+            + ", ".join(sorted(VALID_SESSION_IDENTITIES))
+        )
+    fallback = f"conversation:{conversation_id}"
+    if session_identity == "session_key":
+        return _safe_segment(
+            row["conversation_session_key"] or row["conversation_session_id"],
+            fallback,
+        )
+    return _safe_segment(
+        row["conversation_session_id"] or row["conversation_session_key"],
+        fallback,
+    )
 
 
 def _load_parts(conn: sqlite3.Connection) -> dict[int, list[sqlite3.Row]]:
@@ -296,6 +322,7 @@ def _collect_candidates(
     *,
     namespace: str,
     agent: str,
+    session_identity: str = "session_id",
 ) -> tuple[list[ImportCandidate], int, int, int]:
     _require_columns(conn, "conversations", ["conversation_id", "session_id"])
     _require_columns(conn, "messages", ["message_id", "conversation_id", "seq", "role", "content"])
@@ -342,9 +369,10 @@ def _collect_candidates(
 
         conversation_id = int(row["conversation_id"])
         conversation_ids.add(conversation_id)
-        source_session = _safe_segment(
-            row["conversation_session_key"] or row["conversation_session_id"],
-            f"conversation:{conversation_id}",
+        source_session = _resolve_source_session(
+            row,
+            conversation_id=conversation_id,
+            session_identity=session_identity,
         )
         source = _target_source(namespace, agent, source_session)
         msg = {"role": role, "content": content}
@@ -444,17 +472,24 @@ def import_lossless_claw(
     namespace: str = "openclaw-lcm",
     agent: str = "unknown",
     import_id: str | None = None,
+    session_identity: str = "session_id",
     apply: bool = False,
 ) -> ImportResult:
     source_path = Path(source_db)
     target_path = Path(target_db)
     resolved_import_id = import_id or _default_import_id(source_path)
+    if session_identity not in VALID_SESSION_IDENTITIES:
+        raise ValueError(
+            "session_identity must be one of "
+            + ", ".join(sorted(VALID_SESSION_IDENTITIES))
+        )
 
     with _connect_readonly(source_path) as source_conn:
         candidates, scanned, skipped_empty, conversations = _collect_candidates(
             source_conn,
             namespace=namespace,
             agent=agent,
+            session_identity=session_identity,
         )
 
     existing_ids = _existing_source_message_ids(target_path, resolved_import_id)
@@ -564,6 +599,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--namespace", default="openclaw-lcm", help="Provenance namespace for imported rows")
     parser.add_argument("--agent", default="unknown", help="Source OpenClaw agent/profile label for provenance")
     parser.add_argument("--import-id", help="Stable idempotency key. Defaults to a hash of the source DB path")
+    parser.add_argument(
+        "--session-identity",
+        choices=sorted(VALID_SESSION_IDENTITIES),
+        default="session_id",
+        help=(
+            "Source conversation field used for imported session_id/source provenance. "
+            "Default session_id preserves concrete source conversation boundaries; "
+            "session_key intentionally groups conversations sharing the same key."
+        ),
+    )
     parser.add_argument("--apply", action="store_true", help="Write rows to the target DB. Omit for dry-run")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON summary")
     return parser
@@ -578,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         namespace=args.namespace,
         agent=args.agent,
         import_id=args.import_id,
+        session_identity=args.session_identity,
         apply=args.apply,
     )
     if args.json:
