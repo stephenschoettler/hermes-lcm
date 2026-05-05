@@ -243,6 +243,9 @@ original giant tool blob text directly; search summaries or refs instead.
 
 ## Agent Tools
 
+Use these tools for current-session recall after compaction. Use `session_search`
+for earlier separate sessions or broad cross-session history.
+
 | Tool | Use |
 |------|-----|
 | `lcm_grep` | Search current-session raw messages and summaries. Use `session_search` for earlier separate sessions or broad cross-session recall. |
@@ -266,7 +269,7 @@ source value, not a wildcard. Legacy blank-source rows are treated as `unknown`.
 Carried-over summary nodes can become current-session content after `/new`, but
 their source eligibility still comes from the descendant raw messages.
 
-### Lossless raw recovery
+### Lossless raw recovery contract
 
 Tool responses are bounded so one retrieval call cannot flood the main context.
 Lossless recovery means raw content is stored with stable source lineage and can
