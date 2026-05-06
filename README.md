@@ -270,13 +270,15 @@ Two operator-facing limitations to know about:
   JSON wrapper rather than to the inner text. If you expect cron alerts to
   arrive as multimodal payloads from your gateway, use unanchored patterns
   (for example `Cronjob Response:` instead of `^Cronjob Response:`).
-- **Compaction-window edge.** The filter runs at ingest time. On a rare
-  turn where a matching message is part of the chunk being summarized in
-  the same turn it arrived, the message's text may briefly appear inside
-  the resulting summary node text. The summary node's `source_ids` will
-  not reference the filtered message (it was never written to the store),
-  so DAG lineage stays clean; only the serialized summary text can carry
-  it. Closing this window is tracked as follow-up work.
+- **Compaction-window edge.** The filter runs at ingest time. When a
+  matching message is part of the chunk being summarized in the same
+  turn it arrived, the message's text may appear inside the resulting
+  summary node text. In long-running sessions where compaction triggers
+  every several dozen turns, this can affect multiple summary nodes per
+  day rather than only happening rarely. The summary node's `source_ids`
+  will not reference the filtered message (it was never written to the
+  store), so DAG lineage stays clean; only the serialized summary text
+  can carry it. Closing this window is tracked as follow-up work.
 
 `lcm_status` surfaces `ignore_message_patterns`, `ignore_message_patterns_source`
 (`default` or `env`), and a process-lifetime `ignored_message_count` so

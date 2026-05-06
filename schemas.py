@@ -166,8 +166,10 @@ LCM_STATUS = {
     "description": (
         "Get a quick health overview of the LCM engine for the current session. "
         "Shows compression count, store size, DAG depth distribution, context usage, "
-        "and active configuration. Use this to understand how much history has been "
-        "compacted and how the engine is performing."
+        "active configuration, and session-filter state (whether the current session "
+        "is matched by ignore or stateless session patterns). Use this to understand "
+        "how much history has been compacted, how the engine is performing, and "
+        "whether the current session is subject to any noise-suppression filters."
     ),
     "parameters": {
         "type": "object",

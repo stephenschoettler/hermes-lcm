@@ -1161,6 +1161,47 @@ class TestMessageFiltering:
 
         assert caplog.text.count("LCM ignore_message_patterns from env: ^Cronjob Response:") == 1
 
+    def test_stateless_session_skips_message_filter_entirely(self, tmp_path):
+        # Stateless sessions short-circuit ingest before the message filter runs,
+        # mirroring the ignored-session contract. The counter must not increment
+        # for a stateless session even when patterns would otherwise match.
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_stateless_msg.db"),
+            stateless_session_patterns=["telegram:*"],
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("debug", platform="telegram", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "anything"},
+        ])
+        assert engine._store.get_session_count("debug") == 0
+        assert engine._ignored_message_count == 0
+
+    def test_cursor_advances_when_filter_drops_entire_batch(self, tmp_path):
+        # When every message in a batch matches a filter pattern, _ingest_cursor
+        # must still advance to len(messages). Otherwise a second call with the
+        # same list would re-evaluate every message and double-increment the
+        # counter. Regression guard for the all-filtered early-return path.
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_cursor_all_filtered.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: alpha"},
+            {"role": "user", "content": "Cronjob Response: beta"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 2
+        assert engine._ingest_cursor == len(messages)
+
+        # Second call with the same list must not re-process the messages.
+        engine._ingest_messages(messages)
+        assert engine._ignored_message_count == 2
+        assert engine._ingest_cursor == len(messages)
+
     def test_restart_reconciliation_skips_ignored_messages_when_matching_store_tail(self, tmp_path):
         db_path = tmp_path / "lcm_msg_restart_tail.db"
         config = LCMConfig(
