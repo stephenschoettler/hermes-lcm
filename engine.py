@@ -39,6 +39,7 @@ from .session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+from .message_patterns import compile_message_patterns, matches_message_pattern
 from .lifecycle_state import LifecycleStateStore
 from .message_content import normalize_content_value
 from .store import MessageStore
@@ -251,6 +252,10 @@ class LCMEngine(ContextEngine):
         self._compiled_stateless_session_patterns = compile_session_patterns(
             self._config.stateless_session_patterns
         )
+        self._compiled_ignore_message_patterns = compile_message_patterns(
+            self._config.ignore_message_patterns
+        )
+        self._ignored_message_count: int = 0
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -1557,8 +1562,11 @@ class LCMEngine(ContextEngine):
             status["session_stateless"] = self._session_stateless
             status["ignore_session_patterns"] = list(self._config.ignore_session_patterns)
             status["stateless_session_patterns"] = list(self._config.stateless_session_patterns)
+            status["ignore_message_patterns"] = list(self._config.ignore_message_patterns)
             status["ignore_session_patterns_source"] = self._config.ignore_session_patterns_source
             status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
+            status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
+            status["ignored_message_count"] = self._ignored_message_count
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
             status["conversation_id"] = self._conversation_id
@@ -1626,6 +1634,12 @@ class LCMEngine(ContextEngine):
                     self._config.stateless_session_patterns_source,
                     ", ".join(self._config.stateless_session_patterns),
                 )
+            if self._config.ignore_message_patterns:
+                logger.info(
+                    "LCM ignore_message_patterns from %s: %s",
+                    self._config.ignore_message_patterns_source,
+                    ", ".join(self._config.ignore_message_patterns),
+                )
             self._logged_filter_config = True
         if self._session_ignored:
             logger.info(
@@ -1652,6 +1666,12 @@ class LCMEngine(ContextEngine):
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
+
+    def _matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
+        if not self._compiled_ignore_message_patterns:
+            return False
+        text = normalize_content_value(msg.get("content")) or ""
+        return matches_message_pattern(text, self._compiled_ignore_message_patterns)
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
         """Return true for active-context scaffolding that should not be re-ingested."""
@@ -1712,6 +1732,7 @@ class LCMEngine(ContextEngine):
                 self._message_replay_identity(msg)
                 for msg in messages[:cursor]
                 if not self._is_replayed_context_scaffold_message(msg)
+                and not self._matches_ignore_message_patterns(msg)
             ]
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
@@ -1738,12 +1759,14 @@ class LCMEngine(ContextEngine):
             return 0
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
+        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        if not stored_rows:
+            return 0
         stored_tail = [
             self._message_replay_identity(row)
-            for row in self._store.get_session_tail(self._session_id, limit=tail_limit)
+            for row in stored_rows
+            if not self._matches_ignore_message_patterns(row)
         ]
-        if not stored_tail:
-            return 0
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
@@ -1795,6 +1818,26 @@ class LCMEngine(ContextEngine):
         new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
+            return
+
+        if self._compiled_ignore_message_patterns:
+            kept: List[Dict[str, Any]] = []
+            for msg in new_messages:
+                if self._matches_ignore_message_patterns(msg):
+                    self._ignored_message_count += 1
+                    text = normalize_content_value(msg.get("content")) or ""
+                    excerpt = text[:80].replace("\n", " ")
+                    logger.debug(
+                        "LCM ignore_message_patterns dropped %s message: %r",
+                        msg.get("role", "unknown"),
+                        excerpt,
+                    )
+                    continue
+                kept.append(msg)
+            new_messages = kept
+
+        if not new_messages:
+            self._ingest_cursor = n
             return
 
         estimates = [count_message_tokens(m) for m in new_messages]

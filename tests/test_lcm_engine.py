@@ -959,6 +959,288 @@ class TestSessionFiltering:
         assert instance.compression_count == 0
 
 
+class TestMessageFiltering:
+    def _make_engine(self, tmp_path, db_name, **config_kwargs):
+        config = LCMConfig(
+            database_path=str(tmp_path / db_name),
+            **config_kwargs,
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("user-123", platform="telegram", context_length=1000)
+        return engine
+
+    def test_no_patterns_means_no_filtering(self, tmp_path):
+        engine = self._make_engine(tmp_path, "lcm_msg_unset.db")
+        messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "normal text"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 3
+        assert engine._ignored_message_count == 0
+
+    def test_anchored_prefix_drops_matching_message(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_anchor.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: hermie heartbeat\n(job_id: abc)"},
+            {"role": "user", "content": "can you check the database for me?"},
+            {"role": "assistant", "content": "Sure, looking now."},
+        ]
+        engine._ingest_messages(messages)
+
+        stored = engine._store.get_session_messages("user-123")
+        stored_contents = [row["content"] for row in stored]
+        assert len(stored) == 2
+        assert "Cronjob Response:" not in "\n".join(stored_contents)
+        assert "can you check the database for me?" in stored_contents
+        assert engine._ignored_message_count == 1
+
+    def test_triple_bracket_wrapper_variant_dropped(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_triple.db",
+            ignore_message_patterns=["^>>>Cronjob Response<<<:"],
+        )
+        messages = [
+            {"role": "user", "content": ">>>Cronjob Response<<<: heartbeat"},
+            {"role": "user", "content": "regular question"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_inline_flag_pattern_drops_both_wrapper_variants(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_inline.db",
+            ignore_message_patterns=[r"(?is)^\s*(>>>\s*)?Cronjob Response"],
+        )
+        messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "  >>> Cronjob Response: heartbeat"},
+            {"role": "user", "content": "non-matching content"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 2
+
+    def test_active_pattern_does_not_regress_normal_messages(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_normal.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "user", "content": "Can you check the database for me?"},
+            {"role": "assistant", "content": "Looking now."},
+        ]
+        engine._ingest_messages(messages)
+        stored_contents = [
+            row["content"] for row in engine._store.get_session_messages("user-123")
+        ]
+        assert stored_contents == [
+            "Can you check the database for me?",
+            "Looking now.",
+        ]
+        assert engine._ignored_message_count == 0
+
+    def test_anchored_pattern_does_not_match_multimodal_content(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_anchored.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 0
+
+    def test_unanchored_pattern_matches_multimodal_content(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_substr.db",
+            ignore_message_patterns=["Cronjob Response:"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
+
+    def test_filter_is_role_agnostic(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_roles.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {"role": "tool", "content": "Cronjob Response: tool-emitted"},
+            {"role": "assistant", "content": "Cronjob Response: assistant-quoted"},
+            {"role": "user", "content": "user-normal"},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 2
+
+    def test_invalid_regex_warned_and_surviving_pattern_still_filters(self, tmp_path, caplog):
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            engine = self._make_engine(
+                tmp_path, "lcm_msg_invalid.db",
+                ignore_message_patterns=["[unclosed", "^Cronjob Response:"],
+            )
+
+        assert "skipping invalid regex" in caplog.text
+        assert "[unclosed" in caplog.text
+
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "normal text"},
+        ])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_session_filter_and_message_filter_coexist(self, tmp_path):
+        # Session-level filter blocks all writes for a matched session,
+        # taking precedence over per-message filtering.
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_both_filters.db"),
+            ignore_session_patterns=["cron:*"],
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start("cron_123", platform="cron", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "anything"},
+        ])
+        assert engine._store.get_session_count("cron_123") == 0
+        # Counter does not increment for ignored sessions: ingest short-circuits before the message filter runs.
+        assert engine._ignored_message_count == 0
+
+        # On a normal-platform session, only the message filter applies.
+        engine.on_session_start("user-123", platform="telegram", context_length=1000)
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "regular conversation"},
+        ])
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 1
+
+    def test_status_surfaces_message_pattern_keys(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_status.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        engine._ingest_messages([
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+        ])
+        status = engine.get_status()
+        assert status["ignore_message_patterns"] == ["^Cronjob Response:"]
+        assert status["ignore_message_patterns_source"] == "env"
+        assert status["ignored_message_count"] == 1
+        # Existing session-pattern keys are still surfaced unchanged.
+        assert status["ignore_session_patterns"] == []
+        assert status["ignore_session_patterns_source"] == "default"
+
+    def test_diagnostic_log_emits_once_per_engine(self, tmp_path, caplog):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_msg_log_once.db"),
+            ignore_message_patterns=["^Cronjob Response:"],
+            ignore_message_patterns_source="env",
+        )
+        engine = LCMEngine(config=config)
+
+        with caplog.at_level("INFO", logger="hermes_lcm.engine"):
+            engine.on_session_start("user-123", platform="telegram", context_length=1000)
+            engine.on_session_start("user-456", platform="telegram", context_length=1000)
+
+        assert caplog.text.count("LCM ignore_message_patterns from env: ^Cronjob Response:") == 1
+
+    def test_restart_reconciliation_skips_ignored_messages_when_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_tail.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_restart._ingest_messages(active_context)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == ["first real message", "real answer"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_restart_reconciliation_skips_historical_ignored_rows_when_filter_enabled_later(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_later_filter.db"
+        before_config = LCMConfig(database_path=str(db_path))
+
+        before_filter = LCMEngine(config=before_config)
+        before_filter.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_filter._ingest_messages(active_context)
+        before_filter._store.close()
+        before_filter._dag.close()
+        before_filter._lifecycle.close()
+
+        after_config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        after_filter_restart = LCMEngine(config=after_config)
+        after_filter_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_filter_restart._ingest_messages(active_context)
+
+        rows = after_filter_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == [
+            "first real message",
+            "Cronjob Response: heartbeat",
+            "real answer",
+        ]
+        assert after_filter_restart._ingest_cursor == len(active_context)
+
+
 class TestEngineIngest:
     def test_ingest_stores_messages(self, engine):
         messages = [

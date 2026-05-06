@@ -192,6 +192,7 @@ environment variables:
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
+| `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content (plain text, or the normalized form for structured/multimodal content) is excluded from LCM storage |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized tool outputs in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for tool output text |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Rewrite already-externalized summarized tool rows to compact placeholders |
@@ -227,6 +228,60 @@ Pattern matching checks multiple keys: raw `session_id`, `platform`, and
 
 Example: `cron:*` can match Hermes cron sessions, while exact raw session IDs
 still work.
+
+### Noise suppression
+
+LCM offers two layers of noise filtering, sized to two different shapes of
+noise:
+
+- **Session-level filters** (`LCM_IGNORE_SESSION_PATTERNS`,
+  `LCM_STATELESS_SESSION_PATTERNS`) catch the case where the noisy traffic
+  arrives as its own session or platform, for example a dedicated `cron:*`
+  session. Match keys cover the session id, the platform, and
+  `platform:session_id`.
+- **Message-level patterns** (`LCM_IGNORE_MESSAGE_PATTERNS`) catch the case
+  where cron alerts or other noise are injected into a normal Telegram or
+  WhatsApp conversation as ordinary user-visible messages. From LCM's
+  perspective the session/platform is `telegram` or `whatsapp`, not `cron`,
+  so only the message content is distinctive.
+
+Message-level patterns are Python regex strings, comma-separated, compiled
+once at engine start. They run against the normalized message content (the
+same string LCM would have written to the store). Matching messages are
+skipped before storage, so new matching rows do not enter the messages table
+or FTS index. Filtering is role-agnostic by default, since cron alerts can
+be re-emitted under any role depending on the gateway.
+
+Example operator config:
+
+```
+LCM_IGNORE_MESSAGE_PATTERNS=^Cronjob Response:,^>>>Cronjob Response<<<:
+```
+
+Invalid regex entries are logged at warning level and dropped; the
+surviving patterns in the same list still take effect, so a misconfigured
+entry never crashes ingest.
+
+Two operator-facing limitations to know about:
+
+- **Anchored patterns are best-effort against multimodal content.**
+  Structured payloads (lists of content parts) are normalized via JSON
+  serialization before matching, so a `^`-anchored pattern binds to the
+  JSON wrapper rather than to the inner text. If you expect cron alerts to
+  arrive as multimodal payloads from your gateway, use unanchored patterns
+  (for example `Cronjob Response:` instead of `^Cronjob Response:`).
+- **Compaction-window edge.** The filter runs at ingest time. On a rare
+  turn where a matching message is part of the chunk being summarized in
+  the same turn it arrived, the message's text may briefly appear inside
+  the resulting summary node text. The summary node's `source_ids` will
+  not reference the filtered message (it was never written to the store),
+  so DAG lineage stays clean; only the serialized summary text can carry
+  it. Closing this window is tracked as follow-up work.
+
+`lcm_status` surfaces `ignore_message_patterns`, `ignore_message_patterns_source`
+(`default` or `env`), and a process-lifetime `ignored_message_count` so
+operators can confirm their pattern is loaded and watch how often it fires.
+The counter resets on engine restart.
 
 ### Large tool-output handling
 
