@@ -518,6 +518,27 @@ class TestMessagePatterns:
         assert caplog.text.count("timed out") == 1
         assert "(a+)+$" in caplog.text
 
+    def test_stdlib_timeout_fallback_is_cached_after_first_type_error(self):
+        class StdlibPattern:
+            pattern = "^Cronjob Response:"
+
+            def __init__(self):
+                self.timeout_attempts = 0
+                self.normal_attempts = 0
+
+            def search(self, text, **kwargs):
+                if "timeout" in kwargs:
+                    self.timeout_attempts += 1
+                    raise TypeError("'timeout' is an invalid keyword argument for search()")
+                self.normal_attempts += 1
+                return text.startswith("Cronjob Response:")
+
+        pattern = StdlibPattern()
+        assert matches_message_pattern("Cronjob Response: one", [pattern]) is True
+        assert matches_message_pattern("Cronjob Response: two", [pattern]) is True
+        assert pattern.timeout_attempts == 1
+        assert pattern.normal_attempts == 2
+
 
 class TestTokens:
     def test_count_tokens_empty(self):

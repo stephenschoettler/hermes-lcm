@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 MESSAGE_PATTERN_MATCH_TIMEOUT_SECONDS = 0.05
 MESSAGE_PATTERN_FALLBACK_MAX_CHARS = 100_000
 _TIMEOUT_WARNED_PATTERNS: set[str] = set()
+_PATTERN_TIMEOUT_SUPPORT: dict[int, bool] = {}
 
 
 def _pattern_label(pattern: Any) -> str:
@@ -51,13 +52,19 @@ def compile_message_patterns(patterns: Iterable[str]) -> list[Any]:
 
 
 def _search_with_timeout(pattern: Any, text: str) -> Any:
+    pattern_id = id(pattern)
+    if _PATTERN_TIMEOUT_SUPPORT.get(pattern_id) is False:
+        return pattern.search(text[:MESSAGE_PATTERN_FALLBACK_MAX_CHARS])
     try:
-        return pattern.search(text, timeout=MESSAGE_PATTERN_MATCH_TIMEOUT_SECONDS)
+        result = pattern.search(text, timeout=MESSAGE_PATTERN_MATCH_TIMEOUT_SECONDS)
+        _PATTERN_TIMEOUT_SUPPORT[pattern_id] = True
+        return result
     except TypeError as exc:
         # stdlib re.Pattern.search has no timeout parameter. Keep minimal installs
         # working, but cap very large inputs to reduce worst-case exposure.
         if "timeout" not in str(exc):
             raise
+        _PATTERN_TIMEOUT_SUPPORT[pattern_id] = False
         return pattern.search(text[:MESSAGE_PATTERN_FALLBACK_MAX_CHARS])
 
 
