@@ -1866,6 +1866,7 @@ class LCMEngine(ContextEngine):
         *,
         allow_empty_prefix: bool,
         session_count: int,
+        raw_session_count: int,
     ) -> int | None:
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
@@ -1896,10 +1897,18 @@ class LCMEngine(ContextEngine):
             # replay is also accepted.  Singleton full replay remains ambiguous
             # with a one-message delta that repeats the tail, so it is persisted
             # rather than risk data loss.
-            has_full_context_replay = len(candidate_prefix) >= session_count and (
+            has_effective_full_replay = len(candidate_prefix) >= session_count and (
                 session_count > 1 or any(identity[0] == "system" for identity in candidate_prefix)
             )
-            if has_full_context_replay:
+            has_scaffold_evidence = any(
+                self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
+            )
+            has_raw_full_replay = (
+                not has_scaffold_evidence
+                and len(candidate_messages) >= raw_session_count
+                and raw_session_count > 1
+            )
+            if has_effective_full_replay or has_raw_full_replay:
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
@@ -1930,6 +1939,7 @@ class LCMEngine(ContextEngine):
             stored_tail,
             allow_empty_prefix=True,
             session_count=len(stored_tail),
+            raw_session_count=session_count,
         )
         if cursor is not None:
             logger.debug(
