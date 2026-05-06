@@ -6403,8 +6403,48 @@ class TestAssemblyGuardrails:
 
 
 class TestAssemblyToolPairGuardrail:
-    """Regression: _assemble_context must return valid OpenAI-format
-    message sequences — no orphan tool results, no missing tool-result stubs."""
+    """Regression: active context must return provider-valid tool sequences."""
+
+    def _make_engine(self, tmp_path, db_name="lcm_tool_pairs.db"):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / db_name),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "tool-pair-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+        return instance
+
+    def _assert_provider_tool_sequence_valid(self, messages):
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            if msg.get("role") == "tool":
+                raise AssertionError(f"bare/late tool result at index {i}: {msg!r}")
+
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = [
+                    str((tool_call or {}).get("id") or (tool_call or {}).get("tool_call_id") or "").strip()
+                    for tool_call in (msg.get("tool_calls") or [])
+                    if isinstance(tool_call, dict)
+                ]
+                expected_ids = [call_id for call_id in expected_ids if call_id]
+
+                for offset, expected_id in enumerate(expected_ids, start=1):
+                    assert i + offset < len(messages), (
+                        f"missing direct tool result for {expected_id} after assistant index {i}"
+                    )
+                    tool_msg = messages[i + offset]
+                    assert tool_msg.get("role") == "tool", (
+                        f"expected tool result for {expected_id} at index {i + offset}, got {tool_msg!r}"
+                    )
+                    assert str(tool_msg.get("tool_call_id") or "").strip() == expected_id
+
+                i += 1 + len(expected_ids)
+                continue
+
+            i += 1
 
     def test_assemble_removes_orphan_tool_result(self, tmp_path):
         """When a tool result references a call_id whose assistant tool_call
@@ -6633,6 +6673,74 @@ class TestAssemblyToolPairGuardrail:
 
         result = instance._sanitize_tool_pairs([dict(m) for m in messages])
         assert result == messages
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_sanitize_tool_pairs_drops_late_tool_result_after_intervening_message(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_late_tool_result.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_late", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "user", "content": "intervening turn"},
+            {"role": "tool", "tool_call_id": "call_late", "content": "late result"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_late"
+        assert "earlier conversation" in result[1]["content"]
+        assert all(msg.get("content") != "late result" for msg in result)
+
+    def test_sanitize_tool_pairs_drops_duplicate_late_result(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_duplicate_tool_result.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "call_dup", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_dup", "content": "direct result"},
+            {"role": "assistant", "content": "done"},
+            {"role": "tool", "tool_call_id": "call_dup", "content": "duplicate late result"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert [msg.get("content") for msg in result].count("direct result") == 1
+        assert all(msg.get("content") != "duplicate late result" for msg in result)
+
+    def test_sanitize_tool_pairs_keeps_ordered_parallel_results(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_parallel_ordered.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+            {"role": "assistant", "content": "done"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        assert result == messages
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_sanitize_tool_pairs_replaces_out_of_order_parallel_results_with_stubs(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_parallel_out_of_order.db")
+        messages = [
+            {"role": "assistant", "tool_calls": [
+                {"id": "call_a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "terminal", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "call_b", "content": "B out of order"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A out of order"},
+        ]
+
+        result = instance._sanitize_tool_pairs([dict(m) for m in messages])
+
+        self._assert_provider_tool_sequence_valid(result)
+        assert [msg.get("tool_call_id") for msg in result[1:3]] == ["call_a", "call_b"]
+        assert result[1]["content"] == "A out of order"
+        assert "earlier conversation" in result[2]["content"]
+        assert all(msg.get("content") != "B out of order" for msg in result)
 
 
 class TestEngineTools:

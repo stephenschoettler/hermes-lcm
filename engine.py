@@ -2146,62 +2146,75 @@ class LCMEngine(ContextEngine):
     # -- Internal: tool-pair sanitization ------------------------------------
 
     def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fix orphaned tool_call / tool_result pairs in assembled context.
+        """Return provider-safe active-context tool-call/result sequencing.
 
-        Two failure modes:
-        1. A tool result references a call_id whose assistant tool_call was
-           removed (summarized/compacted). The API rejects this with
-           "No tool call found for function call output with call_id ...".
-        2. An assistant message has tool_calls whose results were dropped.
-           The API rejects this because every tool_call must be followed by
-           a tool result with the matching call_id.
-
-        This method removes orphaned results and inserts stub results for
-        orphaned calls so the message list is always well-formed — matching
-        the approach used by the built-in ContextCompressor.
+        Raw store and DAG history remain lossless. This guardrail only sanitizes
+        the active context emitted back to providers, where assistant tool calls
+        must be followed immediately by their contiguous tool results. Late,
+        duplicate, out-of-order, and orphan tool results are dropped; missing
+        direct results get synthetic stubs.
         """
-        surviving_call_ids: set = _assistant_tool_call_ids(messages)
-        result_call_ids: set = set()
-        for msg in messages:
+        sanitized: List[Dict[str, Any]] = []
+        dropped_tool_results = 0
+        inserted_stub_results = 0
+
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+
             if msg.get("role") == "tool":
-                cid = str(msg.get("tool_call_id") or "").strip()
-                if cid:
-                    result_call_ids.add(cid)
+                dropped_tool_results += 1
+                i += 1
+                continue
 
-        # 1. Remove tool results whose call_id has no matching assistant tool_call
-        orphaned_results = result_call_ids - surviving_call_ids
-        if orphaned_results:
-            messages = [
-                m for m in messages
-                if not (m.get("role") == "tool" and str(m.get("tool_call_id") or "").strip() in orphaned_results)
-            ]
+            sanitized.append(msg)
+
+            if msg.get("role") == "assistant":
+                expected_ids = [
+                    call_id
+                    for call_id in (_tool_call_id(tool_call) for tool_call in (msg.get("tool_calls") or []))
+                    if call_id
+                ]
+
+                for expected_id in expected_ids:
+                    matched_direct_result = False
+                    while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
+                        next_msg = messages[i + 1]
+                        next_id = str(next_msg.get("tool_call_id") or "").strip()
+                        if next_id == expected_id:
+                            sanitized.append(next_msg)
+                            i += 1
+                            matched_direct_result = True
+                            break
+                        dropped_tool_results += 1
+                        i += 1
+
+                    if not matched_direct_result:
+                        sanitized.append({
+                            "role": "tool",
+                            "content": "[Result from earlier conversation — see context summary above]",
+                            "tool_call_id": expected_id,
+                        })
+                        inserted_stub_results += 1
+
+                while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
+                    dropped_tool_results += 1
+                    i += 1
+
+            i += 1
+
+        if dropped_tool_results:
             logger.info(
-                "LCM tool-pair guardrail: removed %d orphaned tool result(s)",
-                len(orphaned_results),
+                "LCM tool-pair guardrail: dropped %d late/orphan/duplicate tool result(s)",
+                dropped_tool_results,
+            )
+        if inserted_stub_results:
+            logger.info(
+                "LCM tool-pair guardrail: inserted %d missing tool-result stub(s)",
+                inserted_stub_results,
             )
 
-        # 2. Add stub results for assistant tool_calls whose results were dropped
-        missing_results = surviving_call_ids - result_call_ids
-        if missing_results:
-            patched: List[Dict[str, Any]] = []
-            for msg in messages:
-                patched.append(msg)
-                if msg.get("role") == "assistant":
-                    for tc in msg.get("tool_calls") or []:
-                        cid = _tool_call_id(tc)
-                        if cid in missing_results:
-                            patched.append({
-                                "role": "tool",
-                                "content": "[Result from earlier conversation — see context summary above]",
-                                "tool_call_id": cid,
-                            })
-            messages = patched
-            logger.info(
-                "LCM tool-pair guardrail: added %d stub tool result(s)",
-                len(missing_results),
-            )
-
-        return messages
+        return sanitized
 
     # -- Internal: condensation --------------------------------------------
 
