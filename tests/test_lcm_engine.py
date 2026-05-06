@@ -753,6 +753,88 @@ class TestEngineABC:
         assert rows[-1]["content"] == "repeatable answer"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_existing_session_restart_reconciles_full_replay_without_system_prompt(self, tmp_path):
+        db_path = tmp_path / "restart-full-replay-no-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "full-replay-no-system-session",
+            platform="cli",
+            conversation_id="full-replay-no-system-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "full-replay-no-system-session",
+            platform="cli",
+            conversation_id="full-replay-no-system-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            *persisted_messages,
+            {"role": "user", "content": "new question after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "full-replay-no-system-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows] == [
+            "first question",
+            "first answer",
+            "new question after restart",
+        ]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_reconciles_complete_replay_without_system_prompt(self, tmp_path):
+        db_path = tmp_path / "restart-complete-replay-no-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "complete-replay-no-system-session",
+            platform="cli",
+            conversation_id="complete-replay-no-system-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "complete-replay-no-system-session",
+            platform="cli",
+            conversation_id="complete-replay-no-system-conversation",
+            context_length=200000,
+        )
+
+        after_restart._ingest_messages(list(persisted_messages))
+
+        rows = after_restart._store.get_session_messages(
+            "complete-replay-no-system-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages)
+        assert [row["content"] for row in rows] == ["first question", "first answer"]
+        assert after_restart._ingest_cursor == len(persisted_messages)
+
     def test_existing_session_restart_persists_delta_message_matching_store_tail(self, tmp_path):
         db_path = tmp_path / "restart-repeated-tail-delta.db"
         config = LCMConfig(database_path=str(db_path))
@@ -825,6 +907,44 @@ class TestEngineABC:
         )
         assert len(rows) == 2
         assert [row["content"] for row in rows] == ["retry", "retry"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_single_delta_message_matching_store_tail_with_followup(self, tmp_path):
+        db_path = tmp_path / "restart-single-repeated-tail-followup.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "single-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "user", "content": "retry"}]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "single-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {"role": "user", "content": "retry"},
+            {"role": "assistant", "content": "next answer"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "single-repeat-tail-followup-session",
+            limit=3,
+        )
+        assert len(rows) == 3
+        assert [row["content"] for row in rows] == ["retry", "retry", "next answer"]
         assert after_restart._ingest_cursor == len(active_context)
 
     def test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail(self, tmp_path):

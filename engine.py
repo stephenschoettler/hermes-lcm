@@ -1890,16 +1890,16 @@ class LCMEngine(ContextEngine):
             # gateway restart may provide only newly arrived delta messages; if
             # the first delta happens to repeat the durable tail, treating that
             # row as replay silently loses it.  Only advance the cursor when the
-            # incoming prefix proves replay by looking like a complete durable
-            # context replay with a system prompt anchor.  Synthetic scaffold
-            # rows can be skipped on their own, but they do not prove that a
-            # concrete tail message is replay; ambiguous tail matches are
-            # persisted rather than risk data loss.
-            has_full_context_anchor = (
-                len(candidate_prefix) >= session_count
-                and any(identity[0] == "system" for identity in candidate_prefix)
+            # incoming prefix proves replay by covering the full durable session.
+            # A system prompt is a strong anchor, but older/minimal transcripts
+            # can start directly with user/assistant turns, so multi-row full
+            # replay is also accepted.  Singleton full replay remains ambiguous
+            # with a one-message delta that repeats the tail, so it is persisted
+            # rather than risk data loss.
+            has_full_context_replay = len(candidate_prefix) >= session_count and (
+                session_count > 1 or any(identity[0] == "system" for identity in candidate_prefix)
             )
-            if has_full_context_anchor:
+            if has_full_context_replay:
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
