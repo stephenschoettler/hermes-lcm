@@ -149,13 +149,13 @@ Expected signals:
 
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
-- tool list includes `lcm_grep`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+- tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
 
 Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.8.0 (6 tools)
+  ✓ hermes-lcm v0.8.0 (7 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -249,6 +249,7 @@ for earlier separate sessions or broad cross-session history.
 | Tool | Use |
 |------|-----|
 | `lcm_grep` | Search current-session raw messages and summaries. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only. Use `session_search` for earlier separate sessions or broad cross-session recall. |
+| `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. This is not search: it returns raw rows in `store_id` order, bounded by `limit`, with per-message content bounded by `max_content_chars`, and continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
@@ -260,8 +261,9 @@ for earlier separate sessions or broad cross-session history.
 LCM retrieval tools default to current-session scope. `lcm_grep` accepts
 `session_scope='all'` or `session_scope='session'` as an explicit opt-in for
 bounded archive search over rows already present in `lcm.db` (raw-message hits
-only); use Hermes `session_search` for broad cross-session history outside the
-LCM database.
+only). Once a session id is known, `lcm_load_session` can enumerate that session's
+raw transcript in chronological `store_id` pages without a search query. Use
+Hermes `session_search` for broad cross-session history outside the LCM database.
 
 Within the current session, `source` filters raw rows directly and filters
 summary nodes by descendant raw-message source lineage. `unknown` is a real
@@ -277,6 +279,7 @@ Lossless recovery means raw content is stored with stable source lineage and can
 be recovered in deterministic pages.
 
 - `lcm_expand(node_id=...)` pages immediate sources with `source_offset` and `source_limit`
+- `lcm_load_session(session_id=...)` pages ordered raw session rows with `after_store_id` and `next_cursor`; each row includes bounded content plus truncation metadata, and large individual rows can be recovered with `lcm_expand(store_id=...)` using `content_offset`
 - oversized raw messages continue with `content_offset`
 - `lcm_expand(externalized_ref=...)` pages payload content with `content_offset`
 - `lcm_expand_query` uses `context_max_tokens` for auxiliary context and reports truncation/pagination hints when needed
@@ -354,7 +357,7 @@ store.py         SQLite message store and FTS
 dag.py           summary DAG and FTS
 config.py        env var defaults and overrides
 command.py       /lcm command handlers
-tools.py         lcm_grep, lcm_describe, lcm_expand, lcm_expand_query
+tools.py         lcm_grep, lcm_load_session, lcm_describe, lcm_expand, lcm_expand_query
 schemas.py       tool schemas shown to the model
 tests/           standalone pytest coverage
 ```

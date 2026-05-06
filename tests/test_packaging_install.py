@@ -45,6 +45,23 @@ def test_standalone_install_scripts_exist_and_are_shell_scripts():
     assert update_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
 
 
+def test_plugin_manifest_lists_all_registered_tools():
+    repo_root = Path(__file__).resolve().parent.parent
+    manifest = (repo_root / "plugin.yaml").read_text(encoding="utf-8")
+
+    expected_tools = {
+        "lcm_grep",
+        "lcm_load_session",
+        "lcm_describe",
+        "lcm_expand",
+        "lcm_expand_query",
+        "lcm_status",
+        "lcm_doctor",
+    }
+    for tool_name in expected_tools:
+        assert f"  - {tool_name}\n" in manifest
+
+
 def test_install_script_creates_profile_aware_symlink_and_prints_activation_steps(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     hermes_home = tmp_path / "hermes-home"
@@ -118,6 +135,7 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     tool_names = {schema["name"] for schema in engine.get_tool_schemas()}
     assert {
         "lcm_grep",
+        "lcm_load_session",
         "lcm_describe",
         "lcm_expand",
         "lcm_expand_query",

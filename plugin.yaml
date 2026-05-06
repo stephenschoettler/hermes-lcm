@@ -4,6 +4,7 @@ description: "Lossless Context Management — standalone Hermes plugin with a DA
 author: "Voltropy / Hermes Community"
 provides_tools:
   - lcm_grep
+  - lcm_load_session
   - lcm_describe
   - lcm_expand
   - lcm_expand_query

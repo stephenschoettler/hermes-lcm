@@ -419,6 +419,81 @@ class MessageStore:
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def _session_load_where(
+        self,
+        session_id: str,
+        *,
+        roles: list[str] | None = None,
+        time_from: float | None = None,
+        time_to: float | None = None,
+    ) -> tuple[list[str], list[Any]]:
+        where = ["session_id = ?"]
+        args: list[Any] = [session_id]
+        if roles:
+            placeholders = ",".join("?" for _ in roles)
+            where.append(f"role IN ({placeholders})")
+            args.extend(roles)
+        if time_from is not None:
+            where.append("timestamp >= ?")
+            args.append(time_from)
+        if time_to is not None:
+            where.append("timestamp <= ?")
+            args.append(time_to)
+        return where, args
+
+    def count_session_load_messages(
+        self,
+        session_id: str,
+        *,
+        roles: list[str] | None = None,
+        time_from: float | None = None,
+        time_to: float | None = None,
+    ) -> int:
+        """Count messages matching the lcm_load_session filter contract."""
+        where, args = self._session_load_where(
+            session_id,
+            roles=roles,
+            time_from=time_from,
+            time_to=time_to,
+        )
+        return int(
+            self._conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(where)}",
+                args,
+            ).fetchone()[0]
+        )
+
+    def load_session_page(
+        self,
+        session_id: str,
+        *,
+        after_store_id: int = 0,
+        limit: int = 100,
+        roles: list[str] | None = None,
+        time_from: float | None = None,
+        time_to: float | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Load one ordered raw-message page for a session.
+
+        ``after_store_id`` is exclusive so callers can use the previous page's
+        ``next_cursor`` without duplicating the cursor row.
+        """
+        where, args = self._session_load_where(
+            session_id,
+            roles=roles,
+            time_from=time_from,
+            time_to=time_to,
+        )
+        where.append("store_id > ?")
+        args.extend([after_store_id, limit])
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE {' AND '.join(where)}
+               ORDER BY store_id LIMIT ?""",
+            args,
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
