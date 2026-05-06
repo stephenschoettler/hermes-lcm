@@ -71,3 +71,21 @@ def text_content_for_pattern_matching(content: Any) -> str | None:
         if parts:
             return "\n".join(parts)
     return normalize_content_value(content)
+
+
+def stored_text_content_for_pattern_matching(content: Any) -> str | None:
+    """Return message-filter text for content read back from storage.
+
+    Structured content is persisted as canonical JSON. Decode that legacy stored
+    representation when it round-trips to the same normalized string so restart
+    reconciliation applies the same text-first ignore policy to durable rows as
+    it applies to live structured messages.
+    """
+    if isinstance(content, str):
+        try:
+            decoded = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return text_content_for_pattern_matching(content)
+        if isinstance(decoded, (list, dict)) and normalize_content_value(decoded) == content:
+            return text_content_for_pattern_matching(decoded)
+    return text_content_for_pattern_matching(content)

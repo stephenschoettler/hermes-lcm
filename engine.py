@@ -49,7 +49,11 @@ from .session_patterns import (
 )
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .lifecycle_state import LifecycleStateStore
-from .message_content import normalize_content_value, text_content_for_pattern_matching
+from .message_content import (
+    normalize_content_value,
+    stored_text_content_for_pattern_matching,
+    text_content_for_pattern_matching,
+)
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -1793,10 +1797,15 @@ class LCMEngine(ContextEngine):
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
-    def _matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
+    def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
         if not self._compiled_ignore_message_patterns:
             return False
-        text = text_content_for_pattern_matching(msg.get("content")) or ""
+        content = msg.get("content")
+        text = (
+            stored_text_content_for_pattern_matching(content)
+            if stored_row
+            else text_content_for_pattern_matching(content)
+        ) or ""
         return matches_message_pattern(text, self._compiled_ignore_message_patterns)
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -1891,7 +1900,7 @@ class LCMEngine(ContextEngine):
         stored_tail = [
             self._message_replay_identity(row)
             for row in stored_rows
-            if not self._matches_ignore_message_patterns(row)
+            if not self._matches_ignore_message_patterns(row, stored_row=True)
         ]
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,

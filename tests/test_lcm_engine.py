@@ -1671,6 +1671,50 @@ class TestMessageFiltering:
         ]
         assert after_filter_restart._ingest_cursor == len(active_context)
 
+    def test_restart_reconciliation_matches_legacy_stored_json_with_text_first_filter(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_legacy_multimodal_reconcile.db"
+        session_id = "legacy-structured-session"
+        active_context = [
+            {"role": "user", "content": "normal before ignored tail"},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
+            },
+        ]
+
+        before_restart = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        before_restart.on_session_start(
+            session_id,
+            platform="telegram",
+            conversation_id="legacy-structured-conversation",
+            context_length=1000,
+        )
+        before_restart._ingest_messages(active_context)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                ignore_message_patterns=["^Cronjob Response:"],
+            )
+        )
+        after_restart.on_session_start(
+            session_id,
+            platform="telegram",
+            conversation_id="legacy-structured-conversation",
+            context_length=1000,
+        )
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(session_id)
+        assert [row["content"] for row in rows] == [
+            "normal before ignored tail",
+            '[{"text": "Cronjob Response: heartbeat", "type": "text"}]',
+        ]
+        assert after_restart._ingest_cursor == len(active_context)
+
 
 class TestEngineIngest:
     def test_ingest_stores_messages(self, engine):
