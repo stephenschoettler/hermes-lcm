@@ -49,7 +49,7 @@ from .session_patterns import (
 )
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .lifecycle_state import LifecycleStateStore
-from .message_content import normalize_content_value
+from .message_content import normalize_content_value, text_content_for_pattern_matching
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
@@ -1796,7 +1796,7 @@ class LCMEngine(ContextEngine):
     def _matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
         if not self._compiled_ignore_message_patterns:
             return False
-        text = normalize_content_value(msg.get("content")) or ""
+        text = text_content_for_pattern_matching(msg.get("content")) or ""
         return matches_message_pattern(text, self._compiled_ignore_message_patterns)
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -1951,7 +1951,7 @@ class LCMEngine(ContextEngine):
             for msg in new_messages:
                 if self._matches_ignore_message_patterns(msg):
                     self._ignored_message_count += 1
-                    text = normalize_content_value(msg.get("content")) or ""
+                    text = text_content_for_pattern_matching(msg.get("content")) or ""
                     excerpt = text[:80].replace("\n", " ")
                     logger.debug(
                         "LCM ignore_message_patterns dropped %s message: %r",

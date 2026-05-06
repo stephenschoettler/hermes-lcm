@@ -192,7 +192,7 @@ environment variables:
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
-| `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content (plain text, or the normalized form for structured/multimodal content) is excluded from LCM storage |
+| `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content (plain text, extracted text parts for structured/multimodal content, or normalized JSON fallback when no text parts exist) is excluded from LCM storage |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized tool outputs in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for tool output text |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Rewrite already-externalized summarized tool rows to compact placeholders |
@@ -246,11 +246,14 @@ noise:
   so only the message content is distinctive.
 
 Message-level patterns are Python regex strings, comma-separated, compiled
-once at engine start. They run against the normalized message content (the
-same string LCM would have written to the store). Matching messages are
-skipped before storage, so new matching rows do not enter the messages table
-or FTS index. Filtering is role-agnostic by default, since cron alerts can
-be re-emitted under any role depending on the gateway.
+once at engine start. They run against plain message text. For structured
+multimodal payloads, LCM matches against concatenated text parts first, so
+anchored patterns bind to the text an operator sees. If a structured payload
+contains no text parts, matching falls back to the normalized JSON form that
+LCM would have written to the store. Matching messages are skipped before
+storage, so new matching rows do not enter the messages table or FTS index.
+Filtering is role-agnostic by default, since cron alerts can be re-emitted
+under any role depending on the gateway.
 
 Example operator config:
 

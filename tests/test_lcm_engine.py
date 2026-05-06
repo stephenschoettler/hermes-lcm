@@ -1397,7 +1397,7 @@ class TestMessageFiltering:
         ]
         assert engine._ignored_message_count == 0
 
-    def test_anchored_pattern_does_not_match_multimodal_content(self, tmp_path):
+    def test_anchored_pattern_matches_multimodal_text_part_content(self, tmp_path):
         engine = self._make_engine(
             tmp_path, "lcm_msg_multimodal_anchored.db",
             ignore_message_patterns=["^Cronjob Response:"],
@@ -1407,8 +1407,21 @@ class TestMessageFiltering:
             "content": [{"type": "text", "text": "Cronjob Response: heartbeat"}],
         }
         engine._ingest_messages([multimodal])
-        assert engine._store.get_session_count("user-123") == 1
-        assert engine._ignored_message_count == 0
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
+
+    def test_structured_content_without_text_parts_falls_back_to_normalized_json(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_json_fallback.db",
+            ignore_message_patterns=["file_123"],
+        )
+        multimodal = {
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file_123"}],
+        }
+        engine._ingest_messages([multimodal])
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 1
 
     def test_unanchored_pattern_matches_multimodal_content(self, tmp_path):
         engine = self._make_engine(
