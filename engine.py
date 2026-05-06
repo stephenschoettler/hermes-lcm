@@ -1657,8 +1657,11 @@ class LCMEngine(ContextEngine):
         """Return true for active-context scaffolding that should not be re-ingested."""
         role = str(msg.get("role") or "")
         content = normalize_content_value(msg.get("content")) or ""
-        if role == "system" and "Lossless Context Management (LCM)" in content:
-            return True
+        if role == "system":
+            return (
+                "[Note: This conversation uses Lossless Context Management (LCM)." in content
+                and "Earlier turns have been compacted into hierarchical summaries below." in content
+            )
         if "[Expand for details:" not in content:
             return False
         return bool(

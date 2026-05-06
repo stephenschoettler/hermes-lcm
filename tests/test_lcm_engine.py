@@ -746,6 +746,88 @@ class TestEngineABC:
         assert rows[-1]["content"] == "new user after restart"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_existing_session_restart_persists_new_system_message_that_mentions_lcm(self, tmp_path):
+        db_path = tmp_path / "restart-new-system-lcm-phrase.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-lcm-phrase-session",
+            platform="cli",
+            conversation_id="system-lcm-phrase-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "tail before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-lcm-phrase-session",
+            platform="cli",
+            conversation_id="system-lcm-phrase-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "Policy update: Lossless Context Management (LCM) must be audited during this run.",
+            },
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "system-lcm-phrase-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert rows[-1]["role"] == "system"
+        assert rows[-1]["content"] == "Policy update: Lossless Context Management (LCM) must be audited during this run."
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_skips_exact_lcm_system_scaffold(self, tmp_path):
+        db_path = tmp_path / "restart-system-scaffold.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-scaffold-session",
+            platform="cli",
+            conversation_id="system-scaffold-conversation",
+            context_length=200000,
+        )
+        before_restart._ingest_messages([
+            {"role": "user", "content": "tail before restart"},
+        ])
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-scaffold-session",
+            platform="cli",
+            conversation_id="system-scaffold-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("system-scaffold-session")
+        assert len(rows) == 1
+        assert rows[0]["content"] == "tail before restart"
+        assert after_restart._ingest_cursor == len(active_context)
+
     def test_get_status(self, engine):
         status = engine.get_status()
         assert status["engine"] == "lcm"
