@@ -72,6 +72,65 @@ LCM_GREP = {
     },
 }
 
+LCM_LOAD_SESSION = {
+    "name": "lcm_load_session",
+    "description": (
+        "Load an ordered raw-message transcript page for one explicit session_id from the plugin-local LCM database. "
+        "This is enumeration, not search: it does not require a query, returns raw message content rather than snippets, "
+        "and orders rows chronologically by store_id. Use this after session_search or lcm_grep has identified a session_id "
+        "that already exists in lcm.db. Output is bounded by limit, per-row content is bounded by max_content_chars, "
+        "and row pagination uses after_store_id/next_cursor. "
+        "It returns raw rows only; cross-session summary/DAG expansion remains out of scope."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "description": "Explicit LCM session id to load. Required; no implicit current/all fallback is applied.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Maximum raw messages to return (default 100, hard upper bound 200). "
+                    "Values above the cap are clamped and reported via limit_clamped_from."
+                ),
+                "default": 100,
+            },
+            "max_content_chars": {
+                "type": "integer",
+                "description": (
+                    "Maximum content characters to include per message (default 4000, hard upper bound 20000). "
+                    "Longer rows include content_truncated=true and can be recovered fully with lcm_expand(store_id=...)."
+                ),
+                "default": 4000,
+            },
+            "after_store_id": {
+                "type": "integer",
+                "description": (
+                    "Exclusive cursor for pagination. Pass the previous response's next_cursor "
+                    "to continue with rows whose store_id is greater than this value."
+                ),
+                "default": 0,
+            },
+            "roles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional role filter, for example ['user', 'assistant', 'tool', 'system'].",
+            },
+            "time_from": {
+                "type": "number",
+                "description": "Optional inclusive minimum message timestamp (Unix seconds).",
+            },
+            "time_to": {
+                "type": "number",
+                "description": "Optional inclusive maximum message timestamp (Unix seconds).",
+            },
+        },
+        "required": ["session_id"],
+    },
+}
+
 LCM_DESCRIBE = {
     "name": "lcm_describe",
     "description": (

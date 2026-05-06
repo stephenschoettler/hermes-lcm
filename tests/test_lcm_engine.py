@@ -344,6 +344,7 @@ class TestEngineABC:
         assert "lcm_grep" in names
         assert "lcm_describe" in names
         assert "lcm_expand" in names
+        assert "lcm_load_session" in names
         assert "lcm_status" in names
         assert "lcm_doctor" in names
         assert "lcm_expand_query" in names
@@ -395,6 +396,15 @@ class TestEngineABC:
         assert "store_id" in expand_props
         assert "across sessions" in expand_props["store_id"]["description"].lower() or "cross-session" in expand_props["store_id"]["description"].lower()
         assert "pagination" in expand_props["source_offset"]["description"].lower()
+        load_schema = next(s for s in schemas if s["name"] == "lcm_load_session")
+        load_props = load_schema["parameters"]["properties"]
+        assert load_schema["parameters"]["required"] == ["session_id"]
+        assert "ordered raw-message transcript" in load_schema["description"]
+        assert "after_store_id" in load_props
+        assert "max_content_chars" in load_props
+        assert "roles" in load_props
+        assert "time_from" in load_props
+        assert "time_to" in load_props
         assert "current session" in expand_query_schema["description"].lower()
         assert "session_search" in expand_query_schema["description"]
         expand_query_props = expand_query_schema["parameters"]["properties"]
@@ -416,6 +426,8 @@ class TestEngineABC:
         assert "imported from OpenClaw" not in readme
         assert "imported from lossless-claw" not in readme
         assert "Lossless raw recovery contract" in readme
+        assert "lcm_load_session" in readme
+        assert "after_store_id" in readme
         assert "source_offset" in readme
         assert "content_offset" in readme
         assert "LCM_EXPANSION_CONTEXT_TOKENS" in readme
@@ -8902,6 +8914,197 @@ class TestHandleExpandStoreId:
         )
         assert expand_result["source_type"] == "raw_message"
         assert "phoenix payload" in expand_result["content"]
+
+
+class TestHandleLoadSession:
+    """Ordered, paged raw transcript loading by explicit session_id."""
+
+    def _seed_old_session(self, engine):
+        rows = [
+            ("user", "first old-session message", "cli", 100.0),
+            ("assistant", "second old-session answer", "cli", 200.0),
+            ("tool", "third old-session tool result", "cli", 300.0),
+            ("user", "fourth old-session follow-up", "telegram", 400.0),
+        ]
+        store_ids = []
+        for role, content, source, timestamp in rows:
+            store_id = engine._store.append(
+                "old-session",
+                {"role": role, "content": content, "tool_call_id": "call_x" if role == "tool" else None},
+                source=source,
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (timestamp, store_id),
+            )
+            store_ids.append(store_id)
+        engine._store._conn.commit()
+        engine._store.append("test-session", {"role": "user", "content": "current session message"})
+        return store_ids
+
+    def test_load_session_returns_ordered_bounded_raw_page(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "limit": 2},
+            )
+        )
+
+        assert result["session_id"] == "old-session"
+        assert result["limit"] == 2
+        assert result["total_messages"] == 4
+        assert result["returned_messages"] == 2
+        assert result["has_more"] is True
+        assert result["next_cursor"] == store_ids[1]
+        assert [item["store_id"] for item in result["messages"]] == store_ids[:2]
+        assert [item["role"] for item in result["messages"]] == ["user", "assistant"]
+        assert result["messages"][0]["content"] == "first old-session message"
+        assert result["messages"][0]["content_chars"] == len("first old-session message")
+        assert result["messages"][0]["content_truncated"] is False
+        assert result["messages"][0]["from_current_session"] is False
+        assert "snippet" not in result["messages"][0]
+
+    def test_load_session_pages_after_store_id(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "after_store_id": store_ids[1], "limit": 10},
+            )
+        )
+
+        assert result["after_store_id"] == store_ids[1]
+        assert result["has_more"] is False
+        assert result["next_cursor"] is None
+        assert [item["store_id"] for item in result["messages"]] == store_ids[2:]
+
+    def test_load_session_filters_roles_and_time_range(self, engine):
+        store_ids = self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {
+                    "session_id": "old-session",
+                    "roles": ["user", "tool"],
+                    "time_from": 250.0,
+                    "time_to": 450.0,
+                    "limit": 10,
+                },
+            )
+        )
+
+        assert result["roles"] == ["user", "tool"]
+        assert result["time_from"] == 250.0
+        assert result["time_to"] == 450.0
+        assert result["total_messages"] == 2
+        assert [item["store_id"] for item in result["messages"]] == [store_ids[2], store_ids[3]]
+        assert [item["role"] for item in result["messages"]] == ["tool", "user"]
+
+    def test_load_session_bounds_large_message_content(self, engine):
+        store_id = engine._store.append(
+            "large-session",
+            {"role": "assistant", "content": "abcdef"},
+            source="cli",
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "large-session", "max_content_chars": 3},
+            )
+        )
+
+        assert result["max_content_chars"] == 3
+        assert result["messages"][0]["store_id"] == store_id
+        assert result["messages"][0]["content"] == "abc"
+        assert result["messages"][0]["content_chars"] == 6
+        assert result["messages"][0]["content_returned_chars"] == 3
+        assert result["messages"][0]["content_truncated"] is True
+        assert result["messages"][0]["next_content_offset"] == 3
+
+    def test_load_session_clamps_max_content_chars(self, engine):
+        store_id = engine._store.append(
+            "large-session",
+            {"role": "user", "content": "x" * 25_000},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "large-session", "max_content_chars": 50_000},
+            )
+        )
+
+        assert result["max_content_chars"] == 20_000
+        assert result["max_content_chars_clamped_from"] == 50_000
+        assert result["messages"][0]["store_id"] == store_id
+        assert len(result["messages"][0]["content"]) == 20_000
+        assert result["messages"][0]["content_truncated"] is True
+
+    def test_load_session_rejects_missing_session_id_and_invalid_filters(self, engine):
+        missing = json.loads(engine.handle_tool_call("lcm_load_session", {}))
+        assert "error" in missing and "session_id" in missing["error"]
+
+        bad_roles = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "roles": "user"},
+            )
+        )
+        assert "error" in bad_roles and "roles" in bad_roles["error"]
+
+        bad_cursor = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "after_store_id": "not-an-id"},
+            )
+        )
+        assert "error" in bad_cursor and "after_store_id" in bad_cursor["error"]
+
+        bad_limit = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "limit": "not-a-limit"},
+            )
+        )
+        assert "error" in bad_limit and "limit" in bad_limit["error"]
+
+        bad_max_content_chars = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "max_content_chars": "not-a-size"},
+            )
+        )
+        assert "error" in bad_max_content_chars and "max_content_chars" in bad_max_content_chars["error"]
+
+        bad_range = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "old-session", "time_from": 5, "time_to": 4},
+            )
+        )
+        assert "error" in bad_range and "time_to" in bad_range["error"]
+
+    def test_load_session_clamps_limit_and_never_falls_back_to_current(self, engine):
+        self._seed_old_session(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_load_session",
+                {"session_id": "missing-session", "limit": 5000},
+            )
+        )
+
+        assert result["session_id"] == "missing-session"
+        assert result["limit"] == 200
+        assert result["limit_clamped_from"] == 5000
+        assert result["total_messages"] == 0
+        assert result["messages"] == []
+        assert result["has_more"] is False
 
 
 class TestExtractionDuringCompress:

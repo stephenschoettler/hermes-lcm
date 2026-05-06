@@ -151,8 +151,30 @@ def _parse_positive_int(value: Any, default: int) -> int:
     return max(1, _parse_int_value(value, default))
 
 
+def _parse_optional_float(value: Any, name: str) -> tuple[float | None, str | None]:
+    if value is None:
+        return None, None
+    try:
+        return float(value), None
+    except (TypeError, ValueError, OverflowError):
+        return None, f"{name} must be a number"
+
+
+def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        return int(value), None
+    except (TypeError, ValueError, OverflowError):
+        return None, f"{name} must be an integer"
+
+
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
+_LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
+_LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
+_LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
+_LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS = 20_000
 
 
 def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
@@ -529,6 +551,150 @@ def _synthesize_expansion_answer(
         content = str(content) if content else ""
     from .escalation import _strip_reasoning_blocks
     return _strip_reasoning_blocks(content).strip()
+
+
+def _parse_load_session_roles(value: Any) -> tuple[list[str], str | None]:
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return [], "roles must be an array of strings"
+    roles: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        role = str(item or "").strip()
+        if not role:
+            return [], "roles must contain only non-empty strings"
+        if role not in seen:
+            roles.append(role)
+            seen.add(role)
+    return roles, None
+
+
+def _slice_loaded_content(content: Any, max_content_chars: int) -> dict[str, Any]:
+    text = content or ""
+    sliced = text[:max_content_chars]
+    has_more = len(sliced) < len(text)
+    return {
+        "content": sliced,
+        "content_chars": len(text),
+        "content_returned_chars": len(sliced),
+        "content_truncated": has_more,
+        "next_content_offset": len(sliced) if has_more else 0,
+    }
+
+
+def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_content_chars: int) -> dict[str, Any]:
+    stored_session_id = row.get("session_id", "")
+    content_slice = _slice_loaded_content(row.get("content", "") or "", max_content_chars)
+    item: dict[str, Any] = {
+        "store_id": row.get("store_id"),
+        "session_id": stored_session_id,
+        "source": row.get("source") or "",
+        "role": row.get("role"),
+        "timestamp": row.get("timestamp", 0),
+        "content": content_slice["content"],
+        "content_chars": content_slice["content_chars"],
+        "content_returned_chars": content_slice["content_returned_chars"],
+        "content_truncated": content_slice["content_truncated"],
+        "next_content_offset": content_slice["next_content_offset"],
+        "from_current_session": bool(engine._session_id) and stored_session_id == engine._session_id,
+    }
+    if row.get("tool_call_id"):
+        item["tool_call_id"] = row.get("tool_call_id")
+    if row.get("tool_calls"):
+        item["tool_calls"] = row.get("tool_calls")
+    if row.get("tool_name"):
+        item["tool_name"] = row.get("tool_name")
+    return item
+
+
+def lcm_load_session(args: Dict[str, Any], **kwargs) -> str:
+    """Load an ordered, bounded raw-message page for one explicit session_id."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    session_id = str(args.get("session_id") or "").strip()
+    if not session_id:
+        return json.dumps({"error": "session_id is required"})
+
+    raw_limit_arg = args.get("limit", _LCM_LOAD_SESSION_DEFAULT_LIMIT)
+    parsed_limit, limit_error = _parse_strict_int(raw_limit_arg, "limit")
+    if limit_error:
+        return json.dumps({"error": limit_error})
+    if parsed_limit is None or parsed_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_LOAD_SESSION_HARD_LIMIT_CAP)
+
+    raw_max_content_chars = args.get("max_content_chars", _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS)
+    max_content_chars, max_content_error = _parse_strict_int(raw_max_content_chars, "max_content_chars")
+    if max_content_error:
+        return json.dumps({"error": max_content_error})
+    if max_content_chars is None or max_content_chars <= 0:
+        return json.dumps({"error": "max_content_chars must be a positive integer"})
+    requested_max_content_chars = max_content_chars
+    max_content_chars = min(max_content_chars, _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS)
+
+    after_store_id, cursor_error = _parse_strict_int(args.get("after_store_id", 0), "after_store_id")
+    if cursor_error:
+        return json.dumps({"error": cursor_error})
+    if after_store_id is None or after_store_id < 0:
+        return json.dumps({"error": "after_store_id must be a non-negative integer"})
+
+    roles, roles_error = _parse_load_session_roles(args.get("roles"))
+    if roles_error:
+        return json.dumps({"error": roles_error})
+
+    time_from, time_from_error = _parse_optional_float(args.get("time_from"), "time_from")
+    if time_from_error:
+        return json.dumps({"error": time_from_error})
+    time_to, time_to_error = _parse_optional_float(args.get("time_to"), "time_to")
+    if time_to_error:
+        return json.dumps({"error": time_to_error})
+    if time_from is not None and time_to is not None and time_to < time_from:
+        return json.dumps({"error": "time_to must be greater than or equal to time_from"})
+
+    total_messages = engine._store.count_session_load_messages(
+        session_id,
+        roles=roles or None,
+        time_from=time_from,
+        time_to=time_to,
+    )
+    rows = engine._store.load_session_page(
+        session_id,
+        after_store_id=after_store_id,
+        limit=limit + 1,
+        roles=roles or None,
+        time_from=time_from,
+        time_to=time_to,
+    )
+    page_rows = rows[:limit]
+    has_more = len(rows) > limit
+    next_cursor = page_rows[-1]["store_id"] if has_more and page_rows else None
+
+    response: dict[str, Any] = {
+        "session_id": session_id,
+        "limit": limit,
+        "max_content_chars": max_content_chars,
+        "after_store_id": after_store_id,
+        "total_messages": total_messages,
+        "returned_messages": len(page_rows),
+        "messages": [_serialize_loaded_message(engine, row, max_content_chars) for row in page_rows],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+    if roles:
+        response["roles"] = roles
+    if time_from is not None:
+        response["time_from"] = time_from
+    if time_to is not None:
+        response["time_to"] = time_to
+    if requested_limit > _LCM_LOAD_SESSION_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    if requested_max_content_chars > _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS:
+        response["max_content_chars_clamped_from"] = requested_max_content_chars
+    return json.dumps(response)
 
 
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:

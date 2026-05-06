@@ -33,7 +33,15 @@ from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
 )
-from .schemas import LCM_DESCRIBE, LCM_DOCTOR, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_GREP, LCM_STATUS
+from .schemas import (
+    LCM_DESCRIBE,
+    LCM_DOCTOR,
+    LCM_EXPAND,
+    LCM_EXPAND_QUERY,
+    LCM_GREP,
+    LCM_LOAD_SESSION,
+    LCM_STATUS,
+)
 from .session_patterns import (
     build_session_match_keys,
     compile_session_patterns,
@@ -218,8 +226,8 @@ class LCMEngine(ContextEngine):
          are summarized into leaf nodes (D0) in a SummaryDAG
       3. When enough nodes accumulate at a depth, they're condensed into
          higher-depth nodes (D1, D2, ...)
-      4. The agent gets tools (lcm_grep, lcm_describe, lcm_expand) to
-         search and drill into compacted history
+      4. The agent gets tools (lcm_grep, lcm_load_session, lcm_describe,
+         lcm_expand) to search and drill into compacted history
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
@@ -1447,7 +1455,15 @@ class LCMEngine(ContextEngine):
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_STATUS, LCM_DOCTOR]
+        return [
+            LCM_GREP,
+            LCM_LOAD_SESSION,
+            LCM_DESCRIBE,
+            LCM_EXPAND,
+            LCM_EXPAND_QUERY,
+            LCM_STATUS,
+            LCM_DOCTOR,
+        ]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         # Ingest live messages if passed (enables current-turn search)
@@ -1463,6 +1479,7 @@ class LCMEngine(ContextEngine):
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
+            "lcm_load_session": lcm_tools.lcm_load_session,
             "lcm_describe": lcm_tools.lcm_describe,
             "lcm_expand": lcm_tools.lcm_expand,
             "lcm_expand_query": lcm_tools.lcm_expand_query,
