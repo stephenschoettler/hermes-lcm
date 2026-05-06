@@ -1017,6 +1017,7 @@ class TestSessionFiltering:
         instance.on_session_start(
             "20260506_201605_75a4c6",
             platform="telegram",
+            conversation_id="telegram-conversation",
             context_length=200_000,
         )
         instance._store.append(
@@ -1029,6 +1030,7 @@ class TestSessionFiltering:
         instance.on_session_start(
             "cron_eee06bdbb09b_20260506_210051",
             platform="cron",
+            conversation_id="cron-conversation",
             context_length=200_000,
         )
 
@@ -1046,6 +1048,7 @@ class TestSessionFiltering:
         assert instance._foreground_session_id == "20260506_201605_75a4c6"
         assert instance.current_session_id == "20260506_201605_75a4c6"
         assert instance.current_session_platform == "telegram"
+        assert instance.current_conversation_id == "telegram-conversation"
 
     def test_ignored_session_compress_does_not_leak_into_foreground_store(self, tmp_path):
         """Regression: the foreground view must not come at the cost of
@@ -1103,6 +1106,7 @@ class TestSessionFiltering:
         instance.on_session_start(
             "20260506_201605_75a4c6",
             platform="telegram",
+            conversation_id="telegram-conversation",
             context_length=200_000,
         )
         instance._store.append(
@@ -1115,6 +1119,7 @@ class TestSessionFiltering:
         instance.on_session_start(
             "cron_eee06bdbb09b_20260506_210051",
             platform="cron",
+            conversation_id="cron-conversation",
             context_length=200_000,
         )
 
@@ -1122,6 +1127,15 @@ class TestSessionFiltering:
 
         assert payload["session_id"] == "20260506_201605_75a4c6"
         assert payload["store"]["messages"] == 1
+        assert payload["source_lineage"]["messages_total"] == 1
+        assert payload["runtime_identity"]["session_id"] == "20260506_201605_75a4c6"
+        assert payload["runtime_identity"]["session_platform"] == "telegram"
+        assert payload["runtime_identity"]["conversation_id"] == "telegram-conversation"
+        assert payload["runtime_identity"]["bound_session_id"] == "cron_eee06bdbb09b_20260506_210051"
+        assert payload["runtime_identity"]["bound_session_platform"] == "cron"
+        assert payload["runtime_identity"]["bound_conversation_id"] == "cron-conversation"
+        assert payload["lifecycle"]["conversation_id"] == "telegram-conversation"
+        assert payload["lifecycle"]["current_session_id"] == "20260506_201605_75a4c6"
         assert payload["session_filters"]["ignored"] is False
         assert payload["session_filters"]["stateless"] is False
         assert payload["session_filters"]["side_channel_active"] is True
@@ -1201,11 +1215,31 @@ class TestSessionFiltering:
             ignore_session_patterns=["cron:*"],
         )
         instance = LCMEngine(config=config)
-        instance.on_session_start("telegram-foreground", platform="telegram", context_length=200_000)
-        instance.on_session_start("cron_xxx", platform="cron", context_length=200_000)
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            conversation_id="telegram-conversation",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram row"},
+            token_estimate=2,
+            source="telegram",
+        )
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            conversation_id="cron-conversation",
+            context_length=200_000,
+        )
 
         text = _status_text(instance)
         assert "session_id: telegram-foreground" in text
+        assert "conversation_id: telegram-conversation" in text
+        assert "lifecycle_current_session_id: telegram-foreground" in text
+        assert "source_messages_total: 1" in text
+        assert "store_messages: 1" in text
         assert "session_ignored: no" in text
         assert "session_stateless: no" in text
         assert "side_channel_active: yes" in text
