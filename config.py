@@ -85,14 +85,17 @@ class LCMConfig:
     # (0 = disabled). Effective cap becomes context_length - reserve_tokens_floor.
     reserve_tokens_floor: int = 0
 
-    # -- Session filtering ---
+    # -- Session and message filtering ---
     # Sessions to exclude from LCM storage entirely.
     ignore_session_patterns: list[str] = field(default_factory=list)
     # Sessions that may read carried-over LCM state but never write new data.
     stateless_session_patterns: list[str] = field(default_factory=list)
+    # Per-message regex patterns; matching messages are skipped before LCM storage.
+    ignore_message_patterns: list[str] = field(default_factory=list)
     # Diagnostics: where each pattern list came from.
     ignore_session_patterns_source: str = "default"
     stateless_session_patterns_source: str = "default"
+    ignore_message_patterns_source: str = "default"
 
     # -- Summary instructions ---
     # Custom instructions injected into all summarization prompts
@@ -215,5 +218,10 @@ class LCMConfig:
         if raw_stateless is not None:
             c.stateless_session_patterns = _parse_pattern_list(raw_stateless)
             c.stateless_session_patterns_source = "env"
+
+        raw_ignore_messages = os.environ.get("LCM_IGNORE_MESSAGE_PATTERNS")
+        if raw_ignore_messages is not None:
+            c.ignore_message_patterns = _parse_pattern_list(raw_ignore_messages)
+            c.ignore_message_patterns_source = "env"
 
         return c
