@@ -259,7 +259,11 @@ class LCMEngine(ContextEngine):
         # messages have been persisted.  After compress() shortens the
         # list, the cursor resets to len(compressed) so that only
         # genuinely new messages (appended after compaction) get ingested.
+        # The cursor is process-local; existing sessions rebound after a
+        # gateway restart reconcile it against the durable store on the
+        # next ingest.
         self._ingest_cursor: int = 0
+        self._ingest_cursor_needs_reconcile = False
 
         # State required by ContextEngine ABC and run_agent.py compatibility
         self.model = ""
@@ -650,6 +654,7 @@ class LCMEngine(ContextEngine):
         # Reset cursor to the length of the compressed context so that
         # only messages appended *after* this point get ingested next time.
         self._ingest_cursor = len(compressed)
+        self._ingest_cursor_needs_reconcile = False
 
         logger.info(
             "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",
@@ -1086,6 +1091,7 @@ class LCMEngine(ContextEngine):
         self.cache_metrics_available = False
         self._last_compacted_store_id = 0
         self._ingest_cursor = 0
+        self._ingest_cursor_needs_reconcile = False
         self._context_probed = False
         self._context_probe_persistable = False
         self._last_overflow_recovery_failed = False
@@ -1272,6 +1278,7 @@ class LCMEngine(ContextEngine):
             session_id,
             conversation_id=kwargs.get("conversation_id"),
         )
+        self._schedule_ingest_cursor_reconciliation()
         self._log_session_filter_diagnostics()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -1635,6 +1642,122 @@ class LCMEngine(ContextEngine):
 
     # -- Internal: message ingestion ---------------------------------------
 
+    def _schedule_ingest_cursor_reconciliation(self) -> None:
+        """Mark existing-session rebinds for cursor repair on next ingest."""
+        self._ingest_cursor_needs_reconcile = False
+        if not self._session_id or self._session_ignored or self._session_stateless:
+            return
+        try:
+            self._ingest_cursor_needs_reconcile = self._store.get_session_count(self._session_id) > 0
+        except Exception as exc:  # pragma: no cover - defensive only
+            logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
+            self._ingest_cursor_needs_reconcile = False
+
+    def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
+        """Return true for active-context scaffolding that should not be re-ingested."""
+        role = str(msg.get("role") or "")
+        content = normalize_content_value(msg.get("content")) or ""
+        if role == "system" and "Lossless Context Management (LCM)" in content:
+            return True
+        if "[Expand for details:" not in content:
+            return False
+        return bool(
+            re.search(
+                r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]",
+                content,
+            )
+        )
+
+    @staticmethod
+    def _stable_tool_calls_identity(tool_calls: Any) -> str:
+        if not tool_calls:
+            return ""
+        try:
+            return json.dumps(tool_calls, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(tool_calls)
+
+    def _message_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
+        return (
+            str(msg.get("role") or "unknown"),
+            normalize_content_value(msg.get("content")) or "",
+            str(msg.get("tool_call_id") or ""),
+            self._stable_tool_calls_identity(msg.get("tool_calls")),
+        )
+
+    @staticmethod
+    def _matches_store_tail_suffix(
+        stored_tail: list[tuple[str, str, str, str]],
+        candidate_prefix: list[tuple[str, str, str, str]],
+    ) -> bool:
+        if not candidate_prefix:
+            return True
+        if len(candidate_prefix) > len(stored_tail):
+            return False
+        return stored_tail[-len(candidate_prefix) :] == candidate_prefix
+
+    def _find_reconciled_cursor_for_store_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_tail: list[tuple[str, str, str, str]],
+        *,
+        allow_empty_prefix: bool,
+    ) -> int | None:
+        empty_prefix_cursor: int | None = None
+        for cursor in range(len(messages), -1, -1):
+            candidate_prefix = [
+                self._message_replay_identity(msg)
+                for msg in messages[:cursor]
+                if not self._is_replayed_context_scaffold_message(msg)
+            ]
+            if not candidate_prefix:
+                empty_prefix_cursor = cursor
+                if allow_empty_prefix:
+                    return cursor
+                continue
+            if len(candidate_prefix) > len(stored_tail):
+                continue
+            if self._matches_store_tail_suffix(stored_tail, candidate_prefix):
+                return cursor
+        return empty_prefix_cursor if allow_empty_prefix else None
+
+    def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
+        """Infer the in-memory cursor for an existing session after process restart."""
+        if not self._session_id or not messages:
+            return 0
+
+        try:
+            session_count = self._store.get_session_count(self._session_id)
+        except Exception as exc:  # pragma: no cover - defensive only
+            logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
+            return 0
+        if session_count <= 0:
+            return 0
+
+        tail_limit = min(max(len(messages) * 4, 64), session_count)
+        stored_tail = [
+            self._message_replay_identity(row)
+            for row in self._store.get_session_tail(self._session_id, limit=tail_limit)
+        ]
+        if not stored_tail:
+            return 0
+        cursor = self._find_reconciled_cursor_for_store_tail(
+            messages,
+            stored_tail,
+            allow_empty_prefix=True,
+        )
+        if cursor is not None:
+            logger.debug(
+                "LCM reconciled ingest cursor after existing-session bind: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d",
+                self._session_id,
+                cursor,
+                len(messages),
+                len(stored_tail),
+                session_count,
+            )
+            return cursor
+        return 0
+
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> None:
         """Persist new messages to the store.
 
@@ -1657,6 +1780,9 @@ class LCMEngine(ContextEngine):
             return
 
         n = len(messages)
+        if self._ingest_cursor_needs_reconcile:
+            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(messages)
+            self._ingest_cursor_needs_reconcile = False
         cursor = self._ingest_cursor
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
@@ -2049,6 +2175,7 @@ class LCMEngine(ContextEngine):
     ) -> List[Dict[str, Any]]:
         if compressed != original_messages:
             self._ingest_cursor = len(compressed)
+            self._ingest_cursor_needs_reconcile = False
             logger.info(
                 "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
                 len(original_messages),

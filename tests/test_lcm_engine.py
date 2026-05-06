@@ -499,6 +499,253 @@ class TestEngineABC:
         assert engine._context_probed is False
         assert engine._context_probe_persistable is False
 
+    def test_existing_session_restart_reconciles_cursor_before_ingest(self, tmp_path):
+        db_path = tmp_path / "restart-reconcile.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "restart-session",
+            platform="cli",
+            conversation_id="restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "question before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._lifecycle.advance_frontier(
+            "restart-conversation",
+            "restart-session",
+            before_restart._store.get_session_count("restart-session"),
+        )
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "restart-session",
+            platform="cli",
+            conversation_id="restart-conversation",
+            context_length=200000,
+        )
+        active_context = persisted_messages + [
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_1", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "terminal output after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("restart-session")
+        assert [row["role"] for row in rows] == [
+            "system",
+            "user",
+            "assistant",
+            "assistant",
+            "tool",
+        ]
+        assert rows[-1]["content"] == "terminal output after restart"
+        assert rows[-1]["tool_call_id"] == "call_1"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool(self, tmp_path):
+        db_path = tmp_path / "restart-compacted.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "compacted-session",
+            platform="cli",
+            conversation_id="compacted-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "compacted-session",
+            platform="cli",
+            conversation_id="compacted-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {
+                "role": "assistant",
+                "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+            },
+            {"role": "user", "content": "fresh user tail"},
+            {"role": "assistant", "content": "fresh assistant tail"},
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_2", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "tool output after compacted restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("compacted-session")
+        assert [row["role"] for row in rows] == [
+            "system",
+            "user",
+            "assistant",
+            "assistant",
+            "tool",
+        ]
+        assert rows[-1]["content"] == "tool output after compacted restart"
+        assert rows[-1]["tool_call_id"] == "call_2"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_large_session_restart_reconciles_beyond_short_tail_window(self, tmp_path):
+        db_path = tmp_path / "restart-large.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "large-restart-session",
+            platform="cli",
+            conversation_id="large-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "system", "content": "You are concise."}]
+        persisted_messages.extend(
+            {"role": "user", "content": f"message before restart {i}"}
+            for i in range(5000)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "large-restart-session",
+            platform="cli",
+            conversation_id="large-restart-conversation",
+            context_length=200000,
+        )
+        active_context = persisted_messages + [
+            {"role": "assistant", "content": "calling terminal", "tool_calls": [{"id": "call_large", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_large", "content": "large-session tool output after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "large-restart-session",
+            limit=len(active_context) + 1,
+        )
+        assert len(rows) == len(active_context)
+        assert rows[-1]["role"] == "tool"
+        assert rows[-1]["tool_call_id"] == "call_large"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_does_not_skip_repeated_non_tail_messages(self, tmp_path):
+        db_path = tmp_path / "restart-repeated-non-tail.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "repeat-restart-session",
+            platform="cli",
+            conversation_id="repeat-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "repeatable request"},
+            {"role": "assistant", "content": "repeatable answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"tail message before restart {i}"}
+            for i in range(120)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "repeat-restart-session",
+            platform="cli",
+            conversation_id="repeat-restart-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {"role": "user", "content": "repeatable request"},
+            {"role": "assistant", "content": "repeatable answer"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "repeat-restart-session",
+            limit=len(persisted_messages) + 3,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert rows[-2]["role"] == "user"
+        assert rows[-2]["content"] == "repeatable request"
+        assert rows[-1]["role"] == "assistant"
+        assert rows[-1]["content"] == "repeatable answer"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_new_system_message(self, tmp_path):
+        db_path = tmp_path / "restart-new-system.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "system-restart-session",
+            platform="cli",
+            conversation_id="system-restart-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "tail before restart"},
+            {"role": "assistant", "content": "answer before restart"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "system-restart-session",
+            platform="cli",
+            conversation_id="system-restart-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {"role": "system", "content": "new policy injected after restart"},
+            {"role": "user", "content": "new user after restart"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "system-restart-session",
+            limit=len(persisted_messages) + 2,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert rows[-2]["role"] == "system"
+        assert rows[-2]["content"] == "new policy injected after restart"
+        assert rows[-1]["role"] == "user"
+        assert rows[-1]["content"] == "new user after restart"
+        assert after_restart._ingest_cursor == len(active_context)
+
     def test_get_status(self, engine):
         status = engine.get_status()
         assert status["engine"] == "lcm"
