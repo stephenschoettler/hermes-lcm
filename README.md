@@ -69,7 +69,7 @@ claim that Hermes core has no persisted record of pre-compression history.
 
 - Hermes Agent with the pluggable context engine slot ([PR #7464](https://github.com/NousResearch/hermes-agent/pull/7464))
 - Python 3.11+
-- No required third-party runtime dependencies. `tiktoken` is used if available; otherwise LCM falls back to character-based token estimates.
+- No required third-party runtime dependencies. `tiktoken` is used if available; otherwise LCM falls back to character-based token estimates. `regex` is used if available to apply timeouts to message ignore patterns; otherwise LCM keeps a capped stdlib `re` fallback.
 
 ## Install
 
@@ -263,7 +263,10 @@ LCM_IGNORE_MESSAGE_PATTERNS=^Cronjob Response:,^>>>Cronjob Response<<<:
 
 Invalid regex entries are logged at warning level and dropped; the
 surviving patterns in the same list still take effect, so a misconfigured
-entry never crashes ingest.
+entry never crashes ingest. Pattern matching uses a 50 ms per-pattern timeout
+when the optional `regex` package is installed. If only stdlib `re` is
+available, LCM keeps the plugin importable and caps fallback matching to the
+first 100,000 characters of the normalized content.
 
 Two operator-facing limitations to know about:
 

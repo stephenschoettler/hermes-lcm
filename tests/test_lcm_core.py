@@ -492,6 +492,32 @@ class TestMessagePatterns:
         assert matches_message_pattern("Other: y", compiled)
         assert caplog.text.count("skipping invalid regex") == 1
 
+    def test_timed_out_pattern_is_skipped_once_and_later_patterns_still_match(self, caplog):
+        class TimedOutPattern:
+            pattern = "(a+)+$"
+
+            def search(self, text, *, timeout=None):
+                if timeout is None:
+                    raise AssertionError("message pattern search must pass a timeout")
+                raise TimeoutError("regex timed out")
+
+        class MatchingPattern:
+            pattern = "^Other:"
+
+            def search(self, text, *, timeout=None):
+                if timeout is None:
+                    raise AssertionError("message pattern search must pass a timeout")
+                return text.startswith("Other:")
+
+        patterns = [TimedOutPattern(), MatchingPattern()]
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            assert matches_message_pattern("Other: y", patterns) is True
+            assert matches_message_pattern("normal text", patterns) is False
+
+        assert caplog.text.count("timed out") == 1
+        assert "(a+)+$" in caplog.text
+
 
 class TestTokens:
     def test_count_tokens_empty(self):
