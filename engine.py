@@ -1667,6 +1667,12 @@ class LCMEngine(ContextEngine):
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
+    def _matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
+        if not self._compiled_ignore_message_patterns:
+            return False
+        text = normalize_content_value(msg.get("content")) or ""
+        return matches_message_pattern(text, self._compiled_ignore_message_patterns)
+
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
         """Return true for active-context scaffolding that should not be re-ingested."""
         role = str(msg.get("role") or "")
@@ -1726,6 +1732,7 @@ class LCMEngine(ContextEngine):
                 self._message_replay_identity(msg)
                 for msg in messages[:cursor]
                 if not self._is_replayed_context_scaffold_message(msg)
+                and not self._matches_ignore_message_patterns(msg)
             ]
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
@@ -1752,12 +1759,14 @@ class LCMEngine(ContextEngine):
             return 0
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
+        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        if not stored_rows:
+            return 0
         stored_tail = [
             self._message_replay_identity(row)
-            for row in self._store.get_session_tail(self._session_id, limit=tail_limit)
+            for row in stored_rows
+            if not self._matches_ignore_message_patterns(row)
         ]
-        if not stored_tail:
-            return 0
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
@@ -1814,9 +1823,9 @@ class LCMEngine(ContextEngine):
         if self._compiled_ignore_message_patterns:
             kept: List[Dict[str, Any]] = []
             for msg in new_messages:
-                text = normalize_content_value(msg.get("content")) or ""
-                if matches_message_pattern(text, self._compiled_ignore_message_patterns):
+                if self._matches_ignore_message_patterns(msg):
                     self._ignored_message_count += 1
+                    text = normalize_content_value(msg.get("content")) or ""
                     excerpt = text[:80].replace("\n", " ")
                     logger.debug(
                         "LCM ignore_message_patterns dropped %s message: %r",

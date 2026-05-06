@@ -248,9 +248,9 @@ noise:
 Message-level patterns are Python regex strings, comma-separated, compiled
 once at engine start. They run against the normalized message content (the
 same string LCM would have written to the store). Matching messages are
-skipped before storage, so they never enter the messages table, the FTS
-index, or the DAG. Filtering is role-agnostic by default, since cron alerts
-can be re-emitted under any role depending on the gateway.
+skipped before storage, so new matching rows do not enter the messages table
+or FTS index. Filtering is role-agnostic by default, since cron alerts can
+be re-emitted under any role depending on the gateway.
 
 Example operator config:
 

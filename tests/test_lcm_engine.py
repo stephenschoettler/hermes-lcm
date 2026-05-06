@@ -1161,6 +1161,85 @@ class TestMessageFiltering:
 
         assert caplog.text.count("LCM ignore_message_patterns from env: ^Cronjob Response:") == 1
 
+    def test_restart_reconciliation_skips_ignored_messages_when_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_tail.db"
+        config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_restart._ingest_messages(active_context)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == ["first real message", "real answer"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_restart_reconciliation_skips_historical_ignored_rows_when_filter_enabled_later(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_restart_later_filter.db"
+        before_config = LCMConfig(database_path=str(db_path))
+
+        before_filter = LCMEngine(config=before_config)
+        before_filter.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        active_context = [
+            {"role": "user", "content": "first real message"},
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+        before_filter._ingest_messages(active_context)
+        before_filter._store.close()
+        before_filter._dag.close()
+        before_filter._lifecycle.close()
+
+        after_config = LCMConfig(
+            database_path=str(db_path),
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        after_filter_restart = LCMEngine(config=after_config)
+        after_filter_restart.on_session_start(
+            "user-123",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="chat-1",
+        )
+        after_filter_restart._ingest_messages(active_context)
+
+        rows = after_filter_restart._store.get_session_messages("user-123")
+        assert [row["content"] for row in rows] == [
+            "first real message",
+            "Cronjob Response: heartbeat",
+            "real answer",
+        ]
+        assert after_filter_restart._ingest_cursor == len(active_context)
+
 
 class TestEngineIngest:
     def test_ingest_stores_messages(self, engine):
