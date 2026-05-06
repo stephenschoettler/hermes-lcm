@@ -24,6 +24,10 @@ from hermes_lcm.session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+from hermes_lcm.message_patterns import (
+    compile_message_patterns,
+    matches_message_pattern,
+)
 
 
 class TestModelRouting:
@@ -298,8 +302,10 @@ class TestConfig:
         assert c.deferred_maintenance_max_passes == 4
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
+        assert c.ignore_message_patterns == []
         assert c.ignore_session_patterns_source == "default"
         assert c.stateless_session_patterns_source == "default"
+        assert c.ignore_message_patterns_source == "default"
         assert c.summary_model == ""
         assert c.expansion_model == ""
         assert c.expansion_context_tokens == 32_000
@@ -311,6 +317,10 @@ class TestConfig:
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.80")
         monkeypatch.setenv("LCM_IGNORE_SESSION_PATTERNS", "cron:*,subagent:**")
         monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "telegram:*, cli:debug")
+        monkeypatch.setenv(
+            "LCM_IGNORE_MESSAGE_PATTERNS",
+            "^Cronjob Response:,^>>>Cronjob Response<<<:",
+        )
         monkeypatch.setenv("LCM_EXPANSION_MODEL", "openai/gpt-5.4-mini")
         monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "64000")
         monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
@@ -332,8 +342,13 @@ class TestConfig:
         assert c.context_threshold == 0.80
         assert c.ignore_session_patterns == ["cron:*", "subagent:**"]
         assert c.stateless_session_patterns == ["telegram:*", "cli:debug"]
+        assert c.ignore_message_patterns == [
+            "^Cronjob Response:",
+            "^>>>Cronjob Response<<<:",
+        ]
         assert c.ignore_session_patterns_source == "env"
         assert c.stateless_session_patterns_source == "env"
+        assert c.ignore_message_patterns_source == "env"
         assert c.expansion_model == "openai/gpt-5.4-mini"
         assert c.expansion_context_tokens == 64_000
         assert c.summary_timeout_ms == 45_000
@@ -351,7 +366,8 @@ class TestConfig:
         assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"
         assert c.large_output_transcript_gc_enabled is True
 
-    def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch):
+    def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
         monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "bad-float")
@@ -367,6 +383,42 @@ class TestConfig:
         assert c.max_assembly_tokens == 0
         assert c.reserve_tokens_floor == 0
         assert c.expansion_context_tokens == 32_000
+
+    def test_from_env_reads_hermes_compression_threshold_when_lcm_env_missing(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.68\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
+
+    def test_from_env_lcm_threshold_env_overrides_hermes_config(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.68\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.82")
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.82
+
+    def test_from_env_reads_hermes_threshold_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: '0.68'\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
 
 
 class TestSessionPatterns:
@@ -399,6 +451,46 @@ class TestSessionPatterns:
             build_session_match_keys("sess-123", platform="cli"),
             patterns,
         )
+
+
+class TestMessagePatterns:
+    def test_compile_and_match_anchored_prefix(self):
+        patterns = compile_message_patterns(["^Cronjob Response:"])
+        assert len(patterns) == 1
+        assert matches_message_pattern("Cronjob Response: heartbeat ok", patterns)
+        assert not matches_message_pattern("could you check the cronjob response?", patterns)
+
+    def test_compile_inline_flags_and_wrapper_variants(self):
+        patterns = compile_message_patterns([r"(?is)^\s*(>>>\s*)?Cronjob Response"])
+        assert matches_message_pattern("Cronjob Response: heartbeat", patterns)
+        assert matches_message_pattern("   >>> Cronjob Response: heartbeat", patterns)
+        assert matches_message_pattern("\n  cronjob response: heartbeat", patterns)
+        assert not matches_message_pattern("normal user message", patterns)
+
+    def test_empty_patterns_never_match(self):
+        assert matches_message_pattern("Cronjob Response: x", []) is False
+
+    def test_empty_or_none_text_does_not_match(self):
+        patterns = compile_message_patterns(["^Cronjob"])
+        assert matches_message_pattern("", patterns) is False
+        assert matches_message_pattern(None, patterns) is False
+
+    def test_invalid_regex_is_logged_and_dropped(self, caplog):
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            compiled = compile_message_patterns(["[unclosed"])
+        assert compiled == []
+        assert "skipping invalid regex" in caplog.text
+        assert "[unclosed" in caplog.text
+
+    def test_mixed_validity_keeps_valid_patterns(self, caplog):
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            compiled = compile_message_patterns(
+                ["^Cronjob Response:", "[unclosed", "^Other:"]
+            )
+        assert len(compiled) == 2
+        assert matches_message_pattern("Cronjob Response: x", compiled)
+        assert matches_message_pattern("Other: y", compiled)
+        assert caplog.text.count("skipping invalid regex") == 1
 
 
 class TestTokens:
