@@ -59,24 +59,32 @@ Open small PRs when possible. Large PRs are harder to review and easier to get w
 
 PR titles should be descriptive and usually follow the same style as commit subjects.
 
-PR bodies should use this shape:
+PR bodies should use this template. It is mirrored in `.github/PULL_REQUEST_TEMPLATE.md` so GitHub pre-fills new PRs.
 
 ```md
 ## Summary
-- what changed
-- what changed
+-
 
 ## Why
-- why this change is needed
-- important constraints or tradeoffs
+-
 
 ## Validation
-- exact commands you ran
-- relevant outputs if useful
+- [ ] Focused validation: `<command>` -> `<result>`
+- [ ] Default validation:
+  - [ ] `pytest tests/test_lcm_core.py tests/test_lcm_engine.py tests/test_packaging_install.py -q`
+  - [ ] `pytest -q`
+  - [ ] `python -m compileall -q .`
+  - [ ] `python -m py_compile scripts/import_lossless_claw.py`
+  - [ ] `bash -n scripts/install.sh scripts/update.sh`
+  - [ ] `git diff --check`
 
 ## Notes
-- follow-ups, caveats, or non-blocking context
+-
+
+Refs #
 ```
+
+If you skip any validation item, leave it unchecked and explain why in Notes.
 
 Good PRs are:
 
