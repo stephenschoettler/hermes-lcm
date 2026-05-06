@@ -280,9 +280,11 @@ Two operator-facing limitations to know about:
   store), so DAG lineage stays clean; only the serialized summary text
   can carry it. Closing this window is tracked as follow-up work.
 
-`lcm_status` surfaces `ignore_message_patterns`, `ignore_message_patterns_source`
-(`default` or `env`), and a process-lifetime `ignored_message_count` so
-operators can confirm their pattern is loaded and watch how often it fires.
+`lcm_status` surfaces the full filter contract under `session_filters`, including
+`ignore_session_patterns`, `stateless_session_patterns`, `ignore_message_patterns`,
+their `*_source` fields (`default` or `env`), the current session's `ignored` and
+`stateless` booleans, and a process-lifetime `ignored_message_count` so operators
+can confirm their patterns are loaded and watch how often message filters fire.
 The counter resets on engine restart.
 
 ### Large tool-output handling

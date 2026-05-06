@@ -1401,6 +1401,13 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "session_filters": {
             "ignored": engine._session_ignored,
             "stateless": engine._session_stateless,
+            "ignore_session_patterns": full_status.get("ignore_session_patterns", []),
+            "ignore_session_patterns_source": full_status.get("ignore_session_patterns_source", "default"),
+            "stateless_session_patterns": full_status.get("stateless_session_patterns", []),
+            "stateless_session_patterns_source": full_status.get("stateless_session_patterns_source", "default"),
+            "ignore_message_patterns": full_status.get("ignore_message_patterns", []),
+            "ignore_message_patterns_source": full_status.get("ignore_message_patterns_source", "default"),
+            "ignored_message_count": full_status.get("ignored_message_count", 0),
         },
         "source_lineage": source_lineage,
         "runtime_identity": runtime_identity,

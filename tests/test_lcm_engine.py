@@ -87,6 +87,35 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
 
 
+def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "tool-status-filter-config.db"),
+        ignore_session_patterns=["cron:*"],
+        stateless_session_patterns=["debug:*"],
+        ignore_message_patterns=["^Cronjob Response:"],
+        ignore_session_patterns_source="env",
+        stateless_session_patterns_source="env",
+        ignore_message_patterns_source="env",
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start("chat-1", platform="telegram", context_length=200000)
+    engine._ingest_messages([{"role": "user", "content": "Cronjob Response: heartbeat"}])
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["session_filters"] == {
+        "ignored": False,
+        "stateless": False,
+        "ignore_session_patterns": ["cron:*"],
+        "ignore_session_patterns_source": "env",
+        "stateless_session_patterns": ["debug:*"],
+        "stateless_session_patterns_source": "env",
+        "ignore_message_patterns": ["^Cronjob Response:"],
+        "ignore_message_patterns_source": "env",
+        "ignored_message_count": 1,
+    }
+
+
 def test_lcm_tool_status_reports_runtime_identity_before_session_binding(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "unbound-tool-status.db"))
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
