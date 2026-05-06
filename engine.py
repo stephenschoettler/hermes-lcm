@@ -1929,7 +1929,7 @@ class LCMEngine(ContextEngine):
             messages,
             stored_tail,
             allow_empty_prefix=True,
-            session_count=session_count,
+            session_count=len(stored_tail),
         )
         if cursor is not None:
             logger.debug(
