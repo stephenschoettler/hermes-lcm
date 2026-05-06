@@ -351,7 +351,8 @@ class TestConfig:
         assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"
         assert c.large_output_transcript_gc_enabled is True
 
-    def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch):
+    def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "not-a-number")
         monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "")
         monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "bad-float")
@@ -367,6 +368,42 @@ class TestConfig:
         assert c.max_assembly_tokens == 0
         assert c.reserve_tokens_floor == 0
         assert c.expansion_context_tokens == 32_000
+
+    def test_from_env_reads_hermes_compression_threshold_when_lcm_env_missing(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.68\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
+
+    def test_from_env_lcm_threshold_env_overrides_hermes_config(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.68\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_CONTEXT_THRESHOLD", "0.82")
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.82
+
+    def test_from_env_reads_hermes_threshold_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("compression:\n  threshold: '0.68'\n")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.68
 
 
 class TestSessionPatterns:
