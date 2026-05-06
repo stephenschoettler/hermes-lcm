@@ -14,6 +14,19 @@ from typing import Any
 _TEXT_PART_TYPES = {"text", "input_text", "output_text"}
 
 
+def _extract_text_part_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        nested = value.get("value")
+        if isinstance(nested, str):
+            return nested
+        nested = value.get("content")
+        if isinstance(nested, str):
+            return nested
+    return None
+
+
 def normalize_content_value(content: Any) -> str | None:
     """Return a stable text representation for message content.
 
@@ -49,9 +62,12 @@ def text_content_for_pattern_matching(content: Any) -> str | None:
                 parts.append(part)
             elif isinstance(part, dict):
                 part_type = part.get("type")
-                text = part.get("text")
-                if part_type in _TEXT_PART_TYPES and isinstance(text, str):
-                    parts.append(text)
+                if part_type in _TEXT_PART_TYPES:
+                    text = _extract_text_part_value(part.get("text"))
+                    if text is None:
+                        text = _extract_text_part_value(part.get("content"))
+                    if text:
+                        parts.append(text)
         if parts:
             return "\n".join(parts)
     return normalize_content_value(content)

@@ -1410,6 +1410,32 @@ class TestMessageFiltering:
         assert engine._store.get_session_count("user-123") == 0
         assert engine._ignored_message_count == 1
 
+    def test_anchored_pattern_matches_structured_text_value_parts(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path, "lcm_msg_multimodal_text_value.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": {"value": "Cronjob Response: nested text"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "content": "Cronjob Response: content field"}
+                ],
+            },
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("user-123") == 0
+        assert engine._ignored_message_count == 2
+
     def test_structured_content_without_text_parts_falls_back_to_normalized_json(self, tmp_path):
         engine = self._make_engine(
             tmp_path, "lcm_msg_multimodal_json_fallback.db",
