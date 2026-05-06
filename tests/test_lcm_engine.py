@@ -646,9 +646,13 @@ class TestEngineABC:
             "system",
             "user",
             "assistant",
+            "user",
+            "assistant",
             "assistant",
             "tool",
         ]
+        assert rows[-4]["content"] == "fresh user tail"
+        assert rows[-3]["content"] == "fresh assistant tail"
         assert rows[-1]["content"] == "tool output after compacted restart"
         assert rows[-1]["tool_call_id"] == "call_2"
         assert after_restart._ingest_cursor == len(active_context)
@@ -747,6 +751,171 @@ class TestEngineABC:
         assert rows[-2]["content"] == "repeatable request"
         assert rows[-1]["role"] == "assistant"
         assert rows[-1]["content"] == "repeatable answer"
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_delta_message_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "restart-repeated-tail-delta.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "initial question"},
+            {"role": "assistant", "content": "initial answer"},
+            {"role": "user", "content": "retry"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        active_context = [{"role": "user", "content": "retry"}]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "repeat-tail-delta-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows[-2:]] == ["retry", "retry"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_single_delta_message_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "restart-single-repeated-tail-delta.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "single-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "user", "content": "retry"}]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "single-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="single-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        active_context = [{"role": "user", "content": "retry"}]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "single-repeat-tail-delta-session",
+            limit=2,
+        )
+        assert len(rows) == 2
+        assert [row["content"] for row in rows] == ["retry", "retry"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail(self, tmp_path):
+        db_path = tmp_path / "restart-scaffolded-repeated-tail-delta.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "scaffold-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "initial question"},
+            {"role": "assistant", "content": "initial answer"},
+            {"role": "user", "content": "retry"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "scaffold-repeat-tail-delta-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-delta-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {"role": "user", "content": "retry"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "scaffold-repeat-tail-delta-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows[-2:]] == ["retry", "retry"]
+        assert after_restart._ingest_cursor == len(active_context)
+
+    def test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail_with_followup(self, tmp_path):
+        db_path = tmp_path / "restart-scaffolded-repeated-tail-followup.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "scaffold-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "initial question"},
+            {"role": "assistant", "content": "initial answer"},
+            {"role": "user", "content": "retry"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "scaffold-repeat-tail-followup-session",
+            platform="cli",
+            conversation_id="scaffold-repeat-tail-followup-conversation",
+            context_length=200000,
+        )
+        active_context = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {"role": "user", "content": "retry"},
+            {"role": "assistant", "content": "next answer"},
+        ]
+
+        after_restart._ingest_messages(active_context)
+
+        rows = after_restart._store.get_session_messages(
+            "scaffold-repeat-tail-followup-session",
+            limit=len(persisted_messages) + 2,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert [row["content"] for row in rows[-3:]] == ["retry", "retry", "next answer"]
         assert after_restart._ingest_cursor == len(active_context)
 
     def test_existing_session_restart_persists_new_system_message(self, tmp_path):

@@ -1865,12 +1865,14 @@ class LCMEngine(ContextEngine):
         stored_tail: list[tuple[str, str, str, str]],
         *,
         allow_empty_prefix: bool,
+        session_count: int,
     ) -> int | None:
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
+            candidate_messages = messages[:cursor]
             candidate_prefix = [
                 self._message_replay_identity(msg)
-                for msg in messages[:cursor]
+                for msg in candidate_messages
                 if not self._is_replayed_context_scaffold_message(msg)
                 and not self._matches_ignore_message_patterns(msg)
             ]
@@ -1881,7 +1883,23 @@ class LCMEngine(ContextEngine):
                 continue
             if len(candidate_prefix) > len(stored_tail):
                 continue
-            if self._matches_store_tail_suffix(stored_tail, candidate_prefix):
+            if not self._matches_store_tail_suffix(stored_tail, candidate_prefix):
+                continue
+
+            # Matching a stored suffix is not enough evidence by itself.  A
+            # gateway restart may provide only newly arrived delta messages; if
+            # the first delta happens to repeat the durable tail, treating that
+            # row as replay silently loses it.  Only advance the cursor when the
+            # incoming prefix proves replay by looking like a complete durable
+            # context replay with a system prompt anchor.  Synthetic scaffold
+            # rows can be skipped on their own, but they do not prove that a
+            # concrete tail message is replay; ambiguous tail matches are
+            # persisted rather than risk data loss.
+            has_full_context_anchor = (
+                len(candidate_prefix) >= session_count
+                and any(identity[0] == "system" for identity in candidate_prefix)
+            )
+            if has_full_context_anchor:
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
@@ -1911,6 +1929,7 @@ class LCMEngine(ContextEngine):
             messages,
             stored_tail,
             allow_empty_prefix=True,
+            session_count=session_count,
         )
         if cursor is not None:
             logger.debug(
