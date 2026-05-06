@@ -89,7 +89,7 @@ def _status_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
-    session_bound = bool(engine._session_id)
+    session_bound = bool(engine.current_session_id)
     source_stats = status.get("source_lineage") or {}
     runtime_identity = status.get("runtime_identity") or {}
     source_stats = {
@@ -113,8 +113,8 @@ def _status_text(engine) -> str:
         f"plugin_git_branch: {runtime_identity.get('plugin_git_branch') or '(unavailable)'}",
         f"plugin_git_dirty: {runtime_identity.get('plugin_git_dirty') if runtime_identity.get('plugin_git_dirty') is not None else '(unavailable)'}",
         f"hermes_home: {runtime_identity.get('hermes_home', '') or '(unset)'}",
-        f"session_id: {engine._session_id or '(unbound)'}",
-        f"session_platform: {status.get('session_platform') or ('(unbound)' if not session_bound else '(unknown)')}",
+        f"session_id: {engine.current_session_id or '(unbound)'}",
+        f"session_platform: {engine.current_session_platform or ('(unbound)' if not session_bound else '(unknown)')}",
         f"database_path: {db_path}",
         f"database_path_source: {runtime_identity.get('database_path_source', '(unknown)')}",
         f"database_exists: {_fmt_bool(db_exists)}",
@@ -128,8 +128,13 @@ def _status_text(engine) -> str:
         f"last_cache_write_tokens: {status.get('last_cache_write_tokens', 0)}",
         f"last_reasoning_tokens: {status.get('last_reasoning_tokens', 0)}",
         f"cache_read_ratio: {float(status.get('cache_read_ratio', 0.0) or 0.0) * 100:.1f}%",
-        f"session_ignored: {_fmt_bool(status.get('session_ignored'))}",
-        f"session_stateless: {_fmt_bool(status.get('session_stateless'))}",
+        # Filter classification for current_session_id (the foreground view).
+        # When a side channel is in flight, get_status() reports the bound
+        # session's flags; we read the engine properties instead so this row
+        # stays consistent with the session_id row above.
+        f"session_ignored: {_fmt_bool(engine.current_session_ignored)}",
+        f"session_stateless: {_fmt_bool(engine.current_session_stateless)}",
+        f"side_channel_active: {_fmt_bool(engine.side_channel_active)}",
         f"conversation_id: {runtime_identity.get('conversation_id', '') or '(unbound)'}",
         f"lifecycle_current_session_id: {runtime_identity.get('lifecycle_current_session_id', '') or '(none)'}",
         f"lifecycle_last_finalized_session_id: {runtime_identity.get('lifecycle_last_finalized_session_id', '') or '(none)'}",
@@ -220,6 +225,12 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
             stateless_count += 1
         if not matched_classes:
             continue
+        # Protect the actively-bound session from cleanup, not the foreground
+        # view. While a cron tick has rebound the engine, _session_id points
+        # at the cron session and the engine is actively writing through it
+        # via lifecycle hooks; deleting that data mid-flight would corrupt
+        # the cleanup pass. current_session_id (foreground) is the wrong
+        # field here.
         if session_id == getattr(engine, "_session_id", ""):
             protected_count += 1
             continue
@@ -245,7 +256,13 @@ def _scan_clean_candidates(engine) -> dict[str, Any]:
 def _scan_retention_candidates(engine) -> dict[str, Any]:
     conn = engine._store._conn
     now = datetime.now().timestamp()
-    session_id = getattr(engine, "_session_id", "")
+    # SQL is scoped to the foreground session so /lcm doctor retention
+    # reports the operator's real conversation rather than whatever side
+    # channel (cron tick, debug probe) currently owns engine._session_id.
+    # The "protected" flag below still keys off engine._session_id (the
+    # actively-bound row) because that is the row receiving live writes
+    # from the concurrent run.
+    session_id = engine.current_session_id
     if not session_id:
         return {
             "error": None,
@@ -340,6 +357,8 @@ def _scan_retention_candidates(engine) -> dict[str, Any]:
         first_activity_at = min(float(ts) for ts in (first_message_at, first_node_at) if ts is not None)
         last_activity_at = max(float(ts) for ts in (last_message_at, last_node_at) if ts is not None)
         age_days = max(0.0, (now - last_activity_at) / 86400.0)
+        # Bound (not foreground): protect the live session from retention
+        # bookkeeping while the engine may still be writing to it.
         protected = session_id == getattr(engine, "_session_id", "")
         total_footprint_tokens = int(token_total) + int(node_token_total)
         if protected:
@@ -927,6 +946,10 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
     avoid half-cleaned state if a later table delete fails.
     """
     conn = engine._store._conn
+    # Protect the actively-bound session id, not current_session_id. While a
+    # cron tick has rebound the engine, _session_id is the row the engine is
+    # actively writing to via lifecycle hooks; deleting it during cleanup
+    # would race with that ingest.
     protected_session_ids = {getattr(engine, "_session_id", "")}
     protected_session_ids = {str(s) for s in protected_session_ids if s}
     session_ids = {str(s) for s in session_ids if s and str(s) not in protected_session_ids}

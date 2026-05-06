@@ -113,6 +113,7 @@ def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path):
         "ignore_message_patterns": ["^Cronjob Response:"],
         "ignore_message_patterns_source": "env",
         "ignored_message_count": 1,
+        "side_channel_active": False,
     }
 
 
@@ -998,6 +999,281 @@ class TestSessionFiltering:
         assert instance._store.get_session_count("debug") == 0
         assert instance._dag.get_session_nodes("debug") == []
         assert instance.compression_count == 0
+
+    def test_ignored_session_does_not_rebind_foreground_view(self, tmp_path):
+        """A cron-style ignored session arriving while a foreground session is
+        bound must not steal the engine's foreground "current session" view.
+        The engine continues to rebind ``_session_id`` so cron's own compress
+        / handle_tool_call calls correctly short-circuit on
+        ``_session_ignored=True``, but ``current_session_id`` (the property
+        every LCM tool reads) keeps pointing at the foreground binding.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_rebind_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "20260506_201605_75a4c6",
+            platform="telegram",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "20260506_201605_75a4c6",
+            {"role": "user", "content": "hi from telegram"},
+            token_estimate=4,
+            source="telegram",
+        )
+
+        instance.on_session_start(
+            "cron_eee06bdbb09b_20260506_210051",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        # Bound state continues to follow the side channel so cron's own
+        # compress and handle_tool_call calls correctly short-circuit on
+        # _session_ignored=True. This is the pre-fix behavior and must be
+        # preserved -- without it, cron messages would ingest into the
+        # foreground store via _ingest_messages.
+        assert instance._session_id == "cron_eee06bdbb09b_20260506_210051"
+        assert instance._session_ignored is True
+
+        # Foreground view stays stable across the rebind. Tools that read
+        # current_session_id (lcm_status, lcm_grep default scope, etc.)
+        # continue to see the operator's real conversation.
+        assert instance._foreground_session_id == "20260506_201605_75a4c6"
+        assert instance.current_session_id == "20260506_201605_75a4c6"
+        assert instance.current_session_platform == "telegram"
+
+    def test_ignored_session_compress_does_not_leak_into_foreground_store(self, tmp_path):
+        """Regression: the foreground view must not come at the cost of
+        leaking the side channel's transcript into the foreground store. With
+        the bound binding still pointing at the cron session,
+        ``_session_ignored=True`` correctly gates ingest so cron's compress
+        and should_compress_preflight calls leave the foreground row count
+        untouched.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_leak_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram-1"},
+            token_estimate=2,
+            source="telegram",
+        )
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        cron_messages = [
+            {"role": "system", "content": "sys-cron"},
+            {"role": "user", "content": "cron-1"},
+            {"role": "assistant", "content": "cron-2"},
+            {"role": "user", "content": "cron-3"},
+        ]
+        instance.should_compress_preflight(cron_messages)
+        instance.compress(cron_messages)
+
+        assert instance._store.get_session_count("telegram-foreground") == 1
+        assert instance._store.get_session_count("cron_xxx") == 0
+
+    def test_lcm_status_stays_on_foreground_after_cron_tick(self, tmp_path):
+        """End-to-end: lcm_status must still report the Telegram session id
+        and its row counts after a cron-style ignored session has rebound the
+        engine. The bound side channel surfaces only via the diagnostic
+        ``side_channel_in_flight`` / ``bound_session_id`` keys.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_status_after_cron.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "20260506_201605_75a4c6",
+            platform="telegram",
+            context_length=200_000,
+        )
+        instance._store.append(
+            "20260506_201605_75a4c6",
+            {"role": "user", "content": "telegram message"},
+            token_estimate=3,
+            source="telegram",
+        )
+
+        instance.on_session_start(
+            "cron_eee06bdbb09b_20260506_210051",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=instance))
+
+        assert payload["session_id"] == "20260506_201605_75a4c6"
+        assert payload["store"]["messages"] == 1
+        assert payload["session_filters"]["ignored"] is False
+        assert payload["session_filters"]["stateless"] is False
+        assert payload["session_filters"]["side_channel_active"] is True
+        assert (
+            payload["session_filters"]["side_channel_session_id"]
+            == "cron_eee06bdbb09b_20260506_210051"
+        )
+
+    def test_lcm_status_reports_bound_session_when_no_foreground_yet(self, tmp_path):
+        """A fresh engine that only ever binds an ignored session must still
+        report something usable via lcm_status, with the bound session's
+        ignore flag intact so operators can see why the row count is zero.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_first_bind_ignored.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "cron_first_run_20260506_210051",
+            platform="cron",
+            context_length=200_000,
+        )
+
+        assert instance._session_id == "cron_first_run_20260506_210051"
+        assert instance._session_ignored is True
+        assert instance._foreground_session_id == ""
+        assert instance.current_session_id == "cron_first_run_20260506_210051"
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=instance))
+        assert payload["session_id"] == "cron_first_run_20260506_210051"
+        assert payload["session_filters"]["ignored"] is True
+        assert payload["session_filters"]["side_channel_active"] is False
+        assert "side_channel_session_id" not in payload["session_filters"]
+
+    def test_stateless_session_does_not_rebind_foreground_view(self, tmp_path):
+        """The same protection applies to stateless side-channel sessions: a
+        ``debug:*``-style session must not clobber the foreground
+        ``current_session_id`` view, even though it does claim ``_session_id``
+        for its own lifecycle gating.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_no_rebind_stateless.db"),
+            stateless_session_patterns=["debug:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "telegram-foreground",
+            platform="telegram",
+            context_length=200_000,
+        )
+
+        instance.on_session_start(
+            "debug:probe-1",
+            platform="debug",
+            context_length=200_000,
+        )
+
+        assert instance._session_id == "debug:probe-1"
+        assert instance._session_stateless is True
+        assert instance._foreground_session_id == "telegram-foreground"
+        assert instance.current_session_id == "telegram-foreground"
+        assert instance.current_session_platform == "telegram"
+
+    def test_lcm_command_status_text_is_consistent_with_lcm_status_during_cron_tick(self, tmp_path):
+        """The /lcm command's _status_text and the lcm_status tool must agree
+        on session_id, session_ignored, and session_stateless during a cron
+        tick. Without this, an operator reading /lcm status sees session_id
+        for the foreground but ignored=true for the side channel.
+        """
+        from hermes_lcm.command import _status_text
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_command_consistency.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("telegram-foreground", platform="telegram", context_length=200_000)
+        instance.on_session_start("cron_xxx", platform="cron", context_length=200_000)
+
+        text = _status_text(instance)
+        assert "session_id: telegram-foreground" in text
+        assert "session_ignored: no" in text
+        assert "session_stateless: no" in text
+        assert "side_channel_active: yes" in text
+
+    def test_lcm_doctor_retention_targets_foreground_during_cron_tick(self, tmp_path):
+        """The /lcm doctor retention surface must report on the foreground
+        session, not the cron-style side channel that briefly owns
+        engine._session_id. The SQL filter and the row aggregation both need
+        to follow current_session_id.
+        """
+        from hermes_lcm.command import _scan_retention_candidates
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_retention_during_cron.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("telegram-foreground", platform="telegram", context_length=200_000)
+        instance._store.append(
+            "telegram-foreground",
+            {"role": "user", "content": "telegram retention test"},
+            token_estimate=3,
+            source="telegram",
+        )
+        instance.on_session_start("cron_xxx", platform="cron", context_length=200_000)
+
+        scan = _scan_retention_candidates(instance)
+        assert scan["error"] is None
+        # Foreground row surfaces; cron's empty session is not the scan
+        # target. protected is False because the bound id is cron, not the
+        # row we are reporting on.
+        assert scan["sessions_analyzed"] == 1
+        assert scan["sessions"][0]["session_id"] == "telegram-foreground"
+        assert scan["sessions"][0]["protected"] is False
+
+    def test_foreground_view_advances_when_a_real_foreground_arrives(self, tmp_path):
+        """``_foreground_session_id`` advances forward through real foreground
+        bindings (e.g., compression rollovers) but is never set to an ignored
+        or stateless session id. This is the rebind path the bug fix must not
+        regress.
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_foreground_advances.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+
+        instance.on_session_start(
+            "telegram-1",
+            platform="telegram",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-1"
+
+        instance.on_session_start(
+            "cron_xxx",
+            platform="cron",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-1"
+
+        instance.on_session_start(
+            "telegram-2",
+            platform="telegram",
+            context_length=200_000,
+        )
+        assert instance._foreground_session_id == "telegram-2"
+        assert instance.current_session_id == "telegram-2"
 
 
 class TestMessageFiltering:

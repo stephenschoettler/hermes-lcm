@@ -98,7 +98,7 @@ def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
 
 def _get_session_node(engine: "LCMEngine", node_id: int):
     node = engine._dag.get_node(node_id)
-    if node is None or node.session_id != engine._session_id:
+    if node is None or node.session_id != engine.current_session_id:
         return None
     return node
 
@@ -108,7 +108,7 @@ def _get_externalized_payload(engine: "LCMEngine", ref: str) -> dict[str, Any] |
     if payload is None:
         return None
     payload_session_id = payload.get("session_id") or ""
-    if payload_session_id and payload_session_id != engine._session_id:
+    if payload_session_id and payload_session_id != engine.current_session_id:
         return None
     return payload
 
@@ -290,7 +290,7 @@ def _expand_message_sources(
             has_more = True
             break
         stored = stored_by_id.get(store_id)
-        if not stored or stored.get("session_id") != engine._session_id:
+        if not stored or stored.get("session_id") != engine.current_session_id:
             next_source_offset = source_index + 1
             next_content_offset = 0
             has_more = next_source_offset < total_sources
@@ -394,7 +394,7 @@ def _expand_child_nodes(
     children: list[tuple[int, Any]] = []
     for relative_index, child_id in enumerate(selected_source_ids):
         child = engine._dag.get_node(child_id)
-        if child is None or child.session_id != engine._session_id:
+        if child is None or child.session_id != engine.current_session_id:
             continue
         children.append((source_offset + relative_index, child))
 
@@ -597,7 +597,7 @@ def _serialize_loaded_message(engine: "LCMEngine", row: dict[str, Any], max_cont
         "content_returned_chars": content_slice["content_returned_chars"],
         "content_truncated": content_slice["content_truncated"],
         "next_content_offset": content_slice["next_content_offset"],
-        "from_current_session": bool(engine._session_id) and stored_session_id == engine._session_id,
+        "from_current_session": bool(engine.current_session_id) and stored_session_id == engine.current_session_id,
     }
     if row.get("tool_call_id"):
         item["tool_call_id"] = row.get("tool_call_id")
@@ -740,7 +740,10 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         # MessageStore.search and SummaryDAG.search treat session_id="" as a
         # literal scoped filter, so an unbound engine searching scope=current
         # returns zero results rather than leaking cross-session matches.
-        search_session_id: str | None = engine._session_id
+        # Read current_session_id (the foreground view) so a cron-style side
+        # channel that briefly owns engine._session_id does not redirect the
+        # default search scope away from the operator's real conversation.
+        search_session_id: str | None = engine.current_session_id
         session_scope = "current"
     elif requested_session_scope == "all":
         if explicit_session_id:
@@ -761,14 +764,14 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         # current-session path and report. The data-layer empty-string scoping
         # contract keeps an unbound engine from leaking cross-session matches
         # here too.
-        search_session_id = engine._session_id
+        search_session_id = engine.current_session_id
         session_scope = "current"
         logger.warning(
             "Ignoring unsupported session_scope=%s for lcm_grep",
             requested_session_scope,
         )
 
-    current_session_id = engine._session_id
+    current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
 
@@ -899,7 +902,7 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
         )
 
     node_id = args.get("node_id")
-    session_id = engine._session_id
+    session_id = engine.current_session_id
 
     if node_id is not None:
         node = _get_session_node(engine, node_id)
@@ -1014,7 +1017,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             return json.dumps({"error": f"Message store_id {store_id} not found"})
         transcript_content = stored.get("content", "") or ""
         sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset)
-        engine_session_id = engine._session_id
+        engine_session_id = engine.current_session_id
         stored_session_id = stored.get("session_id", "")
         result: Dict[str, Any] = {
             "store_id": store_id,
@@ -1145,7 +1148,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             if node is not None:
                 nodes.append(node)
     elif query:
-        nodes = engine._dag.search(query, session_id=engine._session_id, limit=max_results)
+        nodes = engine._dag.search(query, session_id=engine.current_session_id, limit=max_results)
     else:
         return json.dumps({"error": "Provide either query or node_ids"})
 
@@ -1329,7 +1332,13 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    session_id = engine._session_id
+    # Read the foreground view so a side-channel session that briefly owns
+    # engine._session_id (cron tick inside the gateway process, debug probe,
+    # etc.) does not divert lcm_status away from the operator's real
+    # conversation. Falls back to the bound id when no foreground has ever
+    # been bound, so cron-only or stateless-only deployments still report
+    # something usable.
+    session_id = engine.current_session_id
     if not session_id:
         return json.dumps({
             "error": "No active session",
@@ -1357,6 +1366,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     lifecycle_fragmentation = full_status.get("lifecycle_fragmentation")
     source_lineage = full_status.get("source_lineage")
     runtime_identity = full_status.get("runtime_identity")
+
+    # Filter classification for the session lcm_status is reporting on.
+    # The engine encapsulates the foreground vs bound divergence; this tool
+    # just reads the property contract.
+    side_channel_active = engine.side_channel_active
 
     return json.dumps({
         "session_id": session_id,
@@ -1399,8 +1413,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "session_filters": {
-            "ignored": engine._session_ignored,
-            "stateless": engine._session_stateless,
+            "ignored": engine.current_session_ignored,
+            "stateless": engine.current_session_stateless,
             "ignore_session_patterns": full_status.get("ignore_session_patterns", []),
             "ignore_session_patterns_source": full_status.get("ignore_session_patterns_source", "default"),
             "stateless_session_patterns": full_status.get("stateless_session_patterns", []),
@@ -1408,6 +1422,12 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "ignore_message_patterns": full_status.get("ignore_message_patterns", []),
             "ignore_message_patterns_source": full_status.get("ignore_message_patterns_source", "default"),
             "ignored_message_count": full_status.get("ignored_message_count", 0),
+            "side_channel_active": side_channel_active,
+            **(
+                {"side_channel_session_id": engine._session_id}
+                if side_channel_active
+                else {}
+            ),
         },
         "source_lineage": source_lineage,
         "runtime_identity": runtime_identity,
@@ -1423,7 +1443,10 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "LCM engine not initialized"})
 
     checks: list[dict] = []
-    session_id = engine._session_id
+    # Diagnose the foreground session, not whatever side-channel session
+    # currently owns engine._session_id. Falls back to the bound id when no
+    # foreground has ever been bound.
+    session_id = engine.current_session_id
 
     # 1. Database integrity
     try:
