@@ -89,11 +89,14 @@ class ImportResult:
         }
 
 
+def _readonly_sqlite_uri(db_path: Path) -> str:
+    return db_path.resolve().as_uri() + "?mode=ro"
+
+
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     if not db_path.is_file():
         raise FileNotFoundError(f"source DB not found: {db_path}")
-    uri = f"file:{db_path.resolve()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    conn = sqlite3.connect(_readonly_sqlite_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -454,8 +457,7 @@ def _backup_target(target_db: Path) -> str | None:
         backup_path = target_db.with_name(f"{target_db.name}.backup-{stamp}-{suffix}")
         suffix += 1
 
-    source_uri = f"file:{target_db.resolve()}?mode=ro"
-    source_conn = sqlite3.connect(source_uri, uri=True)
+    source_conn = sqlite3.connect(_readonly_sqlite_uri(target_db), uri=True)
     backup_conn = sqlite3.connect(backup_path)
     try:
         source_conn.backup(backup_conn)

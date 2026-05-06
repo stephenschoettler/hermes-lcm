@@ -189,6 +189,27 @@ def test_dry_run_does_not_create_target_db(tmp_path: Path):
     assert not target_db.exists()
 
 
+def test_dry_run_handles_uri_reserved_source_db_path(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless#archive?.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="fixture-import",
+        apply=False,
+    )
+
+    assert result.scanned == 2
+    assert result.eligible == 2
+    assert result.would_import == 2
+    assert not target_db.exists()
+
+
 def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path):
     importer = load_importer_module()
     source_db = tmp_path / "lossless.db"
@@ -242,6 +263,41 @@ def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path
         "reply from old OpenClaw",
         "hello from old OpenClaw",
     ]
+
+
+def test_apply_backs_up_uri_reserved_target_db_path(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target#archive?.db"
+    create_lossless_source(source_db)
+    existing_store = MessageStore(target_db)
+    existing_store.append(
+        "existing-session",
+        {"role": "user", "content": "preexisting committed WAL row"},
+        token_estimate=3,
+        source="existing-source",
+    )
+    existing_store.close()
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="fixture-import",
+        apply=True,
+    )
+
+    assert result.imported == 2
+    assert result.backup_path is not None
+    backup_path = Path(result.backup_path)
+    assert backup_path.exists()
+    assert backup_path.name.startswith("target#archive?.db.backup-")
+
+    backup_conn = sqlite3.connect(backup_path)
+    backup_rows = backup_conn.execute("SELECT session_id, content FROM messages").fetchall()
+    backup_conn.close()
+    assert backup_rows == [("existing-session", "preexisting committed WAL row")]
 
 
 def test_apply_is_idempotent_for_same_import_id(tmp_path: Path):
