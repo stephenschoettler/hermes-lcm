@@ -69,7 +69,7 @@ claim that Hermes core has no persisted record of pre-compression history.
 
 - Hermes Agent with the pluggable context engine slot ([PR #7464](https://github.com/NousResearch/hermes-agent/pull/7464))
 - Python 3.11+
-- No required third-party runtime dependencies. `tiktoken` is used if available; otherwise LCM falls back to character-based token estimates. `regex` is used if available to apply timeouts to message ignore patterns; otherwise LCM keeps a capped stdlib `re` fallback.
+- No required third-party runtime dependencies. `tiktoken` is used if available; otherwise LCM falls back to character-based token estimates. `regex` is used if available to apply timeouts to message ignore patterns; if it is not installed, message-level regex filtering is disabled with a warning rather than running unbounded stdlib `re` matches.
 
 ## Install
 
@@ -264,18 +264,12 @@ LCM_IGNORE_MESSAGE_PATTERNS=^Cronjob Response:,^>>>Cronjob Response<<<:
 Invalid regex entries are logged at warning level and dropped; the
 surviving patterns in the same list still take effect, so a misconfigured
 entry never crashes ingest. Pattern matching uses a 50 ms per-pattern timeout
-when the optional `regex` package is installed. If only stdlib `re` is
-available, LCM keeps the plugin importable and caps fallback matching to the
-first 100,000 characters of the normalized content.
+when the optional `regex` package is installed. If `regex` is not installed,
+LCM logs a warning and disables message-level regex filtering rather than
+running unbounded stdlib `re` matches in the ingest path.
 
-Two operator-facing limitations to know about:
+One operator-facing limitation to know about:
 
-- **Anchored patterns are best-effort against multimodal content.**
-  Structured payloads (lists of content parts) are normalized via JSON
-  serialization before matching, so a `^`-anchored pattern binds to the
-  JSON wrapper rather than to the inner text. If you expect cron alerts to
-  arrive as multimodal payloads from your gateway, use unanchored patterns
-  (for example `Cronjob Response:` instead of `^Cronjob Response:`).
 - **Compaction-window edge.** The filter runs at ingest time. When a
   matching message is part of the chunk being summarized in the same
   turn it arrived, the message's text may appear inside the resulting

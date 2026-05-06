@@ -1,6 +1,7 @@
 """Tests for LCM core components: store, DAG, tokens, config, escalation."""
 
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -24,6 +25,7 @@ from hermes_lcm.session_patterns import (
     compile_session_patterns,
     matches_session_pattern,
 )
+from hermes_lcm import message_patterns as message_patterns_mod
 from hermes_lcm.message_patterns import (
     compile_message_patterns,
     matches_message_pattern,
@@ -453,7 +455,29 @@ class TestSessionPatterns:
         )
 
 
+class _FakeTimeoutPattern:
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self._compiled = re.compile(pattern)
+
+    def search(self, text, *, timeout=None):
+        assert timeout is not None
+        return self._compiled.search(text)
+
+
+class _FakeTimeoutRegexEngine:
+    error = re.error
+
+    @staticmethod
+    def compile(pattern):
+        return _FakeTimeoutPattern(pattern)
+
+
 class TestMessagePatterns:
+    @pytest.fixture(autouse=True)
+    def _timeout_capable_regex_engine(self, monkeypatch):
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
     def test_compile_and_match_anchored_prefix(self):
         patterns = compile_message_patterns(["^Cronjob Response:"])
         assert len(patterns) == 1
@@ -518,26 +542,40 @@ class TestMessagePatterns:
         assert caplog.text.count("timed out") == 1
         assert "(a+)+$" in caplog.text
 
-    def test_stdlib_timeout_fallback_is_cached_after_first_type_error(self):
-        class StdlibPattern:
-            pattern = "^Cronjob Response:"
+    def test_missing_regex_dependency_disables_message_patterns(self, monkeypatch, caplog):
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", None)
+        monkeypatch.setattr(message_patterns_mod, "_MISSING_REGEX_WARNING_EMITTED", False)
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            compiled = compile_message_patterns([r"(a+)+$"])
+
+        assert compiled == []
+        assert "regex" in caplog.text
+        assert "disabled" in caplog.text
+        assert matches_message_pattern("a" * 30 + "!", compiled) is False
+
+    def test_pattern_without_timeout_support_is_skipped_without_unsafe_retry(self, caplog):
+        class StdlibLikePattern:
+            pattern = r"(a+)+$"
 
             def __init__(self):
                 self.timeout_attempts = 0
-                self.normal_attempts = 0
+                self.unsafe_attempts = 0
 
             def search(self, text, **kwargs):
                 if "timeout" in kwargs:
                     self.timeout_attempts += 1
                     raise TypeError("'timeout' is an invalid keyword argument for search()")
-                self.normal_attempts += 1
-                return text.startswith("Cronjob Response:")
+                self.unsafe_attempts += 1
+                raise AssertionError("must not retry without timeout")
 
-        pattern = StdlibPattern()
-        assert matches_message_pattern("Cronjob Response: one", [pattern]) is True
-        assert matches_message_pattern("Cronjob Response: two", [pattern]) is True
+        pattern = StdlibLikePattern()
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            assert matches_message_pattern("a" * 30 + "!", [pattern]) is False
+
         assert pattern.timeout_attempts == 1
-        assert pattern.normal_attempts == 2
+        assert pattern.unsafe_attempts == 0
+        assert "does not support timeout" in caplog.text
 
 
 class TestTokens:

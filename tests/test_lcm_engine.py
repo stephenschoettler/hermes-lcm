@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -87,7 +88,11 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
 
 
-def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path):
+def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
+    from hermes_lcm import message_patterns as message_patterns_mod
+
+    monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
     config = LCMConfig(
         database_path=str(tmp_path / "tool-status-filter-config.db"),
         ignore_session_patterns=["cron:*"],
@@ -1310,7 +1315,31 @@ class TestSessionFiltering:
         assert instance.current_session_id == "telegram-2"
 
 
+class _FakeTimeoutPattern:
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self._compiled = re.compile(pattern)
+
+    def search(self, text, *, timeout=None):
+        assert timeout is not None
+        return self._compiled.search(text)
+
+
+class _FakeTimeoutRegexEngine:
+    error = re.error
+
+    @staticmethod
+    def compile(pattern):
+        return _FakeTimeoutPattern(pattern)
+
+
 class TestMessageFiltering:
+    @pytest.fixture(autouse=True)
+    def _timeout_capable_regex_engine(self, monkeypatch):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+
     def _make_engine(self, tmp_path, db_name, **config_kwargs):
         config = LCMConfig(
             database_path=str(tmp_path / db_name),
@@ -1519,6 +1548,29 @@ class TestMessageFiltering:
         ])
         assert engine._store.get_session_count("user-123") == 1
         assert engine._ignored_message_count == 1
+
+    def test_missing_regex_dependency_leaves_messages_unfiltered(self, tmp_path, monkeypatch, caplog):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", None)
+        monkeypatch.setattr(message_patterns_mod, "_MISSING_REGEX_WARNING_EMITTED", False)
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.message_patterns"):
+            engine = self._make_engine(
+                tmp_path,
+                "lcm_msg_no_regex.db",
+                ignore_message_patterns=[r"(a+)+$"],
+                ignore_message_patterns_source="env",
+            )
+
+        engine._ingest_messages([
+            {"role": "user", "content": "a" * 30 + "!"},
+        ])
+
+        assert engine._store.get_session_count("user-123") == 1
+        assert engine._ignored_message_count == 0
+        assert "regex" in caplog.text
+        assert "disabled" in caplog.text
 
     def test_status_surfaces_message_pattern_keys(self, tmp_path):
         engine = self._make_engine(
