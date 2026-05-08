@@ -655,6 +655,69 @@ class TestEngineABC:
         assert rows[-1]["tool_call_id"] == "call_2"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_existing_compacted_session_restart_ignores_preserved_objective_anchor(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "restart-anchored-compacted.db"
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(db_path),
+        )
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "anchored-compacted-session",
+            platform="cli",
+            conversation_id="anchored-compacted-conversation",
+            context_length=200000,
+        )
+
+        def mock_summary(**kwargs):
+            return "Older board cleanup summary.\nExpand for details about: board cleanup", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        latest_request = "increase kanban autonomy"
+        messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "clean up temporary boards"},
+            {"role": "assistant", "content": "I will inspect boards."},
+            {"role": "user", "content": latest_request},
+            {
+                "role": "assistant",
+                "content": "inspect blocker handling",
+                "tool_calls": [{"id": "call_1", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "blocker output"},
+            {
+                "role": "assistant",
+                "content": "inspect notifier handling",
+                "tool_calls": [{"id": "call_2", "type": "function"}],
+            },
+            {"role": "tool", "tool_call_id": "call_2", "content": "notifier output"},
+        ]
+        active_context = before_restart.compress(messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "anchored-compacted-session",
+            platform="cli",
+            conversation_id="anchored-compacted-conversation",
+            context_length=200000,
+        )
+        replay_with_new_message = active_context + [
+            {"role": "user", "content": "follow-up after restart"},
+        ]
+
+        after_restart._ingest_messages(replay_with_new_message)
+
+        rows = after_restart._store.get_session_messages("anchored-compacted-session")
+        assert rows[-1]["content"] == "follow-up after restart"
+        assert [row["content"] for row in rows].count(latest_request) == 1
+        assert all("Current user objective preserved" not in row["content"] for row in rows)
+        assert after_restart._ingest_cursor == len(replay_with_new_message)
+
     def test_existing_large_session_restart_reconciles_beyond_short_tail_window(self, tmp_path):
         db_path = tmp_path / "restart-large.db"
         config = LCMConfig(database_path=str(db_path))
@@ -2204,6 +2267,118 @@ class TestEngineCompress:
         assert result[0]["content"][:-1] == system_msg["content"]
         assert result[0]["content"][-1]["type"] == "text"
         assert "Lossless Context Management" in result[0]["content"][-1]["text"]
+
+    def test_compress_preserves_latest_user_request_outside_fresh_tail(self, tmp_path, monkeypatch):
+        """The latest real user request anchors the task even after tool-heavy turns.
+
+        A long assistant/tool sequence after the user request can push that user
+        message outside the ordinary fresh-tail window.  If compaction only keeps
+        summaries plus the mechanical tail, the next turn may see old summarized
+        goals and tool traces but not the current objective verbatim.
+        """
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_latest_user_anchor.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("latest-user-anchor", platform="discord", context_length=200000)
+
+        latest_request = "We need to increase the autonomy of the kanban board."
+        stale_request = "Could you clean up the temporary kanban boards?"
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": stale_request},
+            {"role": "assistant", "content": "I will inspect the boards."},
+            {"role": "user", "content": latest_request},
+            {
+                "role": "user",
+                "content": "[Your active task list was preserved across context compression]\n- [>] inspect blocker handling",
+            },
+            {
+                "role": "assistant",
+                "content": "I will inspect blocker handling.",
+                "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "search_files", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "blocker code"},
+            {
+                "role": "assistant",
+                "content": "I will inspect notifier handling.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "notifier code"},
+            {
+                "role": "assistant",
+                "content": "I will inspect dispatcher handling.",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_2", "content": "dispatcher code"},
+        ]
+
+        def mock_summary(**kwargs):
+            return "Older Kanban-board cleanup discussion.\nExpand for details about: stale board cleanup", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        result = instance.compress(messages)
+        result_contents = [msg.get("content") for msg in result]
+
+        anchor_content = next(content for content in result_contents if latest_request in content)
+        assert anchor_content.startswith("[Current user objective preserved from compacted history]")
+        assert stale_request not in "\n".join(result_contents)
+        assert result_contents.index(anchor_content) < result_contents.index("I will inspect notifier handling.")
+
+    def test_compress_carries_preserved_user_request_across_repeated_compaction(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_repeated_latest_user_anchor.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("repeated-latest-user-anchor", platform="discord", context_length=200000)
+
+        latest_request = "LATEST OBJECTIVE: increase autonomy"
+
+        def mock_summary(**kwargs):
+            return "Tool-heavy turn summary.\nExpand for details about: active objective", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        first = instance.compress([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": latest_request},
+            {"role": "assistant", "content": "tool1", "tool_calls": [{"id": "call_1", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "out1"},
+            {"role": "assistant", "content": "tool2", "tool_calls": [{"id": "call_2", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "out2"},
+        ])
+        first_serialized = "\n".join(str(msg.get("content", "")) for msg in first)
+        assert latest_request in first_serialized
+        assert "[Current user objective preserved from compacted history]" in first_serialized
+
+        second = instance.compress(first + [
+            {"role": "assistant", "content": "tool3", "tool_calls": [{"id": "call_3", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_3", "content": "out3"},
+            {"role": "assistant", "content": "tool4", "tool_calls": [{"id": "call_4", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_4", "content": "out4"},
+        ])
+        second_serialized = "\n".join(str(msg.get("content", "")) for msg in second)
+        assert latest_request in second_serialized
+        assert second_serialized.count("[Current user objective preserved from compacted history]") == 1
 
     def test_compress_preserves_system_and_tail(self, engine):
         """Compression should always keep system prompt and fresh tail."""
@@ -6519,6 +6694,52 @@ class TestAssemblyGuardrails:
         )
 
         assert result[1:] == []
+
+    def test_context_anchor_is_budgeted_under_max_assembly_tokens(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_guardrail_anchor_budget.db"),
+            max_assembly_tokens=120,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+        monkeypatch.setattr(lcm_engine_module, "count_tokens", lambda text: len(text))
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "summarize_with_escalation",
+            lambda **kwargs: ("summary", 1),
+        )
+
+        oversized_anchor = "current objective " * 7
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "stale"},
+            {"role": "user", "content": oversized_anchor},
+            {"role": "assistant", "content": "a" * 50},
+            {"role": "tool", "tool_call_id": "call_anchor", "content": "t" * 50},
+        ]
+
+        result = instance.compress(messages, current_tokens=140)
+
+        assert lcm_engine_module.count_messages_tokens(result) <= 120
+        assert oversized_anchor not in [msg.get("content") for msg in result]
+        assert not instance.get_status()["overflow_recovery_failed"]
 
     def test_reserve_tokens_floor_warns_when_misconfigured(self, tmp_path, caplog):
         config = LCMConfig(

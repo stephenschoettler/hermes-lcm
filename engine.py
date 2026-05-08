@@ -181,6 +181,9 @@ _SYNTHETIC_ASSISTANT_NOISE = {
     "pong",
 }
 
+_PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
+_PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+
 
 def _tool_call_id(tool_call: Any) -> str:
     if not isinstance(tool_call, dict):
@@ -323,6 +326,10 @@ class LCMEngine(ContextEngine):
         self.summary_model = self._config.summary_model
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        # Temporary source window used only while compress() assembles context.
+        # _assemble_context also serves tests and recovery paths directly, so
+        # keep anchoring opt-in rather than changing its public behavior.
+        self._pending_context_anchor_messages: Optional[List[Dict[str, Any]]] = None
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
@@ -735,11 +742,15 @@ class LCMEngine(ContextEngine):
 
         # Step 7: Assemble new active context
         self._refresh_raw_backlog_debt(working_messages)
-        compressed = self._assemble_context(
-            working_messages[0],
-            working_messages[1:],
-            assembly_cap_override=recovery_assembly_cap,
-        )
+        self._pending_context_anchor_messages = messages[1:]
+        try:
+            compressed = self._assemble_context(
+                working_messages[0],
+                working_messages[1:],
+                assembly_cap_override=recovery_assembly_cap,
+            )
+        finally:
+            self._pending_context_anchor_messages = None
         self.compression_count += 1
         if recovery_assembly_cap is None:
             self._last_overflow_recovery_failed = False
@@ -1840,6 +1851,8 @@ class LCMEngine(ContextEngine):
                 "[Note: This conversation uses Lossless Context Management (LCM)." in content
                 and "Earlier turns have been compacted into hierarchical summaries below." in content
             )
+        if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
+            return True
         if "[Expand for details:" not in content:
             return False
         return bool(
@@ -2397,6 +2410,60 @@ class LCMEngine(ContextEngine):
         normalized = normalize_content_value(content) or ""
         return normalized + note
 
+    @staticmethod
+    def _is_preserved_todo_context_message(message: Dict[str, Any]) -> bool:
+        content = text_content_for_pattern_matching(message.get("content")) or ""
+        return content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX)
+
+    @staticmethod
+    def _preserved_objective_context_content(message: Dict[str, Any]) -> str:
+        content = text_content_for_pattern_matching(message.get("content")) or ""
+        return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
+
+    @staticmethod
+    def _build_preserved_objective_summary_part(message: Dict[str, Any]) -> str:
+        content = text_content_for_pattern_matching(message.get("content")) or ""
+        return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
+
+    def _latest_user_context_anchor(
+        self,
+        messages: List[Dict[str, Any]],
+        selected_tail: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Return a scaffolded newest real user objective omitted from the tail.
+
+        Tool-heavy turns can push the operative user request outside the fresh
+        tail while retaining only assistant/tool traces from that turn.  The
+        returned text is active-context scaffolding, not raw conversation: it is
+        emitted inside the summary block so restart reconciliation ignores it
+        instead of ingesting a duplicate non-contiguous user message.
+
+        If a previous compaction already emitted the preserved-objective
+        scaffold and no newer real user turn exists, carry that scaffold forward
+        as the next anchor source so repeated compaction does not summarize the
+        active objective away one compression later.
+        """
+        selected_tail_messages = [msg for msg in selected_tail if isinstance(msg, dict)]
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            preserved_objective = self._preserved_objective_context_content(message)
+            if preserved_objective:
+                if any(
+                    self._preserved_objective_context_content(selected) == preserved_objective
+                    for selected in selected_tail_messages
+                ):
+                    return None
+                return preserved_objective
+            if message.get("role") != "user":
+                continue
+            if self._is_preserved_todo_context_message(message):
+                continue
+            if any(message == selected for selected in selected_tail_messages):
+                return None
+            return self._build_preserved_objective_summary_part(message)
+        return None
+
     def _assemble_context(
         self,
         system_msg: Dict[str, Any],
@@ -2435,6 +2502,8 @@ class LCMEngine(ContextEngine):
         )
 
         tail_selected = tail_messages
+        anchor_source = getattr(self, "_pending_context_anchor_messages", None)
+        anchor_part: Optional[str] = None
         summary_budget = None
         if assembly_cap is not None:
             used = count_message_tokens(leading_msg)
@@ -2448,15 +2517,24 @@ class LCMEngine(ContextEngine):
                 tail_token_total += msg_tokens
             tail_selected = list(reversed(kept_tail_reversed))
             summary_budget = max(0, assembly_cap - used - tail_token_total)
+        if anchor_source is not None:
+            anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)
 
         # Collect DAG summaries — highest depth first for context hierarchy
+        summary_parts: list[str] = []
+        last_role = result[-1].get("role", "system")
+        summary_role = "assistant" if last_role != "assistant" else "user"
+        if anchor_part is not None:
+            anchor_msg = {"role": summary_role, "content": anchor_part}
+            if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
+                summary_parts.append(anchor_part)
+
         all_nodes = self._dag.get_session_nodes(self._session_id)
         if all_nodes:
             # Group by depth, take the most recent uncondensed at each level
             # For active context, we want the highest-level summaries
             # that haven't been condensed into even higher levels
             depths = sorted(set(n.depth for n in all_nodes), reverse=True)
-            summary_parts = []
             for d in depths:
                 uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, d)
                 for node in uncondensed:
@@ -2471,22 +2549,21 @@ class LCMEngine(ContextEngine):
                         f"[Expand for details: {node.expand_hint}]"
                     )
 
-            if summary_parts:
-                # Choose role to avoid consecutive same-role
-                last_role = result[-1].get("role", "system")
-                summary_role = "assistant" if last_role != "assistant" else "user"
-                selected_parts = summary_parts
-                if summary_budget is not None:
-                    selected_parts = []
-                    for part in summary_parts:
-                        candidate = "\n\n---\n\n".join(selected_parts + [part])
-                        candidate_msg = {"role": summary_role, "content": candidate}
-                        if count_message_tokens(candidate_msg) > summary_budget:
-                            break
-                        selected_parts.append(part)
-                if selected_parts:
-                    combined = "\n\n---\n\n".join(selected_parts)
-                    result.append({"role": summary_role, "content": combined})
+        if summary_parts:
+            selected_parts = summary_parts
+            if summary_budget is not None:
+                selected_parts = []
+                for part in summary_parts:
+                    candidate = "\n\n---\n\n".join(selected_parts + [part])
+                    candidate_msg = {"role": summary_role, "content": candidate}
+                    if count_message_tokens(candidate_msg) > summary_budget:
+                        if part == anchor_part:
+                            continue
+                        break
+                    selected_parts.append(part)
+            if selected_parts:
+                combined = "\n\n---\n\n".join(selected_parts)
+                result.append({"role": summary_role, "content": combined})
 
         # Fresh tail
         result.extend(tail_selected)
@@ -2497,6 +2574,26 @@ class LCMEngine(ContextEngine):
         # tool_call) or assistant tool_calls with missing results. Both violate
         # the OpenAI message format contract and cause 400 errors from providers.
         result = self._sanitize_tool_pairs(result)
+        if (
+            assembly_cap is not None
+            and anchor_part is not None
+            and count_messages_tokens(result) > assembly_cap
+        ):
+            trimmed_result: list[Dict[str, Any]] = []
+            for msg in result:
+                content = normalize_content_value(msg.get("content")) or ""
+                if _PRESERVED_OBJECTIVE_CONTEXT_PREFIX not in content:
+                    trimmed_result.append(msg)
+                    continue
+                parts = [
+                    part for part in content.split("\n\n---\n\n")
+                    if not part.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
+                ]
+                if parts:
+                    trimmed = msg.copy()
+                    trimmed["content"] = "\n\n---\n\n".join(parts)
+                    trimmed_result.append(trimmed)
+            result = self._sanitize_tool_pairs(trimmed_result)
 
         return result
 
