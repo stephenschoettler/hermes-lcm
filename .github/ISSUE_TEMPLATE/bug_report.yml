@@ -44,7 +44,7 @@ body:
     attributes:
       label: Version and branch
       description: hermes-lcm version, branch, commit, or release tag.
-      placeholder: v0.9.1, main at b686ce6, or commit SHA
+      placeholder: v0.9.2, main at d6d4e15, or commit SHA
     validations:
       required: true
 
