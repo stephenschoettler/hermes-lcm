@@ -7260,6 +7260,22 @@ class TestEngineTools:
         assert result["results"][0]["timestamp"] == 1000.0
         assert "older assistant" in result["results"][0]["snippet"]
 
+    def test_handle_grep_sanitizes_period_in_unquoted_fts_query(self, engine):
+        engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "release notes for v2.21 and api.v2"},
+        )
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "v2.21", "limit": 1},
+        ))
+
+        assert "error" not in result
+        assert result["total_results"] == 1
+        assert "release notes for" in result["results"][0]["snippet"]
+        assert "api" in result["results"][0]["snippet"]
+
     def test_handle_grep_rejects_naive_iso_time_filter(self, engine):
         result = json.loads(engine.handle_tool_call(
             "lcm_grep",

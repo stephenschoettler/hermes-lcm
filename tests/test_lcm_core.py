@@ -2010,6 +2010,11 @@ class TestDbBootstrapGuards:
     def test_sanitize_fts5_query_breaks_unbalanced_quotes_into_separate_terms(self):
         assert sanitize_fts5_query('foo"bar') == 'foo bar'
 
+    def test_sanitize_fts5_query_replaces_period_in_unquoted_terms(self):
+        assert sanitize_fts5_query("v2.21") == "v2 21"
+        assert sanitize_fts5_query("api.v2") == "api v2"
+        assert sanitize_fts5_query("hermes.lcm") == "hermes lcm"
+
     def test_ensure_external_content_fts_skips_rebuild_when_disk_is_low(self, tmp_path, monkeypatch):
         conn = sqlite3.connect(tmp_path / "low-disk.db")
         conn.executescript(
