@@ -24,8 +24,10 @@ from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
 from .externalize import (
     build_transcript_gc_placeholder,
-    maybe_externalize_tool_output,
+    extract_externalized_ref,
     find_externalized_payload_for_message,
+    load_externalized_payload,
+    maybe_externalize_tool_output,
     reassign_externalized_payloads,
 )
 from .extraction import (
@@ -33,6 +35,7 @@ from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
 )
+from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -1872,9 +1875,25 @@ class LCMEngine(ContextEngine):
             return str(tool_calls)
 
     def _message_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
+        content = normalize_content_value(msg.get("content")) or ""
+        # Durable rows may contain ingest-time externalization placeholders.
+        # Replay matching should not depend on the current write-time
+        # externalization flag: a restart with the knob toggled must still match
+        # raw live messages against already-externalized rows, and vice versa.
+        # Hydrating the stored placeholder for identity comparison is read-only
+        # and avoids creating payload files while reconciling.
+        ref = extract_externalized_ref(content)
+        if ref:
+            payload = load_externalized_payload(
+                ref,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if payload is not None and isinstance(payload.get("content"), str):
+                content = payload["content"]
         return (
             str(msg.get("role") or "unknown"),
-            normalize_content_value(msg.get("content")) or "",
+            content,
             str(msg.get("tool_call_id") or ""),
             self._stable_tool_calls_identity(msg.get("tool_calls")),
         )
@@ -2040,10 +2059,16 @@ class LCMEngine(ContextEngine):
             self._ingest_cursor = n
             return
 
-        estimates = [count_message_tokens(m) for m in new_messages]
+        protected_messages = protect_messages_for_ingest(
+            new_messages,
+            session_id=self._session_id,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        estimates = [count_message_tokens(m) for m in protected_messages]
         self._store.append_batch(
             self._session_id,
-            new_messages,
+            protected_messages,
             estimates,
             source=self._session_platform,
         )
@@ -2065,11 +2090,22 @@ class LCMEngine(ContextEngine):
         ids: list[int] = []
         store_idx = 0
         for msg in messages:
-            role = msg.get("role", "")
-            content = normalize_content_value(msg.get("content")) or ""
+            protected_msg = protect_message_for_ingest(
+                msg,
+                session_id=self._session_id,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            wanted_identity = self._message_replay_identity(msg)
+            role = protected_msg.get("role", "")
+            content = normalize_content_value(protected_msg.get("content")) or ""
             probe_idx = store_idx
             while probe_idx < len(candidates):
                 stored = candidates[probe_idx]
+                if self._message_replay_identity(stored) == wanted_identity:
+                    ids.append(stored["store_id"])
+                    store_idx = probe_idx + 1
+                    break
                 if stored.get("role", "") == role and (stored.get("content") or "") == content:
                     ids.append(stored["store_id"])
                     store_idx = probe_idx + 1
@@ -2120,6 +2156,18 @@ class LCMEngine(ContextEngine):
             tool_call_id = stored.get("tool_call_id", "") or ""
             if not content:
                 continue
+
+            ref = extract_externalized_ref(content)
+            if ref:
+                externalized = load_externalized_payload(
+                    ref,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
+                    placeholder = build_transcript_gc_placeholder(externalized)
+                    self._store.gc_externalized_tool_result(store_id, placeholder)
+                    continue
 
             lookup_candidates = []
             sanitized_content = sanitize_pre_compaction_content(content)

@@ -1,4 +1,10 @@
-"""Helpers for optional large tool-output externalization during pre-compaction serialization."""
+"""Helpers for optional large-payload externalization.
+
+Externalization started as a pre-compaction serializer guard for oversized tool
+outputs. The same durable payload format is also used by the ingest path so
+obvious oversized content can be kept out of SQLite/FTS while remaining
+recoverable through the LCM inspection and expansion tools.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 def _tool_call_stub(tool_call_id: str) -> str:
     return (tool_call_id or "tool-result").replace("/", "-").replace(":", "-")[:48]
+
+
+def _safe_stub(value: str, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", (value or "").strip())
+    return (text or fallback)[:48]
 
 
 def _content_digest_prefix(content: str) -> str:
@@ -44,6 +55,7 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
         "ref": path.name,
         "kind": payload.get("kind", "tool_result"),
         "tool_call_id": payload.get("tool_call_id", ""),
+        "role": payload.get("role", ""),
         "session_id": payload.get("session_id", ""),
         "content_chars": payload.get("content_chars", len(payload.get("content", ""))),
         "content_bytes": payload.get("content_bytes", len((payload.get("content", "") or "").encode("utf-8"))),
@@ -52,6 +64,13 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
 
 
 def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
+    kind = summary.get("kind", "tool_result") or "tool_result"
+    if kind != "tool_result":
+        return (
+            f"[Externalized payload: kind={kind}; role={summary.get('role') or '?'}; "
+            f"chars={summary.get('content_chars', 0)}; bytes={summary.get('content_bytes', 0)}; "
+            f"ref={summary.get('ref', '')}]"
+        )
     return (
         f"[Externalized tool output: tool_call_id={summary.get('tool_call_id') or '?'}; "
         f"chars={summary.get('content_chars', 0)}; bytes={summary.get('content_bytes', 0)}; ref={summary.get('ref', '')}]"
@@ -59,6 +78,12 @@ def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
 
 
 def build_transcript_gc_placeholder(summary: Dict[str, Any]) -> str:
+    kind = summary.get("kind", "tool_result") or "tool_result"
+    if kind != "tool_result":
+        return (
+            f"[GC'd externalized payload: kind={kind}; role={summary.get('role') or '?'}; "
+            f"chars={summary.get('content_chars', 0)}; ref={summary.get('ref', '')}]"
+        )
     return (
         f"[GC'd externalized tool output: tool_call_id={summary.get('tool_call_id') or '?'}; "
         f"chars={summary.get('content_chars', 0)}; ref={summary.get('ref', '')}]"
@@ -140,6 +165,8 @@ def find_externalized_payload_for_message(
     *,
     tool_call_id: str = "",
     session_id: str = "",
+    kind: str | None = "tool_result",
+    role: str = "",
     config,
     hermes_home: str = "",
 ) -> Dict[str, Any] | None:
@@ -150,17 +177,19 @@ def find_externalized_payload_for_message(
         return None
 
     digest_prefix = _content_digest_prefix(content)
-    tool_stub = _tool_call_stub(tool_call_id)
-    candidates = sorted(storage_dir.glob(f"*_{tool_stub}_{digest_prefix}_*.json"))
+    candidates = sorted(storage_dir.glob(f"*_{digest_prefix}_*.json"))
     fallback_match = None
     for path in candidates:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if payload.get("kind") != "tool_result":
+        if kind is not None and payload.get("kind", "tool_result") != kind:
             continue
         if (payload.get("tool_call_id") or "") != (tool_call_id or ""):
+            continue
+        payload_role = payload.get("role") or ""
+        if role and payload_role and payload_role != role:
             continue
         if payload.get("content") != content:
             continue
@@ -183,6 +212,34 @@ def maybe_externalize_tool_output(
     config,
     hermes_home: str = "",
 ) -> Dict[str, Any] | None:
+    return maybe_externalize_payload(
+        content,
+        kind="tool_result",
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+        role="tool",
+        config=config,
+        hermes_home=hermes_home,
+    )
+
+
+def maybe_externalize_payload(
+    content: str,
+    *,
+    kind: str = "raw_payload",
+    tool_call_id: str = "",
+    session_id: str = "",
+    role: str = "",
+    config,
+    hermes_home: str = "",
+) -> Dict[str, Any] | None:
+    """Externalize one oversized normalized payload if configured.
+
+    Returns a dict with a compact placeholder and the durable JSON payload path,
+    or ``None`` when disabled, below threshold, or storage is unavailable. On
+    storage failure callers should keep the original content so there is no
+    silent data loss.
+    """
     if not getattr(config, "large_output_externalization_enabled", False):
         return None
 
@@ -193,13 +250,15 @@ def maybe_externalize_tool_output(
     try:
         storage_dir = resolve_large_output_storage_dir(config, hermes_home=hermes_home)
     except OSError as exc:
-        logger.warning("Large tool-output externalization skipped (non-blocking): %s", exc)
+        logger.warning("Large payload externalization skipped (non-blocking): %s", exc)
         return None
 
     existing = find_externalized_payload_for_message(
         content,
         tool_call_id=tool_call_id,
         session_id=session_id,
+        kind=kind,
+        role=role,
         config=config,
         hermes_home=hermes_home,
     )
@@ -213,13 +272,21 @@ def maybe_externalize_tool_output(
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     unique_suffix = f"{time.time_ns():x}"
-    tool_stub = _tool_call_stub(tool_call_id)
-    filename = f"{timestamp}_{tool_stub}_{digest_prefix}_{unique_suffix}.json"
+    if kind == "tool_result":
+        # Keep the original filename shape for compatibility with existing
+        # externalized tool-output stores and tests.
+        filename = f"{timestamp}_{_tool_call_stub(tool_call_id)}_{digest_prefix}_{unique_suffix}.json"
+    else:
+        filename = (
+            f"{timestamp}_{_safe_stub(kind, 'payload')}_"
+            f"{_safe_stub(role, 'message')}_{digest_prefix}_{unique_suffix}.json"
+        )
     path = storage_dir / filename
 
     payload = {
-        "kind": "tool_result",
+        "kind": kind,
         "tool_call_id": tool_call_id,
+        "role": role,
         "session_id": session_id,
         "content": content,
         "content_chars": len(content),
@@ -229,12 +296,14 @@ def maybe_externalize_tool_output(
     try:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
-        logger.warning("Large tool-output externalization skipped (non-blocking): %s", exc)
+        logger.warning("Large payload externalization skipped (non-blocking): %s", exc)
         return None
 
     placeholder = _build_externalized_placeholder(
         {
+            "kind": kind,
             "tool_call_id": tool_call_id,
+            "role": role,
             "content_chars": payload["content_chars"],
             "content_bytes": payload["content_bytes"],
             "ref": path.name,

@@ -9827,7 +9827,10 @@ class TestEngineTools:
 
         engine.compress(messages)
 
-        assert engine._store.get(tool_store_id)["content"] == content
+        pinned_content = engine._store.get(tool_store_id)["content"]
+        assert pinned_content.startswith("[Externalized tool output:")
+        assert not pinned_content.startswith("[GC'd externalized tool output:")
+        assert content[:100] not in pinned_content
 
     def test_gc_helper_does_not_miss_tool_rows_when_chunk_contains_unmatched_synthetic_messages(self, tmp_path):
         config = LCMConfig(

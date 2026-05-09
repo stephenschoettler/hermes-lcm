@@ -2956,6 +2956,201 @@ class TestEscalation:
         assert "Additional instructions:" not in l2
 
 
+class TestIngestExternalization:
+    def _engine(self, tmp_path: Path):
+        from hermes_lcm.engine import LCMEngine
+
+        output_dir = tmp_path / "externalized"
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_externalization_path=str(output_dir),
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "ingest-session"
+        return engine, output_dir
+
+    def test_ingest_externalizes_large_tool_result_before_sqlite_and_preserves_tool_pair_replay(self, tmp_path):
+        import hermes_lcm.tools as lcm_tools
+
+        engine, output_dir = self._engine(tmp_path)
+        large_result = "TOOL_UNIQUE_NEEDLE:" + ("x" * 5000)
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Calling the tool",
+                "tool_calls": [
+                    {
+                        "id": "call_ingest_big",
+                        "type": "function",
+                        "function": {"name": "dump", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_ingest_big", "content": large_result},
+        ]
+
+        engine._ingest_messages(messages)
+
+        assert messages[1]["content"] == large_result
+        assert messages[0]["tool_calls"][0]["id"] == "call_ingest_big"
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert len(stored) == 2
+        assert stored[0]["tool_calls"] == messages[0]["tool_calls"]
+        assert stored[1]["role"] == "tool"
+        assert stored[1]["content"].startswith("[Externalized tool output:")
+        assert "TOOL_UNIQUE_NEEDLE" not in stored[1]["content"]
+        assert engine._store.search("TOOL_UNIQUE_NEEDLE", session_id="ingest-session") == []
+
+        payload_files = list(output_dir.glob("*.json"))
+        assert len(payload_files) == 1
+        payload = json.loads(payload_files[0].read_text())
+        assert payload["kind"] == "tool_result"
+        assert payload["tool_call_id"] == "call_ingest_big"
+        assert payload["content"] == large_result
+
+        by_store_id = json.loads(lcm_tools.lcm_expand({"store_id": stored[1]["store_id"]}, engine=engine))
+        ref = by_store_id["externalized_ref"]
+        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": ref, "max_tokens": 20_000}, engine=engine))
+        assert expanded["kind"] == "tool_result"
+        assert expanded["content"] == large_result
+
+        from hermes_lcm.engine import LCMEngine
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+        assert replay._store.get_session_count("ingest-session") == 2
+
+    def test_restart_replay_matches_externalized_rows_when_knob_is_disabled(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine, _output_dir = self._engine(tmp_path)
+        large_result = "TOGGLE_EXTERNALIZED_NEEDLE:" + ("x" * 5000)
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_toggle", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_toggle", "content": large_result},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        disabled_config = LCMConfig(
+            database_path=engine._config.database_path,
+            large_output_externalization_enabled=False,
+            large_output_externalization_threshold_chars=200,
+            large_output_externalization_path=engine._config.large_output_externalization_path,
+        )
+        replay = LCMEngine(config=disabled_config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 2
+        assert replay._ingest_cursor == len(messages)
+
+    def test_restart_replay_matches_raw_rows_when_knob_is_enabled_later(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        db_path = tmp_path / "toggle-raw.db"
+        output_dir = tmp_path / "externalized"
+        disabled_config = LCMConfig(
+            database_path=str(db_path),
+            large_output_externalization_enabled=False,
+            large_output_externalization_threshold_chars=200,
+            large_output_externalization_path=str(output_dir),
+        )
+        raw_engine = LCMEngine(config=disabled_config, hermes_home=str(tmp_path / "hermes"))
+        raw_engine._session_id = "ingest-session"
+        large_result = "TOGGLE_RAW_NEEDLE:" + ("y" * 5000)
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_raw", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_raw", "content": large_result},
+        ]
+        raw_engine._ingest_messages(messages)
+        assert raw_engine._store.get_session_count("ingest-session") == 2
+
+        enabled_config = LCMConfig(
+            database_path=str(db_path),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_externalization_path=str(output_dir),
+        )
+        replay = LCMEngine(config=enabled_config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 2
+        assert replay._ingest_cursor == len(messages)
+        assert not output_dir.exists()
+
+    def test_ingest_externalizes_structured_media_payload_before_fts(self, tmp_path):
+        import hermes_lcm.tools as lcm_tools
+
+        engine, output_dir = self._engine(tmp_path)
+        data_uri = "data:image/png;base64," + ("A" * 1000)
+        content = [
+            {"type": "text", "text": "Please inspect the screenshot."},
+            {"type": "image_url", "image_url": {"url": data_uri}},
+        ]
+
+        engine._ingest_messages([{"role": "user", "content": content}])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert len(stored) == 1
+        assert stored[0]["content"].startswith("[Externalized payload: kind=media_payload;")
+        assert "data:image/png;base64" not in stored[0]["content"]
+        assert engine._store.search("AAAA", session_id="ingest-session") == []
+
+        payload_path = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_path.read_text())
+        assert payload["kind"] == "media_payload"
+        assert "data:image/png;base64" in payload["content"]
+        expanded = json.loads(
+            lcm_tools.lcm_expand(
+                {"externalized_ref": payload_path.name, "max_tokens": 20_000},
+                engine=engine,
+            )
+        )
+        assert expanded["kind"] == "media_payload"
+        assert "Please inspect the screenshot." in expanded["content"]
+        assert "data:image/png;base64" in expanded["content"]
+
+    def test_ingest_externalizes_generic_oversized_raw_payload_fallback(self, tmp_path):
+        engine, output_dir = self._engine(tmp_path)
+        content = "GENERIC_RAW_NEEDLE:" + ("z" * 5000)
+
+        engine._ingest_messages([{"role": "user", "content": content}])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
+        assert "GENERIC_RAW_NEEDLE" not in stored[0]["content"]
+        assert engine._store.search("GENERIC_RAW_NEEDLE", session_id="ingest-session") == []
+
+        payload = json.loads(next(output_dir.glob("*.json")).read_text())
+        assert payload["kind"] == "raw_payload"
+        assert payload["role"] == "user"
+        assert payload["content"] == content
+
+    def test_engine_bootstrap_does_not_externalize_until_ingest_path_runs(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        output_dir = tmp_path / "externalized"
+        config = LCMConfig(
+            database_path=str(tmp_path / "empty.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=10,
+            large_output_externalization_path=str(output_dir),
+        )
+
+        LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+
+        assert not output_dir.exists()
+
+
 class TestExtraction:
     def test_serialize_messages_replaces_pure_inline_media_with_attachment_marker(self, tmp_path):
         from hermes_lcm.config import LCMConfig
