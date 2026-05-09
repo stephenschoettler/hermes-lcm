@@ -21,7 +21,7 @@ from agent.context_engine import ContextEngine
 
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
-from .escalation import summarize_with_escalation
+from .escalation import _strip_reasoning_blocks, summarize_with_escalation
 from .externalize import (
     build_transcript_gc_placeholder,
     extract_externalized_ref,
@@ -66,6 +66,17 @@ logger = logging.getLogger(__name__)
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _PLUGIN_METADATA: dict[str, str] | None = None
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+_VISIBLE_TEXT_PART_TYPES = {"text", "input_text", "output_text"}
+_INTERNAL_ASSISTANT_PART_TYPES = {
+    "analysis",
+    "chain_of_thought",
+    "internal",
+    "reasoning",
+    "redacted_thinking",
+    "scratchpad",
+    "thought",
+    "thinking",
+}
 
 
 def _strip_metadata_scalar(value: str) -> str:
@@ -752,7 +763,14 @@ class LCMEngine(ContextEngine):
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
                 )
-            return messages
+            sanitized_messages = self._sanitize_active_context_messages(messages)
+            if len(sanitized_messages) != len(messages):
+                # _ingest_messages() already advanced the cursor to the original
+                # active-context length. If the host continues from the shorter
+                # sanitized context, keeping the old cursor would make the next
+                # appended messages look already ingested.
+                self._ingest_cursor = len(sanitized_messages)
+            return sanitized_messages
 
         # Step 6: Check if condensation is needed
         self._maybe_condense(
@@ -805,10 +823,10 @@ class LCMEngine(ContextEngine):
             ", forced overflow recovery" if force_overflow else "",
         )
 
-        # ── Tool-pair guardrail (same as _assemble_context) ──
+        # ── Active-context cleanup / tool-pair guardrail (same as _assemble_context) ──
         # compress() output is consumed directly by the main loop in some
         # edge cases (e.g. forced overflow recovery bypassing _assemble_context).
-        compressed = self._sanitize_tool_pairs(compressed)
+        compressed = self._sanitize_active_context_messages(compressed)
 
         return compressed
 
@@ -2452,6 +2470,85 @@ class LCMEngine(ContextEngine):
 
     # -- Internal: tool-pair sanitization ------------------------------------
 
+    @staticmethod
+    def _structured_part_text(part: Dict[str, Any]) -> str:
+        for key in ("text", "content", "value"):
+            value = part.get(key)
+            if isinstance(value, str):
+                return value
+            if isinstance(value, dict):
+                nested = value.get("value")
+                if isinstance(nested, str):
+                    return nested
+                nested = value.get("content")
+                if isinstance(nested, str):
+                    return nested
+        return ""
+
+    @classmethod
+    def _structured_part_has_visible_assistant_content(cls, part: Any) -> bool:
+        if part is None:
+            return False
+        if isinstance(part, str):
+            return bool(_strip_reasoning_blocks(part).strip())
+        if not isinstance(part, dict):
+            return bool(str(part).strip())
+
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
+            return False
+        if part_type in _VISIBLE_TEXT_PART_TYPES:
+            return bool(_strip_reasoning_blocks(cls._structured_part_text(part)).strip())
+
+        # Unknown non-internal content blocks may be visible (for example
+        # images/audio/annotations in provider-specific formats).  Preserve
+        # them rather than risk dropping a legitimate assistant turn.
+        return True
+
+    @classmethod
+    def _assistant_message_has_visible_content(cls, msg: Dict[str, Any]) -> bool:
+        content = msg.get("content")
+        if content is None:
+            return False
+        if isinstance(content, str):
+            return bool(_strip_reasoning_blocks(content).strip())
+        if isinstance(content, list):
+            return any(cls._structured_part_has_visible_assistant_content(part) for part in content)
+        if isinstance(content, dict):
+            return cls._structured_part_has_visible_assistant_content(content)
+        return bool(str(content).strip())
+
+    @classmethod
+    def _should_drop_active_assistant_message(cls, msg: Dict[str, Any]) -> bool:
+        if msg.get("role") != "assistant":
+            return False
+        if msg.get("tool_calls"):
+            return False
+        return not cls._assistant_message_has_visible_content(msg)
+
+    def _sanitize_active_context_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Drop unsafe assistant-only noise, then repair tool sequencing.
+
+        This is intentionally active-context-only: callers pass the selected
+        provider replay context, and this helper never mutates stored rows,
+        source mappings, or DAG nodes.
+        """
+        cleaned: list[Dict[str, Any]] = []
+        dropped_assistant_messages = 0
+        for msg in messages:
+            if self._should_drop_active_assistant_message(msg):
+                dropped_assistant_messages += 1
+                continue
+            cleaned.append(msg)
+
+        if dropped_assistant_messages:
+            logger.info(
+                "LCM active-context cleanup: dropped %d assistant message(s) with no visible content",
+                dropped_assistant_messages,
+            )
+
+        return self._sanitize_tool_pairs(cleaned)
+
     def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Return provider-safe active-context tool-call/result sequencing.
 
@@ -2820,12 +2917,10 @@ class LCMEngine(ContextEngine):
         # Fresh tail
         result.extend(tail_selected)
 
-        # ── Tool-pair guardrail ──
-        # Regression fix: after LCM compression, the assembled active context
-        # may contain orphan tool results (call_id with no matching assistant
-        # tool_call) or assistant tool_calls with missing results. Both violate
-        # the OpenAI message format contract and cause 400 errors from providers.
-        result = self._sanitize_tool_pairs(result)
+        # ── Active-context cleanup / tool-pair guardrail ──
+        # Drop assistant turns that carry only blank/internal structured content,
+        # then ensure provider-valid tool-call/result sequencing.
+        result = self._sanitize_active_context_messages(result)
         if (
             assembly_cap is not None
             and anchor_part is not None
@@ -2845,7 +2940,7 @@ class LCMEngine(ContextEngine):
                     trimmed = msg.copy()
                     trimmed["content"] = "\n\n---\n\n".join(parts)
                     trimmed_result.append(trimmed)
-            result = self._sanitize_tool_pairs(trimmed_result)
+            result = self._sanitize_active_context_messages(trimmed_result)
 
         return result
 
@@ -2987,7 +3082,7 @@ class LCMEngine(ContextEngine):
             include_lcm_note=False,
         )
         if len(candidate) == 1 and tail_messages:
-            return self._sanitize_tool_pairs([system_msg, tail_messages[-1]])
+            return self._sanitize_active_context_messages([system_msg, tail_messages[-1]])
         return candidate
 
     @staticmethod

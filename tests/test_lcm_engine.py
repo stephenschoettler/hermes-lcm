@@ -7705,6 +7705,149 @@ class TestAssemblyToolPairGuardrail:
         ]
         assert len(stub_ids) >= 1, f"No stub result for assistant tool_call: {stub_ids}"
 
+    def test_assemble_drops_structured_blank_and_thinking_only_assistant_messages(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_blank_thinking_cleanup.db")
+        sys_msg = {"role": "system", "content": "sys"}
+        blank_content = [{"type": "text", "text": ""}]
+        thinking_content = [{"type": "thinking", "thinking": "private chain of thought"}]
+        visible_content = [{"type": "text", "text": "Visible answer"}]
+        tail_messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": blank_content},
+            {"role": "assistant", "content": thinking_content},
+            {"role": "assistant", "content": visible_content},
+        ]
+
+        result = instance._assemble_context(sys_msg, tail_messages)
+
+        assert {"role": "assistant", "content": blank_content} not in result
+        assert {"role": "assistant", "content": thinking_content} not in result
+        assert {"role": "assistant", "content": visible_content} in result
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_assemble_cleanup_preserves_valid_tool_call_adjacency(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_tool_call_cleanup_preserve.db")
+        sys_msg = {"role": "system", "content": "sys"}
+        tool_call_msg = {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "deciding which tool to call"}],
+            "tool_calls": [{"id": "call_keep", "function": {"name": "terminal", "arguments": "{}"}}],
+        }
+        tool_result_msg = {"role": "tool", "tool_call_id": "call_keep", "content": "tool output"}
+        tail_messages = [
+            {"role": "user", "content": "run it"},
+            tool_call_msg,
+            tool_result_msg,
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        result = instance._assemble_context(sys_msg, tail_messages)
+
+        assert tool_call_msg in result
+        assert tool_result_msg in result
+        call_index = result.index(tool_call_msg)
+        assert result[call_index + 1] == tool_result_msg
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_assemble_cleanup_repairs_tool_sequence_after_dropping_blank_turn(self, tmp_path):
+        instance = self._make_engine(tmp_path, "lcm_tool_call_cleanup_repair.db")
+        sys_msg = {"role": "system", "content": "sys"}
+        tool_call_msg = {
+            "role": "assistant",
+            "tool_calls": [{"id": "call_repair", "function": {"name": "terminal", "arguments": "{}"}}],
+        }
+        blank_content = [{"type": "text", "text": ""}]
+        real_tool_result = {"role": "tool", "tool_call_id": "call_repair", "content": "real output"}
+        tail_messages = [
+            {"role": "user", "content": "run it"},
+            tool_call_msg,
+            {"role": "assistant", "content": blank_content},
+            real_tool_result,
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        result = instance._assemble_context(sys_msg, tail_messages)
+
+        assert {"role": "assistant", "content": blank_content} not in result
+        call_index = result.index(tool_call_msg)
+        assert result[call_index + 1] == real_tool_result
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_compress_drops_unsafe_assistant_content_without_mutating_store(self, tmp_path, monkeypatch):
+        def mock_summary(**kwargs):
+            return "Leaf summary.\nExpand for details about: cleanup", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+        config = LCMConfig(
+            fresh_tail_count=4,
+            database_path=str(tmp_path / "lcm_compress_cleanup.db"),
+            leaf_chunk_tokens=80,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "compress-cleanup-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+        instance.threshold_tokens = 1
+
+        blank_content = [{"type": "text", "text": ""}]
+        thinking_content = [{"type": "reasoning", "text": "internal reasoning only"}]
+        visible_content = [{"type": "text", "text": "Visible final answer"}]
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old question " + "x" * 200},
+            {"role": "assistant", "content": "old answer " + "y" * 200},
+            {"role": "user", "content": "current question"},
+            {"role": "assistant", "content": blank_content},
+            {"role": "assistant", "content": thinking_content},
+            {"role": "assistant", "content": visible_content},
+        ]
+
+        result = instance.compress(messages)
+
+        assert {"role": "assistant", "content": blank_content} not in result
+        assert {"role": "assistant", "content": thinking_content} not in result
+        assert {"role": "assistant", "content": visible_content} in result
+        assert instance._store.get_session_count("compress-cleanup-test") == len(messages)
+        stored_contents = [
+            row.get("content")
+            for row in instance._store.get_range("compress-cleanup-test", limit=20)
+        ]
+        assert json.dumps(blank_content, ensure_ascii=False, sort_keys=True) in stored_contents
+        assert json.dumps(thinking_content, ensure_ascii=False, sort_keys=True) in stored_contents
+        self._assert_provider_tool_sequence_valid(result)
+
+    def test_no_compaction_cleanup_resets_cursor_for_next_turn(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_no_compaction_cursor_cleanup.db"),
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "cursor-cleanup-test"
+        instance.context_length = 200000
+        instance.threshold_tokens = 190000
+
+        blank_content = [{"type": "text", "text": ""}]
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": blank_content},
+            {"role": "assistant", "content": "visible answer"},
+        ]
+
+        sanitized = instance.compress(messages)
+        assert len(sanitized) == len(messages) - 1
+        assert instance._ingest_cursor == len(sanitized)
+        assert instance._store.get_session_count("cursor-cleanup-test") == len(messages)
+
+        next_messages = sanitized + [{"role": "user", "content": "new follow-up"}]
+        instance.compress(next_messages)
+
+        rows = instance._store.get_session_messages("cursor-cleanup-test")
+        assert len(rows) == len(messages) + 1
+        assert rows[-1]["content"] == "new follow-up"
+
     def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
         """Full compress() output must not contain orphan tool results
         and must include stubs for missing results."""
