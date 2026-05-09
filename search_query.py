@@ -27,7 +27,7 @@ _RISKY_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9][\-:/][A-Za-z0-9]")
 _SPLIT_PUNCT_RE = re.compile(r"[-:/]+")
 _STRIP_EDGE_PUNCT = "\"'()[]{}.,;"
 # Characters that are special in FTS5 query syntax
-_FTS5_SPECIAL_CHARS = frozenset('"()*^-:{}')
+_FTS5_SPECIAL_CHARS = frozenset('"()*^-:{.})')
 
 
 def _sanitize_unquoted_fts5_fragment(text: str) -> str:
