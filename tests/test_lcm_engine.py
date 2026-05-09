@@ -2817,6 +2817,58 @@ class TestEngineCompress:
         assert depth1 == []
         assert engine.get_status()["condensation_suppressed_reason"] == "cache_friendly_single_group"
 
+    def test_critical_budget_pressure_bypasses_cache_friendly_single_group_suppression(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=50,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=120,
+            condensation_fanin=2,
+            critical_budget_pressure_ratio=0.90,
+            database_path=str(tmp_path / "lcm_cache_friendly_critical.db"),
+        )
+        config.cache_friendly_condensation_enabled = True
+        config.cache_friendly_min_debt_groups = 2
+        engine = LCMEngine(config=config)
+        engine._session_id = "test-session"
+        engine.context_length = 1000
+        engine.threshold_tokens = int(1000 * config.context_threshold)
+
+        engine._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary="Earlier leaf",
+            token_count=40,
+            source_token_count=80,
+            source_ids=[1],
+            source_type="messages",
+            created_at=time.time() - 10,
+            expand_hint="earlier leaf",
+        ))
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(6):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({
+                "role": role,
+                "content": f"Message {i}: " + ("chunk " * 35),
+            })
+
+        import hermes_lcm.engine as engine_module
+
+        def mock_summary(**kwargs):
+            if kwargs["depth"] == 0:
+                return "Leaf summary.\nExpand for details about: oldest raw chunk", 1
+            return "Condensed summary.\nExpand for details about: d0 summaries", 1
+
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", mock_summary)
+
+        engine.compress(messages, current_tokens=900)
+
+        depth1 = engine._dag.get_session_nodes("test-session", depth=1)
+        assert len(depth1) == 1
+        assert engine.get_status()["condensation_suppressed_reason"] == ""
+
     def test_cache_friendly_gating_allows_condensation_when_debt_reaches_two_groups(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
@@ -6468,6 +6520,94 @@ class TestDeferredMaintenanceDebt:
         tool_status = json.loads(engine.handle_tool_call("lcm_status", {}))
         assert tool_status["lifecycle"]["debt_kind"] == "raw_backlog"
         assert tool_status["config"]["deferred_maintenance_enabled"] is True
+        assert tool_status["config"]["critical_budget_pressure_ratio"] == 0.0
+
+    def test_critical_budget_pressure_drains_under_threshold_deferred_debt(self, engine, monkeypatch):
+        engine._config.leaf_chunk_tokens = 10_000
+        engine._config.fresh_tail_count = 1
+        engine._config.deferred_maintenance_enabled = True
+        engine._config.critical_budget_pressure_ratio = 0.90
+        engine.on_session_start("critical-debt-session", platform="cli", context_length=100)
+        engine._lifecycle.record_debt(engine._conversation_id, kind="raw_backlog", size_estimate=500)
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "small raw backlog"},
+            {"role": "assistant", "content": "small raw answer"},
+            {"role": "user", "content": "fresh tail"},
+        ]
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", lambda **kwargs: ("critical debt summary", 1))
+        monkeypatch.setattr(
+            engine,
+            "_assemble_context",
+            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+        )
+
+        compressed = engine.compress(messages, current_tokens=90)
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+
+        assert state is not None
+        assert state.debt_kind is None
+        assert state.debt_size_estimate == 0
+        assert len(engine._dag.get_session_nodes("critical-debt-session", depth=0)) == 1
+        assert compressed == [messages[0], messages[-1]]
+
+    def test_critical_budget_pressure_continues_dynamic_catchup_after_first_pass(self, engine, monkeypatch):
+        engine._config.leaf_chunk_tokens = 50
+        engine._config.dynamic_leaf_chunk_enabled = True
+        engine._config.dynamic_leaf_chunk_max = 50
+        engine._config.fresh_tail_count = 1
+        engine._config.deferred_maintenance_enabled = True
+        engine._config.deferred_maintenance_max_passes = 4
+        engine._config.critical_budget_pressure_ratio = 0.90
+        engine.on_session_start("critical-dynamic-debt-session", platform="cli", context_length=100)
+        engine._lifecycle.record_debt(engine._conversation_id, kind="raw_backlog", size_estimate=500)
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "first " + ("chunk " * 20)},
+            {"role": "assistant", "content": "second " + ("chunk " * 20)},
+            {"role": "user", "content": "third " + ("chunk " * 20)},
+            {"role": "assistant", "content": "fresh tail"},
+        ]
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", lambda **kwargs: ("critical dynamic summary", 1))
+        monkeypatch.setattr(
+            engine,
+            "_assemble_context",
+            lambda system_msg, tail_messages, assembly_cap_override=None, include_lcm_note=True: [system_msg, *tail_messages],
+        )
+
+        engine.compress(messages, current_tokens=90)
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+
+        assert len(engine._dag.get_session_nodes("critical-dynamic-debt-session", depth=0)) >= 2
+        assert state is not None
+        assert state.debt_kind is None
+        assert state.debt_size_estimate == 0
+
+    def test_critical_budget_pressure_needs_context_telemetry_for_under_threshold_debt(self, engine):
+        engine._config.leaf_chunk_tokens = 10_000
+        engine._config.fresh_tail_count = 1
+        engine._config.deferred_maintenance_enabled = True
+        engine._config.critical_budget_pressure_ratio = 0.90
+        engine.on_session_start("missing-telemetry-debt-session", platform="cli", context_length=0)
+        engine._lifecycle.record_debt(engine._conversation_id, kind="raw_backlog", size_estimate=500)
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "small raw backlog"},
+            {"role": "assistant", "content": "small raw answer"},
+            {"role": "user", "content": "fresh tail"},
+        ]
+
+        assert engine._should_run_deferred_maintenance(messages, observed_tokens=90) is False
+        engine._refresh_raw_backlog_debt(messages, observed_tokens=90)
+        state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+        assert state is not None
+        assert state.debt_kind is None
+        assert state.debt_size_estimate == 0
 
 
 class TestUnlimitedCondensationDepth:

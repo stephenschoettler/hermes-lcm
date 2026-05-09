@@ -111,6 +111,9 @@ class LCMConfig:
     # Maximum extra leaf passes a debt-triggered later turn may spend on
     # catch-up work.
     deferred_maintenance_max_passes: int = 4
+    # Disabled at 0.0. When set, only bypass cache-friendly/deferred polite
+    # gates once prompt pressure reaches this fraction of the context window.
+    critical_budget_pressure_ratio: float = 0.0
 
     # -- Escalation ---
     # L2 bullet budget as fraction of L1
@@ -215,6 +218,10 @@ class LCMConfig:
         c.deferred_maintenance_max_passes = _int(
             "LCM_DEFERRED_MAINTENANCE_MAX_PASSES",
             c.deferred_maintenance_max_passes,
+        )
+        c.critical_budget_pressure_ratio = _float(
+            "LCM_CRITICAL_BUDGET_PRESSURE_RATIO",
+            c.critical_budget_pressure_ratio,
         )
         c.l2_budget_ratio = _float("LCM_L2_BUDGET_RATIO", c.l2_budget_ratio)
         c.l3_truncate_tokens = _int("LCM_L3_TRUNCATE_TOKENS", c.l3_truncate_tokens)

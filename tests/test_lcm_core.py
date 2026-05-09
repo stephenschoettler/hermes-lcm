@@ -302,6 +302,7 @@ class TestConfig:
         assert c.large_output_transcript_gc_enabled is False
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
+        assert c.critical_budget_pressure_ratio == 0.0
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
         assert c.ignore_message_patterns == []
@@ -331,6 +332,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_MAX", "64000")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", "1")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
+        monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "0.92")
         monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Write as a neutral documenter.")
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("LCM_EXTRACTION_MODEL", "openai/gpt-5.4-mini")
@@ -359,6 +361,7 @@ class TestConfig:
         assert c.dynamic_leaf_chunk_max == 64_000
         assert c.cache_friendly_condensation_enabled is True
         assert c.cache_friendly_min_debt_groups == 3
+        assert c.critical_budget_pressure_ratio == 0.92
         assert c.custom_instructions == "Write as a neutral documenter."
         assert c.extraction_enabled is True
         assert c.extraction_model == "openai/gpt-5.4-mini"
@@ -376,6 +379,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_MAX_ASSEMBLY_TOKENS", "nope")
         monkeypatch.setenv("LCM_RESERVE_TOKENS_FLOOR", "still-nope")
         monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "nah")
+        monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "invalid")
 
         c = LCMConfig.from_env()
 
@@ -385,6 +389,7 @@ class TestConfig:
         assert c.max_assembly_tokens == 0
         assert c.reserve_tokens_floor == 0
         assert c.expansion_context_tokens == 32_000
+        assert c.critical_budget_pressure_ratio == 0.0
 
     def test_from_env_reads_hermes_compression_threshold_when_lcm_env_missing(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"

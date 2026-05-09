@@ -196,6 +196,7 @@ environment variables:
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized tool outputs in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for tool output text |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Rewrite already-externalized summarized tool rows to compact placeholders |
+| `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | `0.0` | Disabled at `0.0`; when set, permits critical-pressure bypasses for bounded deferred catch-up and cache-friendly follow-on condensation only |
 | `LCM_SUMMARY_MODEL` | auxiliary | Override summarization model |
 | `LCM_EXPANSION_MODEL` | summary model / auxiliary | Override `lcm_expand_query` synthesis model |
 | `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Context budget used by the auxiliary LLM for `lcm_expand_query` |
@@ -206,6 +207,23 @@ environment variables:
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
 
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
+
+### Cache policy boundary
+
+LCM is **cache-friendly**, not fully cache-aware. It may avoid some follow-on
+condensation churn, but current cache usage counters are retrospective status
+data only; they do not tell the plugin whether the next prompt mutation will
+break a hot provider cache. For that reason LCM does **not** implement
+provider/model TTL heuristics, provider-family detection, cache-touch/cache-break
+tracking, TTL delays, or full cache-aware deferred compaction.
+
+`LCM_CRITICAL_BUDGET_PRESSURE_RATIO` is a narrow escape hatch. It is disabled by
+default (`0.0`). When set, LCM compares prompt pressure against the context
+window and only at or above that ratio may bypass the existing polite gates for
+bounded deferred maintenance catch-up and cache-friendly follow-on condensation.
+Below that pressure, simpler existing behavior is preserved. Revisit full
+cache-aware deferred compaction only after Hermes core exposes reliable cache
+state / cache-break signals.
 
 ### Threshold ownership
 

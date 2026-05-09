@@ -460,8 +460,8 @@ class LCMEngine(ContextEngine):
             return True
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             return True
-        self._refresh_raw_backlog_debt(messages)
-        return self._should_run_deferred_maintenance(messages)
+        self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
+        return self._should_run_deferred_maintenance(messages, observed_tokens=rough)
 
     def _working_leaf_chunk_tokens(self, raw_tokens_outside_tail: int) -> int:
         base = max(1, self._config.leaf_chunk_tokens)
@@ -619,8 +619,16 @@ class LCMEngine(ContextEngine):
         working_messages = list(messages)
         leaf_compacted_this_turn = False
         leaf_passes = 0
+        critical_budget_pressure = self._critical_budget_pressure_reached(
+            observed_tokens=observed_prompt_tokens,
+            messages=working_messages,
+        )
         deferred_maintenance_active = (
-            not force_overflow and self._should_run_deferred_maintenance(working_messages)
+            not force_overflow
+            and self._should_run_deferred_maintenance(
+                working_messages,
+                observed_tokens=observed_prompt_tokens,
+            )
         )
         if deferred_maintenance_active:
             self._lifecycle.record_maintenance_attempt(self._conversation_id)
@@ -654,14 +662,16 @@ class LCMEngine(ContextEngine):
             if self._config.dynamic_leaf_chunk_enabled:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
-                    break
+                    if not (deferred_maintenance_active and critical_budget_pressure):
+                        break
                 if force_overflow:
                     to_compact = candidate_raw
                 else:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
-                    break
+                    if not (deferred_maintenance_active and critical_budget_pressure):
+                        break
                 to_compact = candidate_raw
 
             if not to_compact:
@@ -716,10 +726,14 @@ class LCMEngine(ContextEngine):
                 remaining_raw_tokens = count_messages_tokens(remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
                 if remaining_raw_tokens < remaining_threshold:
-                    break
+                    if not (deferred_maintenance_active and critical_budget_pressure):
+                        break
 
         if not leaf_compacted_this_turn:
-            self._refresh_raw_backlog_debt(working_messages)
+            self._refresh_raw_backlog_debt(
+                working_messages,
+                observed_tokens=observed_prompt_tokens,
+            )
             if force_overflow and len(messages) >= 1:
                 compressed = self._assemble_overflow_recovery_context(
                     messages[0],
@@ -738,10 +752,14 @@ class LCMEngine(ContextEngine):
             focus_topic=focus_topic,
             leaf_compacted_this_turn=True,
             force_overflow=force_overflow,
+            critical_budget_pressure=critical_budget_pressure,
         )
 
         # Step 7: Assemble new active context
-        self._refresh_raw_backlog_debt(working_messages)
+        self._refresh_raw_backlog_debt(
+            working_messages,
+            observed_tokens=observed_prompt_tokens,
+        )
         self._pending_context_anchor_messages = messages[1:]
         try:
             compressed = self._assemble_context(
@@ -1175,20 +1193,77 @@ class LCMEngine(ContextEngine):
         state = self._lifecycle.get_by_conversation(self._conversation_id)
         return bool(state and state.debt_kind == "raw_backlog" and state.debt_size_estimate > 0)
 
-    def _should_run_deferred_maintenance(self, messages: List[Dict[str, Any]]) -> bool:
+    def _budget_pressure_ratio(
+        self,
+        *,
+        observed_tokens: int | None = None,
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> float | None:
+        if self.context_length <= 0:
+            return None
+        token_count: int | None = None
+        if observed_tokens is not None and observed_tokens > 0:
+            token_count = observed_tokens
+        elif messages is not None:
+            token_count = count_messages_tokens(messages)
+        elif self.last_prompt_tokens > 0:
+            token_count = self.last_prompt_tokens
+        if token_count is None or token_count <= 0:
+            return None
+        return token_count / self.context_length
+
+    def _critical_budget_pressure_reached(
+        self,
+        *,
+        observed_tokens: int | None = None,
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> bool:
+        threshold = self._config.critical_budget_pressure_ratio
+        if threshold <= 0:
+            return False
+        pressure = self._budget_pressure_ratio(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        )
+        return pressure is not None and pressure >= threshold
+
+    def _should_run_deferred_maintenance(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        observed_tokens: int | None = None,
+    ) -> bool:
         if not self._has_raw_backlog_debt():
             return False
         raw_tokens = self._raw_backlog_tokens(messages)
         if raw_tokens <= 0:
             return False
-        return raw_tokens >= self._raw_backlog_threshold(raw_tokens)
+        if raw_tokens >= self._raw_backlog_threshold(raw_tokens):
+            return True
+        return self._critical_budget_pressure_reached(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        )
 
-    def _refresh_raw_backlog_debt(self, messages: List[Dict[str, Any]]) -> None:
+    def _refresh_raw_backlog_debt(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        observed_tokens: int | None = None,
+    ) -> None:
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
             return
         raw_tokens = self._raw_backlog_tokens(messages)
         threshold = self._raw_backlog_threshold(raw_tokens) if raw_tokens > 0 else 0
-        if raw_tokens > 0 and raw_tokens >= threshold:
+        keep_under_critical_pressure = (
+            raw_tokens > 0
+            and self._has_raw_backlog_debt()
+            and self._critical_budget_pressure_reached(
+                observed_tokens=observed_tokens,
+                messages=messages,
+            )
+        )
+        if raw_tokens > 0 and (raw_tokens >= threshold or keep_under_critical_pressure):
             self._lifecycle.record_debt(
                 self._conversation_id,
                 kind="raw_backlog",
@@ -2284,12 +2359,15 @@ class LCMEngine(ContextEngine):
         uncondensed_count: int,
         leaf_compacted_this_turn: bool,
         force_overflow: bool,
+        critical_budget_pressure: bool = False,
     ) -> tuple[bool, str]:
         if not leaf_compacted_this_turn:
             return True, ""
         if not self._config.cache_friendly_condensation_enabled:
             return True, ""
         if force_overflow:
+            return True, ""
+        if critical_budget_pressure:
             return True, ""
 
         fanin = max(1, self._config.condensation_fanin)
@@ -2306,6 +2384,7 @@ class LCMEngine(ContextEngine):
         *,
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
+        critical_budget_pressure: bool = False,
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
@@ -2337,6 +2416,7 @@ class LCMEngine(ContextEngine):
                 uncondensed_count=len(uncondensed),
                 leaf_compacted_this_turn=leaf_compacted_this_turn,
                 force_overflow=force_overflow,
+                critical_budget_pressure=critical_budget_pressure,
             )
             if not allow_condense:
                 suppression_reason = reason or suppression_reason

@@ -1480,6 +1480,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "cache_friendly_min_debt_groups": engine._config.cache_friendly_min_debt_groups,
             "deferred_maintenance_enabled": engine._config.deferred_maintenance_enabled,
             "deferred_maintenance_max_passes": engine._config.deferred_maintenance_max_passes,
+            "critical_budget_pressure_ratio": engine._config.critical_budget_pressure_ratio,
             "context_threshold": engine._config.context_threshold,
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
