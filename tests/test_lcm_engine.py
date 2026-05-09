@@ -7299,6 +7299,130 @@ class TestEngineTools:
         assert result["results"][0]["role"] == "assistant"
         assert "target assistant" in result["results"][0]["snippet"]
 
+    def test_handle_grep_like_fallback_role_filter_preserves_recency_before_limit(self, engine):
+        for idx in range(220):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "assistant", "content": f"docker-compose older assistant {idx}"},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (1000.0 + idx, store_id),
+            )
+        newest_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "docker-compose newest assistant"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (5000.0, newest_id),
+        )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "docker-compose", "role": "assistant", "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["role"] == "assistant"
+        assert len(result["results"]) == 1
+        assert result["results"][0]["role"] == "assistant"
+        assert result["results"][0]["store_id"] == newest_id
+        assert "newest assistant" in result["results"][0]["snippet"]
+
+    def test_handle_grep_like_fallback_recency_sorts_tied_cap_by_score(self, engine):
+        best_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "foo/bar best assistant"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (5000.0, best_id),
+        )
+        for idx in range(600):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "assistant", "content": f"foo low assistant {idx}"},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (5000.0, store_id),
+            )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "foo/bar", "role": "assistant", "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["role"] == "assistant"
+        assert len(result["results"]) == 1
+        assert result["results"][0]["role"] == "assistant"
+        assert result["results"][0]["store_id"] == best_id
+        assert "best assistant" in result["results"][0]["snippet"]
+
+    def test_handle_grep_like_fallback_recency_sorts_tied_cap_by_directness(self, engine):
+        best_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "foo/bar baz direct assistant"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (5000.0, best_id),
+        )
+        for idx in range(600):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "assistant", "content": f"foo/bar baz foo foo foo foo low assistant {idx}"},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (5000.0, store_id),
+            )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "foo/bar baz", "role": "assistant", "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["role"] == "assistant"
+        assert len(result["results"]) == 1
+        assert result["results"][0]["role"] == "assistant"
+        assert result["results"][0]["store_id"] == best_id
+        assert "direct assistant" in result["results"][0]["snippet"]
+
+    def test_handle_grep_like_fallback_recency_extends_tied_cap_for_json_penalty(self, engine):
+        best_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "content": "foo/bar direct tool"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (5000.0, best_id),
+        )
+        for idx in range(600):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "tool", "content": f'{{"message":"foo/bar low tool {idx}"}}'},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (5000.0, store_id),
+            )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "foo/bar", "role": "tool", "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["role"] == "tool"
+        assert len(result["results"]) == 1
+        assert result["results"][0]["role"] == "tool"
+        assert result["results"][0]["store_id"] == best_id
+        assert "direct tool" in result["results"][0]["snippet"]
+
     def test_handle_grep_like_fallback_applies_time_filter_before_limit(self, engine):
         older_id = engine._store.append(
             "test-session",
