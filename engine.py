@@ -1421,6 +1421,12 @@ class LCMEngine(ContextEngine):
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
                     self._ingest_messages(messages)
+                except KeyboardInterrupt:
+                    logger.warning(
+                        "LCM session-end raw-message ingest interrupted; "
+                        "final messages may be absent from the plugin-local store"
+                    )
+                    return
                 except Exception as exc:
                     if _is_sqlite_locked_error(exc):
                         logger.warning(
@@ -1437,6 +1443,12 @@ class LCMEngine(ContextEngine):
                         session_id,
                         frontier_store_id=self._last_compacted_store_id,
                     )
+                except KeyboardInterrupt:
+                    logger.warning(
+                        "LCM session-end lifecycle finalization interrupted; "
+                        "raw messages may be ingested but lifecycle state may be finalized later"
+                    )
+                    return
                 except Exception as exc:
                     if _is_sqlite_locked_error(exc):
                         logger.warning(
@@ -1446,6 +1458,9 @@ class LCMEngine(ContextEngine):
                         )
                         return
                     raise
+        except KeyboardInterrupt:
+            logger.warning("LCM session-end ingest/finalize interrupted before bounded flush completed")
+            return
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
                 logger.warning(

@@ -3073,6 +3073,19 @@ class TestSessionRollover:
 
         assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
 
+    def test_on_session_end_fails_open_when_ingest_is_interrupted(self, engine, monkeypatch, caplog):
+        engine.on_session_start("test-session", platform="discord")
+
+        def interrupted_ingest(messages):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(engine, "_ingest_messages", interrupted_ingest)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
+        assert "LCM session-end raw-message ingest interrupted" in caplog.text
+
     def test_on_session_end_fails_open_when_finalize_store_is_locked(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
 
@@ -3085,6 +3098,19 @@ class TestSessionRollover:
             engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
 
         assert "LCM session-end lifecycle finalization skipped due to SQLite lock" in caplog.text
+
+    def test_on_session_end_fails_open_when_finalize_is_interrupted(self, engine, monkeypatch, caplog):
+        engine.on_session_start("test-session", platform="discord")
+
+        def interrupted_finalize(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(engine._lifecycle, "finalize_session", interrupted_finalize)
+
+        with caplog.at_level(logging.WARNING):
+            engine.on_session_end("test-session", [{"role": "user", "content": "hello"}])
+
+        assert "LCM session-end lifecycle finalization interrupted" in caplog.text
 
     def test_on_session_end_returns_quickly_under_real_sqlite_writer_lock(self, engine, caplog):
         engine.on_session_start("test-session", platform="discord")
