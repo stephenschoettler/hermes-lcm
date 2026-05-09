@@ -1225,6 +1225,394 @@ class TestEngineABC:
         assert rows[0]["content"] == "tail before restart"
         assert after_restart._ingest_cursor == len(active_context)
 
+    def test_existing_session_restart_skips_stale_short_no_overlap_snapshot(self, tmp_path, caplog):
+        db_path = tmp_path / "restart-stale-short-no-overlap.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "stale-short-session",
+            platform="cli",
+            conversation_id="stale-short-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "old startup question"},
+            {"role": "assistant", "content": "old startup answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable tail message {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "stale-short-session",
+            platform="cli",
+            conversation_id="stale-short-conversation",
+            context_length=200000,
+        )
+        stale_runtime_snapshot = persisted_messages[:3]
+
+        with caplog.at_level("WARNING", logger="hermes_lcm.engine"):
+            after_restart._ingest_messages(stale_runtime_snapshot)
+
+        rows = after_restart._store.get_session_messages(
+            "stale-short-session",
+            limit=len(persisted_messages) + len(stale_runtime_snapshot),
+        )
+        assert len(rows) == len(persisted_messages)
+        assert [row["content"] for row in rows[:3]] == [
+            "You are concise.",
+            "old startup question",
+            "old startup answer",
+        ]
+        assert after_restart._ingest_cursor == len(stale_runtime_snapshot)
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "skipped stale no-overlap snapshot"
+        )
+        assert "skipped stale no-overlap snapshot" in caplog.text
+
+    def test_existing_session_restart_persists_one_message_no_overlap_delta(self, tmp_path):
+        db_path = tmp_path / "restart-one-message-no-overlap.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "one-message-delta-session",
+            platform="cli",
+            conversation_id="one-message-delta-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "system", "content": "You are concise."}]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable message {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "one-message-delta-session",
+            platform="cli",
+            conversation_id="one-message-delta-conversation",
+            context_length=200000,
+        )
+        delta = [{"role": "user", "content": "legitimate standalone delta"}]
+
+        after_restart._ingest_messages(delta)
+
+        rows = after_restart._store.get_session_messages(
+            "one-message-delta-session",
+            limit=len(persisted_messages) + 1,
+        )
+        assert len(rows) == len(persisted_messages) + 1
+        assert rows[-1]["content"] == "legitimate standalone delta"
+        assert after_restart._ingest_cursor == len(delta)
+        reconciliation = after_restart.get_status()["ingest_reconciliation"]
+        assert reconciliation["reason"] == "persisted ambiguous delta"
+        assert reconciliation["action"] == "persisted batch"
+
+    def test_existing_session_restart_scaffold_prefix_does_not_skip_unrelated_new_rows(self, tmp_path):
+        db_path = tmp_path / "restart-scaffold-prefix-unrelated.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "scaffold-prefix-session",
+            platform="cli",
+            conversation_id="scaffold-prefix-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "system", "content": "You are concise."}]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable message {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "scaffold-prefix-session",
+            platform="cli",
+            conversation_id="scaffold-prefix-conversation",
+            context_length=200000,
+        )
+        replay_with_new_rows = [
+            {
+                "role": "system",
+                "content": "You are concise.\n\n[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {
+                "role": "assistant",
+                "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+            },
+            {"role": "user", "content": "unrelated new request"},
+            {"role": "assistant", "content": "unrelated new answer"},
+        ]
+
+        after_restart._ingest_messages(replay_with_new_rows)
+
+        rows = after_restart._store.get_session_messages(
+            "scaffold-prefix-session",
+            limit=len(persisted_messages) + 2,
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert [row["content"] for row in rows[-2:]] == [
+            "unrelated new request",
+            "unrelated new answer",
+        ]
+        assert after_restart._ingest_cursor == len(replay_with_new_rows)
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "skipped scaffold-only prefix"
+        )
+
+    def test_existing_session_restart_persists_repeated_prefix_after_scaffold_only_prefix(self, tmp_path):
+        db_path = tmp_path / "restart-scaffold-prefix-repeat-old-prefix.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "scaffold-stale-prefix-session",
+            platform="cli",
+            conversation_id="scaffold-stale-prefix-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "old first question"},
+            {"role": "assistant", "content": "old first answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable tail after scaffold {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "scaffold-stale-prefix-session",
+            platform="cli",
+            conversation_id="scaffold-stale-prefix-conversation",
+            context_length=200000,
+        )
+        stale_replay = [
+            {
+                "role": "system",
+                "content": "[Note: This conversation uses Lossless Context Management (LCM). Earlier turns have been compacted into hierarchical summaries below.]",
+            },
+            {
+                "role": "assistant",
+                "content": "[Recent Summary (d0, node 12)]\nEarlier details.\n[Expand for details: hint-12]",
+            },
+            {"role": "user", "content": "old first question"},
+            {"role": "assistant", "content": "old first answer"},
+        ]
+
+        after_restart._ingest_messages(stale_replay)
+
+        rows = after_restart._store.get_session_messages(
+            "scaffold-stale-prefix-session",
+            limit=len(persisted_messages) + len(stale_replay),
+        )
+        assert len(rows) == len(persisted_messages) + 2
+        assert [row["content"] for row in rows[-2:]] == [
+            "old first question",
+            "old first answer",
+        ]
+        assert after_restart._ingest_cursor == len(stale_replay)
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "skipped scaffold-only prefix"
+        )
+
+    def test_restart_reconciliation_filtered_singleton_tail_stays_ambiguous(self, tmp_path):
+        db_path = tmp_path / "restart-filtered-singleton-tail.db"
+        before_restart = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        before_restart.on_session_start(
+            "filtered-singleton-session",
+            platform="telegram",
+            conversation_id="filtered-singleton-conversation",
+            context_length=1000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "real singleton tail"},
+        ]
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                ignore_message_patterns=["^Cronjob Response:"],
+            )
+        )
+        after_restart.on_session_start(
+            "filtered-singleton-session",
+            platform="telegram",
+            conversation_id="filtered-singleton-conversation",
+            context_length=1000,
+        )
+
+        after_restart._ingest_messages([{"role": "user", "content": "real singleton tail"}])
+
+        rows = after_restart._store.get_session_messages("filtered-singleton-session")
+        assert [row["content"] for row in rows] == [
+            "Cronjob Response: heartbeat",
+            "real singleton tail",
+            "real singleton tail",
+        ]
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "persisted ambiguous delta"
+        )
+
+    def test_existing_session_restart_persists_prefix_repeated_without_system_anchor(self, tmp_path):
+        db_path = tmp_path / "restart-prefix-repeat-no-system-anchor.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "prefix-repeat-session",
+            platform="cli",
+            conversation_id="prefix-repeat-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "opening question"},
+            {"role": "assistant", "content": "opening answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable tail message {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "prefix-repeat-session",
+            platform="cli",
+            conversation_id="prefix-repeat-conversation",
+            context_length=200000,
+        )
+        repeated_prefix_delta = persisted_messages[:2]
+
+        after_restart._ingest_messages(repeated_prefix_delta)
+
+        rows = after_restart._store.get_session_messages(
+            "prefix-repeat-session",
+            limit=len(persisted_messages) + len(repeated_prefix_delta),
+        )
+        assert len(rows) == len(persisted_messages) + len(repeated_prefix_delta)
+        assert [row["content"] for row in rows[-2:]] == [
+            "opening question",
+            "opening answer",
+        ]
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "persisted ambiguous delta"
+        )
+
+    def test_restart_reconciliation_filtered_prefix_does_not_create_stale_proof(self, tmp_path):
+        db_path = tmp_path / "restart-filtered-prefix-stale-proof.db"
+        before_restart = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+        before_restart.on_session_start(
+            "filtered-prefix-session",
+            platform="telegram",
+            conversation_id="filtered-prefix-conversation",
+            context_length=1000,
+        )
+        persisted_messages = [
+            {"role": "user", "content": "Cronjob Response: heartbeat"},
+            {"role": "user", "content": "real prefix question"},
+            {"role": "assistant", "content": "real prefix answer"},
+        ]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable tail after filter {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                ignore_message_patterns=["^Cronjob Response:"],
+            )
+        )
+        after_restart.on_session_start(
+            "filtered-prefix-session",
+            platform="telegram",
+            conversation_id="filtered-prefix-conversation",
+            context_length=1000,
+        )
+        ambiguous_delta = [
+            {"role": "user", "content": "real prefix question"},
+            {"role": "assistant", "content": "real prefix answer"},
+        ]
+
+        after_restart._ingest_messages(ambiguous_delta)
+
+        rows = after_restart._store.get_session_messages(
+            "filtered-prefix-session",
+            limit=len(persisted_messages) + len(ambiguous_delta),
+        )
+        assert len(rows) == len(persisted_messages) + len(ambiguous_delta)
+        assert [row["content"] for row in rows[-2:]] == [
+            "real prefix question",
+            "real prefix answer",
+        ]
+        assert after_restart.get_status()["ingest_reconciliation"]["reason"] == (
+            "persisted ambiguous delta"
+        )
+
+    def test_lcm_status_reports_ingest_reconciliation_diagnostics(self, tmp_path):
+        db_path = tmp_path / "restart-status-ingest-diagnostic.db"
+        config = LCMConfig(database_path=str(db_path))
+        before_restart = LCMEngine(config=config)
+        before_restart.on_session_start(
+            "status-reconcile-session",
+            platform="cli",
+            conversation_id="status-reconcile-conversation",
+            context_length=200000,
+        )
+        persisted_messages = [{"role": "system", "content": "You are concise."}]
+        persisted_messages.extend(
+            {"role": "user", "content": f"durable message {i}"}
+            for i in range(80)
+        )
+        before_restart._ingest_messages(persisted_messages)
+        before_restart._store.close()
+        before_restart._dag.close()
+        before_restart._lifecycle.close()
+
+        after_restart = LCMEngine(config=config)
+        after_restart.on_session_start(
+            "status-reconcile-session",
+            platform="cli",
+            conversation_id="status-reconcile-conversation",
+            context_length=200000,
+        )
+        after_restart._ingest_messages([{"role": "user", "content": "status delta"}])
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=after_restart))
+
+        assert payload["ingest_reconciliation"]["reason"] == "persisted ambiguous delta"
+        assert payload["ingest_reconciliation"]["action"] == "persisted batch"
+
     def test_get_status(self, engine):
         status = engine.get_status()
         assert status["engine"] == "lcm"
