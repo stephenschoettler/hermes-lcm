@@ -2165,6 +2165,48 @@ class TestEngineCompress:
         result = engine.compress(messages)
         assert len(result) == len(messages)
 
+    def test_compress_handles_multimodal_first_user_message_without_system(self, engine, monkeypatch):
+        """Gateway sessions may pass conversation messages without a leading system prompt."""
+        def mock_summary(**kwargs):
+            return "Mock summary.\nExpand for details about: multimodal first user", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+        first_user = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "first user text"},
+                {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+            ],
+        }
+        messages = [first_user]
+        for i in range(10):
+            messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
+            messages.append({"role": "user", "content": f"Question {i}: " + "x" * 200})
+
+        result = engine.compress(messages)
+
+        assert result[0] == first_user
+        assert isinstance(result[0]["content"], list)
+        assert all(
+            not (isinstance(part, dict) and "Lossless Context Management" in str(part.get("text", "")))
+            for part in result[0]["content"]
+        )
+        assert len(result) < len(messages)
+        assert engine.compression_count == 1
+
+    def test_assemble_context_appends_lcm_note_to_structured_system_content(self, engine):
+        system_msg = {
+            "role": "system",
+            "content": [{"type": "text", "text": "You are helpful."}],
+        }
+
+        result = engine._assemble_context(system_msg, [])
+
+        assert result[0]["role"] == "system"
+        assert result[0]["content"][:-1] == system_msg["content"]
+        assert result[0]["content"][-1]["type"] == "text"
+        assert "Lossless Context Management" in result[0]["content"][-1]["text"]
+
     def test_compress_preserves_system_and_tail(self, engine):
         """Compression should always keep system prompt and fresh tail."""
         messages = self._make_long_conversation(20)

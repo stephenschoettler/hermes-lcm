@@ -631,11 +631,14 @@ class LCMEngine(ContextEngine):
             n = len(working_messages)
             fresh_tail_start = max(0, n - self._config.fresh_tail_count)
 
-            # Protect system prompt (always index 0)
+            # Keep the leading message anchored. It is usually the system
+            # prompt, but Hermes gateway sessions may pass only conversation
+            # messages here, so index 0 can be a user message.
             if fresh_tail_start <= 1:
                 break
 
-            # Skip system prompt (index 0), candidate raw backlog is indices 1..fresh_tail_start
+            # Skip the leading anchor, candidate raw backlog is indices
+            # 1..fresh_tail_start.
             candidate_raw = working_messages[1:fresh_tail_start]
             if not candidate_raw:
                 break
@@ -2361,6 +2364,24 @@ class LCMEngine(ContextEngine):
 
     # -- Internal: context assembly ----------------------------------------
 
+    @staticmethod
+    def _append_lcm_note_to_content(content: Any) -> Any:
+        note = (
+            "\n\n[Note: This conversation uses Lossless Context Management (LCM). "
+            "Earlier turns have been compacted into hierarchical summaries below. "
+            "Use lcm_grep to search history, lcm_describe to inspect the DAG, "
+            "and lcm_expand to recover original details from any summary.]"
+        )
+        if isinstance(content, str):
+            return content + note
+        note_part = {"type": "text", "text": note.lstrip()}
+        if content is None:
+            return note.lstrip()
+        if isinstance(content, list):
+            return list(content) + [note_part]
+        normalized = normalize_content_value(content) or ""
+        return normalized + note
+
     def _assemble_context(
         self,
         system_msg: Dict[str, Any],
@@ -2371,24 +2392,26 @@ class LCMEngine(ContextEngine):
         """Build the active context from DAG summaries + fresh tail.
 
         Structure:
-          [system prompt (with LCM note)]
+          [leading anchor, normally system prompt]
           [highest-depth summary nodes first, then lower]
           [fresh tail messages]
         """
         result = []
 
-        # System prompt with LCM annotation
-        sys_msg = system_msg.copy()
-        if self.compression_count == 0 and include_lcm_note:
-            sys_content = sys_msg.get("content", "")
-            sys_msg["content"] = (
-                sys_content
-                + "\n\n[Note: This conversation uses Lossless Context Management (LCM). "
-                "Earlier turns have been compacted into hierarchical summaries below. "
-                "Use lcm_grep to search history, lcm_describe to inspect the DAG, "
-                "and lcm_expand to recover original details from any summary.]"
+        # Leading anchor with optional LCM annotation. Only append the note to
+        # an actual system message; gateway sessions can start with a structured
+        # multimodal user message, and that content must not be treated as a
+        # system prompt or concatenated with text.
+        leading_msg = system_msg.copy()
+        if (
+            leading_msg.get("role") == "system"
+            and self.compression_count == 0
+            and include_lcm_note
+        ):
+            leading_msg["content"] = self._append_lcm_note_to_content(
+                leading_msg.get("content", "")
             )
-        result.append(sys_msg)
+        result.append(leading_msg)
 
         assembly_cap = (
             assembly_cap_override
@@ -2399,7 +2422,7 @@ class LCMEngine(ContextEngine):
         tail_selected = tail_messages
         summary_budget = None
         if assembly_cap is not None:
-            used = count_message_tokens(sys_msg)
+            used = count_message_tokens(leading_msg)
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
             for msg in reversed(tail_messages):
