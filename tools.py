@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
@@ -103,12 +104,18 @@ def _get_session_node(engine: "LCMEngine", node_id: int):
     return node
 
 
-def _get_externalized_payload(engine: "LCMEngine", ref: str) -> dict[str, Any] | None:
+def _get_externalized_payload(
+    engine: "LCMEngine",
+    ref: str,
+    *,
+    allowed_session_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
     payload = load_externalized_payload(ref, config=engine._config, hermes_home=engine._hermes_home)
     if payload is None:
         return None
     payload_session_id = payload.get("session_id") or ""
-    if payload_session_id and payload_session_id != engine.current_session_id:
+    allowed = allowed_session_ids or {engine.current_session_id}
+    if payload_session_id and payload_session_id not in allowed:
         return None
     return payload
 
@@ -158,6 +165,43 @@ def _parse_optional_float(value: Any, name: str) -> tuple[float | None, str | No
         return float(value), None
     except (TypeError, ValueError, OverflowError):
         return None, f"{name} must be a number"
+
+
+def _parse_optional_timestamp(value: Any, name: str) -> tuple[float | None, str | None]:
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, f"{name} must be a Unix timestamp or timezone-aware ISO 8601 string"
+    if isinstance(value, (int, float)):
+        try:
+            return float(value), None
+        except (TypeError, ValueError, OverflowError):
+            return None, f"{name} must be a Unix timestamp or timezone-aware ISO 8601 string"
+    text = str(value).strip()
+    if not text:
+        return None, f"{name} must not be empty"
+    try:
+        return float(text), None
+    except (TypeError, ValueError, OverflowError):
+        pass
+    iso_text = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+    except ValueError:
+        return None, f"{name} must be a Unix timestamp or timezone-aware ISO 8601 string"
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None, f"{name} ISO timestamp must include a timezone offset or Z"
+    return parsed.timestamp(), None
+
+
+def _parse_grep_role(value: Any) -> tuple[str | None, str | None]:
+    if value is None:
+        return None, None
+    role = str(value or "").strip()
+    valid_roles = {"system", "user", "assistant", "tool", "unknown"}
+    if role not in valid_roles:
+        return None, "role must be one of: system, user, assistant, tool, unknown"
+    return role, None
 
 
 def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
@@ -290,7 +334,7 @@ def _expand_message_sources(
             has_more = True
             break
         stored = stored_by_id.get(store_id)
-        if not stored or stored.get("session_id") != engine.current_session_id:
+        if not stored:
             next_source_offset = source_index + 1
             next_content_offset = 0
             has_more = next_source_offset < total_sources
@@ -301,7 +345,11 @@ def _expand_message_sources(
         externalized = None
         ref = extract_externalized_ref(transcript_content)
         if ref:
-            externalized = _get_externalized_payload(engine, ref)
+            externalized = _get_externalized_payload(
+                engine,
+                ref,
+                allowed_session_ids={engine.current_session_id, stored.get("session_id", "")},
+            )
         if hydrate_externalized_content and externalized is not None:
             content = externalized.get("content", "")
             content_source = "externalized_payload"
@@ -313,6 +361,9 @@ def _expand_message_sources(
         expanded = {
             "store_id": stored["store_id"],
             "source_index": source_index,
+            "session_id": stored.get("session_id", ""),
+            "source": stored.get("source") or "",
+            "from_current_session": stored.get("session_id", "") == engine.current_session_id,
             "role": stored["role"],
             "content": sliced["content"],
             "content_chars": sliced["content_chars"],
@@ -731,6 +782,18 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
     )
     source = str(args.get("source") or "").strip() or None
+    role, role_error = _parse_grep_role(args.get("role"))
+    if role_error:
+        return json.dumps({"error": role_error})
+    time_from, time_from_error = _parse_optional_timestamp(args.get("time_from"), "time_from")
+    if time_from_error:
+        return json.dumps({"error": time_from_error})
+    time_to, time_to_error = _parse_optional_timestamp(args.get("time_to"), "time_to")
+    if time_to_error:
+        return json.dumps({"error": time_to_error})
+    if time_from is not None and time_to is not None and time_to < time_from:
+        return json.dumps({"error": "time_to must be greater than or equal to time_from"})
+    raw_message_filter_active = role is not None or time_from is not None or time_to is not None
 
     if requested_session_scope == "current":
         if explicit_session_id:
@@ -782,6 +845,9 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             limit=source_limit,
             sort=sort,
             source=source,
+            role=role,
+            time_from=time_from,
+            time_to=time_to,
         )
         for hit in msg_hits:
             timestamp_value = hit.get("timestamp", 0) or 0
@@ -809,7 +875,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     # contract would push this tool toward a memory-system shape rather than
     # a plugin-local archive search. Raw-message hits remain expandable across
     # sessions via lcm_expand(store_id=...).
-    if session_scope == "current":
+    if session_scope == "current" and not raw_message_filter_active:
         try:
             node_hits = engine._dag.search(
                 query,
@@ -864,6 +930,14 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         "total_results": len(results),
         "results": results[:limit],
     }
+    if role is not None:
+        response["role"] = role
+    if time_from is not None:
+        response["time_from"] = time_from
+    if time_to is not None:
+        response["time_to"] = time_to
+    if raw_message_filter_active:
+        response["summary_results_omitted"] = True
     if session_scope == "session":
         response["session_id"] = explicit_session_id
     if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
@@ -945,9 +1019,9 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     - ``store_id``: fetch a single raw message by store_id; works across sessions
     - ``node_id``: expand a summary node to its source content (current session only)
 
-    Only ``store_id`` mode is cross-session in this version. Cross-session DAG
-    expansion via ``node_id`` is intentionally not supported (it would require
-    descending session-bound source ids).
+    Only ``store_id`` mode accepts an arbitrary cross-session target. ``node_id``
+    stays current-session scoped, but carried-over current-session nodes may
+    reference raw source rows that still belong to the previous session.
     """
     engine = _require_engine(kwargs)
     if engine is None:

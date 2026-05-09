@@ -390,12 +390,10 @@ class TestEngineABC:
         assert grep_props["session_scope"]["enum"] == ["current", "all", "session"]
         assert "session_id" in grep_props
         assert "session_scope='session'" in grep_props["session_id"]["description"]
-        # role/time_from/time_to filters are intentionally absent in this
-        # version; they need to be pushed into the search layer before being
-        # exposed again. See follow-up issue tracking that work.
-        assert "role" not in grep_props
-        assert "time_from" not in grep_props
-        assert "time_to" not in grep_props
+        assert "role" in grep_props
+        assert grep_props["role"]["enum"] == ["system", "user", "assistant", "tool", "unknown"]
+        assert "time_from" in grep_props
+        assert "time_to" in grep_props
         assert "source" in grep_props
         assert "descendant source lineage" in grep_props["source"]["description"]
         assert "unknown" in grep_props["source"]["description"]
@@ -3281,6 +3279,75 @@ class TestSessionRollover:
         assert engine._dag.get_node(pruned_node_id) is None
         assert engine._store.get_session_count("old-retrieval") == 1
         assert engine._store.get_session_count("new-retrieval") == 0
+
+    def test_expand_retained_rollover_summary_recovers_original_session_sources(self, engine):
+        engine._config.new_session_retain_depth = 2
+        engine.on_session_start("old-expand", platform="discord", context_length=200000)
+        old_store_id = engine._store.append(
+            "old-expand",
+            {"role": "user", "content": "discord carried source payload"},
+            token_estimate=9,
+            source="discord",
+        )
+        retained_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-expand",
+            depth=2,
+            summary="carried rollover summary about discord payload",
+            token_count=7,
+            source_token_count=9,
+            source_ids=[old_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+
+        moved = engine.rollover_session(
+            "old-expand",
+            "new-expand",
+            previous_messages=[],
+            platform="discord",
+            context_length=200000,
+        )
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": retained_node_id}))
+
+        assert moved == 1
+        assert expanded["pagination"]["total_sources"] == 1
+        assert expanded["pagination"]["returned_sources"] == 1
+        assert expanded["expanded"][0]["store_id"] == old_store_id
+        assert expanded["expanded"][0]["content"] == "discord carried source payload"
+
+    def test_expand_retained_depth_zero_summary_recovers_original_session_sources(self, engine):
+        engine._config.new_session_retain_depth = -1
+        engine.on_session_start("old-expand-d0", platform="discord", context_length=200000)
+        old_store_id = engine._store.append(
+            "old-expand-d0",
+            {"role": "user", "content": "depth zero carried source payload"},
+            token_estimate=9,
+            source="discord",
+        )
+        retained_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-expand-d0",
+            depth=0,
+            summary="depth zero carried rollover summary",
+            token_count=7,
+            source_token_count=9,
+            source_ids=[old_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+
+        moved = engine.rollover_session(
+            "old-expand-d0",
+            "new-expand-d0",
+            previous_messages=[],
+            platform="discord",
+            context_length=200000,
+        )
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": retained_node_id}))
+
+        assert moved == 1
+        assert expanded["expanded"][0]["session_id"] == "old-expand-d0"
+        assert expanded["expanded"][0]["from_current_session"] is False
+        assert expanded["expanded"][0]["content"] == "depth zero carried source payload"
 
     def test_rollover_session_compression_boundary_keeps_depth_zero_nodes(self, engine):
         engine._config.new_session_retain_depth = 2
@@ -7133,6 +7200,155 @@ class TestEngineTools:
         )
         assert result["sort"] == "relevance"
 
+    def test_handle_grep_role_filter_pushes_into_message_search(self, engine):
+        assistant_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "docker target assistant"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1000.0, assistant_id),
+        )
+        for idx in range(25):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"docker noisy user {idx}"},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (2000.0 + idx, store_id),
+            )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "docker", "role": "assistant", "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["role"] == "assistant"
+        assert result["total_results"] == 1
+        assert result["results"][0]["role"] == "assistant"
+        assert "target assistant" in result["results"][0]["snippet"]
+
+    def test_handle_grep_time_filter_pushes_into_message_search(self, engine):
+        older_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "docker older assistant"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1000.0, older_id),
+        )
+        for idx in range(25):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"docker newer user {idx}"},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (2000.0 + idx, store_id),
+            )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "docker", "time_to": 1500.0, "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["time_to"] == 1500.0
+        assert result["total_results"] == 1
+        assert result["results"][0]["timestamp"] == 1000.0
+        assert "older assistant" in result["results"][0]["snippet"]
+
+    def test_handle_grep_rejects_naive_iso_time_filter(self, engine):
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "docker", "time_to": "2026-05-06T10:00:00"},
+        ))
+
+        assert "error" in result
+        assert "timezone" in result["error"]
+
+    def test_handle_grep_like_fallback_applies_role_filter_before_limit(self, engine):
+        assistant_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "docker-compose target assistant"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1000.0, assistant_id),
+        )
+        for idx in range(25):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"docker-compose noisy user {idx}"},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (2000.0 + idx, store_id),
+            )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "docker-compose", "role": "assistant", "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["role"] == "assistant"
+        assert result["total_results"] == 1
+        assert result["results"][0]["role"] == "assistant"
+        assert "target assistant" in result["results"][0]["snippet"]
+
+    def test_handle_grep_like_fallback_applies_time_filter_before_limit(self, engine):
+        older_id = engine._store.append(
+            "test-session",
+            {"role": "assistant", "content": "docker-compose older assistant"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1000.0, older_id),
+        )
+        for idx in range(25):
+            store_id = engine._store.append(
+                "test-session",
+                {"role": "user", "content": f"docker-compose newer user {idx}"},
+            )
+            engine._store._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+                (2000.0 + idx, store_id),
+            )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "docker-compose", "time_to": 1500.0, "limit": 1, "sort": "recency"},
+        ))
+
+        assert result["time_to"] == 1500.0
+        assert result["total_results"] == 1
+        assert result["results"][0]["timestamp"] == 1000.0
+        assert "older assistant" in result["results"][0]["snippet"]
+
+    def test_handle_grep_accepts_timezone_aware_iso_time_filter(self, engine):
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "docker timezone aware"},
+        )
+        engine._store._conn.execute(
+            "UPDATE messages SET timestamp = ? WHERE store_id = ?",
+            (1_700_000_000.0, store_id),
+        )
+        engine._store._conn.commit()
+
+        result = json.loads(engine.handle_tool_call(
+            "lcm_grep",
+            {"query": "docker", "time_from": "2023-11-14T22:13:20Z"},
+        ))
+
+        assert result["time_from"] == 1_700_000_000.0
+        assert result["total_results"] == 1
+        assert result["results"][0]["store_id"] == store_id
+
     def test_handle_grep_session_scope_all_returns_cross_session_hits(self, engine):
         engine._store.append("test-session", {"role": "user", "content": "docker rollout current session"})
         engine._store.append("old-session", {"role": "user", "content": "docker rollout old session"})
@@ -7270,6 +7486,178 @@ class TestEngineTools:
             for item in result["results"]
             if item["type"] == "summary"
         )
+
+    def test_handle_grep_source_filter_pages_past_newer_unrelated_summaries(self, engine):
+        discord_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "lineage row from discord"},
+            source="discord",
+        )
+        telegram_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "lineage row from telegram"},
+            source="telegram",
+        )
+
+        for idx in range(220):
+            engine._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=0,
+                    summary=f"telegram summary {idx} about docker rollout",
+                    token_count=10,
+                    source_token_count=10,
+                    source_ids=[telegram_store_id],
+                    source_type="messages",
+                    created_at=1_800_000_000 + idx,
+                    latest_at=1_800_000_000 + idx,
+                )
+            )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="discord summary about docker rollout",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[discord_store_id],
+                source_type="messages",
+                created_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "session_scope": "current", "source": "discord", "limit": 1, "sort": "recency"},
+            )
+        )
+
+        assert result["total_results"] == 1
+        assert result["results"][0]["type"] == "summary"
+        assert "discord summary" in result["results"][0]["snippet"]
+
+    def test_handle_grep_source_filter_like_fallback_pages_past_unrelated_summaries(self, engine):
+        discord_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "lineage row from discord"},
+            source="discord",
+        )
+        telegram_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "lineage row from telegram"},
+            source="telegram",
+        )
+
+        for idx in range(220):
+            engine._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=0,
+                    summary=f"telegram summary {idx} about docker:rollout",
+                    token_count=10,
+                    source_token_count=10,
+                    source_ids=[telegram_store_id],
+                    source_type="messages",
+                    created_at=1_800_000_000 + idx,
+                    latest_at=1_800_000_000 + idx,
+                )
+            )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="discord summary about docker:rollout",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[discord_store_id],
+                source_type="messages",
+                created_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker:rollout", "session_scope": "current", "source": "discord", "limit": 1, "sort": "recency"},
+            )
+        )
+
+        assert result["total_results"] == 1
+        assert result["results"][0]["type"] == "summary"
+        assert "discord summary" in result["results"][0]["snippet"]
+
+    def test_handle_grep_source_filter_like_fallback_sorts_across_matching_candidates(self, engine):
+        older_discord_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "older discord lineage"},
+            source="discord",
+        )
+        telegram_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "telegram lineage"},
+            source="telegram",
+        )
+        newer_discord_store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "newer discord lineage"},
+            source="discord",
+        )
+
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="older discord summary about docker:rollout",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[older_discord_store_id],
+                source_type="messages",
+                created_at=1_700_000_000,
+                latest_at=1_700_000_000,
+            )
+        )
+        for idx in range(220):
+            engine._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=0,
+                    summary=f"telegram summary {idx} about docker:rollout",
+                    token_count=10,
+                    source_token_count=10,
+                    source_ids=[telegram_store_id],
+                    source_type="messages",
+                    created_at=1_800_000_000 + idx,
+                    latest_at=1_800_000_000 + idx,
+                )
+            )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="newer discord summary about docker:rollout",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[newer_discord_store_id],
+                source_type="messages",
+                created_at=1_900_000_000,
+                latest_at=1_900_000_000,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker:rollout", "session_scope": "current", "source": "discord", "limit": 1, "sort": "recency"},
+            )
+        )
+
+        assert result["total_results"] == 2
+        assert len(result["results"]) == 1
+        assert result["results"][0]["type"] == "summary"
+        assert "newer discord summary" in result["results"][0]["snippet"]
 
     def test_handle_grep_unknown_source_filter_matches_unknown_messages_and_summaries(self, engine):
         unknown_store_id = engine._store.append(

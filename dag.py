@@ -380,7 +380,6 @@ class SummaryDAG:
                 return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
 
             raw_nodes = [self._row_to_node(r) for r in rows]
-            raw_primary_values: list[float] = []
             for node in raw_nodes:
                 if source and not self._node_matches_source(node.node_id, source, cache=source_match_cache):
                     continue
@@ -388,20 +387,25 @@ class SummaryDAG:
                 if apply_directness_adjustment and node.search_rank is not None:
                     rank_adjustment = max(float(node.search_directness), 0.0)
                     node.search_rank = float(node.search_rank) - (rank_adjustment * 2e-7)
-                raw_primary_values.append(_fts_primary_value(node, sort))
                 results.append(node)
             results.sort(key=lambda node: _fts_result_sort_key(node, sort))
 
-            if not apply_directness_adjustment or len(rows) < fetch_limit or len(results) <= limit:
+            exhausted = len(rows) < fetch_limit or scanned_rows >= candidate_cap
+            if source and not exhausted:
+                offset += len(rows)
+                remaining = candidate_cap - scanned_rows
+                if remaining <= 0:
+                    return results[:limit]
+                fetch_limit = min(fetch_limit * 2, remaining)
+                continue
+
+            if exhausted or not apply_directness_adjustment or len(results) <= limit:
                 return results[:limit]
 
             worst_visible_primary = _fts_primary_value(results[min(limit, len(results)) - 1], sort)
-            last_fetched_primary = raw_primary_values[-1]
+            last_fetched_primary = _fts_primary_value(raw_nodes[-1], sort)
             best_unseen_primary = last_fetched_primary - max_rank_bonus
             if best_unseen_primary > worst_visible_primary:
-                return results[:limit]
-
-            if scanned_rows >= candidate_cap:
                 return results[:limit]
 
             offset += len(rows)
@@ -431,33 +435,44 @@ class SummaryDAG:
             args.append(f"%{escape_like(term)}%")
         where.append("(" + " OR ".join(like_clauses) + ")")
         fetch_limit = compute_like_fallback_fetch_limit(limit, terms, phrases)
-        args.append(fetch_limit)
-
-        rows = self._conn.execute(
-            f"""SELECT * FROM summary_nodes
-                WHERE {' AND '.join(where)}
-                LIMIT ?""",
-            args,
-        ).fetchall()
+        base_args = list(args)
         collapse_risky_repeats = contains_risky_fts_ascii(query)
+        candidate_cap = compute_search_candidate_cap(limit)
+        offset = 0
+        scanned_rows = 0
         nodes: list[SummaryNode] = []
         source_match_cache: dict[int, bool] = {}
-        for row in rows:
-            node = self._row_to_node(row)
-            if source and not self._node_matches_source(node.node_id, source, cache=source_match_cache):
-                continue
-            score = sum(
-                min(count_term_matches(node.summary, term), 1) if collapse_risky_repeats else count_term_matches(node.summary, term)
-                for term in terms
-            )
-            if score <= 0:
-                continue
-            node.search_rank = -float(score)
-            node.search_directness = compute_directness_score(node.summary, terms, phrases)
-            nodes.append(node)
+        while True:
+            rows = self._conn.execute(
+                f"""SELECT * FROM summary_nodes
+                    WHERE {' AND '.join(where)}
+                    LIMIT ? OFFSET ?""",
+                [*base_args, fetch_limit, offset],
+            ).fetchall()
+            scanned_rows += len(rows)
+            for row in rows:
+                node = self._row_to_node(row)
+                if source and not self._node_matches_source(node.node_id, source, cache=source_match_cache):
+                    continue
+                score = sum(
+                    min(count_term_matches(node.summary, term), 1) if collapse_risky_repeats else count_term_matches(node.summary, term)
+                    for term in terms
+                )
+                if score <= 0:
+                    continue
+                node.search_rank = -float(score)
+                node.search_directness = compute_directness_score(node.summary, terms, phrases)
+                nodes.append(node)
 
-        nodes.sort(key=lambda node: _fallback_result_sort_key(node, sort))
-        return nodes[:limit]
+            nodes.sort(key=lambda node: _fallback_result_sort_key(node, sort))
+            if not source or len(rows) < fetch_limit or scanned_rows >= candidate_cap:
+                return nodes[:limit]
+
+            offset += len(rows)
+            remaining = candidate_cap - scanned_rows
+            if remaining <= 0:
+                return nodes[:limit]
+            fetch_limit = min(fetch_limit * 2, remaining)
 
     # -- DAG traversal ------------------------------------------------------
 

@@ -67,6 +67,25 @@ LCM_GREP = {
                     "Use 'unknown' for explicit unknown-source content."
                 ),
             },
+            "role": {
+                "type": "string",
+                "enum": ["system", "user", "assistant", "tool", "unknown"],
+                "description": "Optional raw-message role filter. When supplied, lcm_grep returns raw message hits only.",
+            },
+            "time_from": {
+                "type": ["number", "string"],
+                "description": (
+                    "Optional inclusive minimum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
+                    "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
+                ),
+            },
+            "time_to": {
+                "type": ["number", "string"],
+                "description": (
+                    "Optional inclusive maximum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
+                    "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
+                ),
+            },
         },
         "required": ["query"],
     },

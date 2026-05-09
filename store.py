@@ -626,7 +626,10 @@ class MessageStore:
 
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
-               source: str | None = None) -> List[Dict[str, Any]]:
+               source: str | None = None,
+               role: str | None = None,
+               time_from: float | None = None,
+               time_to: float | None = None) -> List[Dict[str, Any]]:
         """FTS5 search across raw messages.
 
         Retrieval contract:
@@ -641,7 +644,16 @@ class MessageStore:
         terms = extract_search_terms(safe_query)
         phrases = extract_quoted_phrases(safe_query)
         if requires_like_fallback(query):
-            return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
+            return self._search_like(
+                query,
+                session_id=session_id,
+                limit=limit,
+                sort=sort,
+                source=source,
+                role=role,
+                time_from=time_from,
+                time_to=time_to,
+            )
 
         order_by = _build_search_order_by(
             sort,
@@ -666,6 +678,15 @@ class MessageStore:
                 if source_clause:
                     where.append(source_clause)
                     args.extend(source_args)
+                if role is not None:
+                    where.append("m.role = ?")
+                    args.append(role)
+                if time_from is not None:
+                    where.append("m.timestamp >= ?")
+                    args.append(time_from)
+                if time_to is not None:
+                    where.append("m.timestamp <= ?")
+                    args.append(time_to)
                 args.extend([fetch_limit, offset])
                 rows = self._conn.execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
@@ -681,7 +702,16 @@ class MessageStore:
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
-                return self._search_like(query, session_id=session_id, limit=limit, sort=sort, source=source)
+                return self._search_like(
+                    query,
+                    session_id=session_id,
+                    limit=limit,
+                    sort=sort,
+                    source=source,
+                    role=role,
+                    time_from=time_from,
+                    time_to=time_to,
+                )
 
             raw_primary_values: list[float] = []
             for r in rows:
@@ -717,7 +747,10 @@ class MessageStore:
 
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
-                     source: str | None = None) -> List[Dict[str, Any]]:
+                     source: str | None = None,
+                     role: str | None = None,
+                     time_from: float | None = None,
+                     time_to: float | None = None) -> List[Dict[str, Any]]:
         safe_query = sanitize_fts5_query(query)
         terms = extract_search_terms(safe_query)
         phrases = extract_quoted_phrases(safe_query)
@@ -734,6 +767,15 @@ class MessageStore:
         if source_clause:
             where.append(source_clause)
             args.extend(source_args)
+        if role is not None:
+            where.append("role = ?")
+            args.append(role)
+        if time_from is not None:
+            where.append("timestamp >= ?")
+            args.append(time_from)
+        if time_to is not None:
+            where.append("timestamp <= ?")
+            args.append(time_to)
         like_clauses = []
         for term in terms:
             like_clauses.append("content LIKE ? ESCAPE '\\'")
