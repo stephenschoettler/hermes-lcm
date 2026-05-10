@@ -188,7 +188,9 @@ environment variables:
 |----------|---------|-----|
 | `LCM_CONTEXT_THRESHOLD` | `0.75` | Fraction of the context window that triggers LCM compaction |
 | `LCM_FRESH_TAIL_COUNT` | `64` | Recent messages protected from compaction |
-| `LCM_LEAF_CHUNK_TOKENS` | `20000` | Token floor for leaf compaction chunks |
+| `LCM_LEAF_CHUNK_TOKENS` | `20000` | Raw-backlog floor before leaf compaction; with dynamic chunking enabled, the base chunk target |
+| `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
+| `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
@@ -239,9 +241,9 @@ session.
 ### FAQ: tuning LCM for large context windows
 
 Long-context models change the tuning problem. A 1M-token model does not mean
-you always want to spend 750k prompt tokens before LCM starts compacting. The
-right starting point is usually the active prompt size you are willing to pay
-for, then tune LCM around that budget.
+you always want to spend 750k prompt tokens before LCM starts compacting. Start
+with the active prompt budget you are willing to pay for, then tune the threshold
+around that budget.
 
 The basic calculation is:
 
@@ -249,29 +251,35 @@ The basic calculation is:
 compaction trigger = effective context window * LCM_CONTEXT_THRESHOLD
 ```
 
-Examples:
+Or, working backwards:
 
-| Effective context window | `LCM_CONTEXT_THRESHOLD` | Approx. compaction trigger | Good fit |
-|--------------------------|-------------------------|-----------------------------|----------|
-| `128000` | `0.75` | `96000` | Typical smaller long-context setup |
-| `200000` | `0.70` | `140000` | Balanced cost and active context |
-| `400000` | `0.60` | `240000` | Large window, earlier DAG building |
-| `1000000` | `0.25` | `250000` | Cost-sensitive 1M-token model |
-| `1000000` | `0.40` | `400000` | Balanced 1M-token model |
-| `1000000` | `0.60` | `600000` | Maximum active context, higher burn |
+```text
+LCM_CONTEXT_THRESHOLD = desired compaction trigger / effective context window
+```
+
+Examples, as math rather than universal recommendations:
+
+| Effective context window | Desired trigger | Threshold |
+|--------------------------|-----------------|-----------|
+| `128000` | `96000` | `0.75` |
+| `200000` | `140000` | `0.70` |
+| `400000` | `240000` | `0.60` |
+| `1000000` | `250000` | `0.25` |
+| `1000000` | `400000` | `0.40` |
+| `1000000` | `600000` | `0.60` |
 
 If your Hermes config caps the model's effective `context_length`, tune against
 that effective value instead of the provider's advertised maximum. For example,
 a 1M-token provider with an effective `context_length` of `400000` and
 `LCM_CONTEXT_THRESHOLD=0.60` starts compaction around `240000` prompt tokens.
 
-A reasonable first-pass table:
+A reasonable first pass for a true 1M effective window is:
 
-| Goal | Threshold | Fresh tail | Leaf chunk | Expansion context |
-|------|-----------|------------|------------|-------------------|
-| Lower spend / earlier compaction | `0.25` to `0.40` on 1M windows | `32` to `64` | `12000` to `20000` | `32000` |
-| Balanced default for large models | `0.40` to `0.60` | `64` | `20000` to `30000` | `32000` to `64000` |
-| Keep more raw context active | `0.60` to `0.80` | `64` to `128` | `30000` to `40000` | `64000` |
+| Goal | Desired trigger | Threshold | Notes |
+|------|-----------------|-----------|-------|
+| Lower spend / earlier DAG building | `200000` to `300000` | `0.20` to `0.30` | Good when cost and latency matter more than maximum live context |
+| Balanced large-context use | `350000` to `500000` | `0.35` to `0.50` | Good starting point for many long-running agents |
+| Keep more raw context active | `600000+` | `0.60+` | Higher token burn, later compaction |
 
 What the main knobs do:
 
@@ -279,8 +287,12 @@ What the main knobs do:
   DAG earlier and reduce active prompt burn, but compact more often.
 - `LCM_FRESH_TAIL_COUNT` protects recent messages from compaction. Raise it if
   your agent often needs the last few tool calls or planning turns verbatim.
-- `LCM_LEAF_CHUNK_TOKENS` controls the first summary chunk size. Smaller chunks
-  usually preserve local detail better. Larger chunks reduce summary call count.
+- `LCM_LEAF_CHUNK_TOKENS` is the raw-backlog floor before a leaf compaction pass
+  starts. With the default `LCM_DYNAMIC_LEAF_CHUNK_ENABLED=false`, the pass
+  compacts the whole non-tail raw backlog, not only a chunk of this size.
+- `LCM_DYNAMIC_LEAF_CHUNK_ENABLED=true` changes leaf passes into chunk-sized
+  work. In that mode `LCM_LEAF_CHUNK_TOKENS` is the base target and
+  `LCM_DYNAMIC_LEAF_CHUNK_MAX` is the upper bound for a dynamic chunk target.
 - `LCM_EXPANSION_CONTEXT_TOKENS` controls how much recovered material
   `lcm_expand_query` may feed to the auxiliary model. It does not change what
   LCM stores.
@@ -291,10 +303,16 @@ Common questions:
 
 **Should I leave the default threshold on a 1M-token model?**
 
-Usually not if cost, latency, or early recall structure matters. The default
-`0.75` means compaction may wait until roughly `750000` prompt tokens on a true
-1M effective window. That can be intentional, but it is expensive and delays DAG
-construction.
+Not always. The default `0.75` means compaction may wait until roughly `750000`
+prompt tokens on a true 1M effective window. That can be intentional if you want
+maximum live context, but it is expensive and delays DAG construction.
+
+**Should I change leaf chunk settings first?**
+
+Usually no. Start with `LCM_CONTEXT_THRESHOLD`, `LCM_FRESH_TAIL_COUNT`, and large
+output externalization. Only tune leaf chunking after checking `lcm_status` and
+understanding whether your workload is dominated by huge raw backlog passes. If
+you want chunk-sized leaf passes, enable dynamic leaf chunking explicitly.
 
 **Does compacting earlier hurt recall?**
 
