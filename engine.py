@@ -84,10 +84,12 @@ def _strip_metadata_scalar(value: str) -> str:
 
 
 def _plugin_metadata() -> dict[str, str]:
-    """Return plugin identity from the loaded code tree."""
+    """Return plugin identity from the loaded code tree.
+
+    Always re-read the manifest from disk when available so status tools reflect
+    hot-updated plugin checkouts even in long-lived Hermes processes.
+    """
     global _PLUGIN_METADATA
-    if _PLUGIN_METADATA is not None:
-        return dict(_PLUGIN_METADATA)
 
     metadata = {"name": "hermes-lcm", "version": "unknown"}
     manifest = _PLUGIN_ROOT / "plugin.yaml"
@@ -99,10 +101,13 @@ def _plugin_metadata() -> dict[str, str]:
             key = key.strip()
             if key in {"name", "version"}:
                 metadata[key] = _strip_metadata_scalar(raw_value)
+        _PLUGIN_METADATA = metadata
+        return dict(metadata)
     except OSError:
         logger.debug("LCM plugin manifest not readable at %s", manifest)
 
-    _PLUGIN_METADATA = metadata
+    if _PLUGIN_METADATA is not None:
+        return dict(_PLUGIN_METADATA)
     return dict(metadata)
 
 
