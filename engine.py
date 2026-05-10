@@ -2047,12 +2047,19 @@ class LCMEngine(ContextEngine):
         identity: tuple[str, str, str, str],
     ) -> tuple[str, str, str, str] | None:
         role, content, tool_call_id, tool_calls = identity
-        if role != "assistant" or tool_calls:
+        if role != "assistant":
             return identity
-        cleaned = cls._clean_active_assistant_message({
+        msg: dict[str, Any] = {
             "role": role,
             "content": cls._identity_content_for_active_cleanup(content),
-        })
+        }
+        if tool_calls:
+            try:
+                decoded_tool_calls = json.loads(tool_calls)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded_tool_calls = tool_calls
+            msg["tool_calls"] = decoded_tool_calls
+        cleaned = cls._clean_active_assistant_message(msg)
         if cleaned is None:
             return None
         return (
@@ -2655,11 +2662,13 @@ class LCMEngine(ContextEngine):
     def _clean_active_assistant_message(cls, msg: Dict[str, Any]) -> Dict[str, Any] | None:
         if msg.get("role") != "assistant":
             return msg
-        if msg.get("tool_calls"):
+        if "content" not in msg:
             return msg
         cleaned_content = cls._sanitize_active_assistant_content(msg.get("content"))
         if cleaned_content is None:
-            return None
+            if not msg.get("tool_calls"):
+                return None
+            cleaned_content = ""
         if cleaned_content == msg.get("content"):
             return msg
         cleaned = dict(msg)
@@ -2690,7 +2699,7 @@ class LCMEngine(ContextEngine):
         dropped_assistant_messages = 0
         stripped_assistant_messages = 0
         for msg in messages:
-            if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+            if msg.get("role") == "assistant":
                 cleaned_msg = self._clean_active_assistant_message(msg)
                 if cleaned_msg is None:
                     dropped_assistant_messages += 1

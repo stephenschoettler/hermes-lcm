@@ -7743,9 +7743,11 @@ class TestAssemblyToolPairGuardrail:
 
         result = instance._assemble_context(sys_msg, tail_messages)
 
-        assert tool_call_msg in result
+        expected_tool_call_msg = dict(tool_call_msg)
+        expected_tool_call_msg["content"] = ""
+        assert expected_tool_call_msg in result
         assert tool_result_msg in result
-        call_index = result.index(tool_call_msg)
+        call_index = result.index(expected_tool_call_msg)
         assert result[call_index + 1] == tool_result_msg
         self._assert_provider_tool_sequence_valid(result)
 
@@ -8021,6 +8023,81 @@ class TestAssemblyToolPairGuardrail:
         assert [row["role"] for row in rows] == ["system", "user", "assistant", "user"]
         assert rows[2]["content"] == json.dumps(mixed_content, ensure_ascii=False, sort_keys=True)
         assert rows[3]["content"] == "new follow-up"
+        assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
+        assert rebound._last_ingest_reconciliation["cursor"] == len(active_context)
+
+    def test_active_context_cleanup_strips_internal_content_from_assistant_tool_calls(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_tool_call_internal_cleanup.db"),
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        instance = LCMEngine(config=config)
+        session_id = "tool-call-internal-cleanup-test"
+        instance.on_session_start(session_id, context_length=200000)
+        tool_call = {
+            "id": "call_lookup",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "<think>hidden</think>", "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+        ]
+
+        active_context = instance.compress(messages)
+
+        assert active_context[2] == {"role": "assistant", "content": "", "tool_calls": [tool_call]}
+        assert active_context[3] == {"role": "tool", "tool_call_id": "call_lookup", "content": "result"}
+        rows = instance._store.get_session_messages(session_id)
+        assert rows[2]["content"] == "<think>hidden</think>"
+        assert rows[2]["tool_calls"] == [tool_call]
+
+    def test_rebind_reconciliation_tolerates_stripped_assistant_tool_call_content(self, tmp_path):
+        db_path = str(tmp_path / "lcm_rebind_tool_call_internal_cleanup.db")
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        session_id = "rebind-tool-call-internal-cleanup-test"
+        tool_call = {
+            "id": "call_lookup",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "<think>hidden</think>", "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+        ]
+
+        first = LCMEngine(config=config)
+        first.on_session_start(session_id, context_length=200000)
+        active_context = first.compress(messages)
+        assert active_context[2]["content"] == ""
+        assert first._store.get_session_count(session_id) == 4
+        first.shutdown()
+
+        rebound = LCMEngine(config=LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        ))
+        rebound.on_session_start(session_id, context_length=200000)
+        rebound.compress(active_context + [{"role": "user", "content": "new follow-up"}])
+
+        rows = rebound._store.get_session_messages(session_id)
+        assert len(rows) == 5
+        assert [row["role"] for row in rows] == ["system", "user", "assistant", "tool", "user"]
+        assert rows[2]["content"] == "<think>hidden</think>"
+        assert rows[4]["content"] == "new follow-up"
         assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
         assert rebound._last_ingest_reconciliation["cursor"] == len(active_context)
 
