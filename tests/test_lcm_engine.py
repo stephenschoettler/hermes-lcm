@@ -8157,6 +8157,45 @@ class TestAssemblyToolPairGuardrail:
         assert rows[2]["content"] == "<think>hidden</think>"
         assert instance._get_store_ids_for_messages([active_context[2]]) == [rows[2]["store_id"]]
 
+    def test_rebind_reconciliation_preserves_visible_suffix_delta_when_sanitized_tail_collapsed(self, tmp_path):
+        db_path = str(tmp_path / "lcm_rebind_collapsed_tail_delta.db")
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        session_id = "collapsed-tail-delta-test"
+        stored_messages = [
+            {"role": "assistant", "content": [{"type": "thinking", "text": "hidden"}]},
+            {"role": "user", "content": "ping"},
+            {"role": "assistant", "content": "pong"},
+        ]
+
+        first = LCMEngine(config=config)
+        first.on_session_start(session_id, context_length=200000)
+        first.compress(stored_messages)
+        assert first._store.get_session_count(session_id) == 3
+        first.shutdown()
+
+        rebound = LCMEngine(config=LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        ))
+        rebound.on_session_start(session_id, context_length=200000)
+        rebound.compress([
+            {"role": "user", "content": "ping"},
+            {"role": "assistant", "content": "pong"},
+        ])
+
+        rows = rebound._store.get_session_messages(session_id)
+        assert len(rows) == 5
+        assert [row["role"] for row in rows] == ["assistant", "user", "assistant", "user", "assistant"]
+        assert [row["content"] for row in rows[-2:]] == ["ping", "pong"]
+        assert rebound._last_ingest_reconciliation["action"] == "persisted batch"
+
     def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
         """Full compress() output must not contain orphan tool results
         and must include stubs for missing results."""

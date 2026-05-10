@@ -2097,6 +2097,7 @@ class LCMEngine(ContextEngine):
     ) -> int | None:
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
+        sanitized_tail_collapsed = len(sanitized_replay_tail) < len(stored_tail)
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             candidate_messages = messages[:cursor]
@@ -2111,9 +2112,13 @@ class LCMEngine(ContextEngine):
                 if allow_empty_prefix:
                     return cursor
                 continue
-            if len(candidate_prefix) > len(sanitized_replay_tail):
-                continue
-            if not self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix):
+
+            matches_sanitized_tail = (
+                len(candidate_prefix) <= len(sanitized_replay_tail)
+                and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix)
+            )
+            matches_raw_tail = self._matches_store_tail_suffix(stored_tail, candidate_prefix)
+            if not matches_sanitized_tail and not matches_raw_tail:
                 continue
 
             # Matching a stored suffix is not enough evidence by itself.  A
@@ -2121,19 +2126,21 @@ class LCMEngine(ContextEngine):
             # the first delta happens to repeat the durable tail, treating that
             # row as replay silently loses it.  Only advance the cursor when the
             # incoming prefix proves replay by covering the full durable session.
-            # A system prompt is a strong anchor, but older/minimal transcripts
-            # can start directly with user/assistant turns, so multi-row full
-            # replay is also accepted.  Singleton full replay remains ambiguous
-            # with a one-message delta that repeats the tail, so it is persisted
-            # rather than risk data loss.
-            has_effective_full_replay = len(candidate_prefix) >= effective_session_count and (
-                effective_session_count > 1 or any(identity[0] == "system" for identity in candidate_prefix)
+            # A system prompt is a strong anchor. Older/minimal transcripts can
+            # start directly with user/assistant turns, so multi-row full replay
+            # is accepted only when active cleanup did not collapse the durable
+            # tail; otherwise a fresh delta can repeat the remaining visible
+            # suffix and must be preserved.
+            candidate_has_system = any(identity[0] == "system" for identity in candidate_prefix)
+            has_effective_full_replay = matches_sanitized_tail and len(candidate_prefix) >= effective_session_count and (
+                candidate_has_system or (effective_session_count > 1 and not sanitized_tail_collapsed)
             )
             has_scaffold_evidence = any(
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
             has_raw_full_replay = (
-                not has_scaffold_evidence
+                matches_raw_tail
+                and not has_scaffold_evidence
                 and len(candidate_messages) >= raw_session_count
                 and raw_session_count > 1
             )
