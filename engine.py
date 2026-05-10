@@ -2118,6 +2118,11 @@ class LCMEngine(ContextEngine):
                 and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix)
             )
             matches_raw_tail = self._matches_store_tail_suffix(stored_tail, candidate_prefix)
+            raw_tail_suffix = stored_tail[-len(candidate_prefix) :] if matches_raw_tail else []
+            raw_suffix_needs_cleanup_equivalence = any(
+                self._active_cleanup_replay_identity(identity) != identity
+                for identity in raw_tail_suffix
+            )
             if not matches_sanitized_tail and not matches_raw_tail:
                 continue
 
@@ -2144,7 +2149,14 @@ class LCMEngine(ContextEngine):
                 and len(candidate_messages) >= raw_session_count
                 and raw_session_count > 1
             )
-            if has_effective_full_replay or has_raw_full_replay:
+            has_raw_cleanup_replay = (
+                matches_raw_tail
+                and has_scaffold_evidence
+                and cursor < len(messages)
+                and len(candidate_prefix) >= max(1, self._config.fresh_tail_count)
+                and raw_suffix_needs_cleanup_equivalence
+            )
+            if has_effective_full_replay or has_raw_full_replay or has_raw_cleanup_replay:
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
