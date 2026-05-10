@@ -30,7 +30,33 @@ def engine(tmp_path):
     e._session_id = "test-session"
     e.context_length = 200000
     e.threshold_tokens = int(200000 * config.context_threshold)
-    return e
+    try:
+        yield e
+    finally:
+        e.shutdown()
+
+
+def test_shutdown_closes_lifecycle_store(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "shutdown-lifecycle.db"))
+    engine = LCMEngine(config=config)
+
+    engine.shutdown()
+
+    assert engine._lifecycle._conn is None
+
+
+def test_engine_deallocation_releases_sqlite_fds_without_gc(tmp_path):
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.exists():
+        pytest.skip("fd count is Linux-specific")
+    before = len(list(fd_dir.iterdir()))
+
+    for idx in range(5):
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / f"engine-{idx}.db")))
+        del engine
+
+    after = len(list(fd_dir.iterdir()))
+    assert after <= before + 2
 
 
 def test_lcm_tool_status_reports_lifecycle_fragmentation_summary(engine, tmp_path):

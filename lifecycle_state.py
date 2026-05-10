@@ -57,9 +57,16 @@ class LifecycleStateStore:
         self._conn.commit()
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            conn.close()
             self._conn = None
+
+    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def row_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()

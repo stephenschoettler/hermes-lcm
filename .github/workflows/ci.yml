@@ -6,12 +6,26 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Lint GitHub Actions workflows
+        run: "$(go env GOPATH)/bin/actionlint"
+
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -21,7 +35,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install pytest
+      - name: Install test dependencies
         run: pip install pytest
 
       - name: Stub hermes-agent ABC
@@ -53,5 +67,14 @@ jobs:
                   return {}
           STUB
 
-      - name: Run tests
-        run: python -m pytest tests/ -v
+      - name: Run pytest under low file descriptor limit
+        run: |
+          ulimit -n 1024
+          python -m pytest tests/ -q
+
+      - name: Run static validation
+        run: |
+          python -m compileall -q .
+          python -m py_compile scripts/import_lossless_claw.py
+          bash -n scripts/install.sh scripts/update.sh
+          git diff --check

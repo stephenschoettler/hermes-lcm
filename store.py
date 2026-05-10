@@ -972,6 +972,13 @@ class MessageStore:
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self):
-        if self._conn:
-            self._conn.close()
+        conn = getattr(self, "_conn", None)
+        if conn:
+            conn.close()
             self._conn = None
+
+    def __del__(self):  # pragma: no cover - defensive resource cleanup
+        try:
+            self.close()
+        except Exception:
+            pass

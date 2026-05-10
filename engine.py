@@ -3018,3 +3018,4 @@ class LCMEngine(ContextEngine):
     def shutdown(self):
         self._store.close()
         self._dag.close()
+        self._lifecycle.close()
