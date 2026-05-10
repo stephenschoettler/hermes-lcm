@@ -236,6 +236,79 @@ If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the
 session.
 
+### FAQ: tuning LCM for large context windows
+
+Long-context models change the tuning problem. A 1M-token model does not mean
+you always want to spend 750k prompt tokens before LCM starts compacting. The
+right starting point is usually the active prompt size you are willing to pay
+for, then tune LCM around that budget.
+
+The basic calculation is:
+
+```text
+compaction trigger = effective context window * LCM_CONTEXT_THRESHOLD
+```
+
+Examples:
+
+| Effective context window | `LCM_CONTEXT_THRESHOLD` | Approx. compaction trigger | Good fit |
+|--------------------------|-------------------------|-----------------------------|----------|
+| `128000` | `0.75` | `96000` | Typical smaller long-context setup |
+| `200000` | `0.70` | `140000` | Balanced cost and active context |
+| `400000` | `0.60` | `240000` | Large window, earlier DAG building |
+| `1000000` | `0.25` | `250000` | Cost-sensitive 1M-token model |
+| `1000000` | `0.40` | `400000` | Balanced 1M-token model |
+| `1000000` | `0.60` | `600000` | Maximum active context, higher burn |
+
+If your Hermes config caps the model's effective `context_length`, tune against
+that effective value instead of the provider's advertised maximum. For example,
+a 1M-token provider with an effective `context_length` of `400000` and
+`LCM_CONTEXT_THRESHOLD=0.60` starts compaction around `240000` prompt tokens.
+
+A reasonable first-pass table:
+
+| Goal | Threshold | Fresh tail | Leaf chunk | Expansion context |
+|------|-----------|------------|------------|-------------------|
+| Lower spend / earlier compaction | `0.25` to `0.40` on 1M windows | `32` to `64` | `12000` to `20000` | `32000` |
+| Balanced default for large models | `0.40` to `0.60` | `64` | `20000` to `30000` | `32000` to `64000` |
+| Keep more raw context active | `0.60` to `0.80` | `64` to `128` | `30000` to `40000` | `64000` |
+
+What the main knobs do:
+
+- `LCM_CONTEXT_THRESHOLD` decides when compaction starts. Lower values build the
+  DAG earlier and reduce active prompt burn, but compact more often.
+- `LCM_FRESH_TAIL_COUNT` protects recent messages from compaction. Raise it if
+  your agent often needs the last few tool calls or planning turns verbatim.
+- `LCM_LEAF_CHUNK_TOKENS` controls the first summary chunk size. Smaller chunks
+  usually preserve local detail better. Larger chunks reduce summary call count.
+- `LCM_EXPANSION_CONTEXT_TOKENS` controls how much recovered material
+  `lcm_expand_query` may feed to the auxiliary model. It does not change what
+  LCM stores.
+- `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED=true` helps when large tool outputs,
+  logs, media payloads, or raw JSON blobs dominate token pressure.
+
+Common questions:
+
+**Should I leave the default threshold on a 1M-token model?**
+
+Usually not if cost, latency, or early recall structure matters. The default
+`0.75` means compaction may wait until roughly `750000` prompt tokens on a true
+1M effective window. That can be intentional, but it is expensive and delays DAG
+construction.
+
+**Does compacting earlier hurt recall?**
+
+It changes the tradeoff. More content moves from the live prompt into summaries
+earlier, but raw messages are still stored and recoverable through LCM tools. If
+you need exact details later, use `lcm_grep`, `lcm_describe`, `lcm_expand`, or
+`lcm_expand_query` instead of relying only on the active prompt.
+
+**How do I know whether my settings are working?**
+
+After a normal message has initialized the session, check `lcm_status` for the
+effective context length, threshold tokens, prompt pressure, compression count,
+raw rows, and summary nodes. Run `lcm_doctor` when behavior looks surprising.
+
 ### Session pattern syntax
 
 Pattern matching checks multiple keys: raw `session_id`, `platform`, and
