@@ -7945,6 +7945,37 @@ class TestAssemblyToolPairGuardrail:
         assert rows[-1]["content"] == "new follow-up"
         assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
 
+    def test_active_context_cleanup_strips_internal_parts_from_mixed_assistant_content(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_mixed_internal_cleanup.db"),
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("mixed-internal-cleanup-test", context_length=200000)
+        mixed_content = [
+            {"type": "thinking", "text": "secret chain of thought"},
+            {"type": "text", "text": "visible final"},
+        ]
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": mixed_content},
+            {"role": "assistant", "content": "<think>hidden</think>string final"},
+        ]
+
+        active_context = instance.compress(messages)
+
+        assert active_context[2] == {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "visible final"}],
+        }
+        assert active_context[3] == {"role": "assistant", "content": "string final"}
+        rows = instance._store.get_session_messages("mixed-internal-cleanup-test")
+        assert rows[2]["content"] == json.dumps(mixed_content, ensure_ascii=False, sort_keys=True)
+        assert rows[3]["content"] == "<think>hidden</think>string final"
+
     def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
         """Full compress() output must not contain orphan tool results
         and must include stubs for missing results."""

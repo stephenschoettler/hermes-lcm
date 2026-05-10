@@ -2570,12 +2570,87 @@ class LCMEngine(ContextEngine):
         return bool(str(content).strip())
 
     @classmethod
+    def _strip_structured_text_part(cls, part: Dict[str, Any]) -> Dict[str, Any] | None:
+        cleaned = dict(part)
+        for key in ("text", "content", "value"):
+            value = cleaned.get(key)
+            if isinstance(value, str):
+                stripped = _strip_reasoning_blocks(value)
+                if not stripped.strip():
+                    return None
+                cleaned[key] = stripped
+                return cleaned
+            if isinstance(value, dict):
+                nested = dict(value)
+                for nested_key in ("value", "content", "text"):
+                    nested_value = nested.get(nested_key)
+                    if isinstance(nested_value, str):
+                        stripped = _strip_reasoning_blocks(nested_value)
+                        if not stripped.strip():
+                            return None
+                        nested[nested_key] = stripped
+                        cleaned[key] = nested
+                        return cleaned
+        return cleaned if cls._structured_part_has_visible_assistant_content(cleaned) else None
+
+    @classmethod
+    def _sanitize_active_assistant_content(cls, content: Any) -> Any | None:
+        if content is None:
+            return None
+        if isinstance(content, str):
+            stripped = _strip_reasoning_blocks(content)
+            return stripped if stripped.strip() else None
+        if isinstance(content, list):
+            cleaned_parts: list[Any] = []
+            for part in content:
+                if isinstance(part, str):
+                    stripped = _strip_reasoning_blocks(part)
+                    if stripped.strip():
+                        cleaned_parts.append(stripped)
+                    continue
+                if isinstance(part, dict):
+                    part_type = str(part.get("type") or "").strip().lower()
+                    if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
+                        continue
+                    if part_type in _VISIBLE_TEXT_PART_TYPES:
+                        cleaned_part = cls._strip_structured_text_part(part)
+                        if cleaned_part is not None:
+                            cleaned_parts.append(cleaned_part)
+                        continue
+                if cls._structured_part_has_visible_assistant_content(part):
+                    cleaned_parts.append(part)
+            return cleaned_parts or None
+        if isinstance(content, dict):
+            part_type = str(content.get("type") or "").strip().lower()
+            if part_type in _INTERNAL_ASSISTANT_PART_TYPES:
+                return None
+            if part_type in _VISIBLE_TEXT_PART_TYPES:
+                return cls._strip_structured_text_part(content)
+            return content if cls._structured_part_has_visible_assistant_content(content) else None
+        return content if str(content).strip() else None
+
+    @classmethod
+    def _clean_active_assistant_message(cls, msg: Dict[str, Any]) -> Dict[str, Any] | None:
+        if msg.get("role") != "assistant":
+            return msg
+        if msg.get("tool_calls"):
+            return msg
+        cleaned_content = cls._sanitize_active_assistant_content(msg.get("content"))
+        if cleaned_content is None:
+            return None
+        if cleaned_content == msg.get("content"):
+            return msg
+        cleaned = dict(msg)
+        cleaned["content"] = cleaned_content
+        return cleaned
+
+    @classmethod
     def _should_drop_active_assistant_message(cls, msg: Dict[str, Any]) -> bool:
         if msg.get("role") != "assistant":
             return False
         if msg.get("tool_calls"):
             return False
-        return not cls._assistant_message_has_visible_content(msg)
+        return cls._clean_active_assistant_message(msg) is None
 
     def _sanitize_active_context_messages(
         self,
@@ -2591,9 +2666,16 @@ class LCMEngine(ContextEngine):
         """
         cleaned: list[Dict[str, Any]] = []
         dropped_assistant_messages = 0
+        stripped_assistant_messages = 0
         for msg in messages:
-            if self._should_drop_active_assistant_message(msg):
-                dropped_assistant_messages += 1
+            if msg.get("role") == "assistant" and not msg.get("tool_calls"):
+                cleaned_msg = self._clean_active_assistant_message(msg)
+                if cleaned_msg is None:
+                    dropped_assistant_messages += 1
+                    continue
+                if cleaned_msg is not msg:
+                    stripped_assistant_messages += 1
+                cleaned.append(cleaned_msg)
                 continue
             cleaned.append(msg)
 
@@ -2601,6 +2683,11 @@ class LCMEngine(ContextEngine):
             logger.info(
                 "LCM active-context cleanup: dropped %d assistant message(s) with no visible content",
                 dropped_assistant_messages,
+            )
+        if stripped_assistant_messages:
+            logger.info(
+                "LCM active-context cleanup: stripped internal content from %d assistant message(s)",
+                stripped_assistant_messages,
             )
 
         return self._sanitize_tool_pairs(
