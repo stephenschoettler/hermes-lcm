@@ -24,8 +24,10 @@ from .dag import SummaryDAG, SummaryNode
 from .escalation import summarize_with_escalation
 from .externalize import (
     build_transcript_gc_placeholder,
-    maybe_externalize_tool_output,
+    extract_externalized_ref,
     find_externalized_payload_for_message,
+    load_externalized_payload,
+    maybe_externalize_tool_output,
     reassign_externalized_payloads,
 )
 from .extraction import (
@@ -33,6 +35,7 @@ from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
 )
+from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -297,6 +300,10 @@ class LCMEngine(ContextEngine):
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        self._last_ingest_reconciliation: Dict[str, Any] = {
+            "action": "none",
+            "reason": "not run",
+        }
 
         # State required by ContextEngine ABC and run_agent.py compatibility
         self.model = ""
@@ -1287,6 +1294,7 @@ class LCMEngine(ContextEngine):
         self._last_compacted_store_id = 0
         self._ingest_cursor = 0
         self._ingest_cursor_needs_reconcile = False
+        self._last_ingest_reconciliation = {"action": "none", "reason": "not run"}
         self._context_probed = False
         self._context_probe_persistable = False
         self._last_overflow_recovery_failed = False
@@ -1806,6 +1814,7 @@ class LCMEngine(ContextEngine):
             status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
             status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
             status["ignored_message_count"] = self._ignored_message_count
+            status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
             status["conversation_id"] = conversation_id
@@ -1947,9 +1956,25 @@ class LCMEngine(ContextEngine):
             return str(tool_calls)
 
     def _message_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
+        content = normalize_content_value(msg.get("content")) or ""
+        # Durable rows may contain ingest-time externalization placeholders.
+        # Replay matching should not depend on the current write-time
+        # externalization flag: a restart with the knob toggled must still match
+        # raw live messages against already-externalized rows, and vice versa.
+        # Hydrating the stored placeholder for identity comparison is read-only
+        # and avoids creating payload files while reconciling.
+        ref = extract_externalized_ref(content)
+        if ref:
+            payload = load_externalized_payload(
+                ref,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if payload is not None and isinstance(payload.get("content"), str):
+                content = payload["content"]
         return (
             str(msg.get("role") or "unknown"),
-            normalize_content_value(msg.get("content")) or "",
+            content,
             str(msg.get("tool_call_id") or ""),
             self._stable_tool_calls_identity(msg.get("tool_calls")),
         )
@@ -2018,6 +2043,66 @@ class LCMEngine(ContextEngine):
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
+    def _record_ingest_reconciliation(
+        self,
+        *,
+        action: str,
+        reason: str,
+        cursor: int,
+        incoming: int,
+        session_count: int,
+        stored_tail_count: int,
+        effective_incoming: int | None = None,
+    ) -> None:
+        self._last_ingest_reconciliation = {
+            "action": action,
+            "reason": reason,
+            "cursor": cursor,
+            "incoming": incoming,
+            "session_count": session_count,
+            "stored_tail_count": stored_tail_count,
+        }
+        if effective_incoming is not None:
+            self._last_ingest_reconciliation["effective_incoming"] = effective_incoming
+
+    def _effective_replay_identities(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> list[tuple[str, str, str, str]]:
+        return [
+            self._message_replay_identity(msg)
+            for msg in messages
+            if not self._is_replayed_context_scaffold_message(msg)
+            and not self._matches_ignore_message_patterns(msg)
+        ]
+
+    def _is_suspicious_stale_no_overlap_snapshot(
+        self,
+        incoming_identities: list[tuple[str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str]],
+        stored_head: list[tuple[str, str, str, str]],
+    ) -> bool:
+        """Return true for short stale snapshots with no durable-tail overlap.
+
+        A restarted gateway can hand LCM a stale, short in-memory snapshot from
+        the beginning of a longer session.  When that snapshot has no overlap
+        with the durable tail, appending it as a delta creates duplicate rows.
+        Fail closed only when the short batch is proven stale by matching the
+        contiguous durable-store prefix; singleton no-overlap deltas remain
+        ambiguous and are preserved.
+        """
+        if len(incoming_identities) <= 1:
+            return False
+        if incoming_identities[0][0] != "system":
+            return False
+        if not stored_tail or len(incoming_identities) >= len(stored_tail):
+            return False
+        if set(incoming_identities).intersection(stored_tail):
+            return False
+        if len(incoming_identities) > len(stored_head):
+            return False
+        return stored_head[: len(incoming_identities)] == incoming_identities
+
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
@@ -2047,16 +2132,74 @@ class LCMEngine(ContextEngine):
             session_count=len(stored_tail),
             raw_session_count=session_count,
         )
-        if cursor is not None:
+        if cursor is not None and cursor > 0:
+            reason = (
+                "skipped scaffold-only prefix"
+                if not self._effective_replay_identities(messages[:cursor])
+                else "replayed durable tail"
+            )
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason=reason,
+                cursor=cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(self._effective_replay_identities(messages)),
+            )
             logger.debug(
-                "LCM reconciled ingest cursor after existing-session bind: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d",
+                "LCM reconciled ingest cursor after existing-session bind: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d reason=%s",
                 self._session_id,
                 cursor,
                 len(messages),
                 len(stored_tail),
                 session_count,
+                reason,
             )
             return cursor
+
+        incoming_identities = self._effective_replay_identities(messages)
+        stored_head_rows = self._store.get_session_messages(
+            self._session_id,
+            limit=tail_limit,
+        )
+        stored_head = [self._message_replay_identity(row) for row in stored_head_rows]
+        # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
+        # filters may suppress noisy rows for tail reconciliation, but filtered
+        # history alone must not create replay evidence for skipping a batch.
+        if self._is_suspicious_stale_no_overlap_snapshot(
+            incoming_identities,
+            stored_tail,
+            stored_head,
+        ):
+            self._record_ingest_reconciliation(
+                action="skipped batch",
+                reason="skipped stale no-overlap snapshot",
+                cursor=len(messages),
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.warning(
+                "LCM skipped stale no-overlap snapshot after existing-session bind: session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
+                self._session_id,
+                len(messages),
+                len(incoming_identities),
+                len(stored_tail),
+                session_count,
+            )
+            return len(messages)
+
+        self._record_ingest_reconciliation(
+            action="persisted batch",
+            reason="persisted ambiguous delta",
+            cursor=0,
+            incoming=len(messages),
+            session_count=session_count,
+            stored_tail_count=len(stored_tail),
+            effective_incoming=len(incoming_identities),
+        )
         return 0
 
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> None:
@@ -2115,10 +2258,16 @@ class LCMEngine(ContextEngine):
             self._ingest_cursor = n
             return
 
-        estimates = [count_message_tokens(m) for m in new_messages]
+        protected_messages = protect_messages_for_ingest(
+            new_messages,
+            session_id=self._session_id,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        estimates = [count_message_tokens(m) for m in protected_messages]
         self._store.append_batch(
             self._session_id,
-            new_messages,
+            protected_messages,
             estimates,
             source=self._session_platform,
         )
@@ -2140,11 +2289,22 @@ class LCMEngine(ContextEngine):
         ids: list[int] = []
         store_idx = 0
         for msg in messages:
-            role = msg.get("role", "")
-            content = normalize_content_value(msg.get("content")) or ""
+            protected_msg = protect_message_for_ingest(
+                msg,
+                session_id=self._session_id,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            wanted_identity = self._message_replay_identity(msg)
+            role = protected_msg.get("role", "")
+            content = normalize_content_value(protected_msg.get("content")) or ""
             probe_idx = store_idx
             while probe_idx < len(candidates):
                 stored = candidates[probe_idx]
+                if self._message_replay_identity(stored) == wanted_identity:
+                    ids.append(stored["store_id"])
+                    store_idx = probe_idx + 1
+                    break
                 if stored.get("role", "") == role and (stored.get("content") or "") == content:
                     ids.append(stored["store_id"])
                     store_idx = probe_idx + 1
@@ -2195,6 +2355,18 @@ class LCMEngine(ContextEngine):
             tool_call_id = stored.get("tool_call_id", "") or ""
             if not content:
                 continue
+
+            ref = extract_externalized_ref(content)
+            if ref:
+                externalized = load_externalized_payload(
+                    ref,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
+                    placeholder = build_transcript_gc_placeholder(externalized)
+                    self._store.gc_externalized_tool_result(store_id, placeholder)
+                    continue
 
             lookup_candidates = []
             sanitized_content = sanitize_pre_compaction_content(content)
