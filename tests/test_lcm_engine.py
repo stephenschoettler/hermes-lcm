@@ -7841,6 +7841,48 @@ class TestAssemblyToolPairGuardrail:
         assert {"role": "assistant", "content": visible_content} in result
         self._assert_provider_tool_sequence_valid(result)
 
+    def test_assembly_cap_ignores_dropped_internal_assistant_turns_during_tail_selection(self, tmp_path, monkeypatch):
+        import importlib
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(str(msg.get("content", ""))),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(str(msg.get("content", ""))) for msg in messages),
+        )
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_cap_precleanup_tail.db"),
+            max_assembly_tokens=50,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "cap-precleanup-test"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        sys_msg = {"role": "system", "content": "s" * 5}
+        user_msg = {"role": "user", "content": "VISIBLE_USER_OBJECTIVE"}
+        noisy_assistant = {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": "x" * 500}],
+        }
+
+        result = instance._assemble_context(
+            sys_msg,
+            [user_msg, noisy_assistant],
+            assembly_cap_override=50,
+        )
+
+        assert user_msg in result
+        assert noisy_assistant not in result
+        self._assert_provider_tool_sequence_valid(result)
+
     def test_assemble_cleanup_preserves_valid_tool_call_adjacency(self, tmp_path):
         instance = self._make_engine(tmp_path, "lcm_tool_call_cleanup_preserve.db")
         sys_msg = {"role": "system", "content": "sys"}

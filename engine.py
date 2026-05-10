@@ -3068,7 +3068,11 @@ class LCMEngine(ContextEngine):
             used = count_message_tokens(leading_msg)
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
-            for msg in reversed(tail_messages):
+            tail_for_selection = self._sanitize_active_context_messages(
+                tail_messages,
+                insert_missing_tool_stubs=False,
+            )
+            for msg in reversed(tail_for_selection):
                 msg_tokens = count_message_tokens(msg)
                 if used + tail_token_total + msg_tokens > assembly_cap:
                     break
