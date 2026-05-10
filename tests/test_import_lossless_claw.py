@@ -210,6 +210,49 @@ def test_dry_run_handles_uri_reserved_source_db_path(tmp_path: Path):
     assert not target_db.exists()
 
 
+def test_apply_import_routes_oversized_payloads_through_ingest_protection(tmp_path: Path, monkeypatch):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    externalized_dir = tmp_path / "externalized"
+    create_lossless_source(source_db)
+
+    large_content = "IMPORT_RAW_NEEDLE:" + ("q" * 5000)
+    conn = sqlite3.connect(source_db)
+    conn.execute("UPDATE messages SET content = ? WHERE message_id = 10", (large_content,))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", "1")
+    monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", "200")
+    monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", str(externalized_dir))
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="fixture-import",
+        apply=True,
+    )
+
+    assert result.imported == 2
+    db = sqlite3.connect(target_db)
+    content = db.execute(
+        "SELECT content FROM messages WHERE role = 'user' ORDER BY store_id LIMIT 1"
+    ).fetchone()[0]
+    db.close()
+    assert content.startswith("[Externalized payload: kind=raw_payload;")
+    assert "IMPORT_RAW_NEEDLE" not in content
+
+    payload_files = list(externalized_dir.glob("*.json"))
+    assert len(payload_files) == 1
+    payload = json.loads(payload_files[0].read_text())
+    assert payload["kind"] == "raw_payload"
+    assert payload["session_id"] == "openclaw-lcm:agent:sammy:runtime-session-1"
+    assert payload["content"] == large_content
+
+
 def test_apply_imports_messages_with_provenance_backup_and_search(tmp_path: Path):
     importer = load_importer_module()
     source_db = tmp_path / "lossless.db"

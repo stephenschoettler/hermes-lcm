@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -36,6 +37,8 @@ def _ensure_local_package_importable() -> None:
 
 _ensure_local_package_importable()
 
+from hermes_lcm.config import LCMConfig  # noqa: E402
+from hermes_lcm.ingest_protection import protect_message_for_ingest  # noqa: E402
 from hermes_lcm.store import MessageStore, _normalize_source_value  # noqa: E402
 from hermes_lcm.tokens import count_message_tokens  # noqa: E402
 
@@ -535,9 +538,27 @@ def import_lossless_claw(
     _ensure_import_table(conn)
 
     imported = 0
+    ingest_config = LCMConfig.from_env()
+    hermes_home = os.environ.get("HERMES_HOME", "")
     try:
         for candidate in to_import:
-            tool_calls_json = json.dumps(candidate.tool_calls) if candidate.tool_calls else None
+            original_msg: dict[str, Any] = {
+                "role": candidate.role,
+                "content": candidate.content,
+            }
+            if candidate.tool_call_id:
+                original_msg["tool_call_id"] = candidate.tool_call_id
+            if candidate.tool_calls:
+                original_msg["tool_calls"] = candidate.tool_calls
+            if candidate.tool_name:
+                original_msg["tool_name"] = candidate.tool_name
+            protected_msg = protect_message_for_ingest(
+                original_msg,
+                session_id=candidate.target_session_id,
+                config=ingest_config,
+                hermes_home=hermes_home,
+            )
+            tool_calls_json = json.dumps(protected_msg.get("tool_calls")) if protected_msg.get("tool_calls") else None
             cur = conn.execute(
                 """INSERT INTO messages
                    (session_id, source, role, content, tool_call_id, tool_calls,
@@ -546,13 +567,13 @@ def import_lossless_claw(
                 (
                     candidate.target_session_id,
                     _normalize_source_value(candidate.source),
-                    candidate.role,
-                    candidate.content,
-                    candidate.tool_call_id,
+                    protected_msg.get("role", candidate.role),
+                    protected_msg.get("content"),
+                    protected_msg.get("tool_call_id"),
                     tool_calls_json,
-                    candidate.tool_name,
+                    protected_msg.get("tool_name"),
                     candidate.timestamp,
-                    candidate.token_estimate,
+                    count_message_tokens(protected_msg),
                 ),
             )
             conn.execute(
