@@ -2394,12 +2394,21 @@ class LCMEngine(ContextEngine):
                 hermes_home=self._hermes_home,
             )
             wanted_identity = self._message_replay_identity(msg)
+            wanted_cleanup_identity = self._active_cleanup_replay_identity(wanted_identity)
             role = protected_msg.get("role", "")
             content = normalize_content_value(protected_msg.get("content")) or ""
             probe_idx = store_idx
             while probe_idx < len(candidates):
                 stored = candidates[probe_idx]
-                if self._message_replay_identity(stored) == wanted_identity:
+                stored_identity = self._message_replay_identity(stored)
+                if stored_identity == wanted_identity:
+                    ids.append(stored["store_id"])
+                    store_idx = probe_idx + 1
+                    break
+                if (
+                    wanted_cleanup_identity is not None
+                    and self._active_cleanup_replay_identity(stored_identity) == wanted_cleanup_identity
+                ):
                     ids.append(stored["store_id"])
                     store_idx = probe_idx + 1
                     break

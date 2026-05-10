@@ -8101,6 +8101,62 @@ class TestAssemblyToolPairGuardrail:
         assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
         assert rebound._last_ingest_reconciliation["cursor"] == len(active_context)
 
+    def test_source_id_mapping_matches_stripped_assistant_active_context(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_source_id_stripped_cleanup.db"),
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        instance = LCMEngine(config=config)
+        session_id = "source-id-stripped-cleanup-test"
+        instance.on_session_start(session_id, context_length=200000)
+        mixed_content = [
+            {"type": "thinking", "text": "secret chain of thought"},
+            {"type": "text", "text": "visible final"},
+        ]
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": mixed_content},
+        ]
+
+        active_context = instance.compress(messages)
+        rows = instance._store.get_session_messages(session_id)
+
+        assert active_context[2]["content"] == [{"type": "text", "text": "visible final"}]
+        assert rows[2]["content"] == json.dumps(mixed_content, ensure_ascii=False, sort_keys=True)
+        assert instance._get_store_ids_for_messages([active_context[2]]) == [rows[2]["store_id"]]
+
+    def test_source_id_mapping_matches_stripped_tool_call_active_context(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_source_id_tool_call_cleanup.db"),
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        instance = LCMEngine(config=config)
+        session_id = "source-id-tool-call-cleanup-test"
+        instance.on_session_start(session_id, context_length=200000)
+        tool_call = {
+            "id": "call_lookup",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "<think>hidden</think>", "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call_lookup", "content": "result"},
+        ]
+
+        active_context = instance.compress(messages)
+        rows = instance._store.get_session_messages(session_id)
+
+        assert active_context[2]["content"] == ""
+        assert rows[2]["content"] == "<think>hidden</think>"
+        assert instance._get_store_ids_for_messages([active_context[2]]) == [rows[2]["store_id"]]
+
     def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
         """Full compress() output must not contain orphan tool results
         and must include stubs for missing results."""
