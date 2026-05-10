@@ -7976,6 +7976,54 @@ class TestAssemblyToolPairGuardrail:
         assert rows[2]["content"] == json.dumps(mixed_content, ensure_ascii=False, sort_keys=True)
         assert rows[3]["content"] == "<think>hidden</think>string final"
 
+    def test_rebind_reconciliation_tolerates_stripped_active_assistant_content(self, tmp_path):
+        db_path = str(tmp_path / "lcm_rebind_stripped_active_cleanup.db")
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        session_id = "rebind-stripped-cleanup-test"
+        mixed_content = [
+            {"type": "thinking", "text": "secret chain of thought"},
+            {"type": "text", "text": "visible final"},
+        ]
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": mixed_content},
+        ]
+
+        first = LCMEngine(config=config)
+        first.on_session_start(session_id, context_length=200000)
+        active_context = first.compress(messages)
+
+        assert active_context == [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": [{"type": "text", "text": "visible final"}]},
+        ]
+        assert first._store.get_session_count(session_id) == 3
+        first.shutdown()
+
+        rebound = LCMEngine(config=LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        ))
+        rebound.on_session_start(session_id, context_length=200000)
+        rebound.compress(active_context + [{"role": "user", "content": "new follow-up"}])
+
+        rows = rebound._store.get_session_messages(session_id)
+        assert len(rows) == 4
+        assert [row["role"] for row in rows] == ["system", "user", "assistant", "user"]
+        assert rows[2]["content"] == json.dumps(mixed_content, ensure_ascii=False, sort_keys=True)
+        assert rows[3]["content"] == "new follow-up"
+        assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
+        assert rebound._last_ingest_reconciliation["cursor"] == len(active_context)
+
     def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
         """Full compress() output must not contain orphan tool results
         and must include stubs for missing results."""

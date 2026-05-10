@@ -2041,21 +2041,43 @@ class LCMEngine(ContextEngine):
             "content": cls._identity_content_for_active_cleanup(content),
         })
 
+    @classmethod
+    def _active_cleanup_replay_identity(
+        cls,
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str] | None:
+        role, content, tool_call_id, tool_calls = identity
+        if role != "assistant" or tool_calls:
+            return identity
+        cleaned = cls._clean_active_assistant_message({
+            "role": role,
+            "content": cls._identity_content_for_active_cleanup(content),
+        })
+        if cleaned is None:
+            return None
+        return (
+            role,
+            normalize_content_value(cleaned.get("content")) or "",
+            tool_call_id,
+            tool_calls,
+        )
+
     def _stored_tail_for_sanitized_active_replay(
         self,
         stored_tail: list[tuple[str, str, str, str]],
     ) -> list[tuple[str, str, str, str]]:
-        """Drop only rows active-context cleanup may remove from replay.
+        """Mirror active-context cleanup for restart replay reconciliation.
 
         Raw storage remains lossless. This view is used only to reconcile a
-        restarted process when the host replays sanitized active context that no
-        longer contains assistant messages with no visible content.
+        restarted process when the host replays sanitized active context where
+        assistant rows may be removed or have internal content stripped.
         """
-        return [
-            identity
-            for identity in stored_tail
-            if not self._is_active_context_droppable_identity(identity)
-        ]
+        sanitized_tail: list[tuple[str, str, str, str]] = []
+        for identity in stored_tail:
+            cleaned_identity = self._active_cleanup_replay_identity(identity)
+            if cleaned_identity is not None:
+                sanitized_tail.append(cleaned_identity)
+        return sanitized_tail
 
     def _find_reconciled_cursor_for_store_tail(
         self,
