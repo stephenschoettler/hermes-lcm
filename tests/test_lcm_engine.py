@@ -7901,6 +7901,50 @@ class TestAssemblyToolPairGuardrail:
         assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
         assert rebound._last_ingest_reconciliation["cursor"] == len(sanitized)
 
+    def test_no_compaction_cleanup_does_not_return_untracked_tool_stubs_after_rebind(self, tmp_path):
+        db_path = str(tmp_path / "lcm_no_compaction_pending_tool_stub.db")
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        session_id = "pending-tool-stub-test"
+        pending_call = {
+            "id": "call_pending",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "tool_calls": [pending_call]},
+        ]
+
+        first = LCMEngine(config=config)
+        first.on_session_start(session_id, context_length=200000)
+        active_context = first.compress(messages)
+
+        assert active_context == messages
+        assert all(msg.get("role") != "tool" for msg in active_context)
+        assert first._store.get_session_count(session_id) == 3
+        first.shutdown()
+
+        rebound = LCMEngine(config=LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        ))
+        rebound.on_session_start(session_id, context_length=200000)
+        rebound.compress(active_context + [{"role": "user", "content": "new follow-up"}])
+
+        rows = rebound._store.get_session_messages(session_id)
+        assert len(rows) == 4
+        assert [row["role"] for row in rows] == ["system", "user", "assistant", "user"]
+        assert rows[-1]["content"] == "new follow-up"
+        assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
+
     def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
         """Full compress() output must not contain orphan tool results
         and must include stubs for missing results."""

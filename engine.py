@@ -763,7 +763,10 @@ class LCMEngine(ContextEngine):
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
                 )
-            sanitized_messages = self._sanitize_active_context_messages(messages)
+            sanitized_messages = self._sanitize_active_context_messages(
+                messages,
+                insert_missing_tool_stubs=False,
+            )
             if len(sanitized_messages) != len(messages):
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from the shorter
@@ -2574,7 +2577,12 @@ class LCMEngine(ContextEngine):
             return False
         return not cls._assistant_message_has_visible_content(msg)
 
-    def _sanitize_active_context_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sanitize_active_context_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        insert_missing_tool_stubs: bool = True,
+    ) -> List[Dict[str, Any]]:
         """Drop unsafe assistant-only noise, then repair tool sequencing.
 
         This is intentionally active-context-only: callers pass the selected
@@ -2595,9 +2603,17 @@ class LCMEngine(ContextEngine):
                 dropped_assistant_messages,
             )
 
-        return self._sanitize_tool_pairs(cleaned)
+        return self._sanitize_tool_pairs(
+            cleaned,
+            insert_missing_tool_stubs=insert_missing_tool_stubs,
+        )
 
-    def _sanitize_tool_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sanitize_tool_pairs(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        insert_missing_tool_stubs: bool = True,
+    ) -> List[Dict[str, Any]]:
         """Return provider-safe active-context tool-call/result sequencing.
 
         Raw store and DAG history remain lossless. This guardrail only sanitizes
@@ -2641,7 +2657,7 @@ class LCMEngine(ContextEngine):
                         dropped_tool_results += 1
                         i += 1
 
-                    if not matched_direct_result:
+                    if not matched_direct_result and insert_missing_tool_stubs:
                         sanitized.append({
                             "role": "tool",
                             "content": "[Result from earlier conversation — see context summary above]",
