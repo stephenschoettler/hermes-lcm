@@ -2008,6 +2008,52 @@ class LCMEngine(ContextEngine):
             return False
         return stored_tail[-len(candidate_prefix) :] == candidate_prefix
 
+    @classmethod
+    def _identity_content_for_active_cleanup(cls, content: str) -> Any:
+        """Decode canonical stored JSON content before active-cleanup checks.
+
+        Structured assistant content is persisted as deterministic JSON. Active
+        replay cleanup sees the original list/dict shape, so restart
+        reconciliation has to decode the stored identity before deciding whether
+        a durable assistant row could be absent from sanitized active context.
+        """
+        if not isinstance(content, str):
+            return content
+        try:
+            decoded = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return content
+        if isinstance(decoded, (list, dict)) and normalize_content_value(decoded) == content:
+            return decoded
+        return content
+
+    @classmethod
+    def _is_active_context_droppable_identity(cls, identity: tuple[str, str, str, str]) -> bool:
+        """Return true for durable rows sanitized out of active replay only."""
+        role, content, _tool_call_id, tool_calls = identity
+        if role != "assistant" or tool_calls:
+            return False
+        return cls._should_drop_active_assistant_message({
+            "role": role,
+            "content": cls._identity_content_for_active_cleanup(content),
+        })
+
+    def _stored_tail_for_sanitized_active_replay(
+        self,
+        stored_tail: list[tuple[str, str, str, str]],
+    ) -> list[tuple[str, str, str, str]]:
+        """Drop only rows active-context cleanup may remove from replay.
+
+        Raw storage remains lossless. This view is used only to reconcile a
+        restarted process when the host replays sanitized active context that no
+        longer contains assistant messages with no visible content.
+        """
+        return [
+            identity
+            for identity in stored_tail
+            if not self._is_active_context_droppable_identity(identity)
+        ]
+
     def _find_reconciled_cursor_for_store_tail(
         self,
         messages: List[Dict[str, Any]],
@@ -2017,6 +2063,8 @@ class LCMEngine(ContextEngine):
         session_count: int,
         raw_session_count: int,
     ) -> int | None:
+        sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
+        effective_session_count = len(sanitized_replay_tail)
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             candidate_messages = messages[:cursor]
@@ -2031,9 +2079,9 @@ class LCMEngine(ContextEngine):
                 if allow_empty_prefix:
                     return cursor
                 continue
-            if len(candidate_prefix) > len(stored_tail):
+            if len(candidate_prefix) > len(sanitized_replay_tail):
                 continue
-            if not self._matches_store_tail_suffix(stored_tail, candidate_prefix):
+            if not self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix):
                 continue
 
             # Matching a stored suffix is not enough evidence by itself.  A
@@ -2046,8 +2094,8 @@ class LCMEngine(ContextEngine):
             # replay is also accepted.  Singleton full replay remains ambiguous
             # with a one-message delta that repeats the tail, so it is persisted
             # rather than risk data loss.
-            has_effective_full_replay = len(candidate_prefix) >= session_count and (
-                session_count > 1 or any(identity[0] == "system" for identity in candidate_prefix)
+            has_effective_full_replay = len(candidate_prefix) >= effective_session_count and (
+                effective_session_count > 1 or any(identity[0] == "system" for identity in candidate_prefix)
             )
             has_scaffold_evidence = any(
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages

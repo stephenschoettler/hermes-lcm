@@ -7848,6 +7848,59 @@ class TestAssemblyToolPairGuardrail:
         assert len(rows) == len(messages) + 1
         assert rows[-1]["content"] == "new follow-up"
 
+    def test_rebind_reconciliation_tolerates_sanitized_active_context_cleanup(self, tmp_path):
+        db_path = str(tmp_path / "lcm_rebind_sanitized_active_cleanup.db")
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        )
+        session_id = "rebind-cleanup-test"
+        blank_content = [{"type": "text", "text": ""}]
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": blank_content},
+            {"role": "assistant", "content": "visible answer"},
+        ]
+
+        first = LCMEngine(config=config)
+        first.on_session_start(session_id, context_length=200000)
+        sanitized = first.compress(messages)
+
+        assert len(sanitized) == 3
+        assert first._store.get_session_count(session_id) == 4
+        first.shutdown()
+
+        rebound = LCMEngine(config=LCMConfig(
+            fresh_tail_count=10,
+            database_path=db_path,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+        ))
+        rebound.on_session_start(session_id, context_length=200000)
+        rebound.compress(sanitized + [{"role": "user", "content": "new follow-up"}])
+
+        rows = rebound._store.get_session_messages(session_id)
+        assert len(rows) == 5
+        assert [row["role"] for row in rows] == [
+            "system",
+            "user",
+            "assistant",
+            "assistant",
+            "user",
+        ]
+        assert [row["content"] for row in rows] == [
+            "sys",
+            "question",
+            json.dumps(blank_content, ensure_ascii=False, sort_keys=True),
+            "visible answer",
+            "new follow-up",
+        ]
+        assert rebound._last_ingest_reconciliation["action"] == "advanced cursor"
+        assert rebound._last_ingest_reconciliation["cursor"] == len(sanitized)
+
     def test_compress_output_is_valid_tool_pair_sequence(self, tmp_path, monkeypatch):
         """Full compress() output must not contain orphan tool results
         and must include stubs for missing results."""
