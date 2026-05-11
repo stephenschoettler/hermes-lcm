@@ -110,6 +110,8 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["last_cache_write_tokens"] == 50
     assert payload["last_reasoning_tokens"] == 30
     assert payload["cache_read_ratio"] == 0.381
+    assert payload["last_compression_status"] == "idle"
+    assert payload["last_compression_noop_reason"] == ""
     assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
     assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
 
@@ -2764,14 +2766,35 @@ class TestEngineCompress:
         assert "stale orphan args" not in serialized
 
     def test_compress_short_conversation_noop(self, engine):
-        """Short conversations should pass through unchanged."""
+        """Short conversations should pass through unchanged with an explicit reason."""
         messages = [
             {"role": "system", "content": "You are helpful"},
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi"},
         ]
         result = engine.compress(messages)
+        assert result == messages
+        assert engine._last_compression_status == "noop"
+        assert "eligible raw backlog" in engine._last_compression_noop_reason
+
+        status = engine.get_status()
+        assert status["last_compression_status"] == "noop"
+        assert "eligible raw backlog" in status["last_compression_noop_reason"]
+
+    def test_compress_short_conversation_sanitized_content_is_not_noop(self, engine):
+        """Content-only active-context cleanup should report sanitized, not noop."""
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "<think>internal</think>Visible answer"},
+        ]
+
+        result = engine.compress(messages)
+
         assert len(result) == len(messages)
+        assert result[-1]["content"] == "Visible answer"
+        assert engine._last_compression_status == "sanitized"
+        assert engine._last_compression_noop_reason == ""
 
     def test_compress_handles_multimodal_first_user_message_without_system(self, engine, monkeypatch):
         """Gateway sessions may pass conversation messages without a leading system prompt."""

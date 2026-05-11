@@ -129,6 +129,20 @@ class TestModelRouting:
         assert route.provider == "my-provider"
         assert route.model == "model-a"
 
+    def test_custom_prefixed_named_provider_is_split_when_provider_resolves(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch,
+            named_custom={"lcpp": {"base_url": "http://127.0.0.1:8081/v1"}},
+            registry={"openai-codex": object()},
+        )
+
+        route = parse_lcm_model_override("custom:LCPP/4B-Qwen3-2507-compressor")
+
+        assert route.provider == "lcpp"
+        assert route.model == "4B-Qwen3-2507-compressor"
+
     def test_openrouter_organization_slug_stays_model_only(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
@@ -237,6 +251,43 @@ class TestProviderPrefixedAuxiliaryCalls:
 
         assert "provider" not in seen
         assert seen["model"] == "meta-llama/Llama-3.3-70B-Instruct"
+
+    def test_summary_call_passes_custom_prefixed_provider_and_stripped_model(self, monkeypatch):
+        from hermes_lcm.escalation import _call_llm_for_summary
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return self._fake_response("summary")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        hermes_cli = ModuleType("hermes_cli")
+        hermes_cli.__path__ = []
+        runtime_provider = ModuleType("hermes_cli.runtime_provider")
+        runtime_provider._get_named_custom_provider = (
+            lambda provider: {"name": "LCPP", "base_url": "http://127.0.0.1:8081/v1"}
+            if provider == "lcpp"
+            else None
+        )
+        auth = ModuleType("hermes_cli.auth")
+        auth.PROVIDER_REGISTRY = {}
+        hermes_cli.runtime_provider = runtime_provider
+        hermes_cli.auth = auth
+        monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", runtime_provider)
+        monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
+        result = _call_llm_for_summary(
+            "summarize",
+            200,
+            model="custom:LCPP/4B-Qwen3-2507-compressor",
+        )
+
+        assert result == "summary"
+        assert seen["provider"] == "lcpp"
+        assert seen["model"] == "4B-Qwen3-2507-compressor"
 
     def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
         from hermes_lcm.extraction import _call_extraction_llm

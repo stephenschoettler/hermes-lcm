@@ -1457,6 +1457,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     return json.dumps({
         "session_id": session_id,
         "compression_count": engine.compression_count,
+        "last_compression_status": full_status.get("last_compression_status", "idle"),
+        "last_compression_noop_reason": full_status.get("last_compression_noop_reason", ""),
         "context_length": engine.context_length,
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,

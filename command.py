@@ -120,6 +120,8 @@ def _status_text(engine) -> str:
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
         f"compression_count: {engine.compression_count}",
+        f"last_compression_status: {status.get('last_compression_status', 'idle')}",
+        f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
         f"last_input_tokens: {status.get('last_input_tokens', 0)}",

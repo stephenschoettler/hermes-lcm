@@ -36,8 +36,23 @@ def test_lcm_status_default_reports_current_session(engine):
     assert "cache_metrics_available: no" in result
     assert "last_cache_read_tokens: 0" in result
     assert "last_cache_write_tokens: 0" in result
+    assert "last_compression_status: idle" in result
+    assert "last_compression_noop_reason: (none)" in result
     assert "store_messages: 0" in result
     assert "dag_nodes: 0" in result
+
+
+def test_lcm_status_reports_last_compression_noop_reason(engine):
+    engine._last_compression_status = "noop"
+    engine._last_compression_noop_reason = "no eligible raw backlog outside fresh tail"
+
+    result = handle_lcm_command("status", engine)
+
+    assert "last_compression_status: noop" in result
+    assert (
+        "last_compression_noop_reason: no eligible raw backlog outside fresh tail"
+        in result
+    )
 
 
 def test_lcm_status_reports_cache_usage_metrics_when_host_provides_them(engine):

@@ -344,6 +344,8 @@ class LCMEngine(ContextEngine):
         self.summary_model = self._config.summary_model
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_compression_status = "idle"
+        self._last_compression_noop_reason = ""
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -607,14 +609,28 @@ class LCMEngine(ContextEngine):
         5. Assemble new active context: summaries + fresh tail
         """
         if not messages:
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "empty message list"
             return messages
 
+        self._last_compression_status = "running"
+        self._last_compression_noop_reason = ""
+
         if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+            reason = (
+                "auxiliary thread context"
+                if self._thread_context_stateless()
+                else "ignored session"
+                if self._session_ignored
+                else "stateless session"
+            )
             logger.debug(
                 "LCM compress bypassed for %s session %s",
                 "auxiliary" if self._thread_context_stateless() else "ignored" if self._session_ignored else "stateless",
                 self._thread_context_session_id() or self._session_id or "(unknown)",
             )
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = f"bypassed: {reason}"
             return messages
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
@@ -659,6 +675,7 @@ class LCMEngine(ContextEngine):
             if observed_prompt_tokens is not None and observed_prompt_tokens > 0
             else count_messages_tokens(messages)
         )
+        noop_reason = "no eligible raw backlog outside fresh tail"
 
         while leaf_passes < max_leaf_passes:
             n = len(working_messages)
@@ -668,12 +685,14 @@ class LCMEngine(ContextEngine):
             # prompt, but Hermes gateway sessions may pass only conversation
             # messages here, so index 0 can be a user message.
             if fresh_tail_start <= 1:
+                noop_reason = "no eligible raw backlog outside fresh tail"
                 break
 
             # Skip the leading anchor, candidate raw backlog is indices
             # 1..fresh_tail_start.
             candidate_raw = working_messages[1:fresh_tail_start]
             if not candidate_raw:
+                noop_reason = "no eligible raw backlog outside fresh tail"
                 break
 
             raw_tokens_outside_tail = count_messages_tokens(candidate_raw)
@@ -681,6 +700,9 @@ class LCMEngine(ContextEngine):
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
                     if not (deferred_maintenance_active and critical_budget_pressure):
+                        noop_reason = (
+                            "raw backlog outside fresh tail is below leaf chunk threshold"
+                        )
                         break
                 if force_overflow:
                     to_compact = candidate_raw
@@ -689,10 +711,14 @@ class LCMEngine(ContextEngine):
             else:
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
                     if not (deferred_maintenance_active and critical_budget_pressure):
+                        noop_reason = (
+                            "raw backlog outside fresh tail is below leaf chunk threshold"
+                        )
                         break
                 to_compact = candidate_raw
 
             if not to_compact:
+                noop_reason = "no eligible leaf chunk selected"
                 break
 
             # Pre-compaction extraction: best-effort, never blocks compaction
@@ -767,12 +793,19 @@ class LCMEngine(ContextEngine):
                 messages,
                 insert_missing_tool_stubs=False,
             )
-            if len(sanitized_messages) != len(messages):
+            if sanitized_messages != messages:
                 # _ingest_messages() already advanced the cursor to the original
-                # active-context length. If the host continues from the shorter
-                # sanitized context, keeping the old cursor would make the next
-                # appended messages look already ingested.
+                # active-context length. If the host continues from a sanitized
+                # context, keeping the old cursor could make the next appended
+                # messages look already ingested. This applies to content-only
+                # cleanup as well as dropped-message cleanup.
                 self._ingest_cursor = len(sanitized_messages)
+                self._last_compression_status = "sanitized"
+                self._last_compression_noop_reason = ""
+            else:
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = noop_reason
+                logger.info("LCM compression no-op: %s", noop_reason)
             return sanitized_messages
 
         # Step 6: Check if condensation is needed
@@ -798,6 +831,8 @@ class LCMEngine(ContextEngine):
         finally:
             self._pending_context_anchor_messages = None
         self.compression_count += 1
+        self._last_compression_status = "compacted"
+        self._last_compression_noop_reason = ""
         if recovery_assembly_cap is None:
             self._last_overflow_recovery_failed = False
         else:
@@ -1320,6 +1355,8 @@ class LCMEngine(ContextEngine):
         self._context_probe_persistable = False
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
+        self._last_compression_status = "idle"
+        self._last_compression_noop_reason = ""
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
@@ -1801,6 +1838,8 @@ class LCMEngine(ContextEngine):
             "cache_read_ratio": round(self.cache_read_ratio, 4),
             "context_length": self.context_length,
             "threshold_tokens": self.threshold_tokens,
+            "last_compression_status": self._last_compression_status,
+            "last_compression_noop_reason": self._last_compression_noop_reason,
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
@@ -3165,12 +3204,19 @@ class LCMEngine(ContextEngine):
         assembly_cap_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if compressed != original_messages:
+            self._last_compression_status = "overflow_recovery"
+            self._last_compression_noop_reason = ""
             self._ingest_cursor = len(compressed)
             self._ingest_cursor_needs_reconcile = False
             logger.info(
                 "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
                 len(original_messages),
                 len(compressed),
+            )
+        else:
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = (
+                "forced overflow recovery found no droppable active-context messages"
             )
 
         effective_cap = (
