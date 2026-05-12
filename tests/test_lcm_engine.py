@@ -194,6 +194,55 @@ def test_get_status_exposes_runtime_identity_for_loaded_plugin_tree(tmp_path):
 
 
 
+def test_plugin_metadata_refreshes_when_manifest_changes(tmp_path, monkeypatch):
+    import hermes_lcm.engine as engine_mod
+
+    repo_root = Path(engine_mod.__file__).resolve().parent
+    manifest = repo_root / "plugin.yaml"
+    original = manifest.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(engine_mod, "_PLUGIN_METADATA", None)
+
+    initial = engine_mod._plugin_metadata()
+    assert initial["name"] == "hermes-lcm"
+    assert initial["version"] == "0.10.2"
+
+    updated = original.replace('version: "0.10.2"', 'version: "9.9.9-test"')
+    if updated == original:
+        updated = original.replace('version: 0.10.2', 'version: 9.9.9-test')
+    assert updated != original
+
+    try:
+        manifest.write_text(updated, encoding="utf-8")
+        refreshed = engine_mod._plugin_metadata()
+        assert refreshed == {"name": "hermes-lcm", "version": "9.9.9-test"}
+
+        manifest.unlink()
+        fallback = engine_mod._plugin_metadata()
+        assert fallback == {"name": "hermes-lcm", "version": "9.9.9-test"}
+    finally:
+        manifest.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(engine_mod, "_PLUGIN_METADATA", None)
+
+
+def test_plugin_metadata_defaults_when_manifest_missing_before_first_read(tmp_path, monkeypatch):
+    import hermes_lcm.engine as engine_mod
+
+    repo_root = Path(engine_mod.__file__).resolve().parent
+    manifest = repo_root / "plugin.yaml"
+    original = manifest.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(engine_mod, "_PLUGIN_METADATA", None)
+
+    try:
+        manifest.unlink()
+        metadata = engine_mod._plugin_metadata()
+        assert metadata == {"name": "hermes-lcm", "version": "unknown"}
+    finally:
+        manifest.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(engine_mod, "_PLUGIN_METADATA", None)
+
+
 def test_lcm_doctor_json_includes_runtime_identity(engine):
     payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
 
