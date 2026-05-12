@@ -47,6 +47,7 @@ compacted.
 - **Source-aware retrieval** - filters raw rows and summaries by descendant source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with glob patterns
 - **Large payload controls** - optional ingest-time externalization for oversized tool/media/raw payloads, plus transcript GC for already-externalized tool results
+- **Storage-boundary payload guard** - media-ish `data:*;base64` and long base64-looking strings are externalized before LCM writes them to SQLite
 - **Diagnostics** - `lcm_status`, `lcm_doctor`, and optional `/lcm` slash commands
 
 ## LCM vs built-in compression
@@ -398,10 +399,33 @@ The counter resets on engine restart.
 
 ### Large tool-output handling
 
-Externalization is opt-in. When enabled, oversized tool results are written to
-plugin-managed JSON files and referenced from summaries. They remain inspectable
-later through `lcm_describe(externalized_ref=...)` and
-`lcm_expand(externalized_ref=...)`.
+Externalization for ordinary large tool output is opt-in. When enabled,
+oversized tool results are written to plugin-managed JSON files and referenced
+from summaries. They remain inspectable later through
+`lcm_describe(externalized_ref=...)` and `lcm_expand(externalized_ref=...)`.
+
+The storage-boundary payload guard is separate from that opt-in. LCM always
+scans messages at the store boundary before writing `messages.content` or
+`messages.tool_calls` to SQLite. Inline `data:*;base64,...` payloads and
+conservative long base64-looking runs are replaced with compact placeholders and
+written to the same plugin-managed externalized-payload directory. This is a
+safer default for media-ish payloads: LCM still preserves lossless recovery via
+the placeholder `ref` and `lcm_expand(externalized_ref=...)`, but it does not
+duplicate those payload bytes into `lcm.db`, FTS shadow tables, WAL files, or
+ordinary SQLite backups. If externalization fails, LCM logs a warning and leaves
+the original text inline rather than dropping data.
+
+`lcm_doctor` reports SQLite `journal_mode`, `quick_check`, database/WAL sizes,
+the largest content/tool-call rows, suspicious inline `data:*;base64` rows,
+suspicious long base64-looking rows, and aggregate externalized-payload stats.
+Doctor output is metadata-only for these scans; it intentionally does not print
+raw payload previews.
+
+This guard is scoped to LCM's own `lcm.db` write boundary. It does not prevent
+Hermes core, or any other host layer, from writing inline payloads to Hermes
+`state.db`; that is upstream/outside LCM scope. It also does not rewrite
+historical rows already present in `lcm.db`. Cleaning older suspicious rows
+requires a separate backup-first cleanup or migration flow.
 
 Transcript GC is separate and also opt-in. It only rewrites already-externalized,
 already-summarized tool-role rows to compact placeholders. It keeps the same
@@ -558,3 +582,13 @@ See the [releases page](https://github.com/stephenschoettler/hermes-lcm/releases
 ## License
 
 MIT
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=stephenschoettler%2Fhermes-lcm&type=timeline&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=stephenschoettler/hermes-lcm&type=timeline&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=stephenschoettler/hermes-lcm&type=timeline&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=stephenschoettler/hermes-lcm&type=timeline&legend=top-left" />
+ </picture>
+</a>

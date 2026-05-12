@@ -6,7 +6,6 @@ daily note files so key decisions survive even if the DAG summary loses nuance.
 
 import json
 import logging
-import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -162,7 +161,10 @@ def _sanitize_content_block(content: Any) -> str:
 
 def _sanitize_json_like(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _sanitize_json_like(val) for key, val in value.items()}
+        return {
+            _sanitize_string_media(key) if isinstance(key, str) else key: _sanitize_json_like(val)
+            for key, val in value.items()
+        }
     if isinstance(value, list):
         return [_sanitize_json_like(item) for item in value]
     if isinstance(value, str):

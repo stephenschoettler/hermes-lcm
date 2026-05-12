@@ -1868,8 +1868,8 @@ class TestLifecycleStateStore:
         state_db = tmp_path / "state.db"
         # Initialize all shared LCM tables; fragmentation diagnostics compare
         # lifecycle rows against raw-message and summary-DAG session coverage.
-        store = MessageStore(db_path)
-        dag = SummaryDAG(db_path)
+        _store = MessageStore(db_path)
+        _dag = SummaryDAG(db_path)
         state = LifecycleStateStore(db_path)
         conn = state._conn
         conn.execute(
@@ -3139,6 +3139,29 @@ class TestIngestExternalization:
         assert payload["kind"] == "raw_payload"
         assert payload["role"] == "user"
         assert payload["content"] == content
+
+    def test_non_tool_externalized_placeholder_sanitizes_role_metadata_for_ref_parsing(self, tmp_path):
+        import hermes_lcm.tools as lcm_tools
+
+        engine, output_dir = self._engine(tmp_path)
+        content = "INJECTED_ROLE_RAW_NEEDLE:" + ("z" * 5000)
+        injected_role = "user; ref=bogus]"
+
+        engine._ingest_messages([{"role": injected_role, "content": content}])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        placeholder = stored[0]["content"]
+        assert placeholder.startswith("[Externalized payload: kind=raw_payload;")
+        assert "; ref=bogus]" not in placeholder
+        assert "INJECTED_ROLE_RAW_NEEDLE" not in placeholder
+
+        payload_file = next(output_dir.glob("*.json"))
+        payload = json.loads(payload_file.read_text())
+        assert payload["role"] == injected_role
+        by_store_id = json.loads(lcm_tools.lcm_expand({"store_id": stored[0]["store_id"], "max_tokens": 20_000}, engine=engine))
+        assert by_store_id["externalized_ref"] == payload_file.name
+        expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": by_store_id["externalized_ref"], "max_tokens": 20_000}, engine=engine))
+        assert expanded["content"] == content
 
     def test_engine_bootstrap_does_not_externalize_until_ingest_path_runs(self, tmp_path):
         from hermes_lcm.engine import LCMEngine

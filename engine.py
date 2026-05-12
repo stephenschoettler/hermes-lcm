@@ -35,7 +35,13 @@ from .extraction import (
     sanitize_pre_compaction_content,
     sanitize_pre_compaction_tool_arguments,
 )
-from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
+from .ingest_protection import (
+    _json_has_duplicate_object_keys,
+    extract_ingest_externalized_refs,
+    protect_inline_payloads_in_text,
+    protect_messages_for_ingest,
+    restore_ingest_payload_placeholders,
+)
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -270,7 +276,7 @@ class LCMEngine(ContextEngine):
         else:
             db_path = Path.home() / ".hermes" / "lcm.db"
 
-        self._store = MessageStore(db_path)
+        self._store = MessageStore(db_path, ingest_protection_config=self._config, hermes_home=hermes_home)
         self._dag = SummaryDAG(db_path)
         self._lifecycle = LifecycleStateStore(db_path)
 
@@ -956,11 +962,29 @@ class LCMEngine(ContextEngine):
             self._auxiliary_session_ids.discard(session_id)
         self._clear_thread_context_stateless(session_id)
 
+    def _get_allowed_hermes_base(self) -> Path | None:
+        """Get the allowed base directory for hermes_home, or None if not restricted."""
+        env_base = os.environ.get("LCM_HERMES_BASE_DIR")
+        if env_base:
+            return Path(env_base).expanduser().resolve()
+        return None  # No restriction when env var not set
+
     def _state_db_path(self, kwargs: Dict[str, Any] | None = None) -> Path:
         kwargs = kwargs or {}
         hermes_home = str(kwargs.get("hermes_home") or self._hermes_home or "")
         if hermes_home:
-            return Path(hermes_home).expanduser() / "state.db"
+            # Prevent directory traversal by resolving the path
+            path = Path(hermes_home).expanduser().resolve()
+            # Check containment within allowed base only when restriction is active
+            allowed_base = self._get_allowed_hermes_base()
+            if allowed_base is not None:
+                try:
+                    path.relative_to(allowed_base)
+                except ValueError:
+                    raise ValueError(
+                        f"hermes_home {hermes_home} resolves to {path} which is not within allowed base {allowed_base}"
+                    )
+            return path / "state.db"
         return Path(self._store.db_path).parent / "state.db"
 
     def _caller_is_auxiliary_agent_frame(self, caller_self: Any) -> bool:
@@ -1973,36 +1997,120 @@ class LCMEngine(ContextEngine):
         )
 
     @staticmethod
+    def _canonicalize_tool_call_identity_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: LCMEngine._canonicalize_tool_call_identity_value(val)
+                for key, val in value.items()
+            }
+        if isinstance(value, list):
+            return [LCMEngine._canonicalize_tool_call_identity_value(item) for item in value]
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped[0] in "[{":
+                if _json_has_duplicate_object_keys(value):
+                    return value
+                try:
+                    parsed = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return value
+                if isinstance(parsed, (dict, list)):
+                    canonical = LCMEngine._canonicalize_tool_call_identity_value(parsed)
+                    return json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            return value
+        return value
+
+    @staticmethod
     def _stable_tool_calls_identity(tool_calls: Any) -> str:
         if not tool_calls:
             return ""
         try:
-            return json.dumps(tool_calls, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            canonical = LCMEngine._canonicalize_tool_call_identity_value(tool_calls)
+            return json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         except (TypeError, ValueError):
             return str(tool_calls)
 
-    def _message_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
-        content = normalize_content_value(msg.get("content")) or ""
-        # Durable rows may contain ingest-time externalization placeholders.
-        # Replay matching should not depend on the current write-time
-        # externalization flag: a restart with the knob toggled must still match
-        # raw live messages against already-externalized rows, and vice versa.
-        # Hydrating the stored placeholder for identity comparison is read-only
-        # and avoids creating payload files while reconciling.
-        ref = extract_externalized_ref(content)
-        if ref:
-            payload = load_externalized_payload(
-                ref,
+    def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
+        if isinstance(value, dict):
+            return {
+                self._restore_ingest_payload_placeholders_in_value(key, session_id=session_id)
+                if isinstance(key, str)
+                else key: self._restore_ingest_payload_placeholders_in_value(val, session_id=session_id)
+                for key, val in value.items()
+            }
+        if isinstance(value, list):
+            return [self._restore_ingest_payload_placeholders_in_value(item, session_id=session_id) for item in value]
+        if isinstance(value, str):
+            return restore_ingest_payload_placeholders(
+                value,
                 config=self._config,
                 hermes_home=self._hermes_home,
+                session_id=session_id,
             )
-            if payload is not None and isinstance(payload.get("content"), str):
-                content = payload["content"]
+        return value
+
+    def _restore_ingest_payload_placeholders_in_content_identity(self, content: str, *, session_id: str) -> str:
+        if not content:
+            return content
+        try:
+            decoded = json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return restore_ingest_payload_placeholders(
+                content,
+                config=self._config,
+                hermes_home=self._hermes_home,
+                session_id=session_id,
+            )
+        restore_as_structured = False
+        if isinstance(decoded, (dict, list)) and normalize_content_value(decoded) == content:
+            for ref in extract_ingest_externalized_refs(content):
+                payload = load_externalized_payload(
+                    ref,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                payload_session_id = (payload or {}).get("session_id") or ""
+                if session_id and payload_session_id and payload_session_id != session_id:
+                    continue
+                field_path = str((payload or {}).get("field_path") or "")
+                if field_path and field_path != "content":
+                    restore_as_structured = True
+                    break
+        if restore_as_structured:
+            restored = self._restore_ingest_payload_placeholders_in_value(decoded, session_id=session_id)
+            return normalize_content_value(restored) or ""
+        return restore_ingest_payload_placeholders(
+            content,
+            config=self._config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
+
+    def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        content = normalize_content_value(msg.get("content")) or ""
+        tool_calls = msg.get("tool_calls")
+        if stored_row:
+            session_id = str(msg.get("session_id") or self._session_id or "")
+            content = self._restore_ingest_payload_placeholders_in_content_identity(
+                content,
+                session_id=session_id,
+            )
+            tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
+            ref = extract_externalized_ref(content)
+            if ref:
+                payload = load_externalized_payload(
+                    ref,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                if payload is not None and isinstance(payload.get("content"), str):
+                    content = payload["content"]
+        tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
             str(msg.get("role") or "unknown"),
             content,
             str(msg.get("tool_call_id") or ""),
-            self._stable_tool_calls_identity(msg.get("tool_calls")),
+            tool_calls_identity,
         )
 
     @staticmethod
@@ -2243,7 +2351,7 @@ class LCMEngine(ContextEngine):
         if not stored_rows:
             return 0
         stored_tail = [
-            self._message_replay_identity(row)
+            self._message_replay_identity(row, stored_row=True)
             for row in stored_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
         ]
@@ -2285,7 +2393,7 @@ class LCMEngine(ContextEngine):
             self._session_id,
             limit=tail_limit,
         )
-        stored_head = [self._message_replay_identity(row) for row in stored_head_rows]
+        stored_head = [self._message_replay_identity(row, stored_row=True) for row in stored_head_rows]
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
         # filters may suppress noisy rows for tail reconciliation, but filtered
         # history alone must not create replay evidence for skipping a batch.
@@ -2411,21 +2519,13 @@ class LCMEngine(ContextEngine):
         ids: list[int] = []
         store_idx = 0
         for msg in messages:
-            protected_msg = protect_message_for_ingest(
-                msg,
-                session_id=self._session_id,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
-            wanted_identity = self._message_replay_identity(msg)
-            wanted_cleanup_identity = self._active_cleanup_replay_identity(wanted_identity)
-            role = protected_msg.get("role", "")
-            content = normalize_content_value(protected_msg.get("content")) or ""
+            message_identity = self._message_replay_identity(msg)
+            wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = store_idx
             while probe_idx < len(candidates):
                 stored = candidates[probe_idx]
-                stored_identity = self._message_replay_identity(stored)
-                if stored_identity == wanted_identity:
+                stored_identity = self._message_replay_identity(stored, stored_row=True)
+                if stored_identity == message_identity:
                     ids.append(stored["store_id"])
                     store_idx = probe_idx + 1
                     break
@@ -2433,10 +2533,6 @@ class LCMEngine(ContextEngine):
                     wanted_cleanup_identity is not None
                     and self._active_cleanup_replay_identity(stored_identity) == wanted_cleanup_identity
                 ):
-                    ids.append(stored["store_id"])
-                    store_idx = probe_idx + 1
-                    break
-                if stored.get("role", "") == role and (stored.get("content") or "") == content:
                     ids.append(stored["store_id"])
                     store_idx = probe_idx + 1
                     break
@@ -2525,7 +2621,6 @@ class LCMEngine(ContextEngine):
     def _serialize_messages(self, messages: List[Dict[str, Any]]) -> str:
         """Serialize messages into labeled text for the summarizer."""
         parts = []
-        assistant_tool_ids = _assistant_tool_call_ids(messages)
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
@@ -2984,9 +3079,16 @@ class LCMEngine(ContextEngine):
         content = text_content_for_pattern_matching(message.get("content")) or ""
         return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
 
-    @staticmethod
-    def _build_preserved_objective_summary_part(message: Dict[str, Any]) -> str:
+    def _build_preserved_objective_summary_part(self, message: Dict[str, Any]) -> str:
         content = text_content_for_pattern_matching(message.get("content")) or ""
+        content = protect_inline_payloads_in_text(
+            content,
+            role=str(message.get("role") or "user"),
+            session_id=self._session_id,
+            field_path="preserved_objective.content",
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
         return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
 
     def _latest_user_context_anchor(

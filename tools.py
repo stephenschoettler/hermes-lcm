@@ -17,6 +17,12 @@ from .externalize import (
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import check_external_content_fts_integrity
 from .extraction import sanitize_pre_compaction_content
+from .ingest_protection import (
+    externalized_payload_stats,
+    extract_ingest_externalized_refs,
+    restore_ingest_payload_placeholders,
+    scan_sqlite_payload_risks,
+)
 from .model_routing import apply_lcm_model_route
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .store import build_message_fts_spec
@@ -258,6 +264,26 @@ def _full_content_slice(content: str, content_offset: int = 0) -> dict[str, Any]
     }
 
 
+def _restore_ingest_placeholder_for_lookup(
+    content: str,
+    ref: str | None,
+    payload: dict[str, Any] | None,
+    *,
+    config,
+    hermes_home: str,
+    session_id: str,
+) -> str | None:
+    if not content or not ref or not payload or payload.get("kind") != "ingest_payload":
+        return None
+    restored = restore_ingest_payload_placeholders(
+        content,
+        config=config,
+        hermes_home=hermes_home,
+        session_id=session_id,
+    )
+    return restored if restored != content else None
+
+
 def _is_compact_externalized_marker(content: str, ref: str | None) -> bool:
     if not ref or not content:
         return False
@@ -268,6 +294,7 @@ def _is_compact_externalized_marker(content: str, ref: str | None) -> bool:
         or content.startswith("[GC'd externalized tool output:")
         or content.startswith("[Externalized payload:")
         or content.startswith("[GC'd externalized payload:")
+        or "[Externalized LCM ingest payload:" in content
     )
 
 
@@ -348,13 +375,17 @@ def _expand_message_sources(
         content = transcript_content
         content_source = "message"
         externalized = None
-        ref = extract_externalized_ref(transcript_content)
+        ref_payload = None
+        ingest_refs = extract_ingest_externalized_refs(transcript_content)
+        ref = ingest_refs[0] if ingest_refs else extract_externalized_ref(transcript_content)
         if ref:
-            externalized = _get_externalized_payload(
+            ref_payload = _get_externalized_payload(
                 engine,
                 ref,
                 allowed_session_ids={engine.current_session_id, stored.get("session_id", "")},
             )
+            if ref_payload is not None and ref_payload.get("kind") != "ingest_payload":
+                externalized = ref_payload
         if hydrate_externalized_content and externalized is not None:
             content = externalized.get("content", "")
             content_source = "externalized_payload"
@@ -387,6 +418,19 @@ def _expand_message_sources(
                 expanded["externalized"] = externalized_summary
             if "externalized" not in expanded:
                 lookup_candidates = [transcript_content]
+                restored_ingest_content = _restore_ingest_placeholder_for_lookup(
+                    transcript_content,
+                    ref,
+                    ref_payload,
+                    config=engine._config,
+                    hermes_home=engine._hermes_home,
+                    session_id=stored.get("session_id", ""),
+                )
+                if restored_ingest_content is not None:
+                    lookup_candidates.insert(0, restored_ingest_content)
+                    sanitized_restored = sanitize_pre_compaction_content(restored_ingest_content)
+                    if sanitized_restored != restored_ingest_content:
+                        lookup_candidates.insert(0, sanitized_restored)
                 sanitized_content = sanitize_pre_compaction_content(transcript_content)
                 if sanitized_content != transcript_content:
                     lookup_candidates.insert(0, sanitized_content)
@@ -974,6 +1018,7 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
                 "tool_call_id": payload.get("tool_call_id", ""),
                 "role": payload.get("role", ""),
                 "session_id": payload.get("session_id", ""),
+                "field_path": payload.get("field_path", ""),
                 "content_chars": payload.get("content_chars", 0),
                 "content_bytes": payload.get("content_bytes", 0),
                 "created_at": payload.get("created_at"),
@@ -1077,6 +1122,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                 "tool_call_id": payload.get("tool_call_id", ""),
                 "role": payload.get("role", ""),
                 "session_id": payload.get("session_id", ""),
+                "field_path": payload.get("field_path", ""),
                 "content_chars": payload.get("content_chars", len(content)),
                 "content_bytes": payload.get("content_bytes", 0),
                 "content": sliced["content"],
@@ -1122,15 +1168,37 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         # default. Externalized lookup remains session-scoped (per the existing
         # _get_externalized_payload contract); cross-session rows surface only the
         # ref string, with a hint pointing at the same-session expansion path.
-        ref = extract_externalized_ref(transcript_content)
-        if ref:
-            result["externalized_ref"] = ref
+        ref_values = [transcript_content]
+        if stored.get("tool_calls"):
+            try:
+                ref_values.append(json.dumps(stored.get("tool_calls"), ensure_ascii=False, sort_keys=True))
+            except (TypeError, ValueError):
+                ref_values.append(str(stored.get("tool_calls")))
+        refs: list[str] = []
+        for value in ref_values:
+            if not isinstance(value, str):
+                continue
+            for found_ref in extract_ingest_externalized_refs(value):
+                if found_ref not in refs:
+                    refs.append(found_ref)
+            legacy_ref = extract_externalized_ref(value)
+            if legacy_ref and legacy_ref not in refs:
+                refs.append(legacy_ref)
+        if refs:
+            result["externalized_refs"] = refs
+            result["externalized_ref"] = refs[0]
             if bool(engine_session_id) and stored_session_id == engine_session_id:
-                payload = _get_externalized_payload(engine, ref)
-                if payload is not None:
+                payload_summaries = []
+                for ref in refs:
+                    payload = _get_externalized_payload(engine, ref)
+                    if payload is None:
+                        continue
                     payload_summary = dict(payload)
                     payload_summary.pop("content", None)
-                    result["externalized"] = payload_summary
+                    payload_summaries.append(payload_summary)
+                if payload_summaries:
+                    result["externalized_payloads"] = payload_summaries
+                    result["externalized"] = payload_summaries[0]
             else:
                 result["externalized_note"] = (
                     "Externalized payload metadata is session-scoped; "
@@ -1569,7 +1637,45 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
                 "detail": str(e),
             })
 
-    # 2. FTS index sync
+    # 2. SQLite storage posture and payload diagnostics
+    try:
+        journal_mode_row = engine._store._conn.execute("PRAGMA journal_mode").fetchone()
+        quick_check_row = engine._store._conn.execute("PRAGMA quick_check").fetchone()
+        db_path = Path(engine._store.db_path)
+        wal_path = Path(str(db_path) + "-wal")
+        checks.append({
+            "check": "sqlite_storage",
+            "status": "pass" if quick_check_row and quick_check_row[0] == "ok" else "fail",
+            "detail": {
+                "journal_mode": journal_mode_row[0] if journal_mode_row else "unknown",
+                "quick_check": quick_check_row[0] if quick_check_row else "unknown",
+                "database_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
+                "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+            },
+        })
+        payload_risks = scan_sqlite_payload_risks(engine._store._conn)
+        externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
+        suspicious_count = (
+            len(payload_risks["suspicious_data_uri_content_rows"])
+            + len(payload_risks["suspicious_data_uri_tool_calls_rows"])
+            + len(payload_risks["suspicious_base64_like_rows"])
+        )
+        checks.append({
+            "check": "payload_storage",
+            "status": "warn" if suspicious_count else "pass",
+            "detail": {
+                **payload_risks,
+                **externalized_stats,
+            },
+        })
+    except Exception as e:
+        checks.append({
+            "check": "payload_storage",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # 3. FTS index sync
     try:
         msg_count = engine._store._conn.execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
