@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Immutable-first message store — the source of truth.
 
 Every message is persisted durably in SQLite. The normal model is append-only,
@@ -9,7 +11,9 @@ row identity (`store_id`) for DAG/source lookup.
 
 import json
 import logging
+import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -20,6 +24,8 @@ from .db_bootstrap import (
     ensure_external_content_fts,
     run_versioned_migrations,
 )
+from .config import LCMConfig
+from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -201,9 +207,11 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
+        self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
@@ -257,6 +265,12 @@ class MessageStore:
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "") -> int:
         """Persist a message and return its store_id."""
+        msg = protect_message_for_ingest(
+            msg,
+            config=self._ingest_protection_config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
         tool_calls = msg.get("tool_calls")
         tc_json = json.dumps(tool_calls) if tool_calls else None
 
@@ -289,10 +303,17 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
+        protected_messages = protect_messages_for_ingest(
+            messages,
+            config=self._ingest_protection_config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
+
         ids = []
         ts = time.time()
         with self._conn:
-            for msg, est in zip(messages, token_estimates):
+            for msg, est in zip(protected_messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 cur = self._conn.execute(

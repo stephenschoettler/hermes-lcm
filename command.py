@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import os
 import sqlite3
 from typing import Any
 
 from .db_bootstrap import external_content_fts_needs_repair, repair_external_content_fts
+from .ingest_protection import externalized_payload_stats, scan_sqlite_payload_risks
 from .dag import build_nodes_fts_spec
 from .session_patterns import build_session_match_keys, matches_session_pattern
 from .store import build_message_fts_spec
@@ -16,7 +18,18 @@ from .store import build_message_fts_spec
 def _state_db_path_for_engine(engine) -> Path:
     hermes_home = getattr(engine, "_hermes_home", "") or ""
     if hermes_home:
-        return Path(hermes_home).expanduser() / "state.db"
+        resolved = Path(hermes_home).expanduser().resolve() / "state.db"
+        # Check containment within allowed base only when restriction is active
+        env_base = os.environ.get("LCM_HERMES_BASE_DIR")
+        if env_base:
+            allowed_base = Path(env_base).expanduser().resolve()
+            try:
+                resolved.relative_to(allowed_base)
+            except ValueError:
+                raise ValueError(
+                    f"hermes_home {hermes_home} resolves to {resolved} which is not within allowed base {allowed_base}"
+                )
+        return resolved
     db_path = Path(getattr(engine._store, "db_path", Path.home() / ".hermes" / "lcm.db"))
     return db_path.parent / "state.db"
 
@@ -705,6 +718,40 @@ def _doctor_text(engine) -> str:
 
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
+    wal_path = Path(str(db_path) + "-wal")
+    wal_size = wal_path.stat().st_size if wal_path.exists() else 0
+    try:
+        journal_row = store_conn.execute("PRAGMA journal_mode").fetchone()
+        journal_mode = str(journal_row[0]) if journal_row else "unknown"
+    except Exception as exc:  # pragma: no cover - defensive
+        journal_mode = f"error: {exc}"
+        issues.append("sqlite_journal_mode")
+    try:
+        quick_row = store_conn.execute("PRAGMA quick_check").fetchone()
+        quick_check = str(quick_row[0]) if quick_row else "unknown"
+    except Exception as exc:  # pragma: no cover - defensive
+        quick_check = f"error: {exc}"
+        issues.append("sqlite_quick_check")
+    try:
+        payload_risks = scan_sqlite_payload_risks(store_conn)
+        externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
+    except Exception:  # pragma: no cover - defensive
+        payload_risks = {
+            "largest_content_rows": [],
+            "largest_tool_calls_rows": [],
+            "suspicious_data_uri_content_rows": [],
+            "suspicious_data_uri_tool_calls_rows": [],
+            "suspicious_base64_like_rows": [],
+        }
+        externalized_stats = {
+            "externalized_payload_count": 0,
+            "externalized_payload_bytes": 0,
+            "externalized_payload_chars": 0,
+            "externalized_payload_dir": "",
+            "latest_externalized_payload_path": "",
+            "latest_externalized_payload_mtime": 0,
+        }
+        issues.append("payload_storage")
     clean_scan = _scan_clean_candidates(engine)
 
     debt_rows = []
@@ -827,6 +874,9 @@ def _doctor_text(engine) -> str:
         f"database_path: {db_path}",
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
+        f"wal_size: {_fmt_size(wal_size)}",
+        f"journal_mode: {journal_mode}",
+        f"quick_check: {quick_check}",
         f"sqlite_integrity: {integrity}",
         f"messages_total: {total_messages}",
         f"message_sessions_total: {total_message_sessions}",
@@ -836,6 +886,16 @@ def _doctor_text(engine) -> str:
         f"messages_fts_rows: {store_fts_count}",
         f"nodes_fts: {node_fts}",
         f"nodes_fts_rows: {node_fts_count}",
+        f"largest_content_rows: {payload_risks['largest_content_rows']}",
+        f"largest_tool_calls_rows: {payload_risks['largest_tool_calls_rows']}",
+        f"suspicious_data_uri_content_rows: {payload_risks['suspicious_data_uri_content_rows']}",
+        f"suspicious_data_uri_tool_calls_rows: {payload_risks['suspicious_data_uri_tool_calls_rows']}",
+        f"suspicious_base64_like_rows: {payload_risks['suspicious_base64_like_rows']}",
+        f"externalized_payload_dir: {externalized_stats['externalized_payload_dir']}",
+        f"externalized_payload_count: {externalized_stats['externalized_payload_count']}",
+        f"externalized_payload_bytes: {externalized_stats['externalized_payload_bytes']}",
+        f"externalized_payload_chars: {externalized_stats['externalized_payload_chars']}",
+        f"latest_externalized_payload_path: {externalized_stats['latest_externalized_payload_path'] or '(none)'}",
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")

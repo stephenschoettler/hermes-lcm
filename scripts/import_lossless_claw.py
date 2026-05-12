@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sqlite3
 import sys
 import time
@@ -39,6 +38,7 @@ _ensure_local_package_importable()
 
 from hermes_lcm.config import LCMConfig  # noqa: E402
 from hermes_lcm.ingest_protection import protect_message_for_ingest  # noqa: E402
+from hermes_lcm.message_content import normalize_content_value  # noqa: E402
 from hermes_lcm.store import MessageStore, _normalize_source_value  # noqa: E402
 from hermes_lcm.tokens import count_message_tokens  # noqa: E402
 
@@ -533,30 +533,34 @@ def import_lossless_claw(
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     backup_path = _backup_target(target_path)
-    store = MessageStore(target_path)
+    protection_config = LCMConfig.from_env()
+    protection_config.database_path = str(target_path)
+    store = MessageStore(
+        target_path,
+        ingest_protection_config=protection_config,
+        hermes_home=str(target_path.parent),
+    )
     conn = store._conn
     _ensure_import_table(conn)
 
     imported = 0
-    ingest_config = LCMConfig.from_env()
-    hermes_home = os.environ.get("HERMES_HOME", "")
     try:
         for candidate in to_import:
-            original_msg: dict[str, Any] = {
+            msg: dict[str, Any] = {
                 "role": candidate.role,
                 "content": candidate.content,
             }
             if candidate.tool_call_id:
-                original_msg["tool_call_id"] = candidate.tool_call_id
+                msg["tool_call_id"] = candidate.tool_call_id
             if candidate.tool_calls:
-                original_msg["tool_calls"] = candidate.tool_calls
+                msg["tool_calls"] = candidate.tool_calls
             if candidate.tool_name:
-                original_msg["tool_name"] = candidate.tool_name
+                msg["tool_name"] = candidate.tool_name
             protected_msg = protect_message_for_ingest(
-                original_msg,
+                msg,
+                config=protection_config,
+                hermes_home=str(target_path.parent),
                 session_id=candidate.target_session_id,
-                config=ingest_config,
-                hermes_home=hermes_home,
             )
             tool_calls_json = json.dumps(protected_msg.get("tool_calls")) if protected_msg.get("tool_calls") else None
             cur = conn.execute(
@@ -568,7 +572,7 @@ def import_lossless_claw(
                     candidate.target_session_id,
                     _normalize_source_value(candidate.source),
                     protected_msg.get("role", candidate.role),
-                    protected_msg.get("content"),
+                    normalize_content_value(protected_msg.get("content")),
                     protected_msg.get("tool_call_id"),
                     tool_calls_json,
                     protected_msg.get("tool_name"),
