@@ -383,6 +383,37 @@ def test_missing_session_start_context_length_clears_stale_update_model_window_f
     assert engine._context_length_source == "session_start"
 
 
+def test_positive_session_start_context_length_replaces_consumed_update_model_window_for_new_runtime(engine):
+    engine.update_model(
+        model="previous-resolver-model",
+        context_length=1_000_000,
+        provider="previous-provider",
+    )
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-resolver-model",
+        provider="previous-provider",
+        context_length=1_000_000,
+        conversation_id="telegram:chat-1",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="session-only-model",
+        provider="session-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "session-only-model"
+    assert engine.provider == "session-provider"
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens == int(204_800 * engine._config.context_threshold)
+    assert engine._context_length_source == "session_start"
+
+
 def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
     from hermes_lcm import message_patterns as message_patterns_mod
 
