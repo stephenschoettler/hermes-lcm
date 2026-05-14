@@ -379,8 +379,15 @@ class LCMEngine(ContextEngine):
             logger.debug("LCM ignored invalid %s context_length: %r", source, context_length)
             return False
         if parsed_context_length <= 0:
-            logger.debug("LCM ignored non-positive %s context_length: %r", source, context_length)
-            return False
+            logger.debug(
+                "LCM cleared non-positive %s context_length: %r",
+                source,
+                context_length,
+            )
+            self.context_length = 0
+            self._context_length_source = source
+            self.threshold_tokens = 0
+            return True
         self.context_length = parsed_context_length
         self._context_length_source = source
         self.threshold_tokens = int(
@@ -1448,33 +1455,38 @@ class LCMEngine(ContextEngine):
                 )
                 return
             if parsed_context_length <= 0:
-                logger.debug(
-                    "LCM ignored non-positive session-start context_length: %r",
-                    incoming_context_length,
-                )
-                return
-            if (
-                self._context_length_source == "update_model"
-                and self.context_length > 0
-                and parsed_context_length != self.context_length
-            ):
-                logger.warning(
-                    "LCM ignored stale session-start context_length=%s for model=%s; active update_model context_length=%s",
-                    parsed_context_length,
-                    self.model or str(kwargs.get("model") or ""),
-                    self.context_length,
-                )
-                return
-            if self._context_length_source == "update_model" and self.context_length > 0:
-                if not self._session_metadata_matches_active_runtime(kwargs):
-                    logger.warning(
-                        "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
-                        str(kwargs.get("model") or ""),
-                        self.model,
+                if self._context_length_source == "update_model" and self.context_length > 0:
+                    logger.debug(
+                        "LCM ignored missing session-start context_length=%r for model=%s; active update_model context_length=%s",
+                        incoming_context_length,
+                        self.model or str(kwargs.get("model") or ""),
+                        self.context_length,
                     )
                     return
-            else:
                 self._set_context_length(parsed_context_length, source="session_start")
+            else:
+                if (
+                    self._context_length_source == "update_model"
+                    and self.context_length > 0
+                    and parsed_context_length != self.context_length
+                ):
+                    logger.warning(
+                        "LCM ignored stale session-start context_length=%s for model=%s; active update_model context_length=%s",
+                        parsed_context_length,
+                        self.model or str(kwargs.get("model") or ""),
+                        self.context_length,
+                    )
+                    return
+                if self._context_length_source == "update_model" and self.context_length > 0:
+                    if not self._session_metadata_matches_active_runtime(kwargs):
+                        logger.warning(
+                            "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
+                            str(kwargs.get("model") or ""),
+                            self.model,
+                        )
+                        return
+                else:
+                    self._set_context_length(parsed_context_length, source="session_start")
         if (
             self._context_length_source == "update_model"
             and self.context_length > 0

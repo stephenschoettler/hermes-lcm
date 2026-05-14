@@ -277,6 +277,56 @@ def test_session_start_can_initialize_context_length_without_update_model(engine
     assert engine.threshold_tokens == int(204_800 * engine._config.context_threshold)
 
 
+def test_session_start_clears_previous_session_context_window_when_new_window_is_missing(engine):
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="known-window-model",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens > 0
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="unknown-window-model",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "unknown-window-model"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "session_start"
+    assert not engine.should_compress(1_000_000)
+
+
+def test_missing_session_start_context_length_does_not_clear_authoritative_update_model_window(engine):
+    engine.update_model(
+        model="resolver-window-model",
+        context_length=1_000_000,
+        provider="resolver-provider",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="resolver-window-model",
+        provider="resolver-provider",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "resolver-window-model"
+    assert engine.provider == "resolver-provider"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+    assert engine._context_length_source == "update_model"
+
+
 def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
     from hermes_lcm import message_patterns as message_patterns_mod
 
