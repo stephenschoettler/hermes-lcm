@@ -395,11 +395,21 @@ class LCMEngine(ContextEngine):
         )
         return True
 
-    def _session_metadata_matches_active_runtime(self, kwargs: Dict[str, Any]) -> bool:
+    def _session_metadata_matches_active_runtime(
+        self,
+        kwargs: Dict[str, Any],
+        *,
+        ignore_empty_optional: bool = False,
+    ) -> bool:
         if "model" in kwargs and str(kwargs.get("model") or "") != self.model:
             return False
         for key in ("provider", "base_url", "api_key", "api_mode"):
-            if key in kwargs and str(kwargs.get(key) or "") != str(getattr(self, key, "") or ""):
+            if key not in kwargs:
+                continue
+            incoming = str(kwargs.get(key) or "")
+            if ignore_empty_optional and not incoming:
+                continue
+            if incoming != str(getattr(self, key, "") or ""):
                 return False
         return True
 
@@ -1455,7 +1465,14 @@ class LCMEngine(ContextEngine):
                 )
                 return
             if parsed_context_length <= 0:
-                if self._context_length_source == "update_model" and self.context_length > 0:
+                if (
+                    self._context_length_source == "update_model"
+                    and self.context_length > 0
+                    and self._session_metadata_matches_active_runtime(
+                        kwargs,
+                        ignore_empty_optional=True,
+                    )
+                ):
                     logger.debug(
                         "LCM ignored missing session-start context_length=%r for model=%s; active update_model context_length=%s",
                         incoming_context_length,

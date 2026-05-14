@@ -302,6 +302,7 @@ def test_session_start_clears_previous_session_context_window_when_new_window_is
     assert engine.threshold_tokens == 0
     assert engine._context_length_source == "session_start"
     assert not engine.should_compress(1_000_000)
+    assert not engine._critical_budget_pressure_reached(observed_tokens=1_000_000)
 
 
 def test_missing_session_start_context_length_does_not_clear_authoritative_update_model_window(engine):
@@ -325,6 +326,61 @@ def test_missing_session_start_context_length_does_not_clear_authoritative_updat
     assert engine.context_length == 1_000_000
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
     assert engine._context_length_source == "update_model"
+
+
+def test_missing_session_start_context_length_preserves_update_model_window_with_blank_optional_fields(engine):
+    engine.update_model(
+        model="resolver-window-model",
+        context_length=1_000_000,
+        base_url="https://resolver.example/v1",
+        api_key="resolver-key",
+        provider="resolver-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="resolver-window-model",
+        base_url="",
+        api_key="",
+        provider="resolver-provider",
+        api_mode="chat_completions",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "resolver-window-model"
+    assert engine.base_url == "https://resolver.example/v1"
+    assert engine.api_key == "resolver-key"
+    assert engine.provider == "resolver-provider"
+    assert engine.api_mode == "chat_completions"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+    assert engine._context_length_source == "update_model"
+
+
+def test_missing_session_start_context_length_clears_stale_update_model_window_for_new_runtime(engine):
+    engine.update_model(
+        model="previous-resolver-model",
+        context_length=1_000_000,
+        provider="previous-provider",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="session-only-model",
+        provider="session-provider",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "session-only-model"
+    assert engine.provider == "session-provider"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "session_start"
 
 
 def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
