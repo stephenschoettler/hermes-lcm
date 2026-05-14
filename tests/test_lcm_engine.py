@@ -116,6 +116,86 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
 
 
+def test_update_model_updates_runtime_metadata_and_context_window(engine):
+    engine.update_model(
+        model="deepseek-v4-flash",
+        context_length=1_000_000,
+        base_url="https://opencode.ai/zen/go",
+        api_key="test-key",
+        provider="opencode-go",
+        api_mode="anthropic_messages",
+    )
+
+    assert engine.model == "deepseek-v4-flash"
+    assert engine.base_url == "https://opencode.ai/zen/go"
+    assert engine.api_key == "test-key"
+    assert engine.provider == "opencode-go"
+    assert engine.api_mode == "anthropic_messages"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+
+
+def test_session_start_does_not_overwrite_update_model_context_length_with_stale_metadata(engine):
+    engine.update_model(
+        model="deepseek-v4-flash",
+        context_length=1_000_000,
+        provider="opencode-go",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="deepseek-v4-flash",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "deepseek-v4-flash"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+
+
+def test_session_start_does_not_overwrite_update_model_with_stale_runtime_identity(engine):
+    engine.update_model(
+        model="deepseek-v4-flash",
+        context_length=1_000_000,
+        provider="opencode-go",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="minimax-m2.7",
+        provider="minimax",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "deepseek-v4-flash"
+    assert engine.provider == "opencode-go"
+    assert engine.context_length == 1_000_000
+    assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
+
+
+def test_session_start_can_initialize_context_length_without_update_model(engine):
+    engine.model = ""
+    engine.context_length = 0
+    engine.threshold_tokens = 0
+    engine._context_length_source = ""
+
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="minimax-m2.7",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "minimax-m2.7"
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens == int(204_800 * engine._config.context_threshold)
+
+
 def test_lcm_tool_status_forwards_filter_config_to_agent_surface(tmp_path, monkeypatch):
     from hermes_lcm import message_patterns as message_patterns_mod
 
