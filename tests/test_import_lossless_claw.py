@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.store import MessageStore
 
 
@@ -101,6 +102,158 @@ def add_shared_session_key_conversation(db_path: Path) -> None:
         """INSERT INTO messages
            (message_id, conversation_id, seq, role, content, token_count, created_at)
            VALUES (12, 2, 1, 'user', 'hello from second conversation', 5, '2026-04-20 12:01:01')"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def create_summary_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE summaries (
+            summary_id TEXT PRIMARY KEY,
+            conversation_id INTEGER NOT NULL,
+            depth INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            content TEXT NOT NULL,
+            token_count INTEGER NOT NULL DEFAULT 0,
+            source_message_token_count INTEGER NOT NULL DEFAULT 0,
+            descendant_token_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            earliest_at TEXT NOT NULL,
+            latest_at TEXT NOT NULL,
+            expand_hint TEXT DEFAULT ''
+        );
+        CREATE TABLE summary_messages (
+            summary_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL
+        );
+        CREATE TABLE summary_parents (
+            summary_id TEXT NOT NULL,
+            parent_summary_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL
+        );
+        """
+    )
+
+
+def add_lossless_summaries(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    create_summary_tables(conn)
+    conn.execute(
+        """INSERT INTO summaries
+           (summary_id, conversation_id, depth, kind, content, token_count,
+            source_message_token_count, descendant_token_count,
+            created_at, earliest_at, latest_at, expand_hint)
+           VALUES ('leaf-1', 1, 0, 'leaf', 'leaf pineapple memory', 5,
+                   15, 0, '2026-04-20 12:00:10',
+                   '2026-04-20 12:00:01', '2026-04-20 12:00:02',
+                   'leaf hint')"""
+    )
+    conn.execute(
+        """INSERT INTO summaries
+           (summary_id, conversation_id, depth, kind, content, token_count,
+            source_message_token_count, descendant_token_count,
+            created_at, earliest_at, latest_at, expand_hint)
+           VALUES ('condensed-1', 1, 1, 'condensed', 'condensed pineapple memory', 7,
+                   0, 33, '2026-04-20 12:00:20',
+                   '2026-04-20 12:00:01', '2026-04-20 12:00:20',
+                   'condensed hint')"""
+    )
+    conn.executemany(
+        """INSERT INTO summary_messages (summary_id, message_id, ordinal)
+           VALUES (?, ?, ?)""",
+        [("leaf-1", 10, 0), ("leaf-1", 10, 1), ("leaf-1", 11, 2)],
+    )
+    conn.execute(
+        """INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal)
+           VALUES ('condensed-1', 'leaf-1', 0)"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_unresolved_leaf_summary(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    create_summary_tables(conn)
+    conn.execute(
+        """INSERT INTO messages
+           (message_id, conversation_id, seq, role, content, token_count, created_at)
+           VALUES (12, 1, 3, 'assistant', '', 0, '2026-04-20 12:00:03')"""
+    )
+    conn.execute(
+        """INSERT INTO summaries
+           (summary_id, conversation_id, depth, kind, content, token_count,
+            source_message_token_count, descendant_token_count,
+            created_at, earliest_at, latest_at, expand_hint)
+           VALUES ('empty-leaf', 1, 0, 'leaf', 'unresolvable empty stub summary', 3,
+                   9, 0, '2026-04-20 12:00:11',
+                   '2026-04-20 12:00:03', '2026-04-20 12:00:03',
+                   '')"""
+    )
+    conn.execute(
+        """INSERT INTO summary_messages (summary_id, message_id, ordinal)
+           VALUES ('empty-leaf', 12, 0)"""
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_partially_unresolved_leaf_summary(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    create_summary_tables(conn)
+    conn.execute(
+        """INSERT INTO summaries
+           (summary_id, conversation_id, depth, kind, content, token_count,
+            source_message_token_count, descendant_token_count,
+            created_at, earliest_at, latest_at, expand_hint)
+           VALUES ('partial-leaf', 1, 0, 'leaf', 'partial leaf should not import', 3,
+                   15, 0, '2026-04-20 12:00:10',
+                   '2026-04-20 12:00:01', '2026-04-20 12:00:02',
+                   '')"""
+    )
+    conn.executemany(
+        """INSERT INTO summary_messages (summary_id, message_id, ordinal)
+           VALUES (?, ?, ?)""",
+        [("partial-leaf", 10, 0), ("partial-leaf", 999, 1)],
+    )
+    conn.commit()
+    conn.close()
+
+
+def add_partially_unresolved_parent_summary(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    create_summary_tables(conn)
+    conn.execute(
+        """INSERT INTO summaries
+           (summary_id, conversation_id, depth, kind, content, token_count,
+            source_message_token_count, descendant_token_count,
+            created_at, earliest_at, latest_at, expand_hint)
+           VALUES ('leaf-1', 1, 0, 'leaf', 'leaf parent can import', 5,
+                   15, 0, '2026-04-20 12:00:10',
+                   '2026-04-20 12:00:01', '2026-04-20 12:00:02',
+                   '')"""
+    )
+    conn.execute(
+        """INSERT INTO summaries
+           (summary_id, conversation_id, depth, kind, content, token_count,
+            source_message_token_count, descendant_token_count,
+            created_at, earliest_at, latest_at, expand_hint)
+           VALUES ('partial-condensed', 1, 1, 'condensed', 'partial condensed should not import', 7,
+                   0, 33, '2026-04-20 12:00:20',
+                   '2026-04-20 12:00:01', '2026-04-20 12:00:20',
+                   '')"""
+    )
+    conn.executemany(
+        """INSERT INTO summary_messages (summary_id, message_id, ordinal)
+           VALUES (?, ?, ?)""",
+        [("leaf-1", 10, 0), ("leaf-1", 11, 1)],
+    )
+    conn.executemany(
+        """INSERT INTO summary_parents (summary_id, parent_summary_id, ordinal)
+           VALUES (?, ?, ?)""",
+        [("partial-condensed", "leaf-1", 0), ("partial-condensed", "missing-parent", 1)],
     )
     conn.commit()
     conn.close()
@@ -207,6 +360,212 @@ def test_dry_run_handles_uri_reserved_source_db_path(tmp_path: Path):
     assert result.scanned == 2
     assert result.eligible == 2
     assert result.would_import == 2
+    assert not target_db.exists()
+
+
+def test_apply_imports_lossless_summaries_as_summary_nodes(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_lossless_summaries(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="fixture-import",
+        include_summaries=True,
+        apply=True,
+    )
+
+    assert result.imported == 2
+    assert result.summaries_imported == 2
+    conn = sqlite3.connect(target_db)
+    conn.row_factory = sqlite3.Row
+    message_map = {
+        int(row["source_message_id"]): int(row["target_store_id"])
+        for row in conn.execute(
+            """SELECT source_message_id, target_store_id
+               FROM lcm_imported_messages
+               WHERE import_id = 'fixture-import'"""
+        )
+    }
+    rows = conn.execute(
+        """SELECT node_id, depth, summary, source_token_count, source_ids,
+                  source_type, created_at, earliest_at, latest_at
+           FROM summary_nodes
+           ORDER BY depth, node_id"""
+    ).fetchall()
+    fts_count = conn.execute(
+        "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH ?",
+        ("pineapple",),
+    ).fetchone()[0]
+    conn.close()
+
+    assert len(rows) == 2
+    leaf = rows[0]
+    condensed = rows[1]
+    assert leaf["source_type"] == "messages"
+    assert json.loads(leaf["source_ids"]) == [message_map[10], message_map[11]]
+    assert condensed["source_type"] == "nodes"
+    assert json.loads(condensed["source_ids"]) == [leaf["node_id"]]
+    assert leaf["source_token_count"] == 15
+    assert condensed["source_token_count"] == 33
+    dag = SummaryDAG(target_db)
+    condensed_node = dag.get_node(condensed["node_id"])
+    assert condensed_node is not None
+    assert [node.node_id for node in dag.get_source_nodes(condensed_node)] == [leaf["node_id"]]
+    subtree = dag.describe_subtree(condensed["node_id"])
+    dag.close()
+    assert subtree["source_type"] == "nodes"
+    assert subtree["children"] == [
+        {
+            "node_id": leaf["node_id"],
+            "depth": 0,
+            "token_count": 5,
+            "source_token_count": 15,
+            "expand_hint": "leaf hint",
+        }
+    ]
+    assert leaf["created_at"] == pytest.approx(1776686410.0)
+    assert leaf["earliest_at"] == pytest.approx(1776686401.0)
+    assert leaf["latest_at"] == pytest.approx(1776686402.0)
+    assert condensed["created_at"] == pytest.approx(1776686420.0)
+    assert condensed["earliest_at"] == pytest.approx(1776686401.0)
+    assert condensed["latest_at"] == pytest.approx(1776686420.0)
+    assert fts_count == 2
+
+
+def test_apply_summary_import_is_idempotent_for_same_import_id(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_lossless_summaries(source_db)
+
+    first = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        agent="sammy",
+        import_id="fixture-import",
+        include_summaries=True,
+        apply=True,
+    )
+    second = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        agent="sammy",
+        import_id="fixture-import",
+        include_summaries=True,
+        apply=True,
+    )
+
+    assert first.summaries_imported == 2
+    assert second.summaries_imported == 0
+    assert second.summaries_skipped_existing == 2
+    conn = sqlite3.connect(target_db)
+    assert conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM lcm_imported_summaries").fetchone()[0] == 2
+    conn.close()
+
+
+def test_summary_leaf_with_only_skipped_empty_messages_is_skipped(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_unresolved_leaf_summary(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        agent="sammy",
+        import_id="fixture-import",
+        include_summaries=True,
+        apply=True,
+    )
+
+    assert result.imported == 2
+    assert result.skipped_empty == 1
+    assert result.summaries_imported == 0
+    assert result.summaries_skipped_unresolved == 1
+    conn = sqlite3.connect(target_db)
+    assert conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0] == 0
+    conn.close()
+
+
+def test_summary_leaf_with_partially_unresolved_messages_is_skipped(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_partially_unresolved_leaf_summary(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        agent="sammy",
+        import_id="fixture-import",
+        include_summaries=True,
+        apply=True,
+    )
+
+    assert result.imported == 2
+    assert result.summaries_imported == 0
+    assert result.summaries_skipped_unresolved == 1
+    conn = sqlite3.connect(target_db)
+    assert conn.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM lcm_imported_summaries").fetchone()[0] == 0
+    conn.close()
+
+
+def test_summary_condensed_with_partially_unresolved_parents_is_skipped(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_partially_unresolved_parent_summary(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        agent="sammy",
+        import_id="fixture-import",
+        include_summaries=True,
+        apply=True,
+    )
+
+    assert result.imported == 2
+    assert result.summaries_imported == 1
+    assert result.summaries_skipped_unresolved == 1
+    conn = sqlite3.connect(target_db)
+    rows = conn.execute(
+        "SELECT depth, summary, source_type FROM summary_nodes ORDER BY node_id"
+    ).fetchall()
+    assert rows == [(0, "leaf parent can import", "messages")]
+    assert conn.execute("SELECT COUNT(*) FROM lcm_imported_summaries").fetchone()[0] == 1
+    conn.close()
+
+
+def test_dry_run_include_summaries_does_not_create_target_db(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "target-lcm.db"
+    create_lossless_source(source_db)
+    add_lossless_summaries(source_db)
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        agent="sammy",
+        import_id="fixture-import",
+        include_summaries=True,
+        apply=False,
+    )
+
+    assert result.summaries_would_import == 2
     assert not target_db.exists()
 
 
