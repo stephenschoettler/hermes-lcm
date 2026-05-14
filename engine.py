@@ -389,13 +389,10 @@ class LCMEngine(ContextEngine):
         return True
 
     def _session_metadata_matches_active_runtime(self, kwargs: Dict[str, Any]) -> bool:
-        incoming_model = str(kwargs.get("model") or "")
-        if incoming_model and self.model and incoming_model != self.model:
+        if "model" in kwargs and str(kwargs.get("model") or "") != self.model:
             return False
-        for key in ("provider", "base_url", "api_mode"):
-            incoming = str(kwargs.get(key) or "")
-            active = str(getattr(self, key, "") or "")
-            if incoming and active and incoming != active:
+        for key in ("provider", "base_url", "api_key", "api_mode"):
+            if key in kwargs and str(kwargs.get(key) or "") != str(getattr(self, key, "") or ""):
                 return False
         return True
 
@@ -1468,12 +1465,27 @@ class LCMEngine(ContextEngine):
                     self.context_length,
                 )
                 return
-            if not (
-                self._context_length_source == "update_model"
-                and parsed_context_length == self.context_length
-                and self._session_metadata_matches_active_runtime(kwargs)
-            ):
+            if self._context_length_source == "update_model" and self.context_length > 0:
+                if not self._session_metadata_matches_active_runtime(kwargs):
+                    logger.warning(
+                        "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
+                        str(kwargs.get("model") or ""),
+                        self.model,
+                    )
+                    return
+            else:
                 self._set_context_length(parsed_context_length, source="session_start")
+        if (
+            self._context_length_source == "update_model"
+            and self.context_length > 0
+            and not self._session_metadata_matches_active_runtime(kwargs)
+        ):
+            logger.warning(
+                "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
+                str(kwargs.get("model") or ""),
+                self.model,
+            )
+            return
         if "model" in kwargs:
             self.model = str(kwargs.get("model") or "")
         for key in ("base_url", "api_key", "provider", "api_mode"):

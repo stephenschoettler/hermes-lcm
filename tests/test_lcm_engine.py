@@ -177,6 +177,87 @@ def test_session_start_does_not_overwrite_update_model_with_stale_runtime_identi
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
 
 
+def test_session_start_does_not_overwrite_update_model_identity_when_context_length_matches(engine):
+    engine.update_model(
+        model="new-model-same-window",
+        context_length=204_800,
+        base_url="https://new.example/v1",
+        api_key="new-key",
+        provider="new-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="old-model-same-window",
+        base_url="https://old.example/v1",
+        api_key="old-key",
+        provider="old-provider",
+        api_mode="anthropic_messages",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "new-model-same-window"
+    assert engine.base_url == "https://new.example/v1"
+    assert engine.api_key == "new-key"
+    assert engine.provider == "new-provider"
+    assert engine.api_mode == "chat_completions"
+    assert engine.context_length == 204_800
+    assert engine.threshold_tokens == int(204_800 * engine._config.context_threshold)
+
+
+def test_session_start_does_not_clear_or_repopulate_update_model_identity_when_optional_fields_are_empty(engine):
+    engine.update_model(
+        model="new-model-same-window",
+        context_length=204_800,
+        base_url="https://new.example/v1",
+        api_key="new-key",
+        provider="new-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="new-model-same-window",
+        base_url="",
+        api_key="",
+        provider="new-provider",
+        api_mode="chat_completions",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.base_url == "https://new.example/v1"
+    assert engine.api_key == "new-key"
+
+    engine.update_model(
+        model="empty-endpoint-model",
+        context_length=204_800,
+        base_url="",
+        api_key="",
+        provider="new-provider",
+        api_mode="chat_completions",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-3",
+        platform="telegram",
+        model="empty-endpoint-model",
+        base_url="https://old.example/v1",
+        api_key="old-key",
+        provider="new-provider",
+        api_mode="chat_completions",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.base_url == ""
+    assert engine.api_key == ""
+
+
 def test_session_start_can_initialize_context_length_without_update_model(engine):
     engine.model = ""
     engine.context_length = 0
