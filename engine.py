@@ -1450,7 +1450,6 @@ class LCMEngine(ContextEngine):
 
         update_model_is_authoritative = (
             self._context_length_source == "update_model"
-            and self.context_length > 0
             and self._update_model_pending_session_start
         )
 
@@ -1473,19 +1472,23 @@ class LCMEngine(ContextEngine):
                 self._update_model_pending_session_start = False
                 return
             if parsed_context_length <= 0:
-                if (
-                    update_model_is_authoritative
-                    and self._session_metadata_matches_active_runtime(
+                if update_model_is_authoritative:
+                    if self._session_metadata_matches_active_runtime(
                         kwargs,
                         ignore_empty_optional=True,
-                    )
-                ):
-                    logger.debug(
-                        "LCM ignored missing session-start context_length=%r for model=%s; active update_model context_length=%s",
-                        incoming_context_length,
-                        self.model or str(kwargs.get("model") or ""),
-                        self.context_length,
-                    )
+                    ):
+                        logger.debug(
+                            "LCM ignored missing session-start context_length=%r for model=%s; active update_model context_length=%s",
+                            incoming_context_length,
+                            self.model or str(kwargs.get("model") or ""),
+                            self.context_length,
+                        )
+                    else:
+                        logger.warning(
+                            "LCM ignored stale session-start runtime metadata for model=%s; active update_model model=%s",
+                            str(kwargs.get("model") or ""),
+                            self.model,
+                        )
                     self._update_model_pending_session_start = False
                     return
                 self._set_context_length(parsed_context_length, source="session_start")

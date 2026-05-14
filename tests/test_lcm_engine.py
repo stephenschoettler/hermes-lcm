@@ -366,6 +366,14 @@ def test_missing_session_start_context_length_clears_stale_update_model_window_f
         context_length=1_000_000,
         provider="previous-provider",
     )
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-resolver-model",
+        provider="previous-provider",
+        context_length=1_000_000,
+        conversation_id="telegram:chat-1",
+    )
 
     engine.on_session_start(
         "telegram:chat-1:session-2",
@@ -381,6 +389,68 @@ def test_missing_session_start_context_length_clears_stale_update_model_window_f
     assert engine.context_length == 0
     assert engine.threshold_tokens == 0
     assert engine._context_length_source == "session_start"
+
+
+def test_update_model_zero_window_ignores_stale_positive_session_metadata(engine):
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+    engine.update_model(
+        model="unknown-window-model",
+        context_length=0,
+        provider="unknown-provider",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "unknown-window-model"
+    assert engine.provider == "unknown-provider"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "update_model"
+
+
+def test_update_model_zero_window_ignores_stale_zero_session_metadata(engine):
+    engine.on_session_start(
+        "telegram:chat-1:session-1",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=204_800,
+        conversation_id="telegram:chat-1",
+    )
+    engine.update_model(
+        model="unknown-window-model",
+        context_length=0,
+        provider="unknown-provider",
+    )
+
+    engine.on_session_start(
+        "telegram:chat-1:session-2",
+        platform="telegram",
+        model="previous-window-model",
+        provider="previous-provider",
+        context_length=0,
+        conversation_id="telegram:chat-1",
+    )
+
+    assert engine.model == "unknown-window-model"
+    assert engine.provider == "unknown-provider"
+    assert engine.context_length == 0
+    assert engine.threshold_tokens == 0
+    assert engine._context_length_source == "update_model"
 
 
 def test_positive_session_start_context_length_replaces_consumed_update_model_window_for_new_runtime(engine):
