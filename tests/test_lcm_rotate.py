@@ -1,5 +1,6 @@
 """Tests for /lcm rotate command surface and engine rotate path."""
 
+import importlib
 import os
 import re
 from pathlib import Path
@@ -102,8 +103,14 @@ def test_rotate_apply_advances_frontier_and_writes_rolling_backup(tmp_path):
     state = engine._lifecycle.get_by_conversation(engine._conversation_id)
     assert state is not None
     assert state.current_frontier_store_id == 7
-    # Engine in-process marker should also move forward.
-    assert engine._last_compacted_store_id >= 7
+    # The in-process source-mapping marker must NOT advance here. Pre-tail
+    # raw messages may still be present in the host's in-memory active
+    # context; advancing the marker would break source_ids lineage on the
+    # next in-process compress(). The persisted lifecycle frontier is the
+    # bootstrap signal; the in-process marker is only updated by actual
+    # compaction inside this process. See the regression at
+    # test_rotate_apply_does_not_corrupt_source_lineage_on_next_compress.
+    assert engine._last_compacted_store_id == 0
 
 
 def test_rotate_apply_preserves_raw_messages_for_lossless_recovery(tmp_path):
@@ -372,6 +379,97 @@ def test_rotate_apply_reports_stale_lifecycle_state_when_session_drifts(tmp_path
     state = engine._lifecycle.get_by_conversation(engine._conversation_id)
     assert state is not None
     assert state.current_frontier_store_id == 0
+
+
+def test_rotate_apply_does_not_corrupt_source_lineage_on_next_compress(tmp_path, monkeypatch):
+    """Regression for the issue Tosko4 surfaced on PR #176.
+
+    After /lcm rotate apply, the in-memory active context still holds the
+    pre-rotate raw messages until the host rebuilds it. A normal compress()
+    later in the same process must produce a DAG node whose source_ids
+    reference the same raw rows it summarized — not just the post-rotate
+    tail. Advancing the in-process source-mapping marker on rotate would
+    cause _get_store_ids_for_messages to filter out the pre-rotate rows,
+    producing a poisoned node (text covers msg-0..msg-7, source_ids = [9]).
+    """
+    config = LCMConfig()
+    config.database_path = str(tmp_path / "lcm_rotate_lineage.db")
+    config.fresh_tail_count = 3
+    config.leaf_chunk_tokens = 10
+    config.context_threshold = 0.001
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._lifecycle.bind_session("live-session", conversation_id="live-session")
+    engine.context_length = 200000
+    engine.threshold_tokens = int(200000 * config.context_threshold)
+
+    messages = [{"role": "system", "content": "You are a helpful assistant."}]
+    for i in range(10):
+        messages.append({"role": "user", "content": f"msg-{i} " + "x" * 200})
+    for msg in messages[1:]:
+        engine._store.append(engine._session_id, msg, source="test")
+    engine._store._conn.commit()
+
+    # Apply rotate. The persisted frontier moves to 8 (store_id of msg-8,
+    # the second-to-last message; tail keeps the last 3 store rows). The
+    # host's in-memory active context still holds system + msg-0..msg-9.
+    rotate_result = engine.rotate_active_session(apply=True)
+    assert rotate_result["ok"] is True
+    assert rotate_result["noop"] is False
+    state = engine._lifecycle.get_by_conversation(engine._conversation_id)
+    assert state is not None
+    assert state.current_frontier_store_id == rotate_result["new_frontier_store_id"]
+    # Critical invariant: the in-process source-mapping marker must NOT
+    # have advanced. If it did, _get_store_ids_for_messages would filter
+    # out the pre-rotate raw rows on the next compress() and the resulting
+    # summary node would have source_ids referencing only post-frontier
+    # rows while its text covered pre-frontier content.
+    assert engine._last_compacted_store_id == 0
+
+    # Host appends a new assistant turn, simulating Hermes continuing in
+    # the same process. The in-memory active context still has all the
+    # pre-rotate messages.
+    messages.append({"role": "assistant", "content": "ack-msg-9"})
+    engine._store.append(engine._session_id, messages[-1], source="test")
+    engine._store._conn.commit()
+
+    # Stub the summarizer so the test is deterministic and we can verify
+    # exactly which raw messages get compacted.
+    lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+    monkeypatch.setattr(
+        lcm_engine_module,
+        "summarize_with_escalation",
+        lambda **kwargs: ("Summary of pre-tail messages.\nExpand for details about: msg-0..msg-7", 1),
+    )
+
+    engine.compress(messages)
+
+    nodes = engine._dag.get_session_nodes(engine._session_id)
+    assert nodes, "compress() should have produced at least one summary node"
+    summary_node = nodes[0]
+
+    # source_ids must reference the actual raw rows the summary covers.
+    # Empty or post-frontier-only source_ids would mean the lineage was
+    # severed by the in-process marker filter.
+    assert summary_node.source_ids, (
+        f"summary_node.source_ids is empty — _get_store_ids_for_messages "
+        f"likely filtered out the pre-rotate rows. Marker was {engine._last_compacted_store_id}, "
+        f"compacted msgs first/last: msg-0..msg-7."
+    )
+    # Source rows must come from the pre-tail range (store_id <= rotate
+    # frontier). If source_ids only contained post-frontier rows (the
+    # original bug shape: source_ids == [9]), this assertion fails.
+    rotate_frontier = rotate_result["new_frontier_store_id"]
+    pre_frontier_sources = [
+        sid for sid in summary_node.source_ids if sid <= rotate_frontier
+    ]
+    assert pre_frontier_sources, (
+        f"summary covers pre-rotate messages but source_ids "
+        f"({summary_node.source_ids}) contains no rows at or below the "
+        f"rotate frontier ({rotate_frontier}). Source lineage is severed."
+    )
 
 
 def test_rotate_backup_path_falls_back_to_db_sibling_when_hermes_home_unset(tmp_path):

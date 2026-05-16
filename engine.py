@@ -3667,6 +3667,27 @@ class LCMEngine(ContextEngine):
 
         Refuses on sessions that are unbound, ignored, or stateless.
 
+        Two frontier markers are intentionally kept separate:
+
+        - The **persisted lifecycle frontier**
+          (``lifecycle_state.current_frontier_store_id``) is the
+          bootstrap signal — on next session start, raw rows at or
+          below it are not replayed into the active context. Rotate
+          advances this marker.
+        - The **in-process source-mapping marker**
+          (``self._last_compacted_store_id``) tracks raw rows that the
+          *current process* has already moved into summary DAG nodes.
+          ``_get_store_ids_for_messages`` uses it to filter candidates
+          when mapping in-memory active messages back to ``store_id``.
+          Rotate deliberately does NOT advance this marker: pre-tail
+          raw messages remain in the in-memory active context until
+          the host rebuilds it, so a normal ``compress()`` later in
+          the same process can still summarize them with correct
+          ``source_ids`` lineage. On next process start,
+          ``_bind_lifecycle_state`` reads the persisted frontier into
+          the in-process marker — at that point the active context is
+          being built from scratch, so the contract holds.
+
         Refusal/no-op reason codes (returned as ``reason``):
 
         - ``no_active_session``: engine has no bound session or conversation.
@@ -3777,9 +3798,18 @@ class LCMEngine(ContextEngine):
                 "reason": "stale_lifecycle_state",
                 "applied_frontier_store_id": persisted_frontier,
             }
-        self._last_compacted_store_id = max(
-            self._last_compacted_store_id, persisted_frontier
-        )
+        # Deliberately do NOT touch self._last_compacted_store_id here.
+        # The in-process source-mapping marker must stay aligned with the
+        # in-memory active context the host is still using. Pre-tail raw
+        # messages remain in that active context until the host rebuilds
+        # it; advancing the marker would make
+        # _get_store_ids_for_messages filter out those rows on the next
+        # in-process compress(), producing summary nodes whose text
+        # covers pre-rotate messages but whose source_ids reference only
+        # post-rotate rows. The persisted lifecycle frontier we just
+        # advanced is the bootstrap signal for the next process start,
+        # where _bind_lifecycle_state will read it into the marker
+        # against a freshly-built active context.
         result["applied_frontier_store_id"] = persisted_frontier
         return result
 
