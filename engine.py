@@ -736,16 +736,16 @@ class LCMEngine(ContextEngine):
             n = len(working_messages)
             fresh_tail_start = max(0, n - self._config.fresh_tail_count)
 
-            # Keep the leading message anchored. It is usually the system
-            # prompt, but Hermes gateway sessions may pass only conversation
-            # messages here, so index 0 can be a user message.
-            if fresh_tail_start <= 1:
+            # Keep only a real system prompt anchored. Gateway sessions may
+            # pass only conversation messages, so index 0 can be an old user
+            # turn; that must remain eligible for compaction instead of being
+            # replayed forever as fresh-looking intent.
+            leading_anchor_count = self._leading_anchor_count(working_messages)
+            if fresh_tail_start <= leading_anchor_count:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 break
 
-            # Skip the leading anchor, candidate raw backlog is indices
-            # 1..fresh_tail_start.
-            candidate_raw = working_messages[1:fresh_tail_start]
+            candidate_raw = working_messages[leading_anchor_count:fresh_tail_start]
             if not candidate_raw:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 break
@@ -784,7 +784,7 @@ class LCMEngine(ContextEngine):
                 to_compact,
                 focus_topic=focus_topic,
             )
-            remaining_messages = working_messages[1 + len(compacted_chunk):]
+            remaining_messages = working_messages[leading_anchor_count + len(compacted_chunk):]
 
             source_store_ids = self._get_store_ids_for_messages(compacted_chunk)
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
@@ -808,7 +808,7 @@ class LCMEngine(ContextEngine):
             self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
             self._persist_frontier_marker()
 
-            working_messages = [working_messages[0]] + remaining_messages
+            working_messages = working_messages[:leading_anchor_count] + remaining_messages
             leaf_compacted_this_turn = True
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
@@ -819,7 +819,10 @@ class LCMEngine(ContextEngine):
             if not force_overflow:
                 if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
                     break
-                remaining_raw = working_messages[1:max(0, len(working_messages) - self._config.fresh_tail_count)]
+                leading_anchor_count = self._leading_anchor_count(working_messages)
+                remaining_raw = working_messages[
+                    leading_anchor_count:max(0, len(working_messages) - self._config.fresh_tail_count)
+                ]
                 if not remaining_raw:
                     break
                 remaining_raw_tokens = count_messages_tokens(remaining_raw)
@@ -834,9 +837,10 @@ class LCMEngine(ContextEngine):
                 observed_tokens=observed_prompt_tokens,
             )
             if force_overflow and len(messages) >= 1:
+                leading_anchor_count = self._leading_anchor_count(messages)
                 compressed = self._assemble_overflow_recovery_context(
-                    messages[0],
-                    messages[1:],
+                    messages[0] if leading_anchor_count else None,
+                    messages[leading_anchor_count:],
                     assembly_cap_override=recovery_assembly_cap,
                 )
                 return self._finalize_forced_overflow_result(
@@ -876,11 +880,12 @@ class LCMEngine(ContextEngine):
             working_messages,
             observed_tokens=observed_prompt_tokens,
         )
-        self._pending_context_anchor_messages = messages[1:]
+        leading_anchor_count = self._leading_anchor_count(working_messages)
+        self._pending_context_anchor_messages = messages[leading_anchor_count:]
         try:
             compressed = self._assemble_context(
-                working_messages[0],
-                working_messages[1:],
+                working_messages[0] if leading_anchor_count else None,
+                working_messages[leading_anchor_count:],
                 assembly_cap_override=recovery_assembly_cap,
             )
         finally:
@@ -1308,9 +1313,23 @@ class LCMEngine(ContextEngine):
     def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = len(messages)
         fresh_tail_start = max(0, n - self._config.fresh_tail_count)
-        if fresh_tail_start <= 1:
+        leading_anchor_count = self._leading_anchor_count(messages)
+        if fresh_tail_start <= leading_anchor_count:
             return []
-        return messages[1:fresh_tail_start]
+        return messages[leading_anchor_count:fresh_tail_start]
+
+    @staticmethod
+    def _leading_anchor_count(messages: List[Dict[str, Any]]) -> int:
+        """Return the number of non-compactable leading messages.
+
+        Only the system prompt is a safe permanent anchor. Hermes gateway
+        sessions can begin with a user message when core passes conversation
+        history without a system prompt; preserving that first user turn as raw
+        active context lets stale requests look current after later compaction.
+        """
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            return 1
+        return 0
 
     def _raw_backlog_tokens(self, messages: List[Dict[str, Any]]) -> int:
         backlog = self._raw_backlog_messages(messages)
@@ -3322,7 +3341,7 @@ class LCMEngine(ContextEngine):
 
     def _assemble_context(
         self,
-        system_msg: Dict[str, Any],
+        system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
         include_lcm_note: bool = True,
@@ -3336,20 +3355,20 @@ class LCMEngine(ContextEngine):
         """
         result = []
 
-        # Leading anchor with optional LCM annotation. Only append the note to
-        # an actual system message; gateway sessions can start with a structured
-        # multimodal user message, and that content must not be treated as a
-        # system prompt or concatenated with text.
-        leading_msg = system_msg.copy()
-        if (
-            leading_msg.get("role") == "system"
-            and self.compression_count == 0
-            and include_lcm_note
-        ):
-            leading_msg["content"] = self._append_lcm_note_to_content(
-                leading_msg.get("content", "")
-            )
-        result.append(leading_msg)
+        # Leading anchor with optional LCM annotation. Only a true system prompt
+        # is a safe permanent anchor; gateway sessions can start directly with
+        # user messages, and those user turns must remain compactable.
+        leading_msg = system_msg.copy() if system_msg is not None else None
+        if leading_msg is not None:
+            if (
+                leading_msg.get("role") == "system"
+                and self.compression_count == 0
+                and include_lcm_note
+            ):
+                leading_msg["content"] = self._append_lcm_note_to_content(
+                    leading_msg.get("content", "")
+                )
+            result.append(leading_msg)
 
         assembly_cap = (
             assembly_cap_override
@@ -3362,7 +3381,7 @@ class LCMEngine(ContextEngine):
         anchor_part: Optional[str] = None
         summary_budget = None
         if assembly_cap is not None:
-            used = count_message_tokens(leading_msg)
+            used = count_message_tokens(leading_msg) if leading_msg is not None else 0
             kept_tail_reversed: list[Dict[str, Any]] = []
             tail_token_total = 0
             tail_for_selection = self._sanitize_active_context_messages(
@@ -3382,7 +3401,7 @@ class LCMEngine(ContextEngine):
 
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
-        last_role = result[-1].get("role", "system")
+        last_role = result[-1].get("role", "system") if result else "system"
         summary_role = "assistant" if last_role != "assistant" else "user"
         if anchor_part is not None:
             anchor_msg = {"role": summary_role, "content": anchor_part}
@@ -3572,7 +3591,7 @@ class LCMEngine(ContextEngine):
 
     def _assemble_overflow_recovery_context(
         self,
-        system_msg: Dict[str, Any],
+        system_msg: Optional[Dict[str, Any]],
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
@@ -3589,7 +3608,7 @@ class LCMEngine(ContextEngine):
                 )
                 if any(
                     (msg.get("content") or "") == content
-                    for msg in candidate[1:]
+                    for msg in (candidate[1:] if system_msg is not None else candidate)
                 ):
                     return candidate
 
@@ -3599,8 +3618,10 @@ class LCMEngine(ContextEngine):
             assembly_cap_override=assembly_cap_override,
             include_lcm_note=False,
         )
-        if len(candidate) == 1 and tail_messages:
-            return self._sanitize_active_context_messages([system_msg, tail_messages[-1]])
+        minimum_candidate_len = 1 if system_msg is not None else 0
+        if len(candidate) == minimum_candidate_len and tail_messages:
+            fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
+            return self._sanitize_active_context_messages(fallback)
         return candidate
 
     @staticmethod

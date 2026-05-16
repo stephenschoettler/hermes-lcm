@@ -1163,6 +1163,54 @@ class TestEngineABC:
         assert all("Current user objective preserved" not in row["content"] for row in rows)
         assert after_restart._ingest_cursor == len(replay_with_new_message)
 
+    def test_gateway_session_without_system_does_not_replay_old_first_user_as_anchor(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "gateway-no-system-anchor.db"
+        config = LCMConfig(
+            fresh_tail_count=3,
+            leaf_chunk_tokens=1,
+            database_path=str(db_path),
+        )
+        engine = LCMEngine(config=config)
+        engine.on_session_start(
+            "gateway-no-system-anchor-session",
+            platform="discord",
+            conversation_id="discord:chat-1",
+            context_length=200000,
+        )
+
+        def mock_summary(**kwargs):
+            return "Older gateway context summary.\nExpand for details about: stale request", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        stale_first_request = "[foo] Go ahead and set up the automation"
+        latest_request = "disable the preflight compression banner"
+        try:
+            active_context = engine.compress([
+                {"role": "user", "content": stale_first_request},
+                {"role": "assistant", "content": "I will set up automation."},
+                {"role": "user", "content": "intermediate request"},
+                {"role": "assistant", "content": "Intermediate response."},
+                {"role": "user", "content": latest_request},
+                {
+                    "role": "assistant",
+                    "content": "checking config",
+                    "tool_calls": [{"id": "call_cfg", "type": "function"}],
+                },
+                {"role": "tool", "tool_call_id": "call_cfg", "content": "config output"},
+                {"role": "assistant", "content": "done"},
+            ])
+        finally:
+            engine.shutdown()
+
+        assert not any(
+            msg.get("role") == "user" and msg.get("content") == stale_first_request
+            for msg in active_context
+        )
+        combined_context = "\n".join(str(msg.get("content", "")) for msg in active_context)
+        assert "Current user objective preserved" in combined_context
+        assert latest_request in combined_context
+
     def test_preserved_objective_anchor_externalizes_inline_payloads(self, tmp_path):
         db_path = tmp_path / "preserved-objective-payload.db"
         data_uri = "data:image/png;base64," + ("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=" * 20)
@@ -3312,11 +3360,12 @@ class TestEngineCompress:
 
         result = engine.compress(messages)
 
-        assert result[0] == first_user
-        assert isinstance(result[0]["content"], list)
-        assert all(
-            not (isinstance(part, dict) and "Lossless Context Management" in str(part.get("text", "")))
-            for part in result[0]["content"]
+        assert first_user not in result
+        assert "Mock summary" in "\n".join(str(msg.get("content", "")) for msg in result)
+        stored_rows = engine._store.get_session_messages(engine._session_id)
+        assert any(
+            row["role"] == "user" and "first user text" in str(row["content"])
+            for row in stored_rows
         )
         assert len(result) < len(messages)
         assert engine.compression_count == 1
