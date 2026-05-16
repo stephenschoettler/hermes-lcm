@@ -2016,6 +2016,26 @@ class LCMEngine(ContextEngine):
             )
         except Exception as exc:  # pragma: no cover - defensive
             status["lifecycle_fragmentation"] = {"error": str(exc), "read_only": True}
+        try:
+            rotate_backup_path = self.rotate_backup_path()
+            status["rotate_backup_path"] = str(rotate_backup_path)
+            # Single stat() to avoid a TOCTOU window where the rolling slot
+            # could be atomically replaced between separate mtime and size reads.
+            try:
+                rotate_stat = rotate_backup_path.stat()
+            except FileNotFoundError:
+                rotate_stat = None
+            if rotate_stat is not None:
+                status["last_rotate_at"] = rotate_stat.st_mtime
+                status["rotate_backup_size"] = rotate_stat.st_size
+            else:
+                status["last_rotate_at"] = None
+                status["rotate_backup_size"] = 0
+        except Exception as exc:  # pragma: no cover - defensive
+            status["rotate_backup_path"] = None
+            status["last_rotate_at"] = None
+            status["rotate_backup_size"] = 0
+            status["rotate_backup_error"] = str(exc)
         if session_id:
             status["store_messages"] = self._store.get_session_count(session_id)
             status["dag_nodes"] = len(self._dag.get_session_nodes(session_id))
@@ -3605,6 +3625,163 @@ class LCMEngine(ContextEngine):
             # Take first line only
             return hint.split("\n")[0].strip()
         return ""
+
+    # -- Rotate ------------------------------------------------------------
+
+    def backup_dir(self) -> Path:
+        """Return the directory where LCM backup snapshots are written.
+
+        Centralized so the timestamped ``/lcm backup`` slot and the rolling
+        ``/lcm rotate apply`` slot share the same directory derivation.
+        """
+        db_path = Path(self._store.db_path)
+        backup_root = (
+            Path(self._hermes_home).expanduser()
+            if getattr(self, "_hermes_home", "")
+            else db_path.parent
+        )
+        return backup_root / "backups" / "lcm"
+
+    def rotate_backup_path(self) -> Path:
+        """Return the rolling rotate-latest SQLite backup path for this engine.
+
+        Centralized so command.py (which writes the backup) and get_status()
+        (which reads its mtime to surface last_rotate_at) cannot drift.
+        """
+        db_path = Path(self._store.db_path)
+        return self.backup_dir() / f"{db_path.stem}-rotate-latest.sqlite3"
+
+    def rotate_active_session(
+        self,
+        *,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Compact the active session in-place without changing identity.
+
+        Read-only by default (``apply=False``). Returns a preview describing
+        what would change. When ``apply=True``, advances the lifecycle frontier
+        marker past the pre-tail raw messages so they are no longer replayed
+        into active context on subsequent bootstrap. Raw messages remain in
+        the SQLite store and are recoverable through ``lcm_load_session`` and
+        ``lcm_expand`` — the lossless raw recovery contract is preserved.
+
+        Refuses on sessions that are unbound, ignored, or stateless.
+
+        Refusal/no-op reason codes (returned as ``reason``):
+
+        - ``no_active_session``: engine has no bound session or conversation.
+        - ``session_ignored``: foreground session matched
+          ``LCM_IGNORE_SESSION_PATTERNS``.
+        - ``session_stateless``: foreground session matched
+          ``LCM_STATELESS_SESSION_PATTERNS``.
+        - ``no_pre_tail_content``: total stored messages do not exceed
+          ``fresh_tail_count``; nothing to rotate.
+        - ``empty_tail``: tail query returned no rows despite a non-zero
+          count (concurrent deletion race); rotate cannot compute a boundary.
+        - ``frontier_already_ahead``: lifecycle frontier is already at or
+          past the proposed new frontier; rotate is a no-op.
+        - ``stale_lifecycle_state``: apply requested but lifecycle's
+          ``current_session_id`` did not match this engine's session, so
+          ``advance_frontier`` did not persist the change.
+        """
+        session_id = self._session_id
+        conversation_id = self._conversation_id
+
+        if not session_id or not conversation_id:
+            return {"ok": False, "reason": "no_active_session"}
+        if self._session_ignored:
+            return {"ok": False, "reason": "session_ignored", "session_id": session_id}
+        if self._session_stateless:
+            return {"ok": False, "reason": "session_stateless", "session_id": session_id}
+
+        fresh_tail_count = max(1, int(self._config.fresh_tail_count))
+        total_count = int(self._store.get_session_count(session_id))
+
+        state = self._lifecycle.get_by_conversation(conversation_id)
+        current_frontier = int(state.current_frontier_store_id) if state else 0
+
+        base = {
+            "ok": True,
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "total_message_count": total_count,
+            "fresh_tail_count": fresh_tail_count,
+            "current_frontier_store_id": current_frontier,
+            "mode": "apply" if apply else "preview",
+        }
+
+        if total_count <= fresh_tail_count:
+            return {
+                **base,
+                "noop": True,
+                "reason": "no_pre_tail_content",
+                "pre_tail_message_count": 0,
+                "new_frontier_store_id": current_frontier,
+            }
+
+        tail = self._store.get_session_tail(session_id, fresh_tail_count)
+        if not tail:
+            # Concurrent deletion can empty the tail after the count check.
+            # Surface the same shape callers expect for any other no-op so
+            # downstream formatters can render it without KeyError.
+            return {
+                **base,
+                "noop": True,
+                "reason": "empty_tail",
+                "pre_tail_message_count": 0,
+                "new_frontier_store_id": current_frontier,
+            }
+
+        smallest_tail_store_id = int(tail[0].get("store_id") or 0)
+        new_frontier = max(0, smallest_tail_store_id - 1)
+        pre_tail_count = max(0, total_count - len(tail))
+
+        is_noop = new_frontier <= current_frontier
+        result = {
+            **base,
+            "pre_tail_message_count": pre_tail_count,
+            "new_frontier_store_id": new_frontier,
+            "noop": is_noop,
+        }
+        if is_noop:
+            # Set the reason for both preview and apply so downstream
+            # formatters can render a stable explanation. Preview previously
+            # omitted the reason, which left _rotate_apply_text's preflight
+            # check unable to distinguish frontier-already-ahead from other
+            # no-ops.
+            result["reason"] = "frontier_already_ahead"
+
+        if not apply:
+            return result
+
+        if is_noop:
+            return result
+
+        new_state = self._lifecycle.advance_frontier(
+            conversation_id,
+            session_id,
+            new_frontier,
+        )
+        # advance_frontier silently returns the unchanged state when its
+        # session_id check fails (lifecycle_state.py:557-559). Detect that
+        # by checking whether the persisted frontier actually advanced; only
+        # promote the in-process marker on a confirmed persist.
+        persisted_frontier = (
+            int(new_state.current_frontier_store_id) if new_state else current_frontier
+        )
+        if persisted_frontier < new_frontier:
+            return {
+                **{k: v for k, v in result.items() if k != "ok"},
+                "ok": False,
+                "noop": False,
+                "reason": "stale_lifecycle_state",
+                "applied_frontier_store_id": persisted_frontier,
+            }
+        self._last_compacted_store_id = max(
+            self._last_compacted_store_id, persisted_frontier
+        )
+        result["applied_frontier_store_id"] = persisted_frontier
+        return result
 
     # -- Lifecycle ---------------------------------------------------------
 

@@ -530,10 +530,51 @@ Available commands:
 - `/lcm doctor source apply` - backup-first normalization of legacy blank-source rows to `unknown`
 - `/lcm doctor retention` - read-only retention analysis
 - `/lcm backup` - timestamped SQLite backup
+- `/lcm rotate` - read-only preview of an in-place tail-preserving compact of the active session
+- `/lcm rotate apply` - backup-first rotate that advances the lifecycle frontier past pre-tail raw messages
 - `/lcm help` - command help
 
 Apply paths are intentionally narrow and backup-first. Start with diagnostics
 before cleanup or repair.
+
+### Rotate: in-place compact without changing session identity
+
+`/lcm rotate` lets an operator compact a long-running session in place without
+changing `session_id` or `conversation_id`. It is the in-session counterpart to
+Hermes-level `/new` (which starts a new session) and to `/lcm doctor clean`
+(which prunes whole junk sessions).
+
+What rotate does:
+
+- preserves the live tail (`LCM_FRESH_TAIL_COUNT` most-recent messages)
+- advances the lifecycle frontier marker past every raw message before the tail,
+  so subsequent bootstrap stops replaying them into the active prompt
+- writes a rolling `*-rotate-latest.sqlite3` backup under the same backup
+  directory as `/lcm backup`, overwriting the previous rotate slot atomically
+  so disk usage stays bounded across repeated rotates
+
+What rotate does not do:
+
+- it does not delete raw messages — pre-tail rows remain in the SQLite store
+  and stay recoverable through `lcm_load_session` and `lcm_expand`, preserving
+  the lossless raw recovery contract
+- it does not invoke the summarization model — rotate is a frontier and backup
+  operation, not a synthesis step. Pre-tail content that was not yet covered by
+  a summary node remains accessible only as raw rows; trigger normal compaction
+  first if you want the pre-tail range covered by summary nodes before rotating
+- it does not change session or conversation identity, run on stateless
+  sessions (`LCM_STATELESS_SESSION_PATTERNS`), or run on ignored sessions
+  (`LCM_IGNORE_SESSION_PATTERNS`) — rotate refuses on both with a clear reason
+
+`lcm_status` and `/lcm status` surface `last_rotate_at` (epoch float, or `null`
+when no rotate has happened) and the rolling backup path so operators can see
+when rotate last ran. The mtime of the rolling backup file is the source of
+truth — no new lifecycle column is added by this feature.
+
+Re-running `/lcm rotate apply` on a session whose frontier is already at or
+ahead of the target boundary reports `status: noop` and is safe to retry.
+A no-op apply does not write a new rolling backup, so the previous
+known-good `*-rotate-latest.sqlite3` snapshot survives idempotent retries.
 
 ## How It Works
 
