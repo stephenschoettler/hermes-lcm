@@ -272,17 +272,8 @@ class LCMEngine(ContextEngine):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
 
-        # Resolve DB path
-        if self._config.database_path:
-            db_path = Path(self._config.database_path)
-        elif hermes_home:
-            db_path = Path(hermes_home) / "lcm.db"
-        else:
-            db_path = Path.home() / ".hermes" / "lcm.db"
-
-        self._store = MessageStore(db_path, ingest_protection_config=self._config, hermes_home=hermes_home)
-        self._dag = SummaryDAG(db_path)
-        self._lifecycle = LifecycleStateStore(db_path)
+        db_path = self._resolve_db_path(hermes_home)
+        self._bind_storage(db_path, hermes_home)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -380,6 +371,75 @@ class LCMEngine(ContextEngine):
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
         self._auxiliary_session_lock = threading.RLock()
+
+    def _resolve_db_path(self, hermes_home: str = "") -> Path:
+        """Resolve the SQLite path for the active Hermes profile/home."""
+        if self._config.database_path:
+            return Path(self._config.database_path)
+        if hermes_home:
+            return Path(hermes_home) / "lcm.db"
+        return Path.home() / ".hermes" / "lcm.db"
+
+    def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
+        """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        self._store = MessageStore(
+            db_path,
+            ingest_protection_config=self._config,
+            hermes_home=hermes_home,
+        )
+        self._dag = SummaryDAG(db_path)
+        self._lifecycle = LifecycleStateStore(db_path)
+
+    def _close_storage(self) -> None:
+        """Best-effort close of currently bound SQLite helpers."""
+        for attr in ("_store", "_dag", "_lifecycle"):
+            helper = getattr(self, attr, None)
+            close = getattr(helper, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+
+    def _reset_profile_runtime_state(self) -> None:
+        """Clear process-local session state that cannot cross profile homes."""
+        self._session_id = ""
+        self._session_platform = ""
+        self._foreground_session_id = ""
+        self._foreground_session_platform = ""
+        self._foreground_conversation_id = ""
+        self._conversation_id = ""
+        self._session_match_keys = []
+        self._session_ignored = False
+        self._session_stateless = False
+        self._clear_pending_reset_boundary()
+        self._reset_session_scoped_runtime_state()
+
+    def _rebind_storage_for_home(self, hermes_home: str = "") -> bool:
+        """Switch SQLite-backed state when a reused engine serves another profile.
+
+        Hermes core passes the active ``hermes_home`` on session start.  Older
+        Hermes versions may still reuse the same plugin/context-engine object
+        after ``HERMES_HOME`` changes, so the plugin must not assume the store
+        captured during ``register()`` is still correct.
+        """
+        if not hermes_home:
+            return False
+        if self._config.database_path:
+            self._hermes_home = hermes_home
+            return False
+
+        db_path = self._resolve_db_path(hermes_home)
+        current_db = Path(getattr(getattr(self, "_store", None), "db_path", ""))
+        if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
+            return False
+
+        self._close_storage()
+        self._hermes_home = hermes_home
+        self._bind_storage(db_path, hermes_home)
+        self._reset_profile_runtime_state()
+        logger.info("LCM rebound storage for Hermes home %s", hermes_home)
+        return True
 
     def _set_context_length(self, context_length: Any, *, source: str) -> bool:
         try:
@@ -1735,6 +1795,9 @@ class LCMEngine(ContextEngine):
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        if "hermes_home" in kwargs:
+            self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
+
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
         previous_session_id = self._session_id

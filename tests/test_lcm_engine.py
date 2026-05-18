@@ -59,6 +59,49 @@ def test_engine_deallocation_releases_sqlite_fds_without_gc(tmp_path):
     assert after <= before + 2
 
 
+def test_reused_engine_rebinds_storage_when_hermes_home_changes(tmp_path):
+    """Plugin-side guard for Hermes hosts that reuse one engine across profiles."""
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    config = LCMConfig(database_path="")
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    try:
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        engine.on_session_start(
+            "session-a",
+            hermes_home=str(home_a),
+            platform="cli",
+            context_length=200000,
+        )
+        assert Path(engine._store.db_path) == home_a / "lcm.db"
+        engine._ingest_messages([{"role": "user", "content": "message from profile a"}])
+        assert engine._store.get_session_count("session-a") == 1
+
+        engine.on_session_start(
+            "session-b",
+            hermes_home=str(home_b),
+            platform="cli",
+            context_length=200000,
+        )
+        assert Path(engine._store.db_path) == home_b / "lcm.db"
+        assert engine._session_id == "session-b"
+        assert engine._store.get_session_count("session-a") == 0
+        engine._ingest_messages([{"role": "user", "content": "message from profile b"}])
+        assert engine._store.get_session_count("session-b") == 1
+
+        with sqlite3.connect(home_a / "lcm.db") as conn_a:
+            rows_a = conn_a.execute("SELECT session_id, content FROM messages").fetchall()
+        with sqlite3.connect(home_b / "lcm.db") as conn_b:
+            rows_b = conn_b.execute("SELECT session_id, content FROM messages").fetchall()
+
+        assert rows_a == [("session-a", "message from profile a")]
+        assert rows_b == [("session-b", "message from profile b")]
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_tool_status_reports_lifecycle_fragmentation_summary(engine, tmp_path):
     engine._hermes_home = str(tmp_path / "hermes_home")
     state_db = tmp_path / "hermes_home" / "state.db"
