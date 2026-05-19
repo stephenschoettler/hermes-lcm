@@ -541,28 +541,38 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
         """,
         (limit,),
     ).fetchall()
-    data_uri_content = conn.execute(
+    candidate_cap = max(limit * 20, limit)
+    # Pre-filter broadly in SQL, then apply the same conservative Python regex
+    # used by ingest externalization. This avoids false positives from code or
+    # doctor text that quotes scaffolds such as "data:%;base64,%" or
+    # `DATA_URI = "data:image/png;base64," + DATA_PAYLOAD`.
+    data_uri_content_candidates = conn.execute(
         """
         SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
         FROM messages
-        WHERE content LIKE '%data:%;base64,%'
+        WHERE lower(content) GLOB '*data:*;base64,*'
         ORDER BY content_len DESC
         LIMIT ?
         """,
-        (limit,),
+        (candidate_cap,),
     ).fetchall()
-    data_uri_tool_calls = conn.execute(
+    data_uri_tool_call_candidates = conn.execute(
         """
         SELECT store_id, session_id, source, role, COALESCE(length(tool_calls), 0) AS tool_calls_len, tool_calls
         FROM messages
-        WHERE tool_calls LIKE '%data:%;base64,%'
+        WHERE lower(tool_calls) GLOB '*data:*;base64,*'
         ORDER BY tool_calls_len DESC
         LIMIT ?
         """,
-        (limit,),
+        (candidate_cap,),
     ).fetchall()
+    data_uri_content = [
+        row for row in data_uri_content_candidates if isinstance(row[-1], str) and contains_data_uri_base64(row[-1])
+    ][:limit]
+    data_uri_tool_calls = [
+        row for row in data_uri_tool_call_candidates if isinstance(row[-1], str) and contains_data_uri_base64(row[-1])
+    ][:limit]
 
-    candidate_cap = max(limit * 20, limit)
     generic_rows = []
     for store_id, session_id, source, role, content, tool_calls in conn.execute(
         """

@@ -1234,6 +1234,63 @@ def test_lcm_doctor_reports_largest_and_suspicious_payload_rows(tmp_path):
     assert "suspicious_base64_like_rows:" in result
 
 
+def test_lcm_doctor_ignores_literal_data_uri_like_scaffold(tmp_path):
+    engine = _engine(tmp_path)
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "diagnostic pattern: data:%;base64,%",
+            None,
+            json.dumps([{"function": {"arguments": "LIKE pattern data:%;base64,%"}}]),
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    json_result = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+
+    payload_check = next(check for check in json_result["checks"] if check["check"] == "payload_storage")
+    assert payload_check["status"] == "pass"
+    assert payload_check["detail"]["suspicious_data_uri_content_rows"] == []
+    assert payload_check["detail"]["suspicious_data_uri_tool_calls_rows"] == []
+
+
+def test_lcm_doctor_ignores_code_data_uri_prefix_without_payload(tmp_path):
+    engine = _engine(tmp_path)
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "tool",
+            'DATA_URI = "data:image/png;base64," + DATA_PAYLOAD',
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    json_result = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+
+    payload_check = next(check for check in json_result["checks"] if check["check"] == "payload_storage")
+    assert payload_check["status"] == "pass"
+    assert payload_check["detail"]["suspicious_data_uri_content_rows"] == []
+
+
 def test_lcm_doctor_reports_embedded_generic_base64_without_raw_preview(tmp_path):
     engine = _engine(tmp_path)
     engine._store._conn.execute(
