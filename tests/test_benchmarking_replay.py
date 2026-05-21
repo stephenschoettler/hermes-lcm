@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import hermes_lcm.engine as lcm_engine
 
 from benchmarking.fixtures import make_synthetic_fixture
@@ -93,6 +95,33 @@ def test_replay_uses_output_directory_for_state_and_not_home(tmp_path, monkeypat
     assert Path(metrics.database_path).is_relative_to(output_dir)
     assert Path(metrics.hermes_home).is_relative_to(output_dir)
     assert not (fake_home / ".hermes" / "lcm.db").exists()
+
+
+def test_replay_refuses_to_reuse_existing_non_empty_run_directory(tmp_path):
+    fixture = ReplayFixture(
+        name="stale_fixture",
+        messages=[{"role": "user", "content": "small hello"}],
+    )
+    policy = _small_policy(context_length=10_000, context_threshold=0.90)
+    run_dir = tmp_path / "stale_fixture__small_policy__v1"
+    run_dir.mkdir()
+    (run_dir / "stale.txt").write_text("old benchmark output")
+
+    with pytest.raises(ValueError, match="Refusing to reuse non-empty benchmark run directory"):
+        run_replay(fixture, policy, output_dir=tmp_path)
+
+
+def test_replay_refuses_run_directory_path_that_is_file(tmp_path):
+    fixture = ReplayFixture(
+        name="file_fixture",
+        messages=[{"role": "user", "content": "small hello"}],
+    )
+    policy = _small_policy(context_length=10_000, context_threshold=0.90)
+    run_dir = tmp_path / "file_fixture__small_policy__v1"
+    run_dir.write_text("not a directory")
+
+    with pytest.raises(ValueError, match="Refusing to reuse benchmark run path"):
+        run_replay(fixture, policy, output_dir=tmp_path)
 
 
 def test_run_replays_isolates_same_name_policy_versions(tmp_path):

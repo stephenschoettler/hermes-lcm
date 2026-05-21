@@ -191,6 +191,10 @@ def run_replay(
 
     root_dir = Path(output_dir)
     run_dir = root_dir / f"{_safe_name(fixture.name)}__{_policy_run_key(policy)}"
+    if run_dir.exists() and not run_dir.is_dir():
+        raise ValueError(f"Refusing to reuse benchmark run path that is not a directory: {run_dir}")
+    if run_dir.exists() and any(run_dir.iterdir()):
+        raise ValueError(f"Refusing to reuse non-empty benchmark run directory: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
     engine = _new_engine(policy, run_dir)
     start = time.perf_counter()

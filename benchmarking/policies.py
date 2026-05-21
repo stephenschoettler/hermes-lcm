@@ -36,14 +36,14 @@ def builtin_policies() -> list[LCMPolicy]:
             notes="Current long-context baseline: 64-message fresh tail, 20k leaf chunks.",
         ),
         LCMPolicy(
-            name="codex_gpt_long_context_candidate",
+            name="codex_gpt_long_context",
             context_length=272_000,
             context_threshold=0.75,
             fresh_tail_count=24,
             leaf_chunk_tokens=8_000,
             target_after_compaction=0.55,
             policy_version="1",
-            notes="Initial deterministic GPT/Codex long-context candidate.",
+            notes="Initial benchmark candidate for GPT/Codex long-context routes.",
         ),
         LCMPolicy(
             name="pressure_smoke",

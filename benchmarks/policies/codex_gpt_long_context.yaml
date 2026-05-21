@@ -1,0 +1,12 @@
+name: codex_gpt_long_context
+context_length: 272000
+context_threshold: 0.75
+fresh_tail_count: 24
+leaf_chunk_tokens: 8000
+condensation_fanin: 4
+incremental_max_depth: 1
+dynamic_leaf_chunk_enabled: false
+target_after_compaction: 0.55
+min_turns_between_compactions: 0
+policy_version: "1"
+notes: "Initial benchmark candidate for GPT/Codex long-context routes."

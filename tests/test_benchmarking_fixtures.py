@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from benchmarking.fixtures import load_fixture, make_synthetic_fixture
+from benchmarking.fixtures import load_fixture, make_synthetic_fixture, parse_synthetic_fixture_spec
 from benchmarking.policies import load_policy
 from benchmarking.replay import run_replay
 
@@ -59,6 +59,31 @@ def test_make_synthetic_fixture_is_deterministic():
         "CANARY_DETERMINISTIC_0001",
     ]
     assert "CANARY_DETERMINISTIC_0000 = VALUE_DETERMINISTIC_0000" in first.messages[1]["content"]
+
+
+def test_parse_synthetic_fixture_spec_builds_named_fixture():
+    fixture = parse_synthetic_fixture_spec("codex_pressure_probe:5:2:7")
+
+    assert fixture.name == "codex_pressure_probe"
+    assert len(fixture.messages) == 11
+    assert len(fixture.canaries) == 2
+    assert fixture.tags == ["synthetic", "deterministic"]
+    assert "codex_pressure_probe_filler_6" in fixture.messages[1]["content"]
+
+
+def test_parse_synthetic_fixture_spec_rejects_invalid_specs():
+    with pytest.raises(ValueError, match="name:pairs:canaries:filler_words"):
+        parse_synthetic_fixture_spec("bad")
+    with pytest.raises(ValueError, match="message_pairs must be positive"):
+        parse_synthetic_fixture_spec("bad:0:1:5")
+    with pytest.raises(ValueError, match="canary_count cannot be negative"):
+        parse_synthetic_fixture_spec("bad:1:-1:5")
+    with pytest.raises(ValueError, match="canary_count cannot exceed message_pairs"):
+        parse_synthetic_fixture_spec("bad:1:2:5")
+    with pytest.raises(ValueError, match="message_pairs exceeds maximum"):
+        parse_synthetic_fixture_spec("bad:251:1:5")
+    with pytest.raises(ValueError, match="filler_words exceeds maximum"):
+        parse_synthetic_fixture_spec("bad:1:1:2001")
 
 
 def test_committed_long_history_fixture_loads():

@@ -57,16 +57,40 @@ def test_metrics_round_trips_with_failure_list():
     assert restored == metrics
 
 
-def test_builtin_policies_include_baseline_codex_candidate_and_pressure_smoke():
+def test_builtin_policies_include_baseline_codex_policy_and_pressure_smoke():
     policies = {policy.name: policy for policy in builtin_policies()}
 
     assert policies["baseline_272k"].context_length == 272_000
     assert policies["baseline_272k"].fresh_tail_count == 64
-    assert policies["codex_gpt_long_context_candidate"].leaf_chunk_tokens == 8_000
-    assert policies["codex_gpt_long_context_candidate"].target_after_compaction == 0.55
-    assert policies["codex_gpt_long_context_candidate"].policy_version == "1"
+    assert policies["codex_gpt_long_context"].context_length == 272_000
+    assert policies["codex_gpt_long_context"].fresh_tail_count == 24
+    assert policies["codex_gpt_long_context"].leaf_chunk_tokens == 8_000
+    assert policies["codex_gpt_long_context"].target_after_compaction == 0.55
+    assert policies["codex_gpt_long_context"].policy_version == "1"
     assert policies["pressure_smoke"].context_length < 1_000
     assert policies["pressure_smoke"].policy_version == "1"
+
+
+def test_committed_codex_gpt_long_context_policy_matches_builtin_policy():
+    policy = load_policy("benchmarks/policies/codex_gpt_long_context.yaml")
+    builtin = {item.name: item for item in builtin_policies()}["codex_gpt_long_context"]
+
+    assert policy == builtin
+    assert "benchmark candidate" in policy.notes
+
+
+def test_committed_policy_files_match_builtin_policies():
+    builtins = {item.name: item for item in builtin_policies()}
+    policy_paths = [
+        "benchmarks/policies/baseline.yaml",
+        "benchmarks/policies/codex_gpt_long_context.yaml",
+        "benchmarks/policies/pressure_smoke.yaml",
+    ]
+
+    loaded = [load_policy(path) for path in policy_paths]
+
+    assert {policy.name for policy in loaded} == set(builtins)
+    assert loaded == [builtins[policy.name] for policy in loaded]
 
 
 def test_load_policy_accepts_json_and_minimal_yaml(tmp_path):

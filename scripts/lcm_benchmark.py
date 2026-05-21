@@ -21,6 +21,12 @@ from benchmarking.report import write_metrics_jsonl, write_summary
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", action="append", default=[], help="Fixture JSON path. Repeatable.")
+    parser.add_argument(
+        "--synthetic-fixture",
+        action="append",
+        default=[],
+        help="Deterministic synthetic fixture spec: name:pairs:canaries:filler_words. Repeatable.",
+    )
     parser.add_argument("--policy", action="append", default=[], help="Policy JSON/YAML path. Repeatable.")
     parser.add_argument("--output", required=True, help="Benchmark output directory.")
     parser.add_argument("--json", action="store_true", help="Print summary JSON to stdout.")
@@ -40,17 +46,17 @@ def _validate_output_path(path: Path, *, allow_external: bool) -> Path:
             f"Refusing output outside repo: {resolved}. "
             "Pass --allow-external-output to override."
         )
-    resolved.mkdir(parents=True, exist_ok=True)
     return resolved
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv or sys.argv[1:])
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    if not args.fixture and not args.synthetic_fixture:
+        raise SystemExit("At least one --fixture or --synthetic-fixture is required")
     output_dir = _validate_output_path(Path(args.output), allow_external=args.allow_external_output)
-    if not args.fixture:
-        raise SystemExit("At least one --fixture path is required")
-    fixtures = load_fixtures(args.fixture)
+    fixtures = load_fixtures(args.fixture, synthetic_specs=args.synthetic_fixture)
     policies = load_policies(args.policy)
+    output_dir.mkdir(parents=True, exist_ok=True)
     metrics = run_replays(fixtures, policies, output_dir=output_dir)
     write_metrics_jsonl(output_dir / "metrics.jsonl", metrics)
     summary = write_summary(output_dir / "summary.json", metrics)

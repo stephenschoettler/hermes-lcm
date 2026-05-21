@@ -11,6 +11,8 @@ from .types import ReplayFixture
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_MAX_SYNTHETIC_MESSAGE_PAIRS = 250
+_MAX_SYNTHETIC_FILLER_WORDS = 2_000
 
 
 def _resolve_path(path: str | Path) -> Path:
@@ -38,8 +40,42 @@ def load_fixture(path: str | Path) -> ReplayFixture:
     return fixture_from_dict(data)
 
 
-def load_fixtures(paths: Iterable[str | Path]) -> list[ReplayFixture]:
-    return [load_fixture(path) for path in paths]
+def load_fixtures(paths: Iterable[str | Path], synthetic_specs: Iterable[str] | None = None) -> list[ReplayFixture]:
+    fixtures = [load_fixture(path) for path in paths]
+    fixtures.extend(parse_synthetic_fixture_spec(spec) for spec in (synthetic_specs or []))
+    return fixtures
+
+
+def parse_synthetic_fixture_spec(spec: str) -> ReplayFixture:
+    """Parse `name:pairs:canaries:filler_words` into a deterministic fixture."""
+    parts = spec.split(":")
+    if len(parts) != 4 or not parts[0].strip():
+        raise ValueError("synthetic fixture spec must be name:pairs:canaries:filler_words")
+    name = parts[0].strip()
+    try:
+        message_pairs = int(parts[1])
+        canary_count = int(parts[2])
+        filler_words = int(parts[3])
+    except ValueError as exc:
+        raise ValueError("synthetic fixture counts must be integers") from exc
+    if message_pairs <= 0:
+        raise ValueError("message_pairs must be positive")
+    if canary_count < 0:
+        raise ValueError("canary_count cannot be negative")
+    if canary_count > message_pairs:
+        raise ValueError("canary_count cannot exceed message_pairs")
+    if message_pairs > _MAX_SYNTHETIC_MESSAGE_PAIRS:
+        raise ValueError(f"message_pairs exceeds maximum {_MAX_SYNTHETIC_MESSAGE_PAIRS}")
+    if filler_words < 0:
+        raise ValueError("filler_words cannot be negative")
+    if filler_words > _MAX_SYNTHETIC_FILLER_WORDS:
+        raise ValueError(f"filler_words exceeds maximum {_MAX_SYNTHETIC_FILLER_WORDS}")
+    return make_synthetic_fixture(
+        name=name,
+        message_pairs=message_pairs,
+        canary_count=canary_count,
+        filler_words=filler_words,
+    )
 
 
 def iter_fixture_files(directory: str | Path = "benchmarks/fixtures") -> list[Path]:
