@@ -464,6 +464,35 @@ class TestConfig:
 
         assert c.context_threshold == 0.82
 
+    def test_from_env_ignores_disabled_hermes_compression_threshold(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: false\n  threshold: 0.50\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.75
+
+    def test_from_env_ignores_disabled_hermes_threshold_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "compression:\n  enabled: false\n  threshold: '0.50'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.75
+
     def test_from_env_reads_hermes_threshold_without_pyyaml(self, monkeypatch, tmp_path):
         import hermes_lcm.config as config_mod
 

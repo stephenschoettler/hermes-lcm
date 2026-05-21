@@ -45,13 +45,22 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     return default
 
 
+def _config_bool_disabled(value) -> bool:
+    if isinstance(value, bool):
+        return value is False
+    if isinstance(value, str):
+        return value.strip().lower() in {"0", "false", "no", "off"}
+    return False
+
+
 def _hermes_compression_threshold(default: float) -> float:
     """Read Hermes compression.threshold when no LCM env override is present.
 
     Hermes gateways may load ``~/.hermes/config.yaml`` without exporting every
     setting into the process environment. Falling back to the main Hermes
     compression threshold keeps LCM aligned with the active agent config while
-    still allowing ``LCM_CONTEXT_THRESHOLD`` to override it explicitly.
+    still allowing ``LCM_CONTEXT_THRESHOLD`` to override it explicitly. Disabled
+    Hermes compression should not leak its threshold into LCM.
     """
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     cfg_path = home / "config.yaml"
@@ -59,22 +68,42 @@ def _hermes_compression_threshold(default: float) -> float:
         text = cfg_path.read_text()
         if yaml is not None:
             cfg = yaml.safe_load(text) or {}
-            value = (cfg.get("compression") or {}).get("threshold")
+            compression = cfg.get("compression") or {}
+            if _config_bool_disabled(compression.get("enabled")):
+                return default
+            value = compression.get("threshold")
             if value is None:
                 return default
             return float(value)
 
         in_compression = False
+        direct_indent = None
+        compression_disabled = False
+        threshold_value = None
         for raw_line in text.splitlines():
             line = raw_line.split("#", 1)[0].rstrip()
             if not line.strip():
                 continue
             if not line.startswith((" ", "\t")):
                 in_compression = line.strip() == "compression:"
+                direct_indent = None
                 continue
-            if in_compression and line.strip().startswith("threshold:"):
-                return float(line.split(":", 1)[1].strip().strip("'\""))
-        return default
+            if not in_compression:
+                continue
+            indent = len(line) - len(line.lstrip(" \t"))
+            if direct_indent is None:
+                direct_indent = indent
+            if indent != direct_indent or ":" not in line:
+                continue
+            key, raw_value = line.strip().split(":", 1)
+            value = raw_value.strip().strip("'\"")
+            if key == "enabled" and _config_bool_disabled(value):
+                compression_disabled = True
+            elif key == "threshold":
+                threshold_value = value
+        if compression_disabled or threshold_value is None:
+            return default
+        return float(threshold_value)
     except Exception:
         return default
 
