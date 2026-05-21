@@ -1,0 +1,18 @@
+{
+  "name": "repeated_compaction_chatter",
+  "tags": ["compaction_chatter", "synthetic"],
+  "messages": [
+    {"role": "system", "content": "You are a deterministic LCM benchmark agent."},
+    {"role": "user", "content": "CANARY_CHATTER = VALUE_CHATTER. This fact anchors the chatter replay."},
+    {"role": "assistant", "content": "Acknowledged chatter anchor."},
+    {"role": "user", "content": "Large-ish but deterministic backlog segment one. filler filler filler filler filler filler filler filler filler filler."},
+    {"role": "assistant", "content": "Acknowledged segment one."},
+    {"role": "user", "content": "Large-ish but deterministic backlog segment two. filler filler filler filler filler filler filler filler filler filler."},
+    {"role": "assistant", "content": "Acknowledged segment two."},
+    {"role": "user", "content": "Recent user turn should remain in the fresh tail."},
+    {"role": "assistant", "content": "Recent assistant turn should remain in the fresh tail."}
+  ],
+  "canaries": [
+    {"id": "CANARY_CHATTER", "value": "VALUE_CHATTER", "expected_query": "CANARY_CHATTER"}
+  ]
+}

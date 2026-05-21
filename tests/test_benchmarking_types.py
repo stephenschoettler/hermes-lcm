@@ -1,0 +1,93 @@
+"""Tests for model-aware benchmark data structures and policies."""
+
+import json
+
+from benchmarking.policies import builtin_policies, load_policy
+from benchmarking.types import Canary, LCMPolicy, ReplayFixture, ReplayMetrics
+
+
+def test_policy_round_trips_through_json_mapping():
+    policy = LCMPolicy(
+        name="codex_gpt_272k",
+        context_length=272_000,
+        context_threshold=0.75,
+        fresh_tail_count=24,
+        leaf_chunk_tokens=8_000,
+        target_after_compaction=0.55,
+        notes="dry-run candidate",
+    )
+
+    restored = LCMPolicy.from_dict(json.loads(json.dumps(policy.to_dict())))
+
+    assert restored == policy
+
+
+def test_fixture_round_trips_nested_canaries():
+    fixture = ReplayFixture(
+        name="long_history_canaries",
+        messages=[{"role": "user", "content": "CANARY_ALPHA = VALUE_ALPHA"}],
+        canaries=[Canary(id="CANARY_ALPHA", value="VALUE_ALPHA", expected_query="CANARY_ALPHA")],
+        tags=["exact_recall"],
+    )
+
+    restored = ReplayFixture.from_dict(json.loads(json.dumps(fixture.to_dict())))
+
+    assert restored == fixture
+    assert restored.canaries[0].expected_query == "CANARY_ALPHA"
+
+
+def test_metrics_round_trips_with_failure_list():
+    metrics = ReplayMetrics(
+        policy_name="baseline_272k",
+        fixture_name="long_history_canaries",
+        prompt_tokens_before=100,
+        prompt_tokens_after=80,
+        threshold_tokens=75,
+        compression_count=1,
+        compaction_attempts=1,
+        post_compaction_headroom_tokens=-5,
+        active_canaries_found=1,
+        retrieval_canaries_found=2,
+        total_canaries=2,
+        failures=["headroom below zero"],
+    )
+
+    restored = ReplayMetrics.from_dict(json.loads(json.dumps(metrics.to_dict())))
+
+    assert restored == metrics
+
+
+def test_builtin_policies_include_baseline_and_codex_candidate():
+    policies = {policy.name: policy for policy in builtin_policies()}
+
+    assert policies["baseline_272k"].context_length == 272_000
+    assert policies["baseline_272k"].fresh_tail_count == 64
+    assert policies["codex_gpt_long_context_candidate"].leaf_chunk_tokens == 8_000
+    assert policies["codex_gpt_long_context_candidate"].target_after_compaction == 0.55
+
+
+def test_load_policy_accepts_json_and_minimal_yaml(tmp_path):
+    json_path = tmp_path / "policy.json"
+    json_path.write_text(json.dumps({
+        "name": "json_policy",
+        "context_length": 1000,
+        "context_threshold": 0.7,
+        "fresh_tail_count": 8,
+        "leaf_chunk_tokens": 100,
+    }))
+    yaml_path = tmp_path / "policy.yaml"
+    yaml_path.write_text("""
+name: yaml_policy
+context_length: 2000
+context_threshold: 0.8
+fresh_tail_count: 12
+leaf_chunk_tokens: 250
+dynamic_leaf_chunk_enabled: false
+target_after_compaction: 0.55
+""".strip())
+
+    assert load_policy(json_path).name == "json_policy"
+    yaml_policy = load_policy(yaml_path)
+    assert yaml_policy.name == "yaml_policy"
+    assert yaml_policy.dynamic_leaf_chunk_enabled is False
+    assert yaml_policy.target_after_compaction == 0.55

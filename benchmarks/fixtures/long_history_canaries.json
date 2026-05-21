@@ -1,0 +1,19 @@
+{
+  "name": "long_history_canaries",
+  "tags": ["long_history", "exact_recall", "synthetic"],
+  "messages": [
+    {"role": "system", "content": "You are a deterministic LCM benchmark agent."},
+    {"role": "user", "content": "CANARY_ALPHA = VALUE_ALPHA. Early project invariant: alpha routing must remain recoverable."},
+    {"role": "assistant", "content": "Acknowledged alpha invariant."},
+    {"role": "user", "content": "Routine discussion about implementation details, tests, and release order."},
+    {"role": "assistant", "content": "Acknowledged."},
+    {"role": "user", "content": "CANARY_BETA = VALUE_BETA. Second old fact should be searchable after compaction."},
+    {"role": "assistant", "content": "Acknowledged beta invariant."},
+    {"role": "user", "content": "Later noisy turn with unrelated status updates and validation notes."},
+    {"role": "assistant", "content": "Acknowledged."}
+  ],
+  "canaries": [
+    {"id": "CANARY_ALPHA", "value": "VALUE_ALPHA", "expected_query": "CANARY_ALPHA"},
+    {"id": "CANARY_BETA", "value": "VALUE_BETA", "expected_query": "CANARY_BETA"}
+  ]
+}

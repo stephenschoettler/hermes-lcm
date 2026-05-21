@@ -3,3 +3,7 @@ __pycache__/
 
 # Test stubs
 agent/
+
+# Benchmark outputs
+benchmarks/runs/
+*.lcm-benchmark-result.json
