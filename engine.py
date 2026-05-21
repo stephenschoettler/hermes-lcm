@@ -413,6 +413,10 @@ class LCMEngine(ContextEngine):
         self._session_ignored = False
         self._session_stateless = False
         self._clear_pending_reset_boundary()
+        with self._auxiliary_session_lock:
+            self._auxiliary_session_ids.clear()
+            self._auxiliary_lineage_session_ids.clear()
+        self._clear_thread_context_stateless()
         self._reset_session_scoped_runtime_state()
 
     def _rebind_storage_for_home(self, hermes_home: str = "") -> bool:
@@ -426,8 +430,17 @@ class LCMEngine(ContextEngine):
         if not hermes_home:
             return False
         if self._config.database_path:
+            current_home = str(self._hermes_home or "")
+            current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
+            if current_home == str(hermes_home) and current_store_home == str(hermes_home):
+                return False
             self._hermes_home = hermes_home
-            return False
+            store = getattr(self, "_store", None)
+            if store is not None:
+                store._hermes_home = hermes_home
+            self._reset_profile_runtime_state()
+            logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
+            return True
 
         db_path = self._resolve_db_path(hermes_home)
         current_db = Path(getattr(getattr(self, "_store", None), "db_path", ""))

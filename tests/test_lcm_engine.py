@@ -102,6 +102,71 @@ def test_reused_engine_rebinds_storage_when_hermes_home_changes(tmp_path):
         engine.shutdown()
 
 
+def test_profile_rebind_clears_old_auxiliary_session_state(tmp_path):
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    config = LCMConfig(database_path="")
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    try:
+        engine.on_session_start(
+            "session-a",
+            hermes_home=str(home_a),
+            platform="cli",
+            context_length=200000,
+        )
+        engine._mark_thread_context_stateless("old-profile-aux")
+        assert engine._has_auxiliary_lineage_session("old-profile-aux")
+        assert engine._thread_context_stateless()
+
+        engine.on_session_start(
+            "session-b",
+            hermes_home=str(home_b),
+            platform="cli",
+            parent_session_id="old-profile-aux",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "session-b"
+        assert not engine._has_auxiliary_lineage_session("old-profile-aux")
+        assert not engine._thread_context_stateless()
+    finally:
+        engine.shutdown()
+
+
+def test_config_database_path_profile_rebind_updates_externalization_home(tmp_path):
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    config = LCMConfig(
+        database_path=str(tmp_path / "shared-lcm.db"),
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=10,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(home_a))
+    try:
+        engine.on_session_start(
+            "session-a",
+            hermes_home=str(home_a),
+            platform="cli",
+            context_length=200000,
+        )
+        engine._ingest_messages([{"role": "assistant", "content": "profile-a " + "A" * 32}])
+        assert len(list((home_a / "lcm-large-outputs").glob("*.json"))) == 1
+
+        engine.on_session_start(
+            "session-b",
+            hermes_home=str(home_b),
+            platform="cli",
+            context_length=200000,
+        )
+        assert engine._store._hermes_home == str(home_b)
+        engine._ingest_messages([{"role": "assistant", "content": "profile-b " + "B" * 32}])
+
+        assert len(list((home_a / "lcm-large-outputs").glob("*.json"))) == 1
+        assert len(list((home_b / "lcm-large-outputs").glob("*.json"))) == 1
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_tool_status_reports_lifecycle_fragmentation_summary(engine, tmp_path):
     engine._hermes_home = str(tmp_path / "hermes_home")
     state_db = tmp_path / "hermes_home" / "state.db"
