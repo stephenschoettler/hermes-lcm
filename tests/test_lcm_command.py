@@ -27,6 +27,11 @@ def engine(tmp_path):
     return e
 
 
+def test_lcm_engine_declares_automatic_compaction_silent(engine):
+    assert engine.emit_automatic_compaction_status is False
+    assert engine.quiet_mode is True
+
+
 def test_lcm_status_default_reports_current_session(engine):
     result = handle_lcm_command("", engine)
 

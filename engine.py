@@ -252,6 +252,10 @@ def _is_synthetic_assistant_noise(content: str) -> bool:
 class LCMEngine(ContextEngine):
     """Lossless Context Management engine.
 
+    Automatic LCM compaction is routine background maintenance. Hosts that
+    support user-visible compaction status opt-outs should keep successful
+    automatic LCM passes silent unless the user explicitly asks for diagnostics.
+
     Architecture:
       1. Every message is persisted verbatim in an immutable MessageStore
       2. When context pressure builds, older messages outside the fresh tail
@@ -354,7 +358,11 @@ class LCMEngine(ContextEngine):
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
-        self.quiet_mode = False
+        # Host compatibility: LCM treats successful automatic compaction as
+        # silent maintenance. Manual /lcm diagnostics and warning/error paths
+        # remain explicit.
+        self.emit_automatic_compaction_status = False
+        self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
