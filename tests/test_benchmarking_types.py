@@ -91,3 +91,11 @@ target_after_compaction: 0.55
     assert yaml_policy.name == "yaml_policy"
     assert yaml_policy.dynamic_leaf_chunk_enabled is False
     assert yaml_policy.target_after_compaction == 0.55
+
+
+def test_load_policy_resolves_repo_relative_paths_from_external_cwd(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    policy = load_policy("benchmarks/policies/baseline.yaml")
+
+    assert policy.name == "baseline_272k"

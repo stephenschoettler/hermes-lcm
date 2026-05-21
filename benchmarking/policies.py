@@ -14,6 +14,16 @@ except Exception:  # pragma: no cover - optional dependency
     yaml = None
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return _REPO_ROOT / candidate
+
+
 def builtin_policies() -> list[LCMPolicy]:
     """Return the zero-config policy set used by the skeleton harness."""
     return [
@@ -94,7 +104,7 @@ def _load_mapping(path: Path) -> Mapping[str, Any]:
 
 def load_policy(path: str | Path) -> LCMPolicy:
     """Load one policy from JSON or flat YAML."""
-    return LCMPolicy.from_dict(_load_mapping(Path(path)))
+    return LCMPolicy.from_dict(_load_mapping(_resolve_path(path)))
 
 
 def load_policies(paths: Iterable[str | Path] | None = None) -> list[LCMPolicy]:
