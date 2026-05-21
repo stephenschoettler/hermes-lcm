@@ -115,6 +115,18 @@ def test_install_script_refuses_to_replace_existing_non_symlink_path(tmp_path):
     assert target.is_dir()
 
 
+def test_lcm_grep_time_filters_use_anyof_not_union_type_arrays():
+    engine = _register_plugin_engine("hermes_lcm_schema_shape")
+    assert engine is not None
+    schemas = {schema["name"]: schema for schema in engine.get_tool_schemas()}
+    properties = schemas["lcm_grep"]["parameters"]["properties"]
+
+    for name in ("time_from", "time_to"):
+        field = properties[name]
+        assert field["anyOf"] == [{"type": "number"}, {"type": "string"}]
+        assert "type" not in field
+
+
 def test_plugin_entrypoint_registers_lcm_context_engine():
     engine = _register_plugin_engine("hermes_lcm_packaging_entrypoint")
 

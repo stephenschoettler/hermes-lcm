@@ -73,14 +73,14 @@ LCM_GREP = {
                 "description": "Optional raw-message role filter. When supplied, lcm_grep returns raw message hits only.",
             },
             "time_from": {
-                "type": ["number", "string"],
+                "anyOf": [{"type": "number"}, {"type": "string"}],
                 "description": (
                     "Optional inclusive minimum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
                     "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
                 ),
             },
             "time_to": {
-                "type": ["number", "string"],
+                "anyOf": [{"type": "number"}, {"type": "string"}],
                 "description": (
                     "Optional inclusive maximum raw-message timestamp. Accepts Unix seconds or timezone-aware ISO 8601; "
                     "naive ISO timestamps are rejected. When supplied, lcm_grep returns raw message hits only."
