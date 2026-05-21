@@ -48,8 +48,16 @@ def _parse_bool_env(key: str, default: bool) -> bool:
 def _config_bool_disabled(value) -> bool:
     if isinstance(value, bool):
         return value is False
+    if isinstance(value, (int, float)):
+        return value == 0
     if isinstance(value, str):
-        return value.strip().lower() in {"0", "false", "no", "off"}
+        normalized = value.strip().lower()
+        if normalized in {"0", "false", "no", "off"}:
+            return True
+        try:
+            return float(normalized) == 0
+        except ValueError:
+            return False
     return False
 
 
