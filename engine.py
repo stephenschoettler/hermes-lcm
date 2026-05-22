@@ -2953,14 +2953,18 @@ class LCMEngine(ContextEngine):
             for idx in range(scan_start, n):
                 ignored_original_messages[idx] = self._matches_ignore_message_patterns(messages[idx])
         externalize_messages = [False] * n
+        prefer_existing_externalized = [False] * n
         for idx in range(scan_start, n):
             externalize_messages[idx] = not ignored_original_messages[idx]
+        for idx in range(0, scan_start):
+            prefer_existing_externalized[idx] = not ignored_original_messages[idx]
         replay_messages = quarantine_suspicious_assistant_messages(
             messages,
             session_id=self._session_id,
             config=self._config,
             hermes_home=self._hermes_home,
             externalize=externalize_messages,
+            prefer_existing_externalized=prefer_existing_externalized,
         )
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = replay_messages

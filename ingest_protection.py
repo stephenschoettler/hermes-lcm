@@ -250,6 +250,28 @@ def _externalize_quarantined_assistant_output(
     return _quarantined_assistant_placeholder(summary, reason=reason)
 
 
+def _existing_quarantined_assistant_placeholder(
+    content: str,
+    *,
+    role: str,
+    session_id: str,
+    config,
+    hermes_home: str,
+    reason: str,
+) -> str | None:
+    existing = find_externalized_payload_for_message(
+        content,
+        session_id=session_id,
+        kind=_QUARANTINED_ASSISTANT_KIND,
+        role=role,
+        config=config,
+        hermes_home=hermes_home,
+    )
+    if existing is None:
+        return None
+    return _quarantined_assistant_placeholder(existing, reason=reason)
+
+
 def restore_ingest_payload_placeholders(
     text: str,
     *,
@@ -642,6 +664,7 @@ def quarantine_suspicious_assistant_message(
     session_id: str = "",
     *,
     externalize: bool = True,
+    prefer_existing_externalized: bool = False,
 ) -> Dict[str, Any]:
     """Return ``message`` with obviously broken assistant output quarantined.
 
@@ -667,10 +690,21 @@ def quarantine_suspicious_assistant_message(
             reason=reason,
         )
     else:
-        placeholder = _volatile_quarantined_assistant_placeholder(
-            normalized_content,
-            reason=reason,
-        )
+        placeholder = None
+        if prefer_existing_externalized:
+            placeholder = _existing_quarantined_assistant_placeholder(
+                normalized_content,
+                role=role,
+                session_id=session_id,
+                config=config,
+                hermes_home=hermes_home,
+                reason=reason,
+            )
+        if placeholder is None:
+            placeholder = _volatile_quarantined_assistant_placeholder(
+                normalized_content,
+                reason=reason,
+            )
     if not placeholder:
         return msg
     msg["content"] = placeholder
@@ -683,6 +717,7 @@ def quarantine_suspicious_assistant_messages(
     hermes_home: str = "",
     session_id: str = "",
     externalize: List[bool] | None = None,
+    prefer_existing_externalized: List[bool] | None = None,
 ) -> List[Dict[str, Any]]:
     return [
         quarantine_suspicious_assistant_message(
@@ -691,6 +726,9 @@ def quarantine_suspicious_assistant_messages(
             hermes_home=hermes_home,
             session_id=session_id,
             externalize=True if externalize is None else externalize[idx],
+            prefer_existing_externalized=False
+            if prefer_existing_externalized is None
+            else prefer_existing_externalized[idx],
         )
         for idx, message in enumerate(messages)
     ]

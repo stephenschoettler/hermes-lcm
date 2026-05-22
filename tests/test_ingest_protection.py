@@ -1465,6 +1465,56 @@ def test_quarantined_assistant_output_does_not_enter_summaries_or_active_context
     assert all(BROKEN_ASSISTANT_MARKER not in node.summary for node in nodes)
 
 
+def test_preflight_quarantined_assistant_rebind_keeps_durable_placeholder(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    messages = [
+        {"role": "user", "content": "please help"},
+        {"role": "assistant", "content": _broken_assistant_output()},
+    ]
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first.on_session_start(
+        "quarantine-preflight-rebind-session",
+        platform="telegram",
+        conversation_id="quarantine-preflight-rebind-conversation",
+        context_length=1_000_000,
+    )
+    assert first.should_compress_preflight(messages)
+
+    preflight_rows = first._store.get_session_messages(first.current_session_id)
+    assert len(preflight_rows) == 2
+    assert "Externalized LCM ingest payload" in str(preflight_rows[1].get("content", ""))
+    assert "LCM active replay placeholder" not in str(preflight_rows[1].get("content", ""))
+
+    active_context = first.compress(messages)
+    assert len(active_context) == 2
+    assert all(BROKEN_ASSISTANT_MARKER not in str(message.get("content", "")) for message in active_context)
+    assert "Externalized LCM ingest payload" in str(active_context[1].get("content", ""))
+    assert "LCM active replay placeholder" not in str(active_context[1].get("content", ""))
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second.on_session_start(
+        "quarantine-preflight-rebind-session",
+        platform="telegram",
+        conversation_id="quarantine-preflight-rebind-conversation",
+        context_length=1_000_000,
+    )
+    second.compress(active_context)
+
+    rebound_rows = second._store.get_session_messages(second.current_session_id)
+    assert len(rebound_rows) == 2
+    assert [row["role"] for row in rebound_rows] == ["user", "assistant"]
+    assert "Externalized LCM ingest payload" in str(rebound_rows[1].get("content", ""))
+    assert all("LCM active replay placeholder" not in str(row.get("content", "")) for row in rebound_rows)
+
+
 def test_dynamic_quarantined_assistant_pressure_continues_after_first_leaf_pass(tmp_path, monkeypatch):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
