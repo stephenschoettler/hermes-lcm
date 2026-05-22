@@ -7,9 +7,9 @@ from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
-from .types import ReplayMetrics
+from .types import LCMPolicy, ReplayMetrics
 
 BENCHMARK_VERSION = "2"
 FRESH_TAIL_PRESSURE_THRESHOLD = 0.30
@@ -177,3 +177,59 @@ def write_summary(path: str | Path, metrics: Iterable[ReplayMetrics]) -> dict[st
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return summary
+
+
+def _policy_settings(policies: Iterable[LCMPolicy]) -> dict[str, dict[str, object]]:
+    settings: dict[str, dict[str, object]] = {}
+    for policy in policies:
+        data = policy.to_dict()
+        data.pop("notes", None)
+        settings[f"{policy.name}@{policy.policy_version}"] = data
+    return settings
+
+
+def build_community_export(
+    summary: Mapping[str, Any],
+    *,
+    policies: Iterable[LCMPolicy],
+    provider: str = "",
+    model: str = "",
+) -> dict[str, object]:
+    """Build a scrubbed benchmark result export for community sharing.
+
+    The export intentionally omits per-run metrics because those contain local
+    paths such as ``database_path`` and ``hermes_home``. It includes only the
+    aggregate comparison/provenance fields needed to reproduce and discuss a
+    preset result.
+    """
+
+    return {
+        "schema_version": "1",
+        "benchmark_version": summary.get("benchmark_version", BENCHMARK_VERSION),
+        "generated_at_utc": summary.get("generated_at_utc", _utc_timestamp()),
+        "provider": provider,
+        "model": model,
+        "transcript_contents_included": False,
+        "fixtures": list(summary.get("fixtures", [])),
+        "fixture_suite": list(summary.get("fixture_suite", [])),
+        "policies": list(summary.get("policies", [])),
+        "policy_versions": dict(summary.get("policy_versions", {})),
+        "policy_settings": _policy_settings(policies),
+        "metric_summary": dict(summary.get("metric_summary", {})),
+        "policy_comparison": list(summary.get("policy_comparison", [])),
+    }
+
+
+def write_community_export(
+    path: str | Path,
+    summary: Mapping[str, Any],
+    *,
+    policies: Iterable[LCMPolicy],
+    provider: str = "",
+    model: str = "",
+) -> dict[str, object]:
+    export = build_community_export(summary, policies=policies, provider=provider, model=model)
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(export, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return export

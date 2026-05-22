@@ -1,0 +1,124 @@
+"""Tests for /lcm preset inspection and dry-run application."""
+
+from hermes_lcm.command import handle_lcm_command
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.engine import LCMEngine
+
+
+_PRESET_ENV_VARS = (
+    "LCM_CONTEXT_THRESHOLD",
+    "LCM_FRESH_TAIL_COUNT",
+    "LCM_LEAF_CHUNK_TOKENS",
+    "LCM_CONDENSATION_FANIN",
+    "LCM_INCREMENTAL_MAX_DEPTH",
+)
+
+
+def _clear_preset_env(monkeypatch):
+    for key in _PRESET_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def _engine(tmp_path, *, context_length: int = 272_000) -> LCMEngine:
+    config = LCMConfig(database_path=str(tmp_path / "lcm_preset.db"))
+    hermes_home = tmp_path / "hermes_home"
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine._session_id = "preset-session"
+    engine._session_platform = "cli"
+    engine.context_length = context_length
+    engine.threshold_tokens = int(context_length * config.context_threshold)
+    return engine
+
+
+def test_lcm_preset_help_lists_inspection_commands(tmp_path):
+    engine = _engine(tmp_path)
+
+    result = handle_lcm_command("help", engine)
+
+    assert "- /lcm preset show" in result
+    assert "- /lcm preset suggest" in result
+    assert "- /lcm preset apply <name> --dry-run" in result
+
+
+def test_lcm_preset_show_exposes_codex_provenance_without_mutating_config(tmp_path):
+    engine = _engine(tmp_path)
+    before = (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+    result = handle_lcm_command("preset show codex_gpt_long_context", engine)
+
+    assert "LCM preset show" in result
+    assert "preset: codex_gpt_long_context" in result
+    assert "policy_version: 1" in result
+    assert "benchmark_version: 2" in result
+    assert "fixture_suite: codex_pressure_probe:42:4:1000" in result
+    assert "score: 92.5" in result
+    assert "baseline_score: 72.5" in result
+    assert "policy_path: benchmarks/policies/codex_gpt_long_context.yaml" in result
+    assert "operator_config_precedence: explicit preset-managed LCM_* overrides win" in result
+    assert "runtime_mutation: no" in result
+    assert before == (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+
+def test_lcm_preset_suggest_reports_explicit_operator_config_precedence(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "99")
+    engine = _engine(tmp_path)
+    engine._config.fresh_tail_count = 99
+
+    result = handle_lcm_command("preset suggest", engine)
+
+    assert "LCM preset suggest" in result
+    assert "suggested_preset: codex_gpt_long_context" in result
+    assert "reason: context-window match for GPT/Codex candidate; verify provider/model family before applying" in result
+    assert "match_confidence: context-only" in result
+    assert "explicit_overrides: LCM_FRESH_TAIL_COUNT" in result
+    assert "LCM_FRESH_TAIL_COUNT: keep explicit value 99 (preset 24)" in result
+    assert "note: suggestion only; no live config was changed" in result
+
+
+def test_lcm_preset_suggest_declines_unbenchmarked_context_window(tmp_path):
+    engine = _engine(tmp_path, context_length=32_000)
+
+    result = handle_lcm_command("preset suggest", engine)
+
+    assert "LCM preset suggest" in result
+    assert "suggested_preset: (none)" in result
+    assert "reason: no shipped benchmarked preset matches context_length 32000" in result
+    assert "note: run deterministic benchmarks before promoting a runtime preset" in result
+
+
+def test_lcm_preset_apply_requires_dry_run_and_does_not_mutate_config(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    engine = _engine(tmp_path)
+    before = (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+    denied = handle_lcm_command("preset apply codex_gpt_long_context", engine)
+    dry_run = handle_lcm_command("preset apply codex_gpt_long_context --dry-run", engine)
+
+    assert "LCM preset apply" in denied
+    assert "status: denied" in denied
+    assert "error: preset apply is preview-only for now; pass --dry-run" in denied
+    assert "LCM preset apply" in dry_run
+    assert "status: dry-run" in dry_run
+    assert "preset: codex_gpt_long_context" in dry_run
+    assert "would_set:" in dry_run
+    assert "LCM_CONTEXT_THRESHOLD=0.75" in dry_run
+    assert "LCM_FRESH_TAIL_COUNT=24" in dry_run
+    assert "LCM_LEAF_CHUNK_TOKENS=8000" in dry_run
+    assert "unsupported_runtime_fields: target_after_compaction=0.55" in dry_run
+    assert "note: no live config was changed" in dry_run
+    assert before == (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+
+def test_lcm_preset_apply_dry_run_keeps_explicit_managed_env_values(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "12000")
+    engine = _engine(tmp_path)
+    engine._config.leaf_chunk_tokens = 12_000
+
+    result = handle_lcm_command("preset apply codex_gpt_long_context --dry-run", engine)
+
+    assert "status: dry-run" in result
+    assert "LCM_LEAF_CHUNK_TOKENS: keep explicit value 12000 (preset 8000)" in result
+    assert "LCM_FRESH_TAIL_COUNT=24" in result
+    assert engine._config.leaf_chunk_tokens == 12_000

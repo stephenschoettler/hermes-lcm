@@ -15,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 from benchmarking.fixtures import load_fixtures
 from benchmarking.policies import load_policies
 from benchmarking.replay import run_replays
-from benchmarking.report import write_metrics_jsonl, write_summary
+from benchmarking.report import write_community_export, write_metrics_jsonl, write_summary
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -30,6 +30,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--policy", action="append", default=[], help="Policy JSON/YAML path. Repeatable.")
     parser.add_argument("--output", required=True, help="Benchmark output directory.")
     parser.add_argument("--json", action="store_true", help="Print summary JSON to stdout.")
+    parser.add_argument("--export", help="Write a scrubbed community benchmark export JSON file.")
+    parser.add_argument("--provider", default="", help="Provider label for --export metadata.")
+    parser.add_argument("--model", default="", help="Model label for --export metadata.")
     parser.add_argument(
         "--allow-external-output",
         action="store_true",
@@ -54,12 +57,25 @@ def main(argv: list[str] | None = None) -> int:
     if not args.fixture and not args.synthetic_fixture:
         raise SystemExit("At least one --fixture or --synthetic-fixture is required")
     output_dir = _validate_output_path(Path(args.output), allow_external=args.allow_external_output)
+    export_path = (
+        _validate_output_path(Path(args.export), allow_external=args.allow_external_output)
+        if args.export
+        else None
+    )
     fixtures = load_fixtures(args.fixture, synthetic_specs=args.synthetic_fixture)
     policies = load_policies(args.policy)
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics = run_replays(fixtures, policies, output_dir=output_dir)
     write_metrics_jsonl(output_dir / "metrics.jsonl", metrics)
     summary = write_summary(output_dir / "summary.json", metrics)
+    if export_path:
+        write_community_export(
+            export_path,
+            summary,
+            policies=policies,
+            provider=args.provider,
+            model=args.model,
+        )
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

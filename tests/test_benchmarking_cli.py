@@ -131,3 +131,60 @@ def test_cli_missing_policy_path_does_not_create_output_directory(tmp_path):
         ])
 
     assert not output_dir.exists()
+
+
+def test_cli_writes_scrubbed_community_export(tmp_path):
+    cli = _load_benchmark_cli()
+    output_dir = tmp_path / "benchmark-output"
+    export_path = tmp_path / "community-export.json"
+
+    result = cli.main([
+        "--synthetic-fixture",
+        "export_probe:2:1:3",
+        "--policy",
+        "benchmarks/policies/codex_gpt_long_context.yaml",
+        "--output",
+        str(output_dir),
+        "--allow-external-output",
+        "--export",
+        str(export_path),
+        "--provider",
+        "openai-codex",
+        "--model",
+        "gpt-5.5",
+    ])
+
+    export = json.loads(export_path.read_text())
+    serialized = json.dumps(export, sort_keys=True)
+
+    assert result == 0
+    assert export["schema_version"] == "1"
+    assert export["provider"] == "openai-codex"
+    assert export["model"] == "gpt-5.5"
+    assert export["transcript_contents_included"] is False
+    assert export["policy_settings"]["codex_gpt_long_context@1"]["context_length"] == 272000
+    assert "notes" not in export["policy_settings"]["codex_gpt_long_context@1"]
+    assert "database_path" not in serialized
+    assert "hermes_home" not in serialized
+    assert "messages" not in serialized
+
+
+def test_cli_export_outside_repo_requires_allow_external_output(tmp_path):
+    cli = _load_benchmark_cli()
+    output_dir = Path("benchmarks/runs") / f"export-policy-test-{tmp_path.name}"
+    export_path = tmp_path / "community-export.json"
+
+    with pytest.raises(SystemExit, match="Refusing output outside repo"):
+        cli.main([
+            "--synthetic-fixture",
+            "export_probe:2:1:3",
+            "--policy",
+            "benchmarks/policies/codex_gpt_long_context.yaml",
+            "--output",
+            str(output_dir),
+            "--export",
+            str(export_path),
+        ])
+
+    assert not export_path.exists()
+    assert not output_dir.exists()

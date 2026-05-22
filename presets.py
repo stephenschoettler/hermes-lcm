@@ -1,0 +1,149 @@
+"""Shipped model-family preset metadata and dry-run helpers."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import os
+from typing import Any, Mapping
+
+
+@dataclass(frozen=True)
+class LCMPreset:
+    """Inspectable preset metadata.
+
+    Presets are deliberately metadata and dry-run suggestions for now. They do
+    not mutate live config and do not override explicit operator settings.
+    """
+
+    name: str
+    family: str
+    description: str
+    policy_path: str
+    policy_version: str
+    runtime_env: Mapping[str, Any]
+    unsupported_runtime_fields: Mapping[str, Any] = field(default_factory=dict)
+    applies_to: tuple[str, ...] = ()
+    provenance: Mapping[str, Any] = field(default_factory=dict)
+    notes: str = ""
+
+    @property
+    def policy_key(self) -> str:
+        return f"{self.name}@{self.policy_version}"
+
+
+_FIELD_ENV = {
+    "context_threshold": "LCM_CONTEXT_THRESHOLD",
+    "fresh_tail_count": "LCM_FRESH_TAIL_COUNT",
+    "leaf_chunk_tokens": "LCM_LEAF_CHUNK_TOKENS",
+    "condensation_fanin": "LCM_CONDENSATION_FANIN",
+    "incremental_max_depth": "LCM_INCREMENTAL_MAX_DEPTH",
+}
+
+_CODEX_GPT_LONG_CONTEXT = LCMPreset(
+    name="codex_gpt_long_context",
+    family="GPT/Codex long-context",
+    description="Benchmark-backed candidate for GPT/Codex-style long-context routes.",
+    policy_path="benchmarks/policies/codex_gpt_long_context.yaml",
+    policy_version="1",
+    runtime_env={
+        "context_threshold": 0.75,
+        "fresh_tail_count": 24,
+        "leaf_chunk_tokens": 8_000,
+    },
+    unsupported_runtime_fields={
+        "target_after_compaction": 0.55,
+    },
+    applies_to=(
+        "Codex/OpenAI-style long-context routes",
+        "large context windows near 272k tokens",
+        "workloads where repeated compaction risk matters more than keeping a 64-message fresh tail",
+    ),
+    provenance={
+        "benchmark_version": "2",
+        "fixture_suite": ["codex_pressure_probe:42:4:1000"],
+        "metric_summary": {
+            "score": 92.5,
+            "baseline_score": 72.5,
+            "retrieval_canary_recall": 1.0,
+            "baseline_repeated_compaction_risk_count": 1,
+            "candidate_repeated_compaction_risk_count": 0,
+        },
+        "evidence": "Merged #194 pressure smoke, benchmark-only candidate policy.",
+    },
+    notes=(
+        "Benchmark-only candidate until the preset surface matures. "
+        "No live provider tuning or automatic config mutation is performed."
+    ),
+)
+
+
+def shipped_presets() -> list[LCMPreset]:
+    """Return the shipped, inspectable preset catalog."""
+
+    return [_CODEX_GPT_LONG_CONTEXT]
+
+
+def get_preset(name: str | None = None) -> LCMPreset | None:
+    """Return a preset by name, or the default shipped preset when omitted."""
+
+    selected = (name or _CODEX_GPT_LONG_CONTEXT.name).strip()
+    for preset in shipped_presets():
+        if preset.name == selected:
+            return preset
+    return None
+
+
+def explicit_operator_overrides(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return runtime preset fields explicitly set by LCM_* env vars."""
+
+    env = environ if environ is not None else os.environ
+    return {
+        field: env_var
+        for field, env_var in _FIELD_ENV.items()
+        if env_var in env
+    }
+
+
+def _current_config_value(config: Any, field: str) -> Any:
+    return getattr(config, field, "(unknown)")
+
+
+def preset_env_diff(
+    preset: LCMPreset,
+    config: Any,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Render env-var changes a preset would suggest without applying them."""
+
+    env = environ if environ is not None else os.environ
+    explicit = explicit_operator_overrides(env)
+    lines: list[str] = []
+    for field, value in preset.runtime_env.items():
+        env_var = _FIELD_ENV[field]
+        if field in explicit:
+            current = env.get(env_var, _current_config_value(config, field))
+            lines.append(f"{env_var}: keep explicit value {current} (preset {value})")
+        else:
+            lines.append(f"{env_var}={value}")
+    return lines
+
+
+def suggest_preset_for_engine(engine: Any) -> tuple[LCMPreset | None, str]:
+    """Return the safest shipped preset suggestion for the current engine state."""
+
+    context_length = int(getattr(engine, "context_length", 0) or 0)
+    if context_length >= 200_000:
+        return (
+            _CODEX_GPT_LONG_CONTEXT,
+            "context-window match for GPT/Codex candidate; verify provider/model family before applying",
+        )
+    return None, f"no shipped benchmarked preset matches context_length {context_length}"
+
+
+def unsupported_runtime_fields_text(preset: LCMPreset) -> str:
+    if not preset.unsupported_runtime_fields:
+        return "(none)"
+    return ", ".join(
+        f"{key}={value}" for key, value in sorted(preset.unsupported_runtime_fields.items())
+    )

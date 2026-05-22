@@ -60,7 +60,7 @@ python scripts/lcm_benchmark.py \
 
 Synthetic fixture specs use `name:pairs:canaries:filler_words` and are deterministic. They are bounded to 250 message pairs and 2,000 filler words so typos do not create huge benchmark outputs. Benchmark output directories should be fresh or cleaned between runs because the harness refuses to reuse non-empty per-run directories.
 
-`codex_gpt_long_context` is a benchmark candidate, not an automatically selected runtime preset yet. `pressure_smoke` is not a runtime preset recommendation. It is a control policy for validating benchmark signals.
+`codex_gpt_long_context` is a benchmark candidate and now has an inspectable dry-run preset surface. `pressure_smoke` is not a runtime preset recommendation. It is a control policy for validating benchmark signals.
 
 ## Output files
 
@@ -81,6 +81,70 @@ Summary metadata includes:
 
 The comparison score is intentionally conservative. It rewards canary recall and stability, then penalizes failures, repeated-compaction risk, and excessive fresh-tail pressure. Treat it as a harness signal, not as proof that a policy is ready to become `preset: auto`.
 
+## Scrubbed community exports
+
+Use `--export` to write a shareable benchmark result JSON without raw transcript contents or local state paths. The export path follows the same repo-containment policy as `--output`; pass `--allow-external-output` when writing either path outside the repository.
+
+```bash
+python scripts/lcm_benchmark.py \
+  --synthetic-fixture codex_pressure_probe:42:4:1000 \
+  --policy benchmarks/policies/baseline.yaml \
+  --policy benchmarks/policies/codex_gpt_long_context.yaml \
+  --output benchmarks/runs/codex-gpt-pressure \
+  --export benchmarks/runs/codex-gpt-pressure-export.json \
+  --provider openai-codex \
+  --model gpt-5.5
+```
+
+Only the file written by `--export` is the scrubbed community artifact. If you also pass `--json`, stdout prints the full local benchmark summary, including per-run diagnostic paths, and should not be shared as the community export.
+
+The export contract is intentionally aggregate-only:
+
+- `schema_version`
+- `benchmark_version`
+- `generated_at_utc`
+- `provider` and `model` labels supplied by the operator
+- `transcript_contents_included: false`
+- `fixture_suite`
+- `fixtures`
+- `policies`
+- `policy_versions`
+- `policy_settings`
+- `metric_summary`
+- `policy_comparison`
+
+The export omits per-run `metrics` rows because they can include local `database_path` and `hermes_home` values. Raw transcript content is never included by default.
+
+## Preset provenance and dry-run surface
+
+The shipped preset catalog is inspectable from the `/lcm` command surface when slash commands are enabled:
+
+```text
+/lcm preset show codex_gpt_long_context
+/lcm preset suggest
+/lcm preset apply codex_gpt_long_context --dry-run
+```
+
+Current `codex_gpt_long_context` provenance:
+
+- policy file: `benchmarks/policies/codex_gpt_long_context.yaml`
+- policy version: `1`
+- benchmark version: `2`
+- fixture suite: `codex_pressure_probe:42:4:1000`
+- pressure score: `92.5` vs `72.5` for `baseline_272k`
+- retrieval canary recall: `1.0`
+- repeated-compaction risk: candidate `0`, baseline `1`
+
+The dry-run apply surface previews env-var changes only:
+
+```text
+LCM_CONTEXT_THRESHOLD=0.75
+LCM_FRESH_TAIL_COUNT=24
+LCM_LEAF_CHUNK_TOKENS=8000
+```
+
+Explicit preset-managed operator config wins. If `LCM_FRESH_TAIL_COUNT` or another supported preset-managed `LCM_*` knob is already set, `/lcm preset suggest` and `/lcm preset apply ... --dry-run` report that value as kept rather than overwritten. Runtime `target_after_compaction` is still benchmark-only metadata because the engine does not yet expose that as a live config field.
+
 ## Metrics added for preset research
 
 Each replay records:
@@ -94,4 +158,19 @@ Each replay records:
 - `active_canary_recall`
 - `retrieval_canary_recall`
 
-These are the first benchmark-quality signals for issue #189. Runtime preset selection, `/lcm preset suggest`, `/lcm preset apply`, live-provider tuning, and automatic config edits remain out of scope.
+These are the first benchmark-quality signals for issue #189. Runtime `preset: auto`, live-provider tuning, and automatic config edits remain out of scope.
+
+## Symptom-to-knob tuning guide
+
+Use benchmark output and `lcm_status`, not guesswork:
+
+| Symptom | First knob to inspect | Direction |
+|---------|-----------------------|-----------|
+| Compaction happens nearly every turn | `post_compaction_headroom_tokens`, `repeated_compaction_risk`, `LCM_CONTEXT_THRESHOLD` | Lower the trigger or target more headroom before considering runtime auto-preset behavior |
+| Fresh tail dominates the active prompt | `fresh_tail_pressure_ratio`, `fresh_tail_tokens`, `LCM_FRESH_TAIL_COUNT` | Lower the protected tail for long-context GPT/Codex-style routes; keep it high only when recent tool turns must stay verbatim |
+| Leaf passes are huge and slow | `LCM_LEAF_CHUNK_TOKENS`, `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | Reduce chunk size or enable dynamic chunking after confirming raw backlog is the pressure source |
+| Old facts are not in the active prompt but are retrievable | `active_canary_recall`, `retrieval_canary_recall` | Do not overfit for active recall; train usage toward `lcm_grep`, `lcm_expand`, and `lcm_expand_query` |
+| Old facts are not retrievable | `retrieval_canary_recall`, failures, fixture coverage | Treat as a correctness bug or fixture gap before changing preset thresholds |
+| Large tool outputs dominate token pressure | externalization status, payload sizes | Enable large-output externalization before tuning compaction thresholds |
+
+Hard gates for promoting a preset: no replay failures, no raw transcript leakage in exports, stable retrieval recall, explainable fixture/provenance metadata, and no conflict with explicit operator config.

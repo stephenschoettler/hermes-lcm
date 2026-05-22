@@ -239,6 +239,37 @@ If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the
 session.
 
+### Preset inspection and dry-run suggestions
+
+Model-aware presets are inspectable, but they are not automatic live config
+mutations. With `LCM_ENABLE_SLASH_COMMAND=true`, use:
+
+```text
+/lcm preset show codex_gpt_long_context
+/lcm preset suggest
+/lcm preset apply codex_gpt_long_context --dry-run
+```
+
+`/lcm preset show` reports the shipped preset metadata, benchmark provenance,
+policy file, policy version, and metric summary. `/lcm preset suggest` chooses a
+safe shipped suggestion for the current context window when one exists, and
+labels the current selector as `context-only` when the provider/model family is
+not available to the plugin. `/lcm preset apply ... --dry-run` previews env-var
+settings only; it does not
+write files, change process state, or override explicit preset-managed `LCM_*`
+environment variables.
+
+The current `codex_gpt_long_context` dry-run preview is:
+
+```text
+LCM_CONTEXT_THRESHOLD=0.75
+LCM_FRESH_TAIL_COUNT=24
+LCM_LEAF_CHUNK_TOKENS=8000
+```
+
+`target_after_compaction=0.55` is still benchmark provenance, not a runtime
+setting, because the engine does not expose that live knob yet.
+
 ### FAQ: tuning LCM for large context windows
 
 Long-context models change the tuning problem. A 1M-token model does not mean

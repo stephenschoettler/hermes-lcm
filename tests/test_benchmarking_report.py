@@ -1,6 +1,9 @@
 """Tests for benchmark summary provenance and policy comparison."""
 
-from benchmarking.report import compare_policies, summarize_metrics
+import json
+
+from benchmarking.policies import builtin_policies
+from benchmarking.report import build_community_export, compare_policies, summarize_metrics
 from benchmarking.types import ReplayMetrics
 
 
@@ -88,3 +91,37 @@ def test_summarize_metrics_includes_versioned_provenance_and_comparison():
     ]
     assert summary["metric_summary"]["repeated_compaction_risk_count"] == 1
     assert [row["policy_name"] for row in summary["policy_comparison"]] == ["candidate", "baseline"]
+
+
+def test_build_community_export_is_scrubbed_and_includes_policy_settings():
+    rows = [
+        _metrics(policy_name="baseline_272k", repeated_compaction_risk=True, fresh_tail_pressure_ratio=0.80),
+        _metrics(policy_name="codex_gpt_long_context"),
+    ]
+    rows[0].database_path = "/tmp/private/lcm.db"
+    rows[0].hermes_home = "/home/w0lf/.hermes/profiles/turing"
+    summary = summarize_metrics(rows)
+    policies = builtin_policies()
+
+    export = build_community_export(
+        summary,
+        policies=policies,
+        provider="openai-codex",
+        model="gpt-5.5",
+    )
+    serialized = json.dumps(export, sort_keys=True)
+
+    assert export["schema_version"] == "1"
+    assert export["benchmark_version"] == "2"
+    assert export["provider"] == "openai-codex"
+    assert export["model"] == "gpt-5.5"
+    assert export["transcript_contents_included"] is False
+    assert export["policy_settings"]["codex_gpt_long_context@1"]["fresh_tail_count"] == 24
+    assert export["policy_settings"]["codex_gpt_long_context@1"]["leaf_chunk_tokens"] == 8000
+    assert "notes" not in export["policy_settings"]["codex_gpt_long_context@1"]
+    assert export["fixture_suite"] == summary["fixture_suite"]
+    assert export["policy_comparison"] == summary["policy_comparison"]
+    assert "database_path" not in serialized
+    assert "hermes_home" not in serialized
+    assert "/home/w0lf" not in serialized
+    assert "messages" not in serialized
