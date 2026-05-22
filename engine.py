@@ -2677,11 +2677,13 @@ class LCMEngine(ContextEngine):
                     and self._is_quarantined_assistant_replay_identity(
                         self._message_replay_identity(msg)
                     )
+                    and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
             ]
+            filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
             candidate_identity_messages = (
                 candidate_non_placeholder_messages
-                if candidate_non_placeholder_messages
+                if candidate_non_placeholder_messages or filtered_candidate_placeholders
                 else candidate_visible_messages
             )
             candidate_prefix = [

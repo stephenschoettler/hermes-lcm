@@ -1796,6 +1796,13 @@ class _ContainsBrokenAssistantPattern:
         return object() if BROKEN_ASSISTANT_MARKER in str(text) else None
 
 
+class _NeverMatchesPattern:
+    pattern = "NEVER_MATCHES_BROKEN_ASSISTANT"
+
+    def search(self, text, timeout=None):
+        return None
+
+
 def test_ignore_message_patterns_match_original_suspicious_assistant_before_storage(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
@@ -1912,6 +1919,88 @@ def test_existing_quarantined_assistant_row_rebinds_after_ignore_pattern_added(t
     assert [row["role"] for row in second_rows] == ["system", "assistant", "user"]
     assert "assistant output quarantined" in str(second_active[1].get("content", ""))
     assert BROKEN_ASSISTANT_MARKER not in str(second_active[1].get("content", ""))
+
+
+def test_nonmatching_ignore_pattern_preserves_existing_quarantine_rebind_prefix(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": _broken_assistant_output()},
+        {"role": "user", "content": "fresh request"},
+    ]
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first.on_session_start(
+        "nonmatching-ignore-quarantine-session",
+        platform="telegram",
+        conversation_id="nonmatching-ignore-quarantine-conversation",
+        context_length=10_000,
+    )
+    first_active = first.compress(messages)
+    assert "assistant output quarantined" in str(first_active[1].get("content", ""))
+    assert [row["role"] for row in first._store.get_session_messages(first.current_session_id)] == [
+        "system",
+        "assistant",
+        "user",
+    ]
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second._compiled_ignore_message_patterns = [_NeverMatchesPattern()]
+    second.on_session_start(
+        "nonmatching-ignore-quarantine-session",
+        platform="telegram",
+        conversation_id="nonmatching-ignore-quarantine-conversation",
+        context_length=10_000,
+    )
+    second.compress(first_active)
+
+    second_rows = second._store.get_session_messages(second.current_session_id)
+    assert [row["role"] for row in second_rows] == ["system", "assistant", "user"]
+    assert len(second_rows) == 3
+
+
+def test_singleton_quarantined_assistant_row_rebinds_after_ignore_pattern_added(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    messages = [{"role": "assistant", "content": _broken_assistant_output()}]
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first.on_session_start(
+        "singleton-ignore-added-session",
+        platform="telegram",
+        conversation_id="singleton-ignore-added-conversation",
+        context_length=10_000,
+    )
+    first_active = first.compress(messages)
+    assert "assistant output quarantined" in str(first_active[0].get("content", ""))
+    assert len(first._store.get_session_messages(first.current_session_id)) == 1
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second._compiled_ignore_message_patterns = [_ContainsBrokenAssistantPattern()]
+    second.on_session_start(
+        "singleton-ignore-added-session",
+        platform="telegram",
+        conversation_id="singleton-ignore-added-conversation",
+        context_length=10_000,
+    )
+    second.compress(first_active)
+
+    second_rows = second._store.get_session_messages(second.current_session_id)
+    assert len(second_rows) == 1
+    assert [row["role"] for row in second_rows] == ["assistant"]
 
 
 def test_singleton_quarantined_assistant_rebind_reconciliation_does_not_duplicate_row(tmp_path):
