@@ -2406,7 +2406,7 @@ def test_rebind_does_not_skip_literal_quarantine_placeholder_without_ignore_patt
     assert [row["content"] for row in rows] == ["seed", literal]
 
 
-def test_no_system_raw_ignored_quarantined_assistant_rebind_does_not_duplicate_tail(tmp_path):
+def test_no_system_raw_ignored_quarantined_assistant_rebind_preserves_repeated_tail_delta(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
         fresh_tail_count=10,
@@ -2442,7 +2442,7 @@ def test_no_system_raw_ignored_quarantined_assistant_rebind_does_not_duplicate_t
     second_active = second.compress(messages)
 
     second_rows = second._store.get_session_messages(second.current_session_id)
-    assert [row["content"] for row in second_rows] == ["fresh request"]
+    assert [row["content"] for row in second_rows] == ["fresh request", "fresh request"]
     assert "assistant output quarantined" in str(second_active[0].get("content", ""))
     assert BROKEN_ASSISTANT_MARKER not in str(second_active[0].get("content", ""))
 

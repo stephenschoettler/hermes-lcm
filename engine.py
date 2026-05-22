@@ -2720,8 +2720,18 @@ class LCMEngine(ContextEngine):
             # tail; otherwise a fresh delta can repeat the remaining visible
             # suffix and must be preserved.
             candidate_has_system = any(identity[0] == "system" for identity in candidate_prefix)
-            candidate_dropped_quarantined_assistant = any(
-                self._ignored_message_is_quarantinable_assistant(msg)
+            candidate_dropped_quarantine_replay_placeholder = any(
+                self._is_volatile_ignored_quarantine_placeholder(
+                    msg,
+                    text_content_for_pattern_matching(msg.get("content")) or "",
+                )
+                or (
+                    self._compiled_ignore_message_patterns
+                    and self._is_quarantined_assistant_replay_identity(
+                        self._message_replay_identity(msg)
+                    )
+                    and self._matches_ignore_message_patterns(msg, stored_row=True)
+                )
                 for msg in candidate_messages
             )
             has_quarantined_singleton_replay = (
@@ -2733,7 +2743,7 @@ class LCMEngine(ContextEngine):
             )
             has_filtered_full_replay = (
                 matches_sanitized_tail
-                and candidate_dropped_quarantined_assistant
+                and candidate_dropped_quarantine_replay_placeholder
                 and len(candidate_prefix) >= effective_session_count
                 and effective_session_count > 0
             )
