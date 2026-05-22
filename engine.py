@@ -2355,7 +2355,8 @@ class LCMEngine(ContextEngine):
                 r"kind=quarantined_assistant_output; "
                 r"reason=[A-Za-z0-9_.:/-]+; "
                 r"scope=ignored_message_pattern; field=content; "
-                r"chars=\d+; bytes=\d+\]",
+                r"chars=\d+; bytes=\d+; "
+                r"sha256=[0-9a-f]{16}\]",
                 text.strip(),
             )
         )
@@ -2371,9 +2372,10 @@ class LCMEngine(ContextEngine):
         ) or ""
         if matches_message_pattern(text, self._compiled_ignore_message_patterns):
             return True
-        externalized_text = self._stored_row_externalized_text_for_pattern_matching(msg)
-        if externalized_text and externalized_text != text:
-            return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
+        if stored_row:
+            externalized_text = self._stored_row_externalized_text_for_pattern_matching(msg)
+            if externalized_text and externalized_text != text:
+                return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
         return False
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -2585,10 +2587,28 @@ class LCMEngine(ContextEngine):
     @staticmethod
     def _is_quarantined_assistant_replay_identity(identity: tuple[str, str, str, str]) -> bool:
         role, content, _tool_call_id, _tool_calls = identity
-        return (
-            role == "assistant"
-            and "assistant output quarantined" in content
-            and "quarantined_assistant_output" in content
+        if role != "assistant":
+            return False
+        text = str(content or "").strip()
+        return bool(
+            re.fullmatch(
+                r"\[Externalized LCM ingest payload: assistant output quarantined; "
+                r"kind=quarantined_assistant_output; "
+                r"reason=[A-Za-z0-9_.:/-]+; "
+                r"field=[A-Za-z0-9_.:/<>\[\]-]+; "
+                r"chars=\d+; bytes=\d+; "
+                r"ref=[^\]\s]+\]",
+                text,
+            )
+            or re.fullmatch(
+                r"\[LCM active replay placeholder: assistant output quarantined; "
+                r"kind=quarantined_assistant_output; "
+                r"reason=[A-Za-z0-9_.:/-]+; "
+                r"scope=ignored_message_pattern; field=content; "
+                r"chars=\d+; bytes=\d+; "
+                r"sha256=[0-9a-f]{16}\]",
+                text,
+            )
         )
 
     def _ignored_message_is_quarantinable_assistant(self, msg: Dict[str, Any]) -> bool:
@@ -2597,11 +2617,11 @@ class LCMEngine(ContextEngine):
             text_content_for_pattern_matching(msg.get("content")) or "",
         ):
             return True
-        if not self._matches_ignore_message_patterns(msg):
-            return False
         identity = self._message_replay_identity(msg)
         if self._is_quarantined_assistant_replay_identity(identity):
             return True
+        if not self._matches_ignore_message_patterns(msg):
+            return False
         if identity[0] != "assistant":
             return False
         content = normalize_content_value(msg.get("content")) or ""
@@ -2651,6 +2671,12 @@ class LCMEngine(ContextEngine):
                 if not self._is_volatile_ignored_quarantine_placeholder(
                     msg,
                     text_content_for_pattern_matching(msg.get("content")) or "",
+                )
+                and not (
+                    self._compiled_ignore_message_patterns
+                    and self._is_quarantined_assistant_replay_identity(
+                        self._message_replay_identity(msg)
+                    )
                 )
             ]
             candidate_identity_messages = (
@@ -2920,17 +2946,21 @@ class LCMEngine(ContextEngine):
             return list(messages)
 
         n = len(messages)
-        ignored_original_messages = (
-            [self._matches_ignore_message_patterns(message) for message in messages]
-            if self._compiled_ignore_message_patterns
-            else [False] * n
-        )
+        cursor = min(max(self._ingest_cursor, 0), n)
+        scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
+        ignored_original_messages = [False] * n
+        if self._compiled_ignore_message_patterns:
+            for idx in range(scan_start, n):
+                ignored_original_messages[idx] = self._matches_ignore_message_patterns(messages[idx])
+        externalize_messages = [False] * n
+        for idx in range(scan_start, n):
+            externalize_messages[idx] = not ignored_original_messages[idx]
         replay_messages = quarantine_suspicious_assistant_messages(
             messages,
             session_id=self._session_id,
             config=self._config,
             hermes_home=self._hermes_home,
-            externalize=[not ignored for ignored in ignored_original_messages],
+            externalize=externalize_messages,
         )
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = replay_messages
@@ -2941,7 +2971,7 @@ class LCMEngine(ContextEngine):
                 ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
-        cursor = self._ingest_cursor
+        cursor = min(max(self._ingest_cursor, 0), n)
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
@@ -2957,7 +2987,10 @@ class LCMEngine(ContextEngine):
         if self._compiled_ignore_message_patterns:
             kept: List[Dict[str, Any]] = []
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
-                if ignored_original_messages[cursor + offset]:
+                if ignored_original_messages[cursor + offset] or self._is_volatile_ignored_quarantine_placeholder(
+                    replay_msg,
+                    text_content_for_pattern_matching(replay_msg.get("content")) or "",
+                ):
                     self._ignored_message_count += 1
                     text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                     excerpt = text[:80].replace("\n", " ")

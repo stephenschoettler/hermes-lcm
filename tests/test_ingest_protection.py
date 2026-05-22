@@ -1632,6 +1632,56 @@ class _PrefixPattern:
         return object() if str(text).startswith("Cronjob Response:") else None
 
 
+class _CountingIgnorePattern:
+    pattern = "^DROP:"
+
+    def __init__(self):
+        self.seen: list[str] = []
+
+    def search(self, text, timeout=None):
+        self.seen.append(str(text))
+        return object() if str(text).startswith("DROP:") else None
+
+
+def test_ignore_message_patterns_scan_only_new_tail_after_cursor(tmp_path):
+    engine = _engine(tmp_path)
+    pattern = _CountingIgnorePattern()
+    engine._compiled_ignore_message_patterns = [pattern]
+    messages = [
+        {"role": "user", "content": f"old message {idx}"}
+        for idx in range(50)
+    ]
+
+    engine._ingest_messages(messages)
+    pattern.seen.clear()
+    engine._ingest_messages(messages + [{"role": "user", "content": "new message"}])
+
+    assert pattern.seen == ["new message"]
+    rows = engine._store.get_session_messages(engine.current_session_id)
+    assert [row["content"] for row in rows][-2:] == ["old message 49", "new message"]
+
+
+def test_live_placeholder_text_does_not_match_ignore_pattern_via_payload(tmp_path):
+    engine = _engine(tmp_path)
+    pattern = _CountingIgnorePattern()
+    engine._compiled_ignore_message_patterns = [pattern]
+    result = externalize_ingest_payload(
+        "DROP: hidden payload should not filter copied placeholder text",
+        role="user",
+        session_id=engine.current_session_id,
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path / "home"),
+    )
+    assert result is not None
+    placeholder = result["placeholder"]
+
+    engine.compress([{"role": "user", "content": placeholder}])
+
+    rows = engine._store.get_session_messages(engine.current_session_id)
+    assert [row["content"] for row in rows] == [placeholder]
+
+
 def test_ignore_message_patterns_remain_storage_only_for_compress_replay(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
@@ -1851,6 +1901,40 @@ def test_singleton_quarantined_assistant_rebind_reconciliation_does_not_duplicat
     assert BROKEN_ASSISTANT_MARKER not in str(second_active[0].get("content", ""))
 
 
+def test_fresh_singleton_quarantined_assistant_delta_after_rebind_is_stored(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first.on_session_start(
+        "fresh-singleton-quarantine-delta-session",
+        platform="telegram",
+        conversation_id="fresh-singleton-quarantine-delta-conversation",
+        context_length=10_000,
+    )
+    first.compress([{"role": "assistant", "content": _broken_assistant_output()}])
+    assert len(first._store.get_session_messages(first.current_session_id)) == 1
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second.on_session_start(
+        "fresh-singleton-quarantine-delta-session",
+        platform="telegram",
+        conversation_id="fresh-singleton-quarantine-delta-conversation",
+        context_length=10_000,
+    )
+    second.compress([{"role": "assistant", "content": _broken_assistant_output() + " distinct fresh delta"}])
+
+    second_rows = second._store.get_session_messages(second.current_session_id)
+    assert len(second_rows) == 2
+    assert second._last_ingest_reconciliation["action"] == "persisted batch"
+
+
 def test_no_system_ignored_quarantined_assistant_rebind_does_not_duplicate_tail(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm.db"),
@@ -1888,8 +1972,85 @@ def test_no_system_ignored_quarantined_assistant_rebind_does_not_duplicate_tail(
 
     second_rows = second._store.get_session_messages(second.current_session_id)
     assert [row["role"] for row in second_rows] == ["user"]
+    assert [row["content"] for row in second_rows] == ["fresh request"]
     assert "assistant output quarantined" in str(second_active[0].get("content", ""))
+    assert "sha256=" in str(second_active[0].get("content", ""))
     assert BROKEN_ASSISTANT_MARKER not in str(second_active[0].get("content", ""))
+
+
+def test_no_system_trailing_ignored_quarantined_assistant_rebind_does_not_duplicate_tail(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    messages = [
+        {"role": "user", "content": "fresh request"},
+        {"role": "assistant", "content": _broken_assistant_output()},
+    ]
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first._compiled_ignore_message_patterns = [_ContainsBrokenAssistantPattern()]
+    first.on_session_start(
+        "no-system-trailing-ignore-quarantine-rebind-session",
+        platform="telegram",
+        conversation_id="no-system-trailing-ignore-quarantine-rebind-conversation",
+        context_length=10_000,
+    )
+    first_active = first.compress(messages)
+    assert [row["content"] for row in first._store.get_session_messages(first.current_session_id)] == ["fresh request"]
+    assert "sha256=" in str(first_active[-1].get("content", ""))
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second._compiled_ignore_message_patterns = [_ContainsBrokenAssistantPattern()]
+    second.on_session_start(
+        "no-system-trailing-ignore-quarantine-rebind-session",
+        platform="telegram",
+        conversation_id="no-system-trailing-ignore-quarantine-rebind-conversation",
+        context_length=10_000,
+    )
+    second.compress(first_active)
+
+    second_rows = second._store.get_session_messages(second.current_session_id)
+    assert [row["content"] for row in second_rows] == ["fresh request"]
+
+
+def test_only_ignored_quarantined_assistant_rebind_does_not_store_placeholder(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first._compiled_ignore_message_patterns = [_ContainsBrokenAssistantPattern()]
+    first.on_session_start(
+        "only-ignored-quarantine-rebind-session",
+        platform="telegram",
+        conversation_id="only-ignored-quarantine-rebind-conversation",
+        context_length=10_000,
+    )
+    first_active = first.compress([{"role": "assistant", "content": _broken_assistant_output()}])
+    assert first._store.get_session_messages(first.current_session_id) == []
+    assert "sha256=" in str(first_active[0].get("content", ""))
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second._compiled_ignore_message_patterns = [_ContainsBrokenAssistantPattern()]
+    second.on_session_start(
+        "only-ignored-quarantine-rebind-session",
+        platform="telegram",
+        conversation_id="only-ignored-quarantine-rebind-conversation",
+        context_length=10_000,
+    )
+    second.compress(first_active)
+
+    assert second._store.get_session_messages(second.current_session_id) == []
 
 
 def test_ignore_message_patterns_do_not_drop_plain_text_that_mentions_quarantine_markers(tmp_path):
@@ -1910,6 +2071,142 @@ def test_ignore_message_patterns_do_not_drop_plain_text_that_mentions_quarantine
 
     rows = engine._store.get_session_messages(engine.current_session_id)
     assert [row["content"] for row in rows] == [text]
+
+
+def test_rebind_with_ignore_patterns_preserves_assistant_text_that_mentions_quarantine_markers(tmp_path):
+    class _DropOnlyPattern:
+        pattern = "drop me only"
+
+        def search(self, text, timeout=None):
+            return object() if "drop me only" in str(text) else None
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    text = (
+        "This assistant message literally mentions assistant output quarantined "
+        "and quarantined_assistant_output, but it is not an LCM placeholder."
+    )
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first.on_session_start(
+        "literal-quarantine-marker-session",
+        platform="telegram",
+        conversation_id="literal-quarantine-marker-conversation",
+        context_length=10_000,
+    )
+    first.compress([{"role": "user", "content": "seed"}])
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second._compiled_ignore_message_patterns = [_DropOnlyPattern()]
+    second.on_session_start(
+        "literal-quarantine-marker-session",
+        platform="telegram",
+        conversation_id="literal-quarantine-marker-conversation",
+        context_length=10_000,
+    )
+    second.compress([{"role": "assistant", "content": text}])
+
+    rows = second._store.get_session_messages(second.current_session_id)
+    assert [row["content"] for row in rows] == ["seed", text]
+    assert second._last_ingest_reconciliation["action"] == "persisted batch"
+
+
+def test_rebind_with_ignore_patterns_preserves_trailing_literal_quarantine_placeholder_text(tmp_path):
+    class _DropOnlyPattern:
+        pattern = "drop me only"
+
+        def search(self, text, timeout=None):
+            return object() if "drop me only" in str(text) else None
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    literal = (
+        "[LCM active replay placeholder: assistant output quarantined; "
+        "kind=quarantined_assistant_output; reason=high_repetition; "
+        "scope=ignored_message_pattern; field=content; chars=65536; bytes=65536]"
+    )
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first.on_session_start(
+        "trailing-literal-quarantine-placeholder-session",
+        platform="telegram",
+        conversation_id="trailing-literal-quarantine-placeholder-conversation",
+        context_length=10_000,
+    )
+    first.compress([{"role": "user", "content": "seed"}])
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second._compiled_ignore_message_patterns = [_DropOnlyPattern()]
+    second.on_session_start(
+        "trailing-literal-quarantine-placeholder-session",
+        platform="telegram",
+        conversation_id="trailing-literal-quarantine-placeholder-conversation",
+        context_length=10_000,
+    )
+    second.compress([{"role": "assistant", "content": literal}])
+
+    rows = second._store.get_session_messages(second.current_session_id)
+    assert [row["content"] for row in rows] == ["seed", literal]
+
+
+def test_rebind_with_ignore_patterns_preserves_literal_quarantine_placeholder_before_repeated_tail(tmp_path):
+    class _DropOnlyPattern:
+        pattern = "drop me only"
+
+        def search(self, text, timeout=None):
+            return object() if "drop me only" in str(text) else None
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        fresh_tail_count=10,
+        leaf_chunk_tokens=10_000,
+        context_threshold=0.95,
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    literal = (
+        "[LCM active replay placeholder: assistant output quarantined; "
+        "kind=quarantined_assistant_output; reason=high_repetition; "
+        "scope=ignored_message_pattern; field=content; chars=65536; bytes=65536]"
+    )
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    first.on_session_start(
+        "literal-quarantine-placeholder-before-tail-session",
+        platform="telegram",
+        conversation_id="literal-quarantine-placeholder-before-tail-conversation",
+        context_length=10_000,
+    )
+    first.compress([{"role": "user", "content": "fresh request"}])
+    first.shutdown()
+
+    second = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    second._compiled_ignore_message_patterns = [_DropOnlyPattern()]
+    second.on_session_start(
+        "literal-quarantine-placeholder-before-tail-session",
+        platform="telegram",
+        conversation_id="literal-quarantine-placeholder-before-tail-conversation",
+        context_length=10_000,
+    )
+    second.compress([
+        {"role": "assistant", "content": literal},
+        {"role": "user", "content": "fresh request"},
+    ])
+
+    rows = second._store.get_session_messages(second.current_session_id)
+    assert [row["content"] for row in rows] == ["fresh request", literal, "fresh request"]
+    assert second._last_ingest_reconciliation["action"] == "persisted batch"
 
 
 def test_ignore_message_patterns_do_not_drop_literal_quarantine_placeholder_text(tmp_path):

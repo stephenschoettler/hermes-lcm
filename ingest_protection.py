@@ -10,6 +10,7 @@ externalized-payload tools.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -190,12 +191,14 @@ def _quarantined_assistant_placeholder(summary: Dict[str, Any], *, reason: str) 
 
 
 def _volatile_quarantined_assistant_placeholder(content: str, *, reason: str) -> str:
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
     return (
         "[LCM active replay placeholder: assistant output quarantined; "
         f"kind={_QUARANTINED_ASSISTANT_KIND}; "
         f"reason={_safe_placeholder_metadata(reason)}; "
         "scope=ignored_message_pattern; field=content; "
-        f"chars={len(content)}; bytes={len(content.encode('utf-8'))}]"
+        f"chars={len(content)}; bytes={len(content.encode('utf-8'))}; "
+        f"sha256={digest}]"
     )
 
 
