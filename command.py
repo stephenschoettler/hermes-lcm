@@ -941,6 +941,8 @@ def _doctor_text(engine) -> str:
             "suspicious_data_uri_content_rows": [],
             "suspicious_data_uri_tool_calls_rows": [],
             "suspicious_base64_like_rows": [],
+            "quarantined_assistant_rows": [],
+            "suspicious_repetitive_assistant_rows": [],
         }
         externalized_stats = {
             "externalized_payload_count": 0,
@@ -1090,6 +1092,8 @@ def _doctor_text(engine) -> str:
         f"suspicious_data_uri_content_rows: {payload_risks['suspicious_data_uri_content_rows']}",
         f"suspicious_data_uri_tool_calls_rows: {payload_risks['suspicious_data_uri_tool_calls_rows']}",
         f"suspicious_base64_like_rows: {payload_risks['suspicious_base64_like_rows']}",
+        f"quarantined_assistant_rows: {payload_risks['quarantined_assistant_rows']}",
+        f"suspicious_repetitive_assistant_rows: {payload_risks['suspicious_repetitive_assistant_rows']}",
         f"externalized_payload_dir: {externalized_stats['externalized_payload_dir']}",
         f"externalized_payload_count: {externalized_stats['externalized_payload_count']}",
         f"externalized_payload_bytes: {externalized_stats['externalized_payload_bytes']}",
