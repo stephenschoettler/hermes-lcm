@@ -136,7 +136,7 @@ def test_cli_missing_policy_path_does_not_create_output_directory(tmp_path):
 def test_cli_writes_scrubbed_community_export(tmp_path):
     cli = _load_benchmark_cli()
     output_dir = tmp_path / "benchmark-output"
-    export_path = tmp_path / "community-export.json"
+    export_path = output_dir / "community-export.json"
 
     result = cli.main([
         "--synthetic-fixture",
@@ -169,12 +169,12 @@ def test_cli_writes_scrubbed_community_export(tmp_path):
     assert "messages" not in serialized
 
 
-def test_cli_export_outside_repo_requires_allow_external_output(tmp_path):
+def test_cli_export_outside_output_directory_is_rejected(tmp_path):
     cli = _load_benchmark_cli()
     output_dir = Path("benchmarks/runs") / f"export-policy-test-{tmp_path.name}"
     export_path = tmp_path / "community-export.json"
 
-    with pytest.raises(SystemExit, match="Refusing output outside repo"):
+    with pytest.raises(SystemExit, match="Refusing --export outside output directory"):
         cli.main([
             "--synthetic-fixture",
             "export_probe:2:1:3",
@@ -188,3 +188,39 @@ def test_cli_export_outside_repo_requires_allow_external_output(tmp_path):
 
     assert not export_path.exists()
     assert not output_dir.exists()
+
+
+def test_cli_export_refuses_existing_repo_file():
+    cli = _load_benchmark_cli()
+    readme_path = Path("README.md")
+    original_readme = readme_path.read_text(encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="Refusing to overwrite existing export file"):
+        cli.main([
+            "--synthetic-fixture",
+            "export_probe:2:1:3",
+            "--policy",
+            "benchmarks/policies/codex_gpt_long_context.yaml",
+            "--output",
+            ".",
+            "--export",
+            "README.md",
+        ])
+
+    assert readme_path.read_text(encoding="utf-8") == original_readme
+
+
+def test_cli_export_refuses_git_directory():
+    cli = _load_benchmark_cli()
+
+    with pytest.raises(SystemExit, match="Refusing --export inside .git"):
+        cli.main([
+            "--synthetic-fixture",
+            "export_probe:2:1:3",
+            "--policy",
+            "benchmarks/policies/codex_gpt_long_context.yaml",
+            "--output",
+            ".",
+            "--export",
+            ".git/config",
+        ])
