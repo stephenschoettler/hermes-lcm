@@ -122,3 +122,18 @@ def test_lcm_preset_apply_dry_run_keeps_explicit_managed_env_values(tmp_path, mo
     assert "LCM_LEAF_CHUNK_TOKENS: keep explicit value 12000 (preset 8000)" in result
     assert "LCM_FRESH_TAIL_COUNT=24" in result
     assert engine._config.leaf_chunk_tokens == 12_000
+
+
+def test_lcm_preset_dry_run_does_not_honor_invalid_env_overrides(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "abc")
+    engine = _engine(tmp_path)
+
+    suggest = handle_lcm_command("preset suggest", engine)
+    apply = handle_lcm_command("preset apply codex_gpt_long_context --dry-run", engine)
+
+    assert "explicit_overrides: (none)" in suggest
+    assert "invalid_overrides: LCM_FRESH_TAIL_COUNT=abc" in suggest
+    for result in (suggest, apply):
+        assert "LCM_FRESH_TAIL_COUNT=24 (invalid current value abc ignored by runtime; runtime value 64)" in result
+        assert "keep explicit value abc" not in result

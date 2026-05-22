@@ -39,6 +39,14 @@ _FIELD_ENV = {
     "incremental_max_depth": "LCM_INCREMENTAL_MAX_DEPTH",
 }
 
+_FIELD_PARSERS = {
+    "context_threshold": float,
+    "fresh_tail_count": int,
+    "leaf_chunk_tokens": int,
+    "condensation_fanin": int,
+    "incremental_max_depth": int,
+}
+
 _CODEX_GPT_LONG_CONTEXT = LCMPreset(
     name="codex_gpt_long_context",
     family="GPT/Codex long-context",
@@ -93,14 +101,37 @@ def get_preset(name: str | None = None) -> LCMPreset | None:
     return None
 
 
+def _parse_override_value(field: str, raw: str) -> Any:
+    return _FIELD_PARSERS[field](raw)
+
+
+def _valid_override_value(field: str, raw: str) -> bool:
+    try:
+        _parse_override_value(field, raw)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def explicit_operator_overrides(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Return runtime preset fields explicitly set by LCM_* env vars."""
+    """Return parseable runtime preset fields explicitly set by LCM_* env vars."""
 
     env = environ if environ is not None else os.environ
     return {
         field: env_var
         for field, env_var in _FIELD_ENV.items()
-        if env_var in env
+        if env_var in env and _valid_override_value(field, env[env_var])
+    }
+
+
+def invalid_operator_overrides(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Return present but unparsable runtime preset env vars."""
+
+    env = environ if environ is not None else os.environ
+    return {
+        field: env_var
+        for field, env_var in _FIELD_ENV.items()
+        if env_var in env and not _valid_override_value(field, env[env_var])
     }
 
 
@@ -118,12 +149,20 @@ def preset_env_diff(
 
     env = environ if environ is not None else os.environ
     explicit = explicit_operator_overrides(env)
+    invalid = invalid_operator_overrides(env)
     lines: list[str] = []
     for field, value in preset.runtime_env.items():
         env_var = _FIELD_ENV[field]
         if field in explicit:
-            current = env.get(env_var, _current_config_value(config, field))
+            current = _parse_override_value(field, env[env_var])
             lines.append(f"{env_var}: keep explicit value {current} (preset {value})")
+        elif field in invalid:
+            raw = env.get(env_var, "")
+            current = _current_config_value(config, field)
+            lines.append(
+                f"{env_var}={value} "
+                f"(invalid current value {raw} ignored by runtime; runtime value {current})"
+            )
         else:
             lines.append(f"{env_var}={value}")
     return lines

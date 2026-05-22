@@ -256,8 +256,9 @@ safe shipped suggestion for the current context window when one exists, and
 labels the current selector as `context-only` when the provider/model family is
 not available to the plugin. `/lcm preset apply ... --dry-run` previews env-var
 settings only; it does not
-write files, change process state, or override explicit preset-managed `LCM_*`
-environment variables.
+write files, change process state, or override explicit parseable
+preset-managed `LCM_*` environment variables. Invalid preset-managed env values
+are reported as invalid instead of being treated as active runtime overrides.
 
 The current `codex_gpt_long_context` dry-run preview is:
 

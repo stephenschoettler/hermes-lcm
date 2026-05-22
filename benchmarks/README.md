@@ -143,7 +143,7 @@ LCM_FRESH_TAIL_COUNT=24
 LCM_LEAF_CHUNK_TOKENS=8000
 ```
 
-Explicit preset-managed operator config wins. If `LCM_FRESH_TAIL_COUNT` or another supported preset-managed `LCM_*` knob is already set, `/lcm preset suggest` and `/lcm preset apply ... --dry-run` report that value as kept rather than overwritten. Runtime `target_after_compaction` is still benchmark-only metadata because the engine does not yet expose that as a live config field.
+Explicit parseable preset-managed operator config wins. If `LCM_FRESH_TAIL_COUNT` or another supported preset-managed `LCM_*` knob is already set to a value the runtime can parse, `/lcm preset suggest` and `/lcm preset apply ... --dry-run` report that value as kept rather than overwritten. Invalid env values are reported separately, and the preview shows the preset value that would replace them. Runtime `target_after_compaction` is still benchmark-only metadata because the engine does not yet expose that as a live config field.
 
 ## Metrics added for preset research
 

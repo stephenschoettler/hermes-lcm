@@ -14,6 +14,7 @@ from .dag import build_nodes_fts_spec
 from .presets import (
     explicit_operator_overrides,
     get_preset,
+    invalid_operator_overrides,
     preset_env_diff,
     shipped_presets,
     suggest_preset_for_engine,
@@ -1430,6 +1431,10 @@ def _preset_suggest_text(engine) -> str:
         return "\n".join(lines)
 
     explicit = explicit_operator_overrides()
+    invalid = invalid_operator_overrides()
+    invalid_text = ", ".join(
+        f"{env_var}={os.environ.get(env_var, '')}" for env_var in sorted(invalid.values())
+    ) if invalid else "(none)"
     lines.extend([
         f"suggested_preset: {preset.name}",
         f"reason: {reason}",
@@ -1437,6 +1442,7 @@ def _preset_suggest_text(engine) -> str:
         f"policy_version: {preset.policy_version}",
         f"benchmark_version: {preset.provenance.get('benchmark_version', '(unknown)')}",
         "explicit_overrides: " + (", ".join(sorted(explicit.values())) if explicit else "(none)"),
+        f"invalid_overrides: {invalid_text}",
         "preview:",
     ])
     for item in preset_env_diff(preset, engine._config):
