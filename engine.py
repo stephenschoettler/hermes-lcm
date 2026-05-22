@@ -37,9 +37,11 @@ from .extraction import (
 )
 from .ingest_protection import (
     _json_has_duplicate_object_keys,
+    assistant_output_quarantine_reason,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
+    quarantine_suspicious_assistant_messages,
     restore_ingest_payload_placeholders,
 )
 from .schemas import (
@@ -605,11 +607,14 @@ class LCMEngine(ContextEngine):
         """Pre-flight check — also ingests messages into the store."""
         if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
+        replay_messages = None
         if self._session_id and messages:
             try:
-                self._ingest_messages(messages)
+                replay_messages = self._ingest_messages(messages)
             except Exception as e:
                 logger.warning("Ingest during preflight: %s", e)
+        if replay_messages is not None and replay_messages != messages:
+            return True
         from .tokens import count_messages_tokens
         rough = count_messages_tokens(messages)
         if self._should_force_overflow_recovery(observed_tokens=rough):
@@ -830,10 +835,12 @@ class LCMEngine(ContextEngine):
             else None
         )
 
-        # Step 1: Ingest new messages into the immutable store
-        self._ingest_messages(messages)
-
-        working_messages = list(messages)
+        # Step 1: Ingest new messages into the immutable store. Work from a
+        # replay-safe view so quarantined assistant loops do not enter summaries
+        # or provider context after the durable row has been written.
+        working_messages = self._ingest_messages(messages)
+        anchor_source_messages = list(working_messages)
+        pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
         leaf_passes = 0
         critical_budget_pressure = self._critical_budget_pressure_reached(
@@ -878,7 +885,8 @@ class LCMEngine(ContextEngine):
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 break
 
-            raw_tokens_outside_tail = count_messages_tokens(candidate_raw)
+            pressure_candidate_raw = pressure_messages[leading_anchor_count:fresh_tail_start]
+            raw_tokens_outside_tail = count_messages_tokens(pressure_candidate_raw)
             if self._config.dynamic_leaf_chunk_enabled:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
                 if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
@@ -936,7 +944,9 @@ class LCMEngine(ContextEngine):
             self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
             self._persist_frontier_marker()
 
+            pressure_remaining_messages = pressure_messages[leading_anchor_count + len(compacted_chunk):]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
+            pressure_messages = pressure_messages[:leading_anchor_count] + pressure_remaining_messages
             leaf_compacted_this_turn = True
             leaf_passes += 1
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
@@ -953,7 +963,10 @@ class LCMEngine(ContextEngine):
                 ]
                 if not remaining_raw:
                     break
-                remaining_raw_tokens = count_messages_tokens(remaining_raw)
+                pressure_remaining_raw = pressure_messages[
+                    leading_anchor_count:max(0, len(pressure_messages) - self._config.fresh_tail_count)
+                ]
+                remaining_raw_tokens = count_messages_tokens(pressure_remaining_raw)
                 remaining_threshold = self._working_leaf_chunk_tokens(remaining_raw_tokens)
                 if remaining_raw_tokens < remaining_threshold:
                     if not (deferred_maintenance_active and critical_budget_pressure):
@@ -965,22 +978,22 @@ class LCMEngine(ContextEngine):
                 observed_tokens=observed_prompt_tokens,
             )
             if force_overflow and len(messages) >= 1:
-                leading_anchor_count = self._leading_anchor_count(messages)
+                leading_anchor_count = self._leading_anchor_count(working_messages)
                 compressed = self._assemble_overflow_recovery_context(
-                    messages[0] if leading_anchor_count else None,
-                    messages[leading_anchor_count:],
+                    working_messages[0] if leading_anchor_count else None,
+                    working_messages[leading_anchor_count:],
                     assembly_cap_override=recovery_assembly_cap,
                 )
                 return self._finalize_forced_overflow_result(
-                    messages,
+                    working_messages,
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
                 )
             sanitized_messages = self._sanitize_active_context_messages(
-                messages,
+                working_messages,
                 insert_missing_tool_stubs=False,
             )
-            if sanitized_messages != messages:
+            if sanitized_messages != working_messages:
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized
                 # context, keeping the old cursor could make the next appended
@@ -1009,7 +1022,8 @@ class LCMEngine(ContextEngine):
             observed_tokens=observed_prompt_tokens,
         )
         leading_anchor_count = self._leading_anchor_count(working_messages)
-        self._pending_context_anchor_messages = messages[leading_anchor_count:]
+        anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+        self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
         try:
             compressed = self._assemble_context(
                 working_messages[0] if leading_anchor_count else None,
@@ -2305,6 +2319,48 @@ class LCMEngine(ContextEngine):
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
+    def _stored_row_externalized_text_for_pattern_matching(self, msg: Dict[str, Any]) -> str:
+        content = msg.get("content")
+        if not isinstance(content, str):
+            return ""
+        refs = extract_ingest_externalized_refs(content)
+        legacy_ref = extract_externalized_ref(content)
+        if legacy_ref and legacy_ref not in refs:
+            refs.append(legacy_ref)
+        parts: list[str] = []
+        session_id = str(msg.get("session_id") or self._session_id or "")
+        for ref in refs:
+            payload = load_externalized_payload(
+                ref,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if not payload:
+                continue
+            payload_session_id = str(payload.get("session_id") or "")
+            if session_id and payload_session_id and payload_session_id != session_id:
+                continue
+            payload_content = payload.get("content")
+            if isinstance(payload_content, str):
+                parts.append(payload_content)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _is_volatile_ignored_quarantine_placeholder(msg: Dict[str, Any], text: str) -> bool:
+        if str(msg.get("role") or "") != "assistant":
+            return False
+        return bool(
+            re.fullmatch(
+                r"\[LCM active replay placeholder: assistant output quarantined; "
+                r"kind=quarantined_assistant_output; "
+                r"reason=[A-Za-z0-9_.:/-]+; "
+                r"scope=ignored_message_pattern; field=content; "
+                r"chars=\d+; bytes=\d+; "
+                r"sha256=[0-9a-f]{16}\]",
+                text.strip(),
+            )
+        )
+
     def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
         if not self._compiled_ignore_message_patterns:
             return False
@@ -2314,7 +2370,13 @@ class LCMEngine(ContextEngine):
             if stored_row
             else text_content_for_pattern_matching(content)
         ) or ""
-        return matches_message_pattern(text, self._compiled_ignore_message_patterns)
+        if matches_message_pattern(text, self._compiled_ignore_message_patterns):
+            return True
+        if stored_row:
+            externalized_text = self._stored_row_externalized_text_for_pattern_matching(msg)
+            if externalized_text and externalized_text != text:
+                return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
+        return False
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
         """Return true for active-context scaffolding that should not be re-ingested."""
@@ -2437,7 +2499,7 @@ class LCMEngine(ContextEngine):
             )
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
             ref = extract_externalized_ref(content)
-            if ref:
+            if ref and "quarantined_assistant_output" not in content:
                 payload = load_externalized_payload(
                     ref,
                     config=self._config,
@@ -2522,6 +2584,49 @@ class LCMEngine(ContextEngine):
             tool_calls,
         )
 
+    @staticmethod
+    def _is_quarantined_assistant_replay_identity(identity: tuple[str, str, str, str]) -> bool:
+        role, content, _tool_call_id, _tool_calls = identity
+        if role != "assistant":
+            return False
+        text = str(content or "").strip()
+        return bool(
+            re.fullmatch(
+                r"\[Externalized LCM ingest payload: assistant output quarantined; "
+                r"kind=quarantined_assistant_output; "
+                r"reason=[A-Za-z0-9_.:/-]+; "
+                r"field=[A-Za-z0-9_.:/<>\[\]-]+; "
+                r"chars=\d+; bytes=\d+; "
+                r"ref=[^\]\s]+\]",
+                text,
+            )
+            or re.fullmatch(
+                r"\[LCM active replay placeholder: assistant output quarantined; "
+                r"kind=quarantined_assistant_output; "
+                r"reason=[A-Za-z0-9_.:/-]+; "
+                r"scope=ignored_message_pattern; field=content; "
+                r"chars=\d+; bytes=\d+; "
+                r"sha256=[0-9a-f]{16}\]",
+                text,
+            )
+        )
+
+    def _ignored_message_is_quarantinable_assistant(self, msg: Dict[str, Any]) -> bool:
+        if self._is_volatile_ignored_quarantine_placeholder(
+            msg,
+            text_content_for_pattern_matching(msg.get("content")) or "",
+        ):
+            return True
+        identity = self._message_replay_identity(msg)
+        if self._is_quarantined_assistant_replay_identity(identity):
+            return True
+        if not self._matches_ignore_message_patterns(msg):
+            return False
+        if identity[0] != "assistant":
+            return False
+        content = normalize_content_value(msg.get("content")) or ""
+        return assistant_output_quarantine_reason(content) is not None
+
     def _stored_tail_for_sanitized_active_replay(
         self,
         stored_tail: list[tuple[str, str, str, str]],
@@ -2554,11 +2659,36 @@ class LCMEngine(ContextEngine):
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             candidate_messages = messages[:cursor]
-            candidate_prefix = [
-                self._message_replay_identity(msg)
+            candidate_visible_messages = [
+                msg
                 for msg in candidate_messages
                 if not self._is_replayed_context_scaffold_message(msg)
                 and not self._matches_ignore_message_patterns(msg)
+            ]
+            candidate_non_placeholder_messages = [
+                msg
+                for msg in candidate_visible_messages
+                if not self._is_volatile_ignored_quarantine_placeholder(
+                    msg,
+                    text_content_for_pattern_matching(msg.get("content")) or "",
+                )
+                and not (
+                    self._compiled_ignore_message_patterns
+                    and self._is_quarantined_assistant_replay_identity(
+                        self._message_replay_identity(msg)
+                    )
+                    and self._matches_ignore_message_patterns(msg, stored_row=True)
+                )
+            ]
+            filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
+            candidate_identity_messages = (
+                candidate_non_placeholder_messages
+                if candidate_non_placeholder_messages or filtered_candidate_placeholders
+                else candidate_visible_messages
+            )
+            candidate_prefix = [
+                self._message_replay_identity(msg)
+                for msg in candidate_identity_messages
             ]
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
@@ -2590,8 +2720,38 @@ class LCMEngine(ContextEngine):
             # tail; otherwise a fresh delta can repeat the remaining visible
             # suffix and must be preserved.
             candidate_has_system = any(identity[0] == "system" for identity in candidate_prefix)
+            candidate_dropped_quarantine_replay_placeholder = any(
+                self._is_volatile_ignored_quarantine_placeholder(
+                    msg,
+                    text_content_for_pattern_matching(msg.get("content")) or "",
+                )
+                or (
+                    self._compiled_ignore_message_patterns
+                    and self._is_quarantined_assistant_replay_identity(
+                        self._message_replay_identity(msg)
+                    )
+                    and self._matches_ignore_message_patterns(msg, stored_row=True)
+                )
+                for msg in candidate_messages
+            )
+            has_quarantined_singleton_replay = (
+                matches_sanitized_tail
+                and len(candidate_prefix) == 1
+                and effective_session_count == 1
+                and self._is_quarantined_assistant_replay_identity(candidate_prefix[0])
+                and self._is_quarantined_assistant_replay_identity(sanitized_replay_tail[0])
+            )
+            has_filtered_full_replay = (
+                matches_sanitized_tail
+                and candidate_dropped_quarantine_replay_placeholder
+                and len(candidate_prefix) >= effective_session_count
+                and effective_session_count > 0
+            )
             has_effective_full_replay = matches_sanitized_tail and len(candidate_prefix) >= effective_session_count and (
-                candidate_has_system or (effective_session_count > 1 and not sanitized_tail_collapsed)
+                candidate_has_system
+                or (effective_session_count > 1 and not sanitized_tail_collapsed)
+                or has_quarantined_singleton_replay
+                or has_filtered_full_replay
             )
             has_scaffold_evidence = any(
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
@@ -2772,7 +2932,7 @@ class LCMEngine(ContextEngine):
         )
         return 0
 
-    def _ingest_messages(self, messages: List[Dict[str, Any]]) -> None:
+    def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
@@ -2780,10 +2940,14 @@ class LCMEngine(ContextEngine):
         the cursor is reset to len(compressed), so only messages appended
         after compaction are ingested — regardless of how the store count
         compares to the current list length.
+
+        Returns a replay-safe copy of ``messages`` with obviously broken
+        assistant loops replaced by quarantine placeholders. Existing callers may
+        ignore the return value when they only need durable persistence.
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
-            return
+            return list(messages)
 
         if self._session_ignored or self._session_stateless:
             logger.debug(
@@ -2791,45 +2955,76 @@ class LCMEngine(ContextEngine):
                 "ignored" if self._session_ignored else "stateless",
                 self._session_id,
             )
-            return
+            return list(messages)
 
         n = len(messages)
+        cursor = min(max(self._ingest_cursor, 0), n)
+        scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
+        ignored_original_messages = [False] * n
+        if self._compiled_ignore_message_patterns:
+            for idx in range(scan_start, n):
+                ignored_original_messages[idx] = self._matches_ignore_message_patterns(messages[idx])
+        externalize_messages = [False] * n
+        prefer_existing_externalized = [False] * n
+        for idx in range(scan_start, n):
+            externalize_messages[idx] = not ignored_original_messages[idx]
+        for idx in range(0, scan_start):
+            prefer_existing_externalized[idx] = not ignored_original_messages[idx]
+        replay_messages = quarantine_suspicious_assistant_messages(
+            messages,
+            session_id=self._session_id,
+            config=self._config,
+            hermes_home=self._hermes_home,
+            externalize=externalize_messages,
+            prefer_existing_externalized=prefer_existing_externalized,
+        )
         if self._ingest_cursor_needs_reconcile:
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(messages)
+            reconcile_messages = replay_messages
+            if self._compiled_ignore_message_patterns:
+                reconcile_messages = [
+                    original_msg if ignored_original_messages[idx] else replay_msg
+                    for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
+                ]
+            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
-        cursor = self._ingest_cursor
+        cursor = min(max(self._ingest_cursor, 0), n)
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
         )
 
-        new_messages = messages[cursor:] if cursor < n else []
+        new_messages = replay_messages[cursor:] if cursor < n else []
+        original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
-            return
+            return replay_messages
 
+        messages_to_store = new_messages
         if self._compiled_ignore_message_patterns:
             kept: List[Dict[str, Any]] = []
-            for msg in new_messages:
-                if self._matches_ignore_message_patterns(msg):
+            for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
+                if ignored_original_messages[cursor + offset] or self._is_volatile_ignored_quarantine_placeholder(
+                    replay_msg,
+                    text_content_for_pattern_matching(replay_msg.get("content")) or "",
+                ):
                     self._ignored_message_count += 1
-                    text = text_content_for_pattern_matching(msg.get("content")) or ""
+                    text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                     excerpt = text[:80].replace("\n", " ")
                     logger.debug(
                         "LCM ignore_message_patterns dropped %s message: %r",
-                        msg.get("role", "unknown"),
+                        original_msg.get("role", "unknown"),
                         excerpt,
                     )
                     continue
-                kept.append(msg)
-            new_messages = kept
+                kept.append(replay_msg)
+            messages_to_store = kept
 
-        if not new_messages:
+        if not messages_to_store:
             self._ingest_cursor = n
-            return
+            return replay_messages
 
         protected_messages = protect_messages_for_ingest(
-            new_messages,
+            messages_to_store,
             session_id=self._session_id,
             config=self._config,
             hermes_home=self._hermes_home,
@@ -2842,7 +3037,8 @@ class LCMEngine(ContextEngine):
             source=self._session_platform,
         )
         self._ingest_cursor = n
-        logger.debug("Ingested %d messages into LCM store", len(new_messages))
+        logger.debug("Ingested %d messages into LCM store", len(messages_to_store))
+        return replay_messages
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         """Map current raw messages back to store_ids in stable store order.

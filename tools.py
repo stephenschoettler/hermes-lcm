@@ -1661,6 +1661,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             len(payload_risks["suspicious_data_uri_content_rows"])
             + len(payload_risks["suspicious_data_uri_tool_calls_rows"])
             + len(payload_risks["suspicious_base64_like_rows"])
+            + len(payload_risks["suspicious_repetitive_assistant_rows"])
         )
         checks.append({
             "check": "payload_storage",

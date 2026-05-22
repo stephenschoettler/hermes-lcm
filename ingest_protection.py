@@ -10,14 +10,17 @@ externalized-payload tools.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+from collections import Counter
 from typing import Any, Dict, List
 
 from .externalize import (
     externalize_ingest_payload,
     extract_externalized_ref,
+    find_externalized_payload_for_message,
     is_externalized_placeholder,
     load_externalized_payload,
     maybe_externalize_payload,
@@ -83,6 +86,12 @@ _DATA_URI_BASE64_RE = re.compile(
 _BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{4096,})(?![A-Za-z0-9+/=_-])")
 _BASE64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_\s-]+$")
 _EXTERNALIZED_PLACEHOLDER_PREFIX = "[Externalized LCM ingest payload:"
+_QUARANTINED_ASSISTANT_KIND = "quarantined_assistant_output"
+_QUARANTINED_ASSISTANT_REASON = "high_repetition"
+_QUARANTINED_ASSISTANT_MIN_CHARS = 65_536
+_QUARANTINED_ASSISTANT_MIN_TOKENS = 1_000
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_REPETITION_SEGMENT_SPLIT_RE = re.compile(r"(?:\n+|(?<=[.!?])\s+)")
 _GENERIC_BASE64_MIN_CHARS = 4096
 _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*ref=([^;\]\s]+)\]")
 
@@ -110,6 +119,157 @@ def extract_ingest_externalized_refs(text: str) -> list[str]:
         if ref and ref not in refs:
             refs.append(ref)
     return refs
+
+
+def _safe_placeholder_metadata(value: Any) -> str:
+    text = str(value or "?")
+    safe = re.sub(r"[^A-Za-z0-9_.:/-]+", "-", text).strip("-")
+    return (safe or "?")[:120]
+
+
+def _normalized_repetition_segments(text: str) -> list[str]:
+    segments = []
+    for segment in _REPETITION_SEGMENT_SPLIT_RE.split(text):
+        normalized = re.sub(r"\s+", " ", segment.strip().lower())
+        if len(normalized) >= 32:
+            segments.append(normalized)
+    return segments
+
+
+def assistant_output_quarantine_reason(text: str) -> str | None:
+    """Return a quarantine reason for obviously broken assistant output.
+
+    The gate is intentionally conservative: content must be very large and show
+    both low token novelty and repeated sentence/line segments. Long diverse
+    reports and code with varied identifiers should stay inline.
+    """
+    if not isinstance(text, str) or len(text) < _QUARANTINED_ASSISTANT_MIN_CHARS:
+        return None
+
+    normalized = re.sub(r"\s+", " ", text.strip().lower())
+    tokens = _WORD_TOKEN_RE.findall(normalized)
+    if len(tokens) < _QUARANTINED_ASSISTANT_MIN_TOKENS:
+        if len(normalized) >= _QUARANTINED_ASSISTANT_MIN_CHARS and len(set(normalized)) <= 12:
+            return _QUARANTINED_ASSISTANT_REASON
+        return None
+
+    token_counts = Counter(tokens)
+    unique_token_ratio = len(token_counts) / max(1, len(tokens))
+    top_token_ratio = token_counts.most_common(1)[0][1] / max(1, len(tokens))
+
+    segments = _normalized_repetition_segments(text)
+    top_segment_ratio = 0.0
+    duplicate_segment_ratio = 0.0
+    if len(segments) >= 20:
+        segment_counts = Counter(segments)
+        top_segment_ratio = segment_counts.most_common(1)[0][1] / len(segments)
+        duplicate_segment_ratio = 1.0 - (len(segment_counts) / len(segments))
+
+    if unique_token_ratio <= 0.03 and (
+        top_segment_ratio >= 0.10
+        or duplicate_segment_ratio >= 0.50
+        or top_token_ratio >= 0.08
+    ):
+        return _QUARANTINED_ASSISTANT_REASON
+
+    # Covers degenerate long loops with little punctuation/newline structure.
+    if unique_token_ratio <= 0.015 and len(set(normalized)) <= 64:
+        return _QUARANTINED_ASSISTANT_REASON
+
+    return None
+
+
+def _quarantined_assistant_placeholder(summary: Dict[str, Any], *, reason: str) -> str:
+    return (
+        "[Externalized LCM ingest payload: assistant output quarantined; "
+        f"kind={_safe_placeholder_metadata(summary.get('kind') or _QUARANTINED_ASSISTANT_KIND)}; "
+        f"reason={_safe_placeholder_metadata(reason)}; "
+        f"field={_safe_placeholder_metadata(summary.get('field_path') or 'content')}; "
+        f"chars={summary.get('content_chars', 0)}; bytes={summary.get('content_bytes', 0)}; "
+        f"ref={summary.get('ref', '')}]"
+    )
+
+
+def _volatile_quarantined_assistant_placeholder(content: str, *, reason: str) -> str:
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+    return (
+        "[LCM active replay placeholder: assistant output quarantined; "
+        f"kind={_QUARANTINED_ASSISTANT_KIND}; "
+        f"reason={_safe_placeholder_metadata(reason)}; "
+        "scope=ignored_message_pattern; field=content; "
+        f"chars={len(content)}; bytes={len(content.encode('utf-8'))}; "
+        f"sha256={digest}]"
+    )
+
+
+def _externalize_quarantined_assistant_output(
+    content: str,
+    *,
+    role: str,
+    session_id: str,
+    config,
+    hermes_home: str,
+    reason: str,
+) -> str | None:
+    existing = find_externalized_payload_for_message(
+        content,
+        session_id=session_id,
+        kind=_QUARANTINED_ASSISTANT_KIND,
+        role=role,
+        config=config,
+        hermes_home=hermes_home,
+    )
+    if existing is not None:
+        return _quarantined_assistant_placeholder(existing, reason=reason)
+
+    result = externalize_ingest_payload(
+        content,
+        role=role,
+        session_id=session_id,
+        field_path="content",
+        config=config,
+        hermes_home=hermes_home,
+        kind=_QUARANTINED_ASSISTANT_KIND,
+    )
+    if result is None:
+        logger.warning(
+            "LCM ingest protection could not quarantine repetitive assistant output; preserving inline content for lossless recovery"
+        )
+        return None
+
+    payload = result.get("payload") or {}
+    path = result.get("path")
+    summary = {
+        "ref": getattr(path, "name", ""),
+        "kind": payload.get("kind", _QUARANTINED_ASSISTANT_KIND),
+        "role": payload.get("role", role),
+        "field_path": payload.get("field_path", "content"),
+        "content_chars": payload.get("content_chars", len(content)),
+        "content_bytes": payload.get("content_bytes", len(content.encode("utf-8"))),
+    }
+    return _quarantined_assistant_placeholder(summary, reason=reason)
+
+
+def _existing_quarantined_assistant_placeholder(
+    content: str,
+    *,
+    role: str,
+    session_id: str,
+    config,
+    hermes_home: str,
+    reason: str,
+) -> str | None:
+    existing = find_externalized_payload_for_message(
+        content,
+        session_id=session_id,
+        kind=_QUARANTINED_ASSISTANT_KIND,
+        role=role,
+        config=config,
+        hermes_home=hermes_home,
+    )
+    if existing is None:
+        return None
+    return _quarantined_assistant_placeholder(existing, reason=reason)
 
 
 def restore_ingest_payload_placeholders(
@@ -442,16 +602,34 @@ def protect_message_for_ingest(
         if is_externalized_ingest_placeholder(normalized_content) or is_externalized_placeholder(normalized_content):
             msg["content"] = original_content
         else:
-            kind = _externalization_kind_for_message(msg)
-            externalized = maybe_externalize_payload(
-                normalized_content,
-                kind=kind,
-                tool_call_id=str(msg.get("tool_call_id") or ""),
-                session_id=session_id,
-                role=role,
-                config=config,
-                hermes_home=hermes_home,
+            reason = (
+                assistant_output_quarantine_reason(normalized_content)
+                if role == "assistant"
+                else None
             )
+            externalized = None
+            if reason:
+                placeholder = _externalize_quarantined_assistant_output(
+                    normalized_content,
+                    role=role,
+                    session_id=session_id,
+                    config=config,
+                    hermes_home=hermes_home,
+                    reason=reason,
+                )
+                if placeholder:
+                    externalized = {"placeholder": placeholder}
+            if externalized is None:
+                kind = _externalization_kind_for_message(msg)
+                externalized = maybe_externalize_payload(
+                    normalized_content,
+                    kind=kind,
+                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    session_id=session_id,
+                    role=role,
+                    config=config,
+                    hermes_home=hermes_home,
+                )
             if externalized:
                 msg["content"] = externalized["placeholder"]
             else:
@@ -477,6 +655,83 @@ def protect_message_for_ingest(
         )
 
     return msg
+
+
+def quarantine_suspicious_assistant_message(
+    message: Dict[str, Any],
+    config,
+    hermes_home: str = "",
+    session_id: str = "",
+    *,
+    externalize: bool = True,
+    prefer_existing_externalized: bool = False,
+) -> Dict[str, Any]:
+    """Return ``message`` with obviously broken assistant output quarantined.
+
+    Unlike full ingest protection, this only touches suspicious assistant text.
+    It is safe for active-context replay because it does not externalize user
+    media, tool results, or ordinary long content.
+    """
+    msg = dict(message or {})
+    role = str(msg.get("role") or "unknown")
+    if role != "assistant":
+        return msg
+    normalized_content = normalize_content_value(msg.get("content"))
+    reason = assistant_output_quarantine_reason(normalized_content)
+    if not reason:
+        return msg
+    if externalize:
+        placeholder = _externalize_quarantined_assistant_output(
+            normalized_content,
+            role=role,
+            session_id=session_id,
+            config=config,
+            hermes_home=hermes_home,
+            reason=reason,
+        )
+    else:
+        placeholder = None
+        if prefer_existing_externalized:
+            placeholder = _existing_quarantined_assistant_placeholder(
+                normalized_content,
+                role=role,
+                session_id=session_id,
+                config=config,
+                hermes_home=hermes_home,
+                reason=reason,
+            )
+        if placeholder is None:
+            placeholder = _volatile_quarantined_assistant_placeholder(
+                normalized_content,
+                reason=reason,
+            )
+    if not placeholder:
+        return msg
+    msg["content"] = placeholder
+    return msg
+
+
+def quarantine_suspicious_assistant_messages(
+    messages: List[Dict[str, Any]],
+    config,
+    hermes_home: str = "",
+    session_id: str = "",
+    externalize: List[bool] | None = None,
+    prefer_existing_externalized: List[bool] | None = None,
+) -> List[Dict[str, Any]]:
+    return [
+        quarantine_suspicious_assistant_message(
+            message,
+            config=config,
+            hermes_home=hermes_home,
+            session_id=session_id,
+            externalize=True if externalize is None else externalize[idx],
+            prefer_existing_externalized=False
+            if prefer_existing_externalized is None
+            else prefer_existing_externalized[idx],
+        )
+        for idx, message in enumerate(messages)
+    ]
 
 
 def protect_messages_for_ingest(
@@ -604,6 +859,44 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
         if len(generic_rows) >= limit:
             break
 
+    quarantined_assistant_rows = [
+        make_row(row, field="content", length_key="content_len", category=_QUARANTINED_ASSISTANT_KIND)
+        for row in conn.execute(
+            """
+            SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
+            FROM messages
+            WHERE role = 'assistant'
+              AND content LIKE '%Externalized LCM ingest payload:%quarantined_assistant_output%'
+            ORDER BY store_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    ]
+
+    suspicious_repetitive_assistant_rows = []
+    for row in conn.execute(
+        """
+        SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
+        FROM messages
+        WHERE role = 'assistant'
+          AND COALESCE(length(content), 0) >= ?
+          AND content NOT LIKE '%Externalized LCM ingest payload:%quarantined_assistant_output%'
+        ORDER BY content_len DESC
+        LIMIT ?
+        """,
+        (_QUARANTINED_ASSISTANT_MIN_CHARS, candidate_cap),
+    ).fetchall():
+        value = row[-1]
+        if isinstance(value, str):
+            reason = assistant_output_quarantine_reason(value)
+            if reason:
+                suspicious_repetitive_assistant_rows.append(
+                    make_row(row, field="content", length_key="content_len", category=reason)
+                )
+        if len(suspicious_repetitive_assistant_rows) >= limit:
+            break
+
     return {
         "largest_content_rows": [
             make_row(row, field="content", length_key="content_len", category="largest_content")
@@ -622,6 +915,8 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
             for row in data_uri_tool_calls
         ],
         "suspicious_base64_like_rows": generic_rows,
+        "quarantined_assistant_rows": quarantined_assistant_rows,
+        "suspicious_repetitive_assistant_rows": suspicious_repetitive_assistant_rows,
     }
 
 def externalized_payload_stats(config, hermes_home: str = "") -> dict[str, Any]:

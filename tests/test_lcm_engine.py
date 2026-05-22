@@ -3997,6 +3997,51 @@ class TestEngineCompress:
         compressed_contents = [msg.get("content") for msg in compressed]
         assert messages[-1]["content"] in compressed_contents
 
+    def test_dynamic_leaf_chunk_pressure_uses_current_working_window_after_each_pass(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=200,
+            database_path=str(tmp_path / "lcm_dynamic_leaf_current_window.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = 0
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(8):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({
+                "role": role,
+                "content": f"Message {i}: " + ((f"token{i} ") * (20 + i * 7)),
+            })
+
+        token_pairs: list[tuple[int | None, int]] = []
+        last_pressure_tokens: int | None = None
+
+        def record_working_leaf_chunk_tokens(raw_tokens: int) -> int:
+            nonlocal last_pressure_tokens
+            last_pressure_tokens = raw_tokens
+            return 1
+
+        def select_one(candidate_raw, _token_limit):
+            token_pairs.append((last_pressure_tokens, count_messages_tokens(candidate_raw)))
+            return candidate_raw[:1]
+
+        def fake_summary(chunk, focus_topic=None):
+            return chunk, count_messages_tokens(chunk), "Window summary.\nExpand for details about: current window", 1, 0
+
+        monkeypatch.setattr(engine, "_working_leaf_chunk_tokens", record_working_leaf_chunk_tokens)
+        monkeypatch.setattr(engine, "_select_oldest_leaf_chunk", select_one)
+        monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", fake_summary)
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert len(token_pairs) >= 2
+        assert all(pressure == candidate for pressure, candidate in token_pairs)
+
     def test_adaptive_leaf_rescue_stops_after_bounded_retry_worthy_failures(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
