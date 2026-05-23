@@ -189,6 +189,17 @@ class LCMConfig:
     # Directory for daily extraction files (empty = auto: ~/.hermes/lcm-extractions/)
     extraction_output_path: str = ""
 
+    # -- Sensitive-pattern handling ---
+    # Disabled by default. When enabled, named patterns redact matching secrets
+    # before LCM storage, FTS indexing, summarization, or externalization.
+    sensitive_patterns_enabled: bool = False
+    # Named pattern catalog entries to apply when sensitive handling is enabled.
+    sensitive_patterns: list[str] = field(
+        default_factory=lambda: ["api_key", "bearer_token", "password_assignment", "private_key"]
+    )
+    # Diagnostics: where the sensitive pattern list came from.
+    sensitive_patterns_source: str = "default"
+
     # -- Large tool-output externalization ---
     # When enabled, oversized tool results are written to plugin-managed storage
     # and replaced with compact references in pre-compaction serializer input.
@@ -268,6 +279,14 @@ class LCMConfig:
         c.extraction_enabled = _parse_bool_env("LCM_EXTRACTION_ENABLED", c.extraction_enabled)
         c.extraction_model = _str("LCM_EXTRACTION_MODEL", c.extraction_model)
         c.extraction_output_path = _str("LCM_EXTRACTION_OUTPUT_PATH", c.extraction_output_path)
+        c.sensitive_patterns_enabled = _parse_bool_env(
+            "LCM_SENSITIVE_PATTERNS_ENABLED",
+            c.sensitive_patterns_enabled,
+        )
+        raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")
+        if raw_sensitive_patterns is not None:
+            c.sensitive_patterns = _parse_pattern_list(raw_sensitive_patterns)
+            c.sensitive_patterns_source = "env"
         c.large_output_externalization_enabled = _parse_bool_env(
             "LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED",
             c.large_output_externalization_enabled,

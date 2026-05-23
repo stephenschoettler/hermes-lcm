@@ -9,7 +9,7 @@ import sqlite3
 from typing import Any
 
 from .db_bootstrap import external_content_fts_needs_repair, repair_external_content_fts
-from .ingest_protection import externalized_payload_stats, scan_sqlite_payload_risks
+from .ingest_protection import externalized_payload_stats, scan_sqlite_payload_risks, sensitive_pattern_status
 from .dag import build_nodes_fts_spec
 from .presets import (
     explicit_operator_overrides,
@@ -127,7 +127,7 @@ def _status_text(engine) -> str:
         "effective_unknown_messages": int(source_stats.get("effective_unknown_messages", 0) or 0),
         **({"error": source_stats.get("error")} if source_stats.get("error") else {}),
     }
-
+    protection = status.get("ingest_protection") or sensitive_pattern_status(engine._config)
 
     lines = [
         "LCM status",
@@ -157,6 +157,9 @@ def _status_text(engine) -> str:
         f"last_cache_write_tokens: {status.get('last_cache_write_tokens', 0)}",
         f"last_reasoning_tokens: {status.get('last_reasoning_tokens', 0)}",
         f"cache_read_ratio: {float(status.get('cache_read_ratio', 0.0) or 0.0) * 100:.1f}%",
+        f"sensitive_patterns_enabled: {_fmt_bool(protection.get('enabled'))}",
+        f"sensitive_patterns: {', '.join(protection.get('patterns') or []) or '(none)'}",
+        f"sensitive_patterns_source: {protection.get('source', 'default')}",
         # Filter classification for current_session_id (the foreground view).
         # When a side channel is in flight, get_status() reports the bound
         # session's flags; we read the engine properties instead so this row
@@ -1071,6 +1074,22 @@ def _doctor_text(engine) -> str:
             f"protected_sessions: skipped {clean_scan['protected_count']} currently bound session(s) from cleanup candidates"
         )
 
+    protection = sensitive_pattern_status(engine._config)
+    if protection["enabled"] and protection["active_patterns"]:
+        observations.append(
+            "sensitive_pattern_handling: enabled; matching raw secret values are replaced before SQLite, FTS, summaries, and externalized payloads"
+        )
+    elif protection["enabled"]:
+        observations.append("sensitive_pattern_handling: enabled but no active known patterns are configured")
+        recommended_actions.append("set LCM_SENSITIVE_PATTERNS to one or more known names, or disable sensitive handling")
+    else:
+        observations.append("sensitive_pattern_handling: disabled")
+    if protection["unknown_patterns"]:
+        issues.append("sensitive_pattern_config")
+        recommended_actions.append(
+            "remove unknown LCM_SENSITIVE_PATTERNS entries or replace them with supported names"
+        )
+
     doctor_status = "issues-found" if integrity != "ok" or issues else (
         "action-recommended" if recommended_actions else "ok"
     )
@@ -1106,6 +1125,10 @@ def _doctor_text(engine) -> str:
         f"suspicious_base64_like_rows: {payload_risks['suspicious_base64_like_rows']}",
         f"quarantined_assistant_rows: {payload_risks['quarantined_assistant_rows']}",
         f"suspicious_repetitive_assistant_rows: {payload_risks['suspicious_repetitive_assistant_rows']}",
+        f"sensitive_patterns_enabled: {_fmt_bool(protection.get('enabled'))}",
+        f"sensitive_patterns: {', '.join(protection.get('patterns') or []) or '(none)'}",
+        f"sensitive_patterns_source: {protection.get('source', 'default')}",
+        f"sensitive_patterns_unknown: {', '.join(protection.get('unknown_patterns') or []) or '(none)'}",
         f"externalized_payload_dir: {externalized_stats['externalized_payload_dir']}",
         f"externalized_payload_count: {externalized_stats['externalized_payload_count']}",
         f"externalized_payload_bytes: {externalized_stats['externalized_payload_bytes']}",

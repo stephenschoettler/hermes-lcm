@@ -19,7 +19,7 @@ from hermes_lcm.engine import LCMEngine
 import hermes_lcm.engine as lcm_engine_module
 from hermes_lcm.extraction import sanitize_pre_compaction_tool_arguments
 from hermes_lcm.externalize import build_transcript_gc_placeholder, externalize_ingest_payload, extract_externalized_ref
-from hermes_lcm.ingest_protection import extract_ingest_externalized_refs
+from hermes_lcm.ingest_protection import extract_ingest_externalized_refs, redact_sensitive_text
 from hermes_lcm.tokens import count_messages_tokens
 
 
@@ -34,6 +34,25 @@ def _engine(tmp_path: Path) -> LCMEngine:
         database_path=str(tmp_path / "lcm.db"),
         large_output_externalization_path=str(tmp_path / "externalized"),
     )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    engine.on_session_start(
+        "payload-session",
+        platform="telegram",
+        conversation_id="payload-conversation",
+        context_length=200_000,
+    )
+    return engine
+
+
+def _sensitive_engine(tmp_path: Path, **overrides) -> LCMEngine:
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        large_output_externalization_path=str(tmp_path / "externalized"),
+    )
+    setattr(config, "sensitive_patterns_enabled", True)
+    setattr(config, "sensitive_patterns", ["api_key", "bearer_token", "password_assignment", "private_key"])
+    for key, value in overrides.items():
+        setattr(config, key, value)
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
     engine.on_session_start(
         "payload-session",
@@ -74,6 +93,129 @@ def _expand_ref(engine: LCMEngine, ref: str) -> dict:
 
 def _externalized_files(tmp_path: Path) -> list[Path]:
     return sorted((tmp_path / "externalized").glob("*.json"))
+
+
+def test_sensitive_patterns_disabled_by_default_preserves_lossless_raw_text(tmp_path):
+    engine = _engine(tmp_path)
+    secret = "sk-defaultpreserved1234567890abcdef"
+
+    engine._ingest_messages([{"role": "user", "content": f"api_key={secret}"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert secret in content
+
+
+def test_sensitive_redaction_continues_after_existing_placeholder(tmp_path):
+    engine = _sensitive_engine(tmp_path)
+    first_secret = "sk-firstsecret1234567890abcdef"
+    second_secret = "sk-secondsecret1234567890abcdef"
+    partially_redacted = redact_sensitive_text(f"api_key={first_secret}", engine._config)
+    assert first_secret not in partially_redacted
+
+    redacted = redact_sensitive_text(
+        f"prefix {partially_redacted} and api_key={second_secret}",
+        engine._config,
+    )
+
+    assert first_secret not in redacted
+    assert second_secret not in redacted
+    assert redacted.count("[LCM sensitive redaction:") == 2
+
+
+def test_sensitive_patterns_redact_user_assistant_tool_and_tool_calls_before_sqlite_write(tmp_path):
+    engine = _sensitive_engine(tmp_path)
+    user_secret = "sk-usersecret1234567890abcdef"
+    assistant_secret = "Bearer assistantTOKEN1234567890abcdef"
+    tool_secret = "password=tool-secret-value"
+    tool_call_secret = "sk-toolcall1234567890abcdef"
+
+    engine._ingest_messages([
+        {"role": "user", "content": f"please use api_key={user_secret} for the request"},
+        {
+            "role": "assistant",
+            "content": f"I would call it with {assistant_secret}",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "deploy",
+                        "arguments": json.dumps({"api_key": tool_call_secret}),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": tool_secret},
+    ])
+
+    rows = engine._store._conn.execute(
+        "SELECT content, COALESCE(tool_calls, '') FROM messages ORDER BY store_id"
+    ).fetchall()
+    stored_text = "\n".join("\n".join(row) for row in rows)
+    for raw in (user_secret, assistant_secret, "tool-secret-value", tool_call_secret):
+        assert raw not in stored_text
+        assert engine._store.search(raw, session_id=engine.current_session_id) == []
+    assert stored_text.count("[LCM sensitive redaction:") >= 4
+    assert "please use api_key=" in stored_text
+
+
+def test_sensitive_patterns_redact_before_large_payload_externalization(tmp_path):
+    engine = _sensitive_engine(
+        tmp_path,
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=40,
+    )
+    secret = "sk-externalized1234567890abcdef"
+    content = f"api_key={secret}\n" + ("large payload line\n" * 20)
+
+    engine._ingest_messages([{"role": "user", "content": content}])
+
+    _store_id, stored_content, _tool_calls = _single_message_row(engine, role="user")
+    assert secret not in stored_content
+    ref = _extract_ref(stored_content)
+    expanded = _expand_ref(engine, ref)
+    assert secret not in expanded["content"]
+    assert "[LCM sensitive redaction:" in expanded["content"]
+
+
+def test_sensitive_patterns_redact_before_summary_serialization(tmp_path, monkeypatch):
+    engine = _sensitive_engine(tmp_path, fresh_tail_count=1, leaf_chunk_tokens=1)
+    secret = "sk-summary1234567890abcdef"
+    captured = {}
+
+    def fake_summarize(**kwargs):
+        captured["text"] = kwargs["text"]
+        assert secret not in kwargs["text"]
+        return "summary without raw credential", 1
+
+    monkeypatch.setattr(lcm_engine_module, "summarize_with_escalation", fake_summarize)
+
+    engine.compress(
+        [
+            {"role": "user", "content": f"api_key={secret} should be hidden"},
+            {"role": "user", "content": "fresh tail"},
+        ],
+        current_tokens=10_000,
+    )
+
+    assert captured["text"]
+    assert "[LCM sensitive redaction:" in captured["text"]
+    node = engine._dag.get_session_nodes(engine.current_session_id)[0]
+    assert secret not in node.summary
+
+
+def test_sensitive_patterns_visible_in_status_and_doctor(tmp_path):
+    engine = _sensitive_engine(tmp_path)
+
+    status = json.loads(lcm_tools.lcm_status({}, engine=engine))
+    assert status["ingest_protection"]["sensitive_patterns_enabled"] is True
+    assert "api_key" in status["ingest_protection"]["sensitive_patterns"]
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    protection = next(check for check in doctor["checks"] if check["check"] == "sensitive_pattern_handling")
+    assert protection["status"] == "pass"
+    assert protection["detail"]["enabled"] is True
+    assert "api_key" in protection["detail"]["patterns"]
 
 
 def test_extract_externalized_ref_recovers_tool_and_non_tool_placeholders():

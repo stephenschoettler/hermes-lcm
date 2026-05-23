@@ -347,6 +347,9 @@ class TestConfig:
         assert c.extraction_enabled is False
         assert c.extraction_model == ""
         assert c.extraction_output_path == ""
+        assert c.sensitive_patterns_enabled is False
+        assert c.sensitive_patterns == ["api_key", "bearer_token", "password_assignment", "private_key"]
+        assert c.sensitive_patterns_source == "default"
         assert c.large_output_externalization_enabled is False
         assert c.large_output_externalization_threshold_chars == 12_000
         assert c.large_output_externalization_path == ""
@@ -388,6 +391,8 @@ class TestConfig:
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
         monkeypatch.setenv("LCM_EXTRACTION_MODEL", "openai/gpt-5.4-mini")
         monkeypatch.setenv("LCM_EXTRACTION_OUTPUT_PATH", "/tmp/extractions")
+        monkeypatch.setenv("LCM_SENSITIVE_PATTERNS_ENABLED", "true")
+        monkeypatch.setenv("LCM_SENSITIVE_PATTERNS", "api_key,bearer_token")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", "true")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", "4096")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", "/tmp/lcm-large-outputs")
@@ -417,6 +422,9 @@ class TestConfig:
         assert c.extraction_enabled is True
         assert c.extraction_model == "openai/gpt-5.4-mini"
         assert c.extraction_output_path == "/tmp/extractions"
+        assert c.sensitive_patterns_enabled is True
+        assert c.sensitive_patterns == ["api_key", "bearer_token"]
+        assert c.sensitive_patterns_source == "env"
         assert c.large_output_externalization_enabled is True
         assert c.large_output_externalization_threshold_chars == 4096
         assert c.large_output_externalization_path == "/tmp/lcm-large-outputs"

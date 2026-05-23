@@ -94,6 +94,30 @@ _WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _REPETITION_SEGMENT_SPLIT_RE = re.compile(r"(?:\n+|(?<=[.!?])\s+)")
 _GENERIC_BASE64_MIN_CHARS = 4096
 _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*ref=([^;\]\s]+)\]")
+_SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
+_SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
+    "api_key": re.compile(
+        r"(?P<prefix>\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key)\b\s*[\"']?\s*[:=]\s*[\"']?)"
+        r"(?P<secret>[A-Za-z0-9._~+/=-]{12,})"
+        r"(?P<suffix>[\"']?)",
+        re.IGNORECASE,
+    ),
+    "bearer_token": re.compile(
+        r"(?P<prefix>\bBearer\s+)"
+        r"(?P<secret>[A-Za-z0-9._~+/=-]{12,})",
+        re.IGNORECASE,
+    ),
+    "password_assignment": re.compile(
+        r"(?P<prefix>\b(?:password|passwd|pwd)\b\s*[\"']?\s*[:=]\s*[\"']?)"
+        r"(?P<secret>[^\s,\"'\]}]{6,})"
+        r"(?P<suffix>[\"']?)",
+        re.IGNORECASE,
+    ),
+    "private_key": re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.IGNORECASE | re.DOTALL,
+    ),
+}
 
 
 def is_externalized_ingest_placeholder(text: str) -> bool:
@@ -119,6 +143,154 @@ def extract_ingest_externalized_refs(text: str) -> list[str]:
         if ref and ref not in refs:
             refs.append(ref)
     return refs
+
+
+def sensitive_pattern_status(config) -> dict[str, Any]:
+    """Return metadata-only status for opt-in sensitive redaction."""
+    configured, active, unknown = _configured_sensitive_pattern_names(config)
+    enabled = bool(getattr(config, "sensitive_patterns_enabled", False))
+    return {
+        "sensitive_patterns_enabled": enabled,
+        "enabled": enabled,
+        "sensitive_patterns": configured,
+        "patterns": configured,
+        "active_patterns": active if enabled else [],
+        "unknown_patterns": unknown,
+        "source": getattr(config, "sensitive_patterns_source", "default"),
+        "placeholder_format": "[LCM sensitive redaction: name=<pattern>; chars=<n>; bytes=<n>; sha256=<16>]",
+        "lossless_recovery": False if enabled and active else None,
+    }
+
+
+def _configured_sensitive_pattern_names(config) -> tuple[list[str], list[str], list[str]]:
+    raw = getattr(config, "sensitive_patterns", []) or []
+    if isinstance(raw, str):
+        names = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        names = [str(part).strip() for part in raw if str(part).strip()]
+    if not names:
+        return [], [], []
+    configured: list[str] = []
+    active: list[str] = []
+    unknown: list[str] = []
+    for name in names:
+        normalized = name.lower().strip()
+        if normalized in {"all", "default"}:
+            for catalog_name in _SENSITIVE_PATTERN_CATALOG:
+                if catalog_name not in configured:
+                    configured.append(catalog_name)
+                if catalog_name not in active:
+                    active.append(catalog_name)
+            continue
+        configured.append(normalized)
+        if normalized in _SENSITIVE_PATTERN_CATALOG:
+            if normalized not in active:
+                active.append(normalized)
+        elif normalized not in unknown:
+            unknown.append(normalized)
+    return configured, active, unknown
+
+
+def _active_sensitive_pattern_names(config) -> list[str]:
+    if not bool(getattr(config, "sensitive_patterns_enabled", False)):
+        return []
+    _configured, active, _unknown = _configured_sensitive_pattern_names(config)
+    return active
+
+
+def _sensitive_placeholder(pattern_name: str, secret: str) -> str:
+    digest = hashlib.sha256(secret.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+    return (
+        f"{_SENSITIVE_PLACEHOLDER_PREFIX} "
+        f"name={_safe_placeholder_metadata(pattern_name)}; "
+        f"chars={len(secret)}; bytes={len(secret.encode('utf-8', errors='surrogatepass'))}; "
+        f"sha256={digest}]"
+    )
+
+
+def _redact_match(pattern_name: str, match: re.Match[str]) -> str:
+    group_names = match.re.groupindex
+    if "secret" not in group_names or match.groupdict().get("secret") is None:
+        return _sensitive_placeholder(pattern_name, match.group(0))
+    secret = match.group("secret")
+    relative_start = match.start("secret") - match.start(0)
+    relative_end = match.end("secret") - match.start(0)
+    full = match.group(0)
+    return full[:relative_start] + _sensitive_placeholder(pattern_name, secret) + full[relative_end:]
+
+
+def _sensitive_pattern_for_key(key: Any, active_names: list[str]) -> str | None:
+    if not isinstance(key, str):
+        return None
+    normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+    compact = normalized.replace("_", "")
+    if "api_key" in active_names and (
+        compact in {"apikey", "apitoken", "accesstoken", "secretkey", "clientsecret"}
+        or ("api" in normalized and "key" in normalized)
+        or ("access" in normalized and "token" in normalized)
+        or ("secret" in normalized and "key" in normalized)
+    ):
+        return "api_key"
+    if "bearer_token" in active_names and compact in {"authorization", "authtoken", "bearertoken", "token"}:
+        return "bearer_token"
+    if "password_assignment" in active_names and compact in {"password", "passwd", "pwd", "passphrase"}:
+        return "password_assignment"
+    return None
+
+
+def redact_sensitive_text(text: str, config) -> str:
+    """Replace configured sensitive spans with deterministic placeholders."""
+    if not isinstance(text, str) or not text:
+        return text
+    active_names = _active_sensitive_pattern_names(config)
+    if not active_names:
+        return text
+    protected = text
+    for name in active_names:
+        pattern = _SENSITIVE_PATTERN_CATALOG[name]
+        protected = pattern.sub(lambda match, pattern_name=name: _redact_match(pattern_name, match), protected)
+    return protected
+
+
+def _redact_entire_sensitive_string(text: str, pattern_name: str) -> str:
+    if not text or _SENSITIVE_PLACEHOLDER_PREFIX in text:
+        return text
+    return _sensitive_placeholder(pattern_name, text)
+
+
+def redact_sensitive_value(value: Any, config, *, parse_json_strings: bool = False) -> Any:
+    """Recursively redact configured sensitive values without externalizing data."""
+    active_names = _active_sensitive_pattern_names(config)
+    if not active_names:
+        return value
+    if isinstance(value, dict):
+        protected: dict[Any, Any] = {}
+        for key, val in value.items():
+            protected_key = redact_sensitive_text(key, config) if isinstance(key, str) else key
+            key_pattern = _sensitive_pattern_for_key(key, active_names)
+            if key_pattern and isinstance(val, str):
+                text_redacted = redact_sensitive_text(val, config)
+                if text_redacted == val:
+                    text_redacted = _redact_entire_sensitive_string(val, key_pattern)
+                protected[protected_key] = text_redacted
+            else:
+                protected[protected_key] = redact_sensitive_value(
+                    val,
+                    config,
+                    parse_json_strings=parse_json_strings,
+                )
+        return protected
+    if isinstance(value, list):
+        return [redact_sensitive_value(item, config, parse_json_strings=parse_json_strings) for item in value]
+    if not isinstance(value, str):
+        return value
+    if parse_json_strings:
+        parsed = _maybe_parse_json_string(value)
+        if parsed is not None and not _json_has_duplicate_object_keys(value):
+            protected = redact_sensitive_value(parsed, config, parse_json_strings=True)
+            if protected != parsed:
+                return json.dumps(protected, ensure_ascii=False, separators=(",", ":"))
+    return redact_sensitive_text(value, config)
 
 
 def _safe_placeholder_metadata(value: Any) -> str:
@@ -449,6 +621,11 @@ def _protect_value(
     hermes_home: str,
     parse_json_strings: bool = False,
 ) -> Any:
+    value = redact_sensitive_value(
+        value,
+        config,
+        parse_json_strings=parse_json_strings,
+    )
     if isinstance(value, dict):
         protected: dict[Any, Any] = {}
         for key, val in value.items():
@@ -554,6 +731,7 @@ def protect_inline_payloads_in_text(
     """
     if not isinstance(text, str):
         return text
+    text = redact_sensitive_text(text, config)
     return _protect_payload_substrings(
         text,
         role=role,
@@ -591,7 +769,11 @@ def protect_message_for_ingest(
     """
     msg = dict(message or {})
     role = str(msg.get("role") or "unknown")
-    original_content = msg.get("content")
+    original_content = redact_sensitive_value(
+        msg.get("content"),
+        config,
+        parse_json_strings=False,
+    )
     normalized_content = normalize_content_value(original_content)
 
     # Preserve the pre-existing opt-in large-output behavior on message content.

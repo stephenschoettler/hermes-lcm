@@ -47,6 +47,7 @@ compacted.
 - **Source-aware retrieval** - filters raw rows and summaries by descendant source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with glob patterns
 - **Large payload controls** - optional ingest-time externalization for oversized tool/media/raw payloads, plus transcript GC for already-externalized tool results
+- **Sensitive-pattern controls** - optional named redaction of API keys, bearer tokens, passwords, and private keys before LCM stores or summarizes them
 - **Storage-boundary payload guard** - media-ish `data:*;base64` and long base64-looking strings are externalized before LCM writes them to SQLite
 - **Diagnostics** - `lcm_status`, `lcm_doctor`, and optional `/lcm` slash commands
 
@@ -196,6 +197,8 @@ environment variables:
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
 | `LCM_STATELESS_SESSION_PATTERNS` | empty | Comma-separated session globs kept read-only |
 | `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content (plain text, extracted text parts for structured/multimodal content, or normalized JSON fallback when no text parts exist) is excluded from LCM storage |
+| `LCM_SENSITIVE_PATTERNS_ENABLED` | `false` | Opt in to deterministic redaction before LCM storage, FTS indexing, summarization, active replay, and externalized ingest payloads |
+| `LCM_SENSITIVE_PATTERNS` | `api_key,bearer_token,password_assignment,private_key` | Comma-separated named sensitive pattern catalog entries to apply when redaction is enabled |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized ingest payloads, including tool results, media blocks, and generic raw content, in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for normalized payload text |
 | `LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED` | `false` | Rewrite already-externalized summarized tool rows to compact placeholders |
@@ -210,6 +213,15 @@ environment variables:
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
 
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
+
+Sensitive-pattern handling is disabled by default so ordinary LCM storage and
+`lcm_expand` remain lossless. When `LCM_SENSITIVE_PATTERNS_ENABLED=true`, matched
+secret values are replaced with deterministic metadata-only placeholders before
+SQLite, FTS, summaries, active replay, and externalized payload JSON receive the
+content. This is intentionally not lossless for matching values: the raw matched
+secret is unrecoverable after redaction. `lcm_status` and `lcm_doctor` expose the
+enabled state, configured pattern names, unknown names, source, and placeholder
+format without exposing raw secret values.
 
 ### Cache policy boundary
 

@@ -22,6 +22,7 @@ from .ingest_protection import (
     extract_ingest_externalized_refs,
     restore_ingest_payload_placeholders,
     scan_sqlite_payload_risks,
+    sensitive_pattern_status,
 )
 from .model_routing import apply_lcm_model_route
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
@@ -1583,6 +1584,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             ),
         },
         "source_lineage": source_lineage,
+        "ingest_protection": full_status.get("ingest_protection", sensitive_pattern_status(engine._config)),
         "ingest_reconciliation": ingest_reconciliation,
         "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
@@ -1674,6 +1676,25 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "payload_storage",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    try:
+        protection = sensitive_pattern_status(engine._config)
+        protection_status = "pass"
+        if protection["enabled"] and not protection["active_patterns"]:
+            protection_status = "warn"
+        elif protection["unknown_patterns"]:
+            protection_status = "warn"
+        checks.append({
+            "check": "sensitive_pattern_handling",
+            "status": protection_status,
+            "detail": protection,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "sensitive_pattern_handling",
             "status": "fail",
             "detail": str(e),
         })
