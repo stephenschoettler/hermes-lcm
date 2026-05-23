@@ -97,7 +97,7 @@ _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*r
 _SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
 _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     "api_key": re.compile(
-        r"(?P<prefix>\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key)\b\s*[\"']?\s*[:=]\s*[\"']?)"
+        r"(?P<prefix>\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|client[_-]?secret)\b\s*[\"']?\s*[:=]\s*[\"']?)"
         r"(?P<secret>[A-Za-z0-9._~+/=-]{12,})"
         r"(?P<suffix>[\"']?)",
         re.IGNORECASE,
@@ -108,9 +108,9 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "password_assignment": re.compile(
-        r"(?P<prefix>\b(?:password|passwd|pwd)\b\s*[\"']?\s*[:=]\s*[\"']?)"
-        r"(?P<secret>[^\s,\"'\]}]{6,})"
-        r"(?P<suffix>[\"']?)",
+        r"(?P<prefix>\b(?:password|passwd|pwd|passphrase)\b\s*[\"']?\s*[:=]\s*)"
+        r"(?:(?P<quote>[\"'])(?P<secret_quoted>[^\r\n\]\}]{6,}?)(?P=quote)|"
+        r"(?P<secret_unquoted>[^\s,\"'\]}]{6,}))",
         re.IGNORECASE,
     ),
     "private_key": re.compile(
@@ -157,7 +157,7 @@ def sensitive_pattern_status(config) -> dict[str, Any]:
         "active_patterns": active if enabled else [],
         "unknown_patterns": unknown,
         "source": getattr(config, "sensitive_patterns_source", "default"),
-        "placeholder_format": "[LCM sensitive redaction: name=<pattern>; chars=<n>; bytes=<n>; sha256=<16>]",
+        "placeholder_format": "[LCM sensitive redaction: name=<pattern>; chars=<n>; bytes=<n>; sha256=<16 for non-password>]",
         "lossless_recovery": False if enabled and active else None,
     }
 
@@ -199,22 +199,29 @@ def _active_sensitive_pattern_names(config) -> list[str]:
 
 
 def _sensitive_placeholder(pattern_name: str, secret: str) -> str:
-    digest = hashlib.sha256(secret.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
-    return (
+    parts = [
         f"{_SENSITIVE_PLACEHOLDER_PREFIX} "
         f"name={_safe_placeholder_metadata(pattern_name)}; "
-        f"chars={len(secret)}; bytes={len(secret.encode('utf-8', errors='surrogatepass'))}; "
-        f"sha256={digest}]"
-    )
+        f"chars={len(secret)}; bytes={len(secret.encode('utf-8', errors='surrogatepass'))}"
+    ]
+    if pattern_name != "password_assignment":
+        digest = hashlib.sha256(secret.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+        parts.append(f"sha256={digest}")
+    return "; ".join(parts) + "]"
 
 
 def _redact_match(pattern_name: str, match: re.Match[str]) -> str:
     group_names = match.re.groupindex
-    if "secret" not in group_names or match.groupdict().get("secret") is None:
+    secret_group = None
+    for candidate in ("secret", "secret_quoted", "secret_unquoted"):
+        if candidate in group_names and match.groupdict().get(candidate) is not None:
+            secret_group = candidate
+            break
+    if secret_group is None:
         return _sensitive_placeholder(pattern_name, match.group(0))
-    secret = match.group("secret")
-    relative_start = match.start("secret") - match.start(0)
-    relative_end = match.end("secret") - match.start(0)
+    secret = match.group(secret_group)
+    relative_start = match.start(secret_group) - match.start(0)
+    relative_end = match.end(secret_group) - match.start(0)
     full = match.group(0)
     return full[:relative_start] + _sensitive_placeholder(pattern_name, secret) + full[relative_end:]
 

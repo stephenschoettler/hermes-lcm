@@ -218,6 +218,116 @@ def test_sensitive_patterns_visible_in_status_and_doctor(tmp_path):
     assert "api_key" in protection["detail"]["patterns"]
 
 
+def test_sensitive_patterns_redact_bypassed_active_replay_without_storage(tmp_path):
+    secret = "sk-bypasssecret1234567890abcdef"
+    tool_secret = "sk-bypasstoolsecret1234567890abcdef"
+    messages = [
+        {"role": "user", "content": f"api_key={secret}"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": json.dumps({"api_key": tool_secret}),
+                    },
+                }
+            ],
+        },
+    ]
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "no-session.db"),
+        large_output_externalization_path=str(tmp_path / "no-session-externalized"),
+        sensitive_patterns_enabled=True,
+    )
+    no_session_engine = LCMEngine(config=config, hermes_home=str(tmp_path / "no-session-home"))
+    no_session_active = no_session_engine._ingest_messages(deepcopy(messages))
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "ignored.db"),
+        large_output_externalization_path=str(tmp_path / "ignored-externalized"),
+        sensitive_patterns_enabled=True,
+        ignore_session_patterns=["cron:*"],
+    )
+    ignored_engine = LCMEngine(config=config, hermes_home=str(tmp_path / "ignored-home"))
+    ignored_engine.on_session_start(
+        "nightly",
+        platform="cron",
+        conversation_id="ignored-conversation",
+        context_length=200_000,
+    )
+    ignored_active = ignored_engine.compress(deepcopy(messages), current_tokens=0)
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "stateless.db"),
+        large_output_externalization_path=str(tmp_path / "stateless-externalized"),
+        sensitive_patterns_enabled=True,
+        stateless_session_patterns=["debug:*"],
+    )
+    stateless_engine = LCMEngine(config=config, hermes_home=str(tmp_path / "stateless-home"))
+    stateless_engine.on_session_start(
+        "scratch",
+        platform="debug",
+        conversation_id="stateless-conversation",
+        context_length=200_000,
+    )
+    stateless_active = stateless_engine.compress(deepcopy(messages), current_tokens=0)
+
+    for active in (no_session_active, ignored_active, stateless_active):
+        active_text = json.dumps(active, sort_keys=True)
+        assert secret not in active_text
+        assert tool_secret not in active_text
+        assert active_text.count("[LCM sensitive redaction:") == 2
+        assert "content" not in active[1]
+
+    assert ignored_engine._store.get_session_messages(ignored_engine.current_session_id) == []
+    assert stateless_engine._store.get_session_messages(stateless_engine.current_session_id) == []
+
+
+def test_sensitive_patterns_cover_client_secret_duplicate_json_and_quoted_passwords(tmp_path):
+    engine = _sensitive_engine(tmp_path)
+    client_secret = "oauthsupersecret1234567890"
+    first_json_secret = "oldoauthclientsecret1234567890"
+    second_json_secret = "newoauthclientsecret1234567890"
+    password_phrase = "correct horse battery staple"
+    duplicate_key_json = (
+        f'{{"client_secret":"{first_json_secret}",'
+        f'"client_secret":"{second_json_secret}"}}'
+    )
+
+    engine._ingest_messages([
+        {
+            "role": "user",
+            "content": f"client_secret={client_secret} password=\"{password_phrase}\"",
+        },
+        {
+            "role": "assistant",
+            "content": "prepared oauth call",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "oauth", "arguments": duplicate_key_json},
+                }
+            ],
+        },
+    ])
+
+    rows = engine._store._conn.execute(
+        "SELECT content, COALESCE(tool_calls, '') FROM messages ORDER BY store_id"
+    ).fetchall()
+    stored_text = "\n".join("\n".join(row) for row in rows)
+    for raw in (client_secret, first_json_secret, second_json_secret, password_phrase, "horse battery staple"):
+        assert raw not in stored_text
+        assert engine._store.search(raw, session_id=engine.current_session_id) == []
+    assert "client_secret=" in stored_text
+    assert 'password="[LCM sensitive redaction:' in stored_text
+    assert "sha256=" not in stored_text.split('password="', 1)[1].split('"', 1)[0]
+
+
 def test_extract_externalized_ref_recovers_tool_and_non_tool_placeholders():
     placeholders = [
         "[Externalized tool output: tool_call_id=call_1; chars=1200; bytes=1200; ref=tool.json]",

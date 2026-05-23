@@ -216,12 +216,27 @@ Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
 
 Sensitive-pattern handling is disabled by default so ordinary LCM storage and
 `lcm_expand` remain lossless. When `LCM_SENSITIVE_PATTERNS_ENABLED=true`, matched
-secret values are replaced with deterministic metadata-only placeholders before
-SQLite, FTS, summaries, active replay, and externalized payload JSON receive the
-content. This is intentionally not lossless for matching values: the raw matched
-secret is unrecoverable after redaction. `lcm_status` and `lcm_doctor` expose the
-enabled state, configured pattern names, unknown names, source, and placeholder
-format without exposing raw secret values.
+secret values are replaced with metadata-only placeholders before SQLite, FTS,
+summaries, active replay, and externalized payload JSON receive the content. This
+is intentionally not lossless for matching values: the raw matched secret is
+unrecoverable after redaction.
+
+Supported named catalog entries are:
+
+- `api_key`: `api_key`, `api_token`, `access_token`, `secret_key`, and
+  `client_secret` assignments or JSON keys.
+- `bearer_token`: `Bearer ...` strings and token-like JSON keys.
+- `password_assignment`: `password`, `passwd`, `pwd`, and `passphrase`
+  assignments or JSON keys, including quoted values with spaces.
+- `private_key`: PEM private-key blocks.
+
+Redaction is forward-only. Enabling it does not rewrite existing SQLite rows,
+FTS shadow tables, DAG summaries, or externalized payload JSON that were written
+before the setting was enabled. Non-password placeholders include a short
+truncated SHA-256 digest for correlation. `password_assignment` placeholders omit
+the digest to avoid making password-like values easier to dictionary-check.
+`lcm_status` and `lcm_doctor` expose the enabled state, configured pattern names,
+unknown names, source, and placeholder format without exposing raw secret values.
 
 ### Cache policy boundary
 

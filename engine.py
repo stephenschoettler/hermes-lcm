@@ -821,7 +821,7 @@ class LCMEngine(ContextEngine):
             )
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = f"bypassed: {reason}"
-            return messages
+            return self._redact_active_replay_messages(messages)
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
         force_overflow = self._should_force_overflow_recovery(
@@ -2935,6 +2935,25 @@ class LCMEngine(ContextEngine):
         )
         return 0
 
+    def _redact_active_replay_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        redacted_replay_messages: list[Dict[str, Any]] = []
+        for message in messages:
+            redacted_message = dict(message)
+            if "content" in redacted_message:
+                redacted_message["content"] = redact_sensitive_value(
+                    redacted_message.get("content"),
+                    self._config,
+                    parse_json_strings=False,
+                )
+            if "tool_calls" in redacted_message:
+                redacted_message["tool_calls"] = redact_sensitive_value(
+                    redacted_message.get("tool_calls"),
+                    self._config,
+                    parse_json_strings=True,
+                )
+            redacted_replay_messages.append(redacted_message)
+        return redacted_replay_messages
+
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -2950,7 +2969,7 @@ class LCMEngine(ContextEngine):
         """
         if not self._session_id:
             logger.debug("Ingest skipped: no session_id")
-            return list(messages)
+            return self._redact_active_replay_messages(messages)
 
         if self._session_ignored or self._session_stateless:
             logger.debug(
@@ -2958,7 +2977,7 @@ class LCMEngine(ContextEngine):
                 "ignored" if self._session_ignored else "stateless",
                 self._session_id,
             )
-            return list(messages)
+            return self._redact_active_replay_messages(messages)
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
@@ -2981,23 +3000,7 @@ class LCMEngine(ContextEngine):
             externalize=externalize_messages,
             prefer_existing_externalized=prefer_existing_externalized,
         )
-        redacted_replay_messages: list[Dict[str, Any]] = []
-        for message in replay_messages:
-            redacted_message = dict(message)
-            if "content" in redacted_message:
-                redacted_message["content"] = redact_sensitive_value(
-                    redacted_message.get("content"),
-                    self._config,
-                    parse_json_strings=False,
-                )
-            if "tool_calls" in redacted_message:
-                redacted_message["tool_calls"] = redact_sensitive_value(
-                    redacted_message.get("tool_calls"),
-                    self._config,
-                    parse_json_strings=True,
-                )
-            redacted_replay_messages.append(redacted_message)
-        replay_messages = redacted_replay_messages
+        replay_messages = self._redact_active_replay_messages(replay_messages)
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = replay_messages
             if self._compiled_ignore_message_patterns:

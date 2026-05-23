@@ -1077,7 +1077,7 @@ def _doctor_text(engine) -> str:
     protection = sensitive_pattern_status(engine._config)
     if protection["enabled"] and protection["active_patterns"]:
         observations.append(
-            "sensitive_pattern_handling: enabled; matching raw secret values are replaced before SQLite, FTS, summaries, and externalized payloads"
+            "sensitive_pattern_handling: enabled; matching raw secret values are replaced before SQLite, FTS, summaries, active replay, and externalized payloads"
         )
     elif protection["enabled"]:
         observations.append("sensitive_pattern_handling: enabled but no active known patterns are configured")
