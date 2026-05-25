@@ -56,6 +56,21 @@ def _policy_versions(rows: list[ReplayMetrics]) -> dict[str, str | list[str]]:
     }
 
 
+def _summary_failure_modes(rows: list[ReplayMetrics]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        mode = row.summary_failure_mode.value if hasattr(row.summary_failure_mode, "value") else str(row.summary_failure_mode)
+        counts[mode] += 1
+    return dict(sorted(counts.items()))
+
+
+def _summary_level_runs(rows: list[ReplayMetrics]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        counts[str(row.summary_level)] += 1
+    return dict(sorted(counts.items()))
+
+
 def _metric_summary(rows: list[ReplayMetrics]) -> dict[str, object]:
     total_canaries = sum(row.total_canaries for row in rows)
     return {
@@ -63,6 +78,8 @@ def _metric_summary(rows: list[ReplayMetrics]) -> dict[str, object]:
         "compression_count": sum(row.compression_count for row in rows),
         "compaction_attempts": sum(row.compaction_attempts for row in rows),
         "repeated_compaction_risk_count": sum(1 for row in rows if row.repeated_compaction_risk),
+        "summary_failure_modes": _summary_failure_modes(rows),
+        "summary_level_runs": _summary_level_runs(rows),
         "fresh_tail_pressure_events": sum(
             1 for row in rows if row.fresh_tail_pressure_ratio >= FRESH_TAIL_PRESSURE_THRESHOLD
         ),

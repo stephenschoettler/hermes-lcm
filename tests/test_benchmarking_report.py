@@ -14,6 +14,8 @@ def _metrics(
     active_canaries_found: int = 1,
     retrieval_canaries_found: int = 1,
     total_canaries: int = 1,
+    summary_level: int = 1,
+    summary_failure_mode: str = "none",
     repeated_compaction_risk: bool = False,
     fresh_tail_pressure_ratio: float = 0.10,
     failures: list[str] | None = None,
@@ -38,6 +40,8 @@ def _metrics(
         active_canaries_found=active_canaries_found,
         retrieval_canaries_found=retrieval_canaries_found,
         total_canaries=total_canaries,
+        summary_level=summary_level,
+        summary_failure_mode=summary_failure_mode,
         active_canary_recall=active_canaries_found / total_canaries,
         retrieval_canary_recall=retrieval_canaries_found / total_canaries,
         failures=failures or [],
@@ -91,6 +95,39 @@ def test_summarize_metrics_includes_versioned_provenance_and_comparison():
     ]
     assert summary["metric_summary"]["repeated_compaction_risk_count"] == 1
     assert [row["policy_name"] for row in summary["policy_comparison"]] == ["candidate", "baseline"]
+
+
+
+def test_summarize_metrics_groups_summary_failure_modes():
+    rows = [
+        _metrics(
+            policy_name="candidate",
+            summary_level=1,
+            summary_failure_mode="none",
+        ),
+        _metrics(
+            policy_name="candidate",
+            summary_level=3,
+            summary_failure_mode="llm_timeout_then_truncate",
+            failures=["TimeoutError: summary provider timed out"],
+        ),
+        _metrics(
+            policy_name="baseline",
+            summary_level=3,
+            summary_failure_mode="llm_refusal_then_truncate",
+        ),
+    ]
+
+    summary = summarize_metrics(rows)
+
+    assert summary["metric_summary"]["summary_failure_modes"] == {
+        "none": 1,
+        "llm_refusal_then_truncate": 1,
+        "llm_timeout_then_truncate": 1,
+    }
+    assert summary["metric_summary"]["summary_level_runs"] == {"1": 1, "3": 2}
+    candidate_row = next(row for row in summary["policy_comparison"] if row["policy_name"] == "candidate")
+    assert candidate_row["summary_failure_modes"]["llm_timeout_then_truncate"] == 1
 
 
 def test_build_community_export_is_scrubbed_and_includes_policy_settings():
