@@ -3094,6 +3094,38 @@ class TestEscalation:
     def test_truncate_short(self):
         assert _deterministic_truncate("hello", 1000) == "hello"
 
+    def test_focus_topic_builds_structured_l1_brief(self):
+        from hermes_lcm.escalation import _build_l1_prompt
+        prompt = _build_l1_prompt(
+            "test content", 500, depth=0,
+            focus_topic="database migrations",
+        )
+        assert "Focus brief:" in prompt
+        assert "Primary focus: database migrations" in prompt
+        assert "Preserve concrete decisions, constraints, files, commands, identifiers, and current state for this focus." in prompt
+        assert "Do not discard unrelated blockers or active tasks just because they are off-focus." in prompt
+
+    def test_focus_topic_builds_structured_l2_brief(self):
+        from hermes_lcm.escalation import _build_l2_prompt
+        prompt = _build_l2_prompt(
+            "test content", 500,
+            focus_topic="release blockers",
+        )
+        assert "Focus brief:" in prompt
+        assert "Primary focus: release blockers" in prompt
+        assert "Prefer bullets that preserve decisions, blockers, files, commands, identifiers, and current state for this focus." in prompt
+        assert "Keep other active tasks only when they are current blockers or handoff state." in prompt
+
+    def test_focus_topic_is_normalized_and_bounded_in_prompts(self):
+        from hermes_lcm.escalation import _build_l1_prompt
+        noisy_focus = "  migration\n\n" + ("very-long-topic " * 40)
+        prompt = _build_l1_prompt("test content", 500, depth=0, focus_topic=noisy_focus)
+        primary_focus_line = next(line for line in prompt.splitlines() if line.startswith("Primary focus:"))
+        assert "\n" not in primary_focus_line
+        assert "migration very-long-topic" in primary_focus_line
+        assert len(primary_focus_line) <= 180
+        assert primary_focus_line.endswith("…")
+
     def test_custom_instructions_injected_into_l1_prompt(self):
         from hermes_lcm.escalation import _build_l1_prompt
         prompt = _build_l1_prompt(

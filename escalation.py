@@ -78,6 +78,39 @@ def _invoke_summary_llm(prompt: str, max_tokens: int, model: str = "", timeout: 
     return _call_llm_for_summary(prompt, max_tokens, **kwargs)
 
 
+def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:
+    """Return a single-line, bounded focus topic for prompt injection."""
+    normalized = " ".join(str(focus_topic or "").split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max(0, max_chars - 1)].rstrip() + "…"
+
+
+def _build_l1_focus_brief(focus_topic: str) -> str:
+    topic = _normalized_focus_topic(focus_topic)
+    if not topic:
+        return ""
+    return (
+        "Focus brief:\n"
+        f"Primary focus: {topic}\n"
+        "Preserve concrete decisions, constraints, files, commands, identifiers, and current state for this focus.\n"
+        "Spend roughly 60-70% of the summary budget on the focus when relevant.\n"
+        "Do not discard unrelated blockers or active tasks just because they are off-focus.\n"
+    )
+
+
+def _build_l2_focus_brief(focus_topic: str) -> str:
+    topic = _normalized_focus_topic(focus_topic)
+    if not topic:
+        return ""
+    return (
+        "Focus brief:\n"
+        f"Primary focus: {topic}\n"
+        "Prefer bullets that preserve decisions, blockers, files, commands, identifiers, and current state for this focus.\n"
+        "Keep other active tasks only when they are current blockers or handoff state.\n"
+    )
+
+
 def _build_l1_prompt(text: str, token_budget: int, depth: int,
                      focus_topic: str = "", custom_instructions: str = "") -> str:
     """Level 1: preserve details."""
@@ -88,12 +121,7 @@ def _build_l1_prompt(text: str, token_budget: int, depth: int,
     }
     guidance = depth_guidance.get(depth, depth_guidance[2])
 
-    focus_guidance = ""
-    if focus_topic:
-        focus_guidance = (
-            f'Prioritize preserving information related to: "{focus_topic}".\n'
-            "Spend roughly 60-70% of the summary budget on that topic when relevant.\n"
-        )
+    focus_guidance = _build_l1_focus_brief(focus_topic)
 
     custom_block = ""
     if custom_instructions:
@@ -114,11 +142,7 @@ CONTENT:
 def _build_l2_prompt(text: str, token_budget: int,
                      focus_topic: str = "", custom_instructions: str = "") -> str:
     """Level 2: aggressive bullet points."""
-    focus_guidance = ""
-    if focus_topic:
-        focus_guidance = (
-            f'Prioritize bullets related to: "{focus_topic}" when present.\n'
-        )
+    focus_guidance = _build_l2_focus_brief(focus_topic)
 
     custom_block = ""
     if custom_instructions:
