@@ -3152,6 +3152,86 @@ class TestEscalation:
         assert "Additional instructions:" not in l2
 
 
+class TestAssemblyBudgetSelection:
+    def _engine(self, tmp_path: Path, monkeypatch, *, max_assembly_tokens: int = 120):
+        if "agent.context_engine" not in sys.modules:
+            agent_mod = ModuleType("agent")
+            agent_mod.__path__ = []
+            context_engine_mod = ModuleType("agent.context_engine")
+
+            class ContextEngine:
+                def __init__(self, **kwargs):
+                    self.compression_count = 0
+                    self.last_prompt_tokens = 0
+
+                def get_status(self):
+                    return {}
+
+            setattr(context_engine_mod, "ContextEngine", ContextEngine)
+            monkeypatch.setitem(sys.modules, "agent", agent_mod)
+            monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_mod)
+
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "assembly.db"),
+            max_assembly_tokens=max_assembly_tokens,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "assembly-session"
+        return engine
+
+    def test_assembly_skips_oversized_assistant_turn_to_preserve_user_prompt(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=120)
+        huge_assistant = "oversized assistant tool chatter " * 400
+
+        assembled = engine._assemble_context(
+            {"role": "system", "content": "System anchor."},
+            [
+                {"role": "user", "content": "KEEP_USER_DECISION: continue with prompt-aware assembly."},
+                {"role": "assistant", "content": huge_assistant},
+                {"role": "assistant", "content": "Latest compact status."},
+            ],
+        )
+
+        contents = "\n".join(str(msg.get("content", "")) for msg in assembled)
+        assert "KEEP_USER_DECISION" in contents
+        assert "Latest compact status" in contents
+        assert "oversized assistant tool chatter" not in contents
+
+    def test_assembly_skips_oversized_summary_and_keeps_later_fit_summary(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=140)
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session",
+            depth=2,
+            summary="HUGE_DURABLE_SUMMARY " * 400,
+            token_count=800,
+            source_token_count=2000,
+            source_ids=[1],
+            source_type="messages",
+            expand_hint="durable huge",
+        ))
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session",
+            depth=0,
+            summary="SMALL_RECENT_SUMMARY: keep current handoff state.",
+            token_count=12,
+            source_token_count=80,
+            source_ids=[2],
+            source_type="messages",
+            expand_hint="recent small",
+        ))
+
+        assembled = engine._assemble_context(
+            {"role": "system", "content": "System anchor."},
+            [],
+        )
+
+        contents = "\n".join(str(msg.get("content", "")) for msg in assembled)
+        assert "SMALL_RECENT_SUMMARY" in contents
+        assert "HUGE_DURABLE_SUMMARY" not in contents
+
+
 class TestIngestExternalization:
     def _engine(self, tmp_path: Path):
         from hermes_lcm.engine import LCMEngine

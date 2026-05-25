@@ -3750,6 +3750,8 @@ class LCMEngine(ContextEngine):
             for msg in reversed(tail_for_selection):
                 msg_tokens = count_message_tokens(msg)
                 if used + tail_token_total + msg_tokens > assembly_cap:
+                    if self._is_budget_droppable_tail_message(msg):
+                        continue
                     break
                 kept_tail_reversed.append(msg)
                 tail_token_total += msg_tokens
@@ -3797,7 +3799,7 @@ class LCMEngine(ContextEngine):
                     if count_message_tokens(candidate_msg) > summary_budget:
                         if part == anchor_part:
                             continue
-                        break
+                        continue
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
@@ -3832,6 +3834,24 @@ class LCMEngine(ContextEngine):
             result = self._sanitize_active_context_messages(trimmed_result)
 
         return result
+
+    def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:
+        """Return whether an over-budget tail message may be evicted.
+
+        User turns are prompt-bearing context and stop tail selection when they
+        cannot fit. Assistant/tool turns are derived context; if one bulky turn
+        blocks older prompt material, skip it and keep scanning for budgetable
+        user intent or compact status that still fits.
+        """
+        role = message.get("role")
+        if role not in {"assistant", "tool"}:
+            return False
+        content = normalize_content_value(message.get("content")) or ""
+        if _PRESERVED_TODO_CONTEXT_PREFIX in content:
+            return False
+        if _PRESERVED_OBJECTIVE_CONTEXT_PREFIX in content:
+            return False
+        return True
 
     def _finalize_forced_overflow_result(
         self,
