@@ -13,6 +13,7 @@ from benchmarking.fixtures import (
 )
 from benchmarking.policies import load_policy
 from benchmarking.replay import run_replay
+from benchmarking.types import SummaryFailureMode
 
 
 def test_load_fixture_parses_canaries(tmp_path):
@@ -84,6 +85,22 @@ def test_make_summary_failure_fixture_marks_profile_and_tags():
     }
     assert "summary_failure" in fixture.tags
     assert "timeout_probe_filler_5" in fixture.messages[1]["content"]
+
+
+def test_make_summary_failure_fixture_accepts_enum_failure_mode():
+    fixture = make_summary_failure_fixture(
+        name="timeout_probe",
+        summary_level=3,
+        summary_failure_mode=SummaryFailureMode.LLM_TIMEOUT_THEN_TRUNCATE,
+        message_pairs=4,
+        canary_count=1,
+        filler_words=6,
+    )
+
+    assert fixture.benchmark_profile == {
+        "summary_level": 3,
+        "summary_failure_mode": "llm_timeout_then_truncate",
+    }
 
 
 def test_make_synthetic_fixture_is_deterministic():

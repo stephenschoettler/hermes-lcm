@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .types import ReplayFixture, SummaryFailureMode
+from .types import ReplayFixture, SummaryFailureMode, _summary_failure_mode
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -140,7 +140,7 @@ def make_summary_failure_fixture(
         filler_words=filler_words,
     )
     tags = list(dict.fromkeys([*fixture.tags, "summary_failure"]))
-    mode = SummaryFailureMode(str(summary_failure_mode))
+    mode = _summary_failure_mode(summary_failure_mode)
     return ReplayFixture(
         name=fixture.name,
         messages=fixture.messages,

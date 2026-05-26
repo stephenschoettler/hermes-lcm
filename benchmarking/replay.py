@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .metrics import canary_present, count_active_canaries, normalize_message_content
-from .types import LCMPolicy, ReplayFixture, ReplayMetrics, SummaryFailureMode
+from .types import LCMPolicy, ReplayFixture, ReplayMetrics, SummaryFailureMode, _summary_failure_mode
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -181,7 +181,7 @@ def _ratio(numerator: int | float, denominator: int | float) -> float:
 def _summary_profile(fixture: ReplayFixture) -> tuple[int, SummaryFailureMode]:
     profile = fixture.benchmark_profile
     level = int(profile.get("summary_level", 1)) if profile else 1
-    mode = SummaryFailureMode(str(profile.get("summary_failure_mode", SummaryFailureMode.NONE))) if profile else SummaryFailureMode.NONE
+    mode = _summary_failure_mode(profile.get("summary_failure_mode")) if profile else SummaryFailureMode.NONE
     return level, mode
 
 
