@@ -8080,7 +8080,7 @@ class TestAssemblyGuardrails:
 
         assert [msg["content"] for msg in result[1:]] == ["b" * 20, "c" * 20]
 
-    def test_max_assembly_tokens_skips_droppable_assistant_gap_with_varied_sizes(self, tmp_path, monkeypatch):
+    def test_max_assembly_tokens_does_not_emit_raw_messages_across_droppable_assistant_gap(self, tmp_path, monkeypatch):
         import importlib
 
         config = LCMConfig(
@@ -8108,7 +8108,7 @@ class TestAssemblyGuardrails:
             ],
         )
 
-        assert [msg["content"] for msg in result[1:]] == ["a" * 10, "c" * 20]
+        assert [msg["content"] for msg in result[1:]] == ["c" * 20]
 
     def test_summary_budget_skips_oversized_summary_and_keeps_later_fit_part(self, tmp_path, monkeypatch):
         import importlib

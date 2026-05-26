@@ -2775,6 +2775,20 @@ class LCMEngine(ContextEngine):
                 and len(candidate_messages) >= raw_session_count
                 and raw_session_count > 1
             )
+            has_preserved_objective_scaffold = any(
+                str(msg.get("role") or "") != "system"
+                and (normalize_content_value(msg.get("content")) or "").lstrip().startswith(
+                    _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
+                )
+                for msg in candidate_messages
+            )
+            candidate_suffix_has_user_turn = any(identity[0] == "user" for identity in candidate_prefix)
+            has_scaffold_suffix_replay = (
+                matches_sanitized_tail
+                and has_preserved_objective_scaffold
+                and not candidate_suffix_has_user_turn
+                and cursor < len(messages)
+            )
             has_raw_cleanup_replay = (
                 matches_raw_tail
                 and has_scaffold_evidence
@@ -2782,7 +2796,7 @@ class LCMEngine(ContextEngine):
                 and len(candidate_prefix) >= max(1, self._config.fresh_tail_count)
                 and raw_suffix_needs_cleanup_equivalence
             )
-            if has_effective_full_replay or has_raw_full_replay or has_raw_cleanup_replay:
+            if has_effective_full_replay or has_raw_full_replay or has_scaffold_suffix_replay or has_raw_cleanup_replay:
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
@@ -3749,6 +3763,8 @@ class LCMEngine(ContextEngine):
 
         tail_selected = tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
+        if anchor_source is None:
+            anchor_source = tail_messages
         anchor_part: Optional[str] = None
         summary_budget = None
         if assembly_cap is not None:
@@ -3759,11 +3775,15 @@ class LCMEngine(ContextEngine):
                 tail_messages,
                 insert_missing_tool_stubs=False,
             )
+            skipped_tail_gap = False
             for msg in reversed(tail_for_selection):
                 msg_tokens = count_message_tokens(msg)
                 if used + tail_token_total + msg_tokens > assembly_cap:
                     if self._is_budget_droppable_tail_message(msg):
+                        skipped_tail_gap = True
                         continue
+                    break
+                if skipped_tail_gap and kept_tail_reversed:
                     break
                 kept_tail_reversed.append(msg)
                 tail_token_total += msg_tokens

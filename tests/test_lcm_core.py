@@ -3267,6 +3267,13 @@ class TestAssemblyBudgetSelection:
             monkeypatch.setitem(sys.modules, "agent", agent_mod)
             monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_mod)
 
+        # conftest may have left a partially imported module when agent.context_engine
+        # was unavailable during package registration. Force import against the fake
+        # only for that broken stub; keep a healthy module so monkeypatch targets
+        # remain identical across adjacent tests.
+        existing_engine_module = sys.modules.get("hermes_lcm.engine")
+        if existing_engine_module is not None and not hasattr(existing_engine_module, "LCMEngine"):
+            sys.modules.pop("hermes_lcm.engine", None)
         from hermes_lcm.engine import LCMEngine
 
         config = LCMConfig(
@@ -3294,6 +3301,83 @@ class TestAssemblyBudgetSelection:
         assert "KEEP_USER_DECISION" in contents
         assert "Latest compact status" in contents
         assert "oversized assistant tool chatter" not in contents
+        assert not any(
+            msg.get("role") == "user" and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            for msg in assembled
+        )
+
+    def test_non_contiguous_preserved_prompt_replay_does_not_duplicate_durable_rows(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=450)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old compactable question"},
+            {"role": "assistant", "content": "old compactable answer"},
+            {"role": "user", "content": "KEEP_USER_DECISION: continue prompt-aware assembly"},
+            {"role": "assistant", "content": "oversized assistant tool chatter " * 400},
+            {"role": "assistant", "content": "Latest compact status."},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("assembly-session") == len(messages)
+        engine._dag.add_node(SummaryNode(
+            session_id="assembly-session",
+            depth=0,
+            summary="Earlier compacted details.",
+            token_count=10,
+            source_token_count=100,
+            source_ids=[2, 3],
+            source_type="messages",
+            expand_hint="earlier details",
+        ))
+
+        assembled = engine._assemble_context(messages[0], messages[1:])
+        assert any(
+            "[Current user objective preserved from compacted history]" in str(msg.get("content", ""))
+            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            for msg in assembled
+        )
+        assert not any(
+            msg.get("role") == "user" and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            for msg in assembled
+        )
+
+        from hermes_lcm.engine import LCMEngine
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "assembly-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(assembled + [{"role": "user", "content": "new user after restart"}])
+
+        assert replay._store.get_session_count("assembly-session") == len(messages) + 1
+
+    def test_preserved_objective_scaffold_does_not_skip_new_repeated_user_tail(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=450)
+        persisted_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "stored setup"},
+            {"role": "assistant", "content": "stored answer"},
+            {"role": "user", "content": "repeat me"},
+        ]
+        engine._ingest_messages(persisted_messages)
+        assert engine._store.get_session_count("assembly-session") == len(persisted_messages)
+
+        from hermes_lcm.engine import LCMEngine
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "assembly-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages([
+            {
+                "role": "assistant",
+                "content": "[Current user objective preserved from compacted history]\nstored setup",
+            },
+            {"role": "user", "content": "repeat me"},
+            {"role": "user", "content": "new followup"},
+        ])
+
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(persisted_messages) + 2
+        assert [row["content"] for row in rows].count("repeat me") == 2
+        assert rows[-1]["content"] == "new followup"
 
     def test_assembly_skips_oversized_summary_and_keeps_later_fit_summary(self, tmp_path, monkeypatch):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=140)
