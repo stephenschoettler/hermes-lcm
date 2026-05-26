@@ -3709,6 +3709,51 @@ class TestIngestExternalization:
         assert payload["role"] == "user"
         assert payload["content"] == content
 
+    def test_compress_returns_externalized_stub_for_oversized_active_tail(self, tmp_path):
+        import hermes_lcm.tools as lcm_tools
+        from hermes_lcm.engine import LCMEngine
+
+        engine, output_dir = self._engine(tmp_path)
+        content = "ACTIVE_RAW_NEEDLE:" + ("r" * 5000)
+        messages = [{"role": "user", "content": content}]
+
+        active_context = engine.compress(messages)
+
+        assert len(active_context) == 1
+        active_content = active_context[0]["content"]
+        assert active_content.startswith("[Externalized payload: kind=raw_payload;")
+        assert "ACTIVE_RAW_NEEDLE" not in active_content
+        assert len(active_content) < 512
+        assert messages[0]["content"] == content
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == active_content
+        assert engine._get_store_ids_for_messages(active_context) == [stored[0]["store_id"]]
+        assert engine._store.search("ACTIVE_RAW_NEEDLE", session_id="ingest-session") == []
+        payload_path = next(output_dir.glob("*.json"))
+        expanded = json.loads(
+            lcm_tools.lcm_expand(
+                {"externalized_ref": payload_path.name, "max_tokens": 20_000},
+                engine=engine,
+            )
+        )
+        assert expanded["kind"] == "raw_payload"
+        assert expanded["content"] == content
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(active_context)
+        assert replay._store.get_session_count("ingest-session") == 1
+
+        replay_with_delta = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_with_delta._session_id = "ingest-session"
+        replay_with_delta._ingest_cursor_needs_reconcile = True
+        replay_with_delta._ingest_messages(active_context + [{"role": "user", "content": "followup"}])
+        rows = replay_with_delta._store.get_session_messages("ingest-session")
+        assert len(rows) == 2
+        assert rows[-1]["content"] == "followup"
+
     def test_non_tool_externalized_placeholder_sanitizes_role_metadata_for_ref_parsing(self, tmp_path):
         import hermes_lcm.tools as lcm_tools
 

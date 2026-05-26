@@ -2511,15 +2511,15 @@ class LCMEngine(ContextEngine):
                 session_id=session_id,
             )
             tool_calls = self._restore_ingest_payload_placeholders_in_value(tool_calls, session_id=session_id)
-            ref = extract_externalized_ref(content)
-            if ref and "quarantined_assistant_output" not in content:
-                payload = load_externalized_payload(
-                    ref,
-                    config=self._config,
-                    hermes_home=self._hermes_home,
-                )
-                if payload is not None and isinstance(payload.get("content"), str):
-                    content = payload["content"]
+        ref = extract_externalized_ref(content)
+        if ref and "quarantined_assistant_output" not in content:
+            payload = load_externalized_payload(
+                ref,
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
+            if payload is not None and isinstance(payload.get("content"), str):
+                content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
             str(msg.get("role") or "unknown"),
@@ -2754,6 +2754,13 @@ class LCMEngine(ContextEngine):
                 and self._is_quarantined_assistant_replay_identity(candidate_prefix[0])
                 and self._is_quarantined_assistant_replay_identity(sanitized_replay_tail[0])
             )
+            has_externalized_singleton_replay = (
+                matches_raw_tail
+                and len(candidate_prefix) == 1
+                and raw_session_count == 1
+                and bool(extract_externalized_ref(normalize_content_value(candidate_identity_messages[0].get("content")) or ""))
+                and candidate_prefix == stored_tail
+            )
             has_filtered_full_replay = (
                 matches_sanitized_tail
                 and candidate_dropped_quarantine_replay_placeholder
@@ -2795,7 +2802,13 @@ class LCMEngine(ContextEngine):
                 and len(candidate_prefix) >= max(1, self._config.fresh_tail_count)
                 and raw_suffix_needs_cleanup_equivalence
             )
-            if has_effective_full_replay or has_raw_full_replay or has_scaffold_suffix_replay or has_raw_cleanup_replay:
+            if (
+                has_effective_full_replay
+                or has_externalized_singleton_replay
+                or has_raw_full_replay
+                or has_scaffold_suffix_replay
+                or has_raw_cleanup_replay
+            ):
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
@@ -3045,11 +3058,15 @@ class LCMEngine(ContextEngine):
         if not new_messages:
             return replay_messages
 
-        messages_to_store = new_messages
+        messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
+            (cursor + offset, replay_msg)
+            for offset, replay_msg in enumerate(new_messages)
+        ]
         if self._compiled_ignore_message_patterns:
-            kept: List[Dict[str, Any]] = []
+            kept: list[tuple[int, Dict[str, Any]]] = []
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
-                if ignored_original_messages[cursor + offset] or self._is_volatile_ignored_quarantine_placeholder(
+                absolute_idx = cursor + offset
+                if ignored_original_messages[absolute_idx] or self._is_volatile_ignored_quarantine_placeholder(
                     replay_msg,
                     text_content_for_pattern_matching(replay_msg.get("content")) or "",
                 ):
@@ -3062,15 +3079,15 @@ class LCMEngine(ContextEngine):
                         excerpt,
                     )
                     continue
-                kept.append(replay_msg)
-            messages_to_store = kept
+                kept.append((absolute_idx, replay_msg))
+            messages_to_store_with_index = kept
 
-        if not messages_to_store:
+        if not messages_to_store_with_index:
             self._ingest_cursor = n
             return replay_messages
 
         protected_messages = protect_messages_for_ingest(
-            messages_to_store,
+            [msg for _idx, msg in messages_to_store_with_index],
             session_id=self._session_id,
             config=self._config,
             hermes_home=self._hermes_home,
@@ -3082,9 +3099,15 @@ class LCMEngine(ContextEngine):
             estimates,
             source=self._session_platform,
         )
+        active_replay_messages = list(replay_messages)
+        for (absolute_idx, replay_msg), protected_msg in zip(messages_to_store_with_index, protected_messages):
+            active_msg = dict(protected_msg)
+            if "content" not in replay_msg and active_msg.get("content") in (None, ""):
+                active_msg.pop("content", None)
+            active_replay_messages[absolute_idx] = active_msg
         self._ingest_cursor = n
-        logger.debug("Ingested %d messages into LCM store", len(messages_to_store))
-        return replay_messages
+        logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
+        return active_replay_messages
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         """Map current raw messages back to store_ids in stable store order.
