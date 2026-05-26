@@ -168,6 +168,112 @@ def preset_env_diff(
     return lines
 
 
+def _preset_dry_run_delta(
+    preset: LCMPreset,
+    config: Any,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return structured preset dry-run actions without mutating runtime state."""
+
+    env = environ if environ is not None else os.environ
+    explicit = explicit_operator_overrides(env)
+    invalid = invalid_operator_overrides(env)
+    delta: list[dict[str, Any]] = []
+    for field, preset_value in preset.runtime_env.items():
+        env_var = _FIELD_ENV[field]
+        current = _current_config_value(config, field)
+        if field in explicit:
+            delta.append({
+                "field": field,
+                "env": env_var,
+                "action": "keep_explicit",
+                "current_value": _parse_override_value(field, env[env_var]),
+                "preset_value": preset_value,
+            })
+        elif field in invalid:
+            delta.append({
+                "field": field,
+                "env": env_var,
+                "action": "replace_invalid",
+                "invalid_value": env.get(env_var, ""),
+                "current_value": current,
+                "preset_value": preset_value,
+            })
+        else:
+            delta.append({
+                "field": field,
+                "env": env_var,
+                "action": "set",
+                "current_value": current,
+                "preset_value": preset_value,
+            })
+    return delta
+
+
+def preset_status_payload(
+    engine: Any,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return read-only, machine-readable preset suggestion metadata."""
+
+    env = environ if environ is not None else os.environ
+    preset, reason = suggest_preset_for_engine(engine)
+    explicit = explicit_operator_overrides(env)
+    invalid = invalid_operator_overrides(env)
+    config = getattr(engine, "_config", None)
+
+    explicit_payload = {
+        field: {
+            "env": env_var,
+            "value": _parse_override_value(field, env[env_var]),
+        }
+        for field, env_var in explicit.items()
+    }
+    invalid_payload = {
+        field: {
+            "env": env_var,
+            "value": env.get(env_var, ""),
+            "runtime_value": _current_config_value(config, field),
+            **(
+                {"preset_value": preset.runtime_env[field]}
+                if preset is not None and field in preset.runtime_env
+                else {}
+            ),
+        }
+        for field, env_var in invalid.items()
+    }
+
+    payload: dict[str, Any] = {
+        "read_only": True,
+        "runtime_mutation": False,
+        "reason": reason,
+        "match_confidence": "context-only" if preset is not None else "none",
+        "suggested_preset": None,
+        "provenance": {},
+        "explicit_overrides": explicit_payload,
+        "invalid_overrides": invalid_payload,
+        "dry_run_delta": [],
+    }
+    if preset is None:
+        return payload
+
+    payload["suggested_preset"] = {
+        "name": preset.name,
+        "family": preset.family,
+        "description": preset.description,
+        "policy_version": preset.policy_version,
+        "policy_path": preset.policy_path,
+        "applies_to": list(preset.applies_to),
+        "unsupported_runtime_fields": dict(preset.unsupported_runtime_fields),
+        "notes": preset.notes,
+    }
+    payload["provenance"] = dict(preset.provenance)
+    payload["dry_run_delta"] = _preset_dry_run_delta(preset, config, environ=env)
+    return payload
+
+
 def suggest_preset_for_engine(engine: Any) -> tuple[LCMPreset | None, str]:
     """Return the safest shipped preset suggestion for the current engine state."""
 

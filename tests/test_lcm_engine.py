@@ -12465,6 +12465,34 @@ class TestEngineTools:
         assert result["source_lineage"]["normalized_unknown_messages"] == 1
         assert result["source_lineage"]["legacy_blank_source_messages"] == 0
 
+    def test_handle_status_exposes_structured_preset_suggestion(self, engine, monkeypatch):
+        monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "abc")
+        engine.context_length = 272000
+
+        result = json.loads(engine.handle_tool_call("lcm_status", {}))
+        preset = result["preset_suggestion"]
+
+        assert preset["read_only"] is True
+        assert preset["runtime_mutation"] is False
+        assert preset["suggested_preset"]["name"] == "codex_gpt_long_context"
+        assert preset["suggested_preset"]["family"] == "GPT/Codex long-context"
+        assert preset["match_confidence"] == "context-only"
+        assert preset["provenance"]["benchmark_version"] == "2"
+        assert preset["invalid_overrides"]["fresh_tail_count"] == {
+            "env": "LCM_FRESH_TAIL_COUNT",
+            "value": "abc",
+            "runtime_value": engine._config.fresh_tail_count,
+            "preset_value": 24,
+        }
+        assert {
+            "field": "fresh_tail_count",
+            "env": "LCM_FRESH_TAIL_COUNT",
+            "action": "replace_invalid",
+            "invalid_value": "abc",
+            "current_value": engine._config.fresh_tail_count,
+            "preset_value": 24,
+        } in preset["dry_run_delta"]
+
     def test_handle_status_shows_compression_ratio(self, engine):
         engine._dag.add_node(
             SummaryNode(
