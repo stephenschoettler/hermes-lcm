@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from .model_routing import apply_lcm_model_route
 from .tokens import count_tokens
@@ -185,6 +185,7 @@ def _invoke_summary_llm_chain(
     fallback_models: list[str] | tuple[str, ...] | None = None,
     timeout: float | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
+    accepts_result: Callable[[str], bool] | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
@@ -206,7 +207,7 @@ def _invoke_summary_llm_chain(
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
             result = None
-        if result:
+        if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
             return result
@@ -314,9 +315,10 @@ def summarize_with_escalation(
         fallback_models=fallback_models,
         timeout=timeout,
         circuit_breaker=circuit_breaker,
+        accepts_result=lambda result: count_tokens(result) < source_tokens,
     )
 
-    if l1_result and count_tokens(l1_result) < source_tokens:
+    if l1_result:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
         return l1_result, 1
 
@@ -332,9 +334,10 @@ def summarize_with_escalation(
         fallback_models=fallback_models,
         timeout=timeout,
         circuit_breaker=circuit_breaker,
+        accepts_result=lambda result: count_tokens(result) < source_tokens,
     )
 
-    if l2_result and count_tokens(l2_result) < source_tokens:
+    if l2_result:
         logger.debug("L2 summarization succeeded (%d tokens)", count_tokens(l2_result))
         return l2_result, 2
 

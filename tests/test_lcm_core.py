@@ -314,6 +314,32 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert level == 1
         assert calls == ["primary-model", "fallback-model"]
 
+    def test_summary_fallback_chain_uses_next_model_after_non_compressing_primary(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return "primary verbose text " * 300
+            return "short fallback"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+        )
+
+        assert summary == "short fallback"
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
+
     def test_summary_circuit_breaker_skips_temporarily_open_route(self, monkeypatch):
         from hermes_lcm import escalation
         from hermes_lcm.escalation import SummaryCircuitBreaker
