@@ -238,6 +238,38 @@ def test_lcm_doctor_tool_flags_header_only_database_schema(engine):
     assert "lcm_lifecycle_state" in schema_check["detail"]["missing_tables"]
 
 
+def test_lcm_doctor_handles_closed_store_connection(engine):
+    db_path = Path(engine._store.db_path)
+    engine.shutdown()
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "LCM doctor" in result
+    assert "status: issues-found" in result
+    assert f"database_path: {db_path}" in result
+    assert "schema_core_tables: error:" in result
+    assert "LCM store connection is not initialized" in result
+
+
+def test_lcm_doctor_prioritizes_schema_inspection_error(engine, monkeypatch):
+    def _schema_error(_conn, *, database_path="", required_tables=()):
+        return {
+            "database_path": database_path,
+            "required_tables": ["messages"],
+            "existing_tables": [],
+            "missing_tables": ["messages"],
+            "error": "database disk image is malformed",
+        }
+
+    monkeypatch.setattr(command_mod, "inspect_lcm_schema_health", _schema_error)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "schema_core_tables: error: database disk image is malformed" in result
+    assert "schema_core_tables: missing" not in result
+    assert "verify SQLite can read sqlite_master for the database inspected by Hermes" in result
+
+
 def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "lcm_doctor_actions.db"),

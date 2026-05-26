@@ -173,7 +173,9 @@ def get_existing_table_names(conn: sqlite3.Connection, names: Iterable[str]) -> 
     return existing
 
 
-def _database_path_for_connection(conn: sqlite3.Connection, fallback: str = "") -> str:
+def _database_path_for_connection(conn: sqlite3.Connection | None, fallback: str = "") -> str:
+    if conn is None:
+        return fallback
     try:
         rows = conn.execute("PRAGMA database_list").fetchall()
     except sqlite3.DatabaseError:
@@ -185,7 +187,7 @@ def _database_path_for_connection(conn: sqlite3.Connection, fallback: str = "") 
 
 
 def inspect_lcm_schema_health(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None,
     *,
     database_path: str = "",
     required_tables: Iterable[str] = REQUIRED_CORE_TABLES,
@@ -197,8 +199,12 @@ def inspect_lcm_schema_health(
         "database_path": resolved_path,
         "required_tables": list(required),
         "existing_tables": [],
-        "missing_tables": list(required),
+        "missing_tables": [],
     }
+    if conn is None:
+        detail["error"] = "LCM store connection is not initialized"
+        return detail
+
     try:
         rows = conn.execute(
             """

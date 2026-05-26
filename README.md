@@ -477,9 +477,9 @@ the original text inline rather than dropping data.
 `lcm_doctor` reports the effective SQLite database path, core schema-table
 presence, SQLite `journal_mode`, `quick_check`, database/WAL sizes, the largest
 content/tool-call rows, suspicious inline `data:*;base64` rows, suspicious long
-base64-looking rows, and aggregate externalized-payload stats. Doctor output is
-metadata-only for these scans; it intentionally does not print raw payload
-previews.
+base64-looking rows, and aggregate externalized-payload stats.
+Doctor output is metadata-only for these scans; it intentionally does not print
+raw payload previews.
 
 This guard is scoped to LCM's own `lcm.db` write boundary. It does not prevent
 Hermes core, or any other host layer, from writing inline payloads to Hermes
