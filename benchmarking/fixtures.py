@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .types import ReplayFixture
+from .types import ReplayFixture, SummaryFailureMode, _summary_failure_mode
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -121,3 +121,33 @@ def make_synthetic_fixture(
         "canaries": canaries,
         "tags": ["synthetic", "deterministic"],
     })
+
+
+def make_summary_failure_fixture(
+    *,
+    name: str,
+    summary_level: int,
+    summary_failure_mode: str | SummaryFailureMode,
+    message_pairs: int = 12,
+    canary_count: int = 3,
+    filler_words: int = 40,
+) -> ReplayFixture:
+    """Build a synthetic fixture annotated for summary failure-mode benchmarking."""
+    fixture = make_synthetic_fixture(
+        name=name,
+        message_pairs=message_pairs,
+        canary_count=canary_count,
+        filler_words=filler_words,
+    )
+    tags = list(dict.fromkeys([*fixture.tags, "summary_failure"]))
+    mode = _summary_failure_mode(summary_failure_mode)
+    return ReplayFixture(
+        name=fixture.name,
+        messages=fixture.messages,
+        canaries=fixture.canaries,
+        tags=tags,
+        benchmark_profile={
+            "summary_level": int(summary_level),
+            "summary_failure_mode": mode.value,
+        },
+    )

@@ -9,7 +9,7 @@ import hermes_lcm.engine as lcm_engine
 
 from benchmarking.fixtures import make_synthetic_fixture
 from benchmarking.replay import run_replay, run_replays
-from benchmarking.types import Canary, LCMPolicy, ReplayFixture
+from benchmarking.types import Canary, LCMPolicy, ReplayFixture, SummaryFailureMode
 
 
 def _small_policy(**overrides):
@@ -43,6 +43,23 @@ def test_replay_below_threshold_does_not_compress(tmp_path):
     assert metrics.compression_count == 0
     assert metrics.prompt_tokens_before == metrics.prompt_tokens_after
     assert Path(metrics.database_path).is_relative_to(tmp_path)
+
+
+def test_replay_defaults_partial_summary_profile_failure_mode_to_none(tmp_path):
+    fixture = ReplayFixture(
+        name="partial_summary_profile",
+        messages=[
+            {"role": "system", "content": "You are a test agent."},
+            {"role": "user", "content": "small hello"},
+        ],
+        benchmark_profile={"summary_level": 2},
+    )
+    policy = _small_policy(context_length=10_000, context_threshold=0.90)
+
+    metrics = run_replay(fixture, policy, output_dir=tmp_path)
+
+    assert metrics.summary_level == 2
+    assert metrics.summary_failure_mode is SummaryFailureMode.NONE
 
 
 def test_replay_above_threshold_compresses_and_reports_canary_recall(tmp_path):
