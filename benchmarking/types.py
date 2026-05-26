@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Mapping
+
+
+class SummaryFailureMode(str, Enum):
+    NONE = "none"
+    LLM_TIMEOUT_THEN_TRUNCATE = "llm_timeout_then_truncate"
+    LLM_REFUSAL_THEN_TRUNCATE = "llm_refusal_then_truncate"
+    EMPTY_SUMMARY_THEN_TRUNCATE = "empty_summary_then_truncate"
+
+
+def _summary_failure_mode(value: Any) -> SummaryFailureMode:
+    if isinstance(value, SummaryFailureMode):
+        return value
+    return SummaryFailureMode(str(value or SummaryFailureMode.NONE.value))
 
 
 def _as_bool(value: Any) -> bool:
@@ -79,14 +93,18 @@ class ReplayFixture:
     messages: list[dict[str, Any]]
     canaries: list[Canary] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    benchmark_profile: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data = {
             "name": self.name,
             "messages": list(self.messages),
             "canaries": [canary.to_dict() for canary in self.canaries],
             "tags": list(self.tags),
         }
+        if self.benchmark_profile:
+            data["benchmark_profile"] = dict(self.benchmark_profile)
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ReplayFixture":
@@ -95,6 +113,7 @@ class ReplayFixture:
             messages=[dict(message) for message in data["messages"]],
             canaries=[Canary.from_dict(item) for item in data.get("canaries", [])],
             tags=[str(tag) for tag in data.get("tags", [])],
+            benchmark_profile=dict(data.get("benchmark_profile", {})),
         )
 
 
@@ -114,6 +133,8 @@ class ReplayMetrics:
     failures: list[str] = field(default_factory=list)
     policy_version: str = "1"
     fixture_tags: list[str] = field(default_factory=list)
+    summary_level: int = 1
+    summary_failure_mode: SummaryFailureMode = SummaryFailureMode.NONE
     post_compaction_headroom_ratio: float = 0.0
     fresh_tail_message_count: int = 0
     fresh_tail_tokens: int = 0
@@ -130,7 +151,9 @@ class ReplayMetrics:
     elapsed_ms: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["summary_failure_mode"] = _summary_failure_mode(self.summary_failure_mode).value
+        return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ReplayMetrics":
@@ -149,6 +172,8 @@ class ReplayMetrics:
             failures=[str(item) for item in data.get("failures", [])],
             policy_version=str(data.get("policy_version", "1")),
             fixture_tags=[str(item) for item in data.get("fixture_tags", [])],
+            summary_level=int(data.get("summary_level", 1)),
+            summary_failure_mode=_summary_failure_mode(data.get("summary_failure_mode", SummaryFailureMode.NONE)),
             post_compaction_headroom_ratio=float(data.get("post_compaction_headroom_ratio", 0.0)),
             fresh_tail_message_count=int(data.get("fresh_tail_message_count", 0)),
             fresh_tail_tokens=int(data.get("fresh_tail_tokens", 0)),

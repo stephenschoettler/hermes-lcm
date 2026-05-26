@@ -214,6 +214,12 @@ class LCMConfig:
 
     # -- Models ---
     summary_model: str = ""       # empty = use Hermes auxiliary model
+    # Optional fallback summary models tried after summary_model/task default.
+    summary_fallback_models: list[str] = field(default_factory=list)
+    # Consecutive failed summary calls before a route is skipped temporarily.
+    summary_circuit_breaker_failure_threshold: int = 2
+    # Seconds to skip an open summary route before allowing a retry.
+    summary_circuit_breaker_cooldown_seconds: int = 300
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
     # Serialized summary/raw/child-source/externalized context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
@@ -304,6 +310,17 @@ class LCMConfig:
             c.large_output_transcript_gc_enabled,
         )
         c.summary_model = _str("LCM_SUMMARY_MODEL", c.summary_model)
+        raw_summary_fallback_models = os.environ.get("LCM_SUMMARY_FALLBACK_MODELS")
+        if raw_summary_fallback_models is not None:
+            c.summary_fallback_models = _parse_pattern_list(raw_summary_fallback_models)
+        c.summary_circuit_breaker_failure_threshold = _int(
+            "LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+            c.summary_circuit_breaker_failure_threshold,
+        )
+        c.summary_circuit_breaker_cooldown_seconds = _int(
+            "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
+            c.summary_circuit_breaker_cooldown_seconds,
+        )
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
         c.expansion_context_tokens = _int("LCM_EXPANSION_CONTEXT_TOKENS", c.expansion_context_tokens)
         c.summary_timeout_ms = _int("LCM_SUMMARY_TIMEOUT_MS", c.summary_timeout_ms)
