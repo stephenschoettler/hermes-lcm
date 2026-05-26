@@ -3,7 +3,7 @@
 import json
 
 from benchmarking.policies import builtin_policies, load_policy
-from benchmarking.types import Canary, LCMPolicy, ReplayFixture, ReplayMetrics
+from benchmarking.types import Canary, LCMPolicy, ReplayFixture, ReplayMetrics, SummaryFailureMode
 
 
 def test_policy_round_trips_through_json_mapping():
@@ -34,6 +34,48 @@ def test_fixture_round_trips_nested_canaries():
 
     assert restored == fixture
     assert restored.canaries[0].expected_query == "CANARY_ALPHA"
+
+
+def test_fixture_round_trips_benchmark_profile_metadata():
+    fixture = ReplayFixture(
+        name="summary_timeout_probe",
+        messages=[{"role": "user", "content": "CANARY_TIMEOUT = VALUE_TIMEOUT"}],
+        canaries=[Canary(id="CANARY_TIMEOUT", value="VALUE_TIMEOUT", expected_query="CANARY_TIMEOUT")],
+        tags=["summary_failure"],
+        benchmark_profile={
+            "summary_level": 3,
+            "summary_failure_mode": "llm_timeout_then_truncate",
+        },
+    )
+
+    restored = ReplayFixture.from_dict(json.loads(json.dumps(fixture.to_dict())))
+
+    assert restored == fixture
+    assert restored.benchmark_profile["summary_level"] == 3
+
+
+def test_metrics_round_trips_summary_failure_profile():
+    metrics = ReplayMetrics(
+        policy_name="baseline_272k",
+        fixture_name="summary_timeout_probe",
+        prompt_tokens_before=100,
+        prompt_tokens_after=80,
+        threshold_tokens=75,
+        compression_count=1,
+        compaction_attempts=1,
+        post_compaction_headroom_tokens=-5,
+        active_canaries_found=1,
+        retrieval_canaries_found=2,
+        total_canaries=2,
+        summary_level=3,
+        summary_failure_mode=SummaryFailureMode.LLM_TIMEOUT_THEN_TRUNCATE,
+        failures=["TimeoutError: summary provider timed out"],
+    )
+
+    restored = ReplayMetrics.from_dict(json.loads(json.dumps(metrics.to_dict())))
+
+    assert restored == metrics
+    assert restored.summary_failure_mode == SummaryFailureMode.LLM_TIMEOUT_THEN_TRUNCATE
 
 
 def test_metrics_round_trips_with_failure_list():
