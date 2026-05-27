@@ -213,6 +213,23 @@ class MessageStore:
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
+        # ``self._conn`` is shared across threads (the connection is opened with
+        # ``check_same_thread=False``). SQLite's own C-level mutex serializes
+        # statements at the engine layer, but the Python ``sqlite3`` module
+        # releases the GIL while the C call runs. Under heavy thread contention
+        # with concurrent HTTPS clients in the same process, downstream
+        # operators have observed on-disk corruption that is consistent with
+        # external bytes landing inside SQLite's write path (e.g. the first
+        # 28 bytes of the database file replaced with a TLS record header +
+        # ciphertext while the "SQLit" magic remains intact).
+        #
+        # This re-entrant lock is defense-in-depth: it forces all write call
+        # sites that use ``self._conn`` to be serialized at the Python layer,
+        # eliminating any window where Python-side buffer reuse or memory
+        # aliasing could intersect SQLite's flush of a write. It does not
+        # change semantics for single-threaded callers and adds only a single
+        # uncontended ``RLock.acquire``/``release`` pair per operation.
+        self._write_lock = threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -274,26 +291,27 @@ class MessageStore:
         tool_calls = msg.get("tool_calls")
         tc_json = json.dumps(tool_calls) if tool_calls else None
 
-        cur = self._conn.execute(
-            """INSERT INTO messages
-               (session_id, source, role, content, tool_call_id, tool_calls,
-                tool_name, timestamp, token_estimate, pinned)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                session_id,
-                _normalize_source_value(source),
-                msg.get("role", "unknown"),
-                _normalize_content_value(msg.get("content")),
-                msg.get("tool_call_id"),
-                tc_json,
-                msg.get("tool_name"),
-                time.time(),
-                token_estimate,
-                0,
-            ),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._write_lock:
+            cur = self._conn.execute(
+                """INSERT INTO messages
+                   (session_id, source, role, content, tool_call_id, tool_calls,
+                    tool_name, timestamp, token_estimate, pinned)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    _normalize_source_value(source),
+                    msg.get("role", "unknown"),
+                    _normalize_content_value(msg.get("content")),
+                    msg.get("tool_call_id"),
+                    tc_json,
+                    msg.get("tool_name"),
+                    time.time(),
+                    token_estimate,
+                    0,
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -312,7 +330,7 @@ class MessageStore:
 
         ids = []
         ts = time.time()
-        with self._conn:
+        with self._write_lock, self._conn:
             for msg, est in zip(protected_messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
@@ -341,61 +359,66 @@ class MessageStore:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        cur = self._conn.execute(
-            "UPDATE messages SET session_id = ? WHERE session_id = ?",
-            (new_session_id, old_session_id),
-        )
-        self._conn.commit()
-        return cur.rowcount if cur.rowcount is not None else 0
+        with self._write_lock:
+            cur = self._conn.execute(
+                "UPDATE messages SET session_id = ? WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            self._conn.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
-        cur = self._conn.execute(
-            "DELETE FROM messages WHERE session_id = ?",
-            (session_id,),
-        )
-        self._conn.commit()
-        deleted = cur.rowcount if cur.rowcount is not None else 0
-        return deleted
+        with self._write_lock:
+            cur = self._conn.execute(
+                "DELETE FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            self._conn.commit()
+            deleted = cur.rowcount if cur.rowcount is not None else 0
+            return deleted
 
     def gc_externalized_tool_result(self, store_id: int, placeholder: str) -> bool:
         """Rewrite one unpinned tool-result row to a compact GC placeholder."""
-        row = self._conn.execute(
-            "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
-            (store_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        role, pinned, current_content, tool_call_id = row
-        if role != "tool" or bool(pinned) or current_content == placeholder:
-            return False
-        placeholder_tokens = count_message_tokens(
-            {
-                "role": "tool",
-                "content": placeholder,
-                "tool_call_id": tool_call_id,
-            }
-        )
-        self._conn.execute(
-            "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
-            (placeholder, placeholder_tokens, store_id),
-        )
-        self._conn.commit()
-        return True
+        with self._write_lock:
+            row = self._conn.execute(
+                "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
+                (store_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            role, pinned, current_content, tool_call_id = row
+            if role != "tool" or bool(pinned) or current_content == placeholder:
+                return False
+            placeholder_tokens = count_message_tokens(
+                {
+                    "role": "tool",
+                    "content": placeholder,
+                    "tool_call_id": tool_call_id,
+                }
+            )
+            self._conn.execute(
+                "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
+                (placeholder, placeholder_tokens, store_id),
+            )
+            self._conn.commit()
+            return True
 
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
-        self._conn.execute(
-            "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
+            )
+            self._conn.commit()
 
     def unpin(self, store_id: int) -> None:
-        self._conn.execute(
-            "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
-        )
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.execute(
+                "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
+            )
+            self._conn.commit()
 
     # -- Read operations ----------------------------------------------------
 
@@ -617,7 +640,7 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._conn:
+        with self._write_lock, self._conn:
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),

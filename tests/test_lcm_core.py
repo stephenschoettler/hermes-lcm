@@ -1997,6 +1997,87 @@ class TestMessageStore:
         assert msg["role"] == "assistant"
         assert len(msg["tool_calls"]) == 1
 
+    def test_write_lock_serializes_concurrent_appends(self, tmp_path):
+        """All writes through ``self._conn`` must serialize on ``self._write_lock``.
+
+        ``MessageStore._conn`` is opened with ``check_same_thread=False`` and is
+        shared across threads. SQLite's C-level mutex protects engine-internal
+        state, but the Python ``sqlite3`` module releases the GIL during the
+        C call. Without an explicit Python-side write lock, downstream
+        operators have observed on-disk corruption that is consistent with
+        concurrent in-process clients (notably HTTPS API libraries that
+        operate on TLS buffers in the same address space) intersecting
+        SQLite's write path. The fix is a re-entrant Python lock around all
+        callers that mutate ``self._conn``.
+
+        This test verifies the contract two ways:
+
+        1. The store exposes a ``_write_lock`` attribute (an ``RLock``).
+        2. Heavy concurrent ``append`` and ``append_batch`` traffic from
+           multiple threads completes with no SQLite errors and produces
+           the exact expected row count — which would not be the case if
+           inserts were racing.
+        """
+        store = MessageStore(tmp_path / "concurrency.db")
+        assert hasattr(store, "_write_lock"), "MessageStore must expose _write_lock"
+        # ``threading.RLock`` is a factory; the returned object is a private
+        # type. Assert behavior rather than exact class identity.
+        with store._write_lock:
+            with store._write_lock:  # re-entrancy is required for nested call sites
+                pass
+
+        n_threads = 8
+        per_thread_singles = 25
+        per_thread_batch_size = 5
+        per_thread_batches = 5
+
+        errors: list[BaseException] = []
+
+        def worker(thread_id: int) -> None:
+            try:
+                for i in range(per_thread_singles):
+                    store.append(
+                        f"sess-t{thread_id}",
+                        {"role": "user", "content": f"single-{thread_id}-{i}"},
+                        token_estimate=1,
+                    )
+                for b in range(per_thread_batches):
+                    msgs = [
+                        {"role": "user", "content": f"batch-{thread_id}-{b}-{j}"}
+                        for j in range(per_thread_batch_size)
+                    ]
+                    store.append_batch(f"sess-t{thread_id}", msgs, [1] * per_thread_batch_size)
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(i,), daemon=True)
+            for i in range(n_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+            assert not t.is_alive(), "worker thread did not finish in time"
+
+        assert errors == [], f"concurrent workers raised: {errors!r}"
+
+        expected_rows = n_threads * (
+            per_thread_singles + per_thread_batches * per_thread_batch_size
+        )
+        actual_rows = store._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        assert actual_rows == expected_rows, (
+            f"expected {expected_rows} rows, got {actual_rows} — concurrent appends "
+            "lost or duplicated rows, indicating broken serialization"
+        )
+
+        # Database file must be a valid SQLite database after the storm.
+        # quick_check is a cheap structural sanity check.
+        qc = store._conn.execute("PRAGMA quick_check").fetchone()[0]
+        assert qc == "ok", f"quick_check failed: {qc!r}"
+
+        store.close()
+
 
 class TestLifecycleStateStore:
     def test_init_creates_lifecycle_state_table(self, tmp_path):
