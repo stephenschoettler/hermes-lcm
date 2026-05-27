@@ -15,6 +15,8 @@ The benchmark harness is offline by default:
 python scripts/lcm_benchmark.py \
   --fixture benchmarks/fixtures/long_history_canaries.json \
   --fixture benchmarks/fixtures/repeated_compaction_chatter.json \
+  --fixture benchmarks/fixtures/summary_timeout_probe.json \
+  --fixture benchmarks/fixtures/summary_refusal_probe.json \
   --output benchmarks/runs/local-smoke \
   --json
 ```
@@ -60,6 +62,8 @@ python scripts/lcm_benchmark.py \
 
 Synthetic fixture specs use `name:pairs:canaries:filler_words` and are deterministic. They are bounded to 250 message pairs and 2,000 filler words so typos do not create huge benchmark outputs. Benchmark output directories should be fresh or cleaned between runs because the harness refuses to reuse non-empty per-run directories.
 
+The committed `summary_timeout_probe` and `summary_refusal_probe` fixtures are small pilot fixtures for summary-provider failure-mode accounting. Their `benchmark_profile` records `summary_level` and `summary_failure_mode` metadata so reports can group timeout/refusal fallback scenarios without embedding provider calls or secrets in fixture content.
+
 `codex_gpt_long_context` is a benchmark candidate and now has an inspectable dry-run preset surface. `pressure_smoke` is not a runtime preset recommendation. It is a control policy for validating benchmark signals.
 
 ## Output files
@@ -76,7 +80,7 @@ Summary metadata includes:
 - `generated_at_utc`
 - `fixture_suite`
 - `policy_versions`
-- `metric_summary`
+- `metric_summary` (including `summary_failure_modes` and `summary_level_runs` when summary-failure profiles are present)
 - `policy_comparison`
 
 The comparison score is intentionally conservative. It rewards canary recall and stability, then penalizes failures, repeated-compaction risk, and excessive fresh-tail pressure. Treat it as a harness signal, not as proof that a policy is ready to become `preset: auto`.

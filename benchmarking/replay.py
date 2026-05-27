@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .metrics import canary_present, count_active_canaries, normalize_message_content
-from .types import LCMPolicy, ReplayFixture, ReplayMetrics
+from .types import LCMPolicy, ReplayFixture, ReplayMetrics, SummaryFailureMode, _summary_failure_mode
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -178,6 +178,13 @@ def _ratio(numerator: int | float, denominator: int | float) -> float:
     return numerator / denominator
 
 
+def _summary_profile(fixture: ReplayFixture) -> tuple[int, SummaryFailureMode]:
+    profile = fixture.benchmark_profile
+    level = int(profile.get("summary_level", 1)) if profile else 1
+    mode = _summary_failure_mode(profile.get("summary_failure_mode")) if profile else SummaryFailureMode.NONE
+    return level, mode
+
+
 def run_replay(
     fixture: ReplayFixture,
     policy: LCMPolicy,
@@ -200,6 +207,7 @@ def run_replay(
     start = time.perf_counter()
     failures: list[str] = []
     messages = [dict(message) for message in fixture.messages]
+    summary_level, summary_failure_mode = _summary_profile(fixture)
     compressed_messages = messages
     compaction_attempts = 0
     before = count_messages_tokens(messages)
@@ -223,6 +231,8 @@ def run_replay(
             policy_version=policy.policy_version,
             fixture_name=fixture.name,
             fixture_tags=list(fixture.tags),
+            summary_level=summary_level,
+            summary_failure_mode=summary_failure_mode,
             prompt_tokens_before=before,
             prompt_tokens_after=after,
             threshold_tokens=engine.threshold_tokens,
@@ -261,6 +271,8 @@ def run_replay(
             policy_version=policy.policy_version,
             fixture_name=fixture.name,
             fixture_tags=list(fixture.tags),
+            summary_level=summary_level,
+            summary_failure_mode=summary_failure_mode,
             prompt_tokens_before=before,
             prompt_tokens_after=after,
             threshold_tokens=engine.threshold_tokens,

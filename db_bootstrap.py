@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 SCHEMA_VERSION = 4
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
+REQUIRED_CORE_TABLES = (
+    "messages",
+    "metadata",
+    "summary_nodes",
+    "lcm_lifecycle_state",
+    "lcm_migration_state",
+    "messages_fts",
+    "nodes_fts",
+)
 
 
 class ExternalContentFtsSpec:
@@ -162,6 +171,59 @@ def get_existing_table_names(conn: sqlite3.Connection, names: Iterable[str]) -> 
         if row and row[0]:
             existing.add(row[0])
     return existing
+
+
+def _database_path_for_connection(conn: sqlite3.Connection | None, fallback: str = "") -> str:
+    if conn is None:
+        return fallback
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.DatabaseError:
+        return fallback
+    for row in rows:
+        if len(row) >= 3 and row[1] == "main" and row[2]:
+            return str(row[2])
+    return fallback
+
+
+def inspect_lcm_schema_health(
+    conn: sqlite3.Connection | None,
+    *,
+    database_path: str = "",
+    required_tables: Iterable[str] = REQUIRED_CORE_TABLES,
+) -> dict[str, object]:
+    """Return read-only health metadata for the core hermes-lcm SQLite schema."""
+    required = tuple(required_tables)
+    resolved_path = _database_path_for_connection(conn, database_path)
+    detail: dict[str, object] = {
+        "database_path": resolved_path,
+        "required_tables": list(required),
+        "existing_tables": [],
+        "missing_tables": [],
+    }
+    if conn is None:
+        detail["error"] = "LCM store connection is not initialized"
+        return detail
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table'
+            ORDER BY name
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        detail["error"] = str(exc)
+        return detail
+
+    existing = sorted(str(row[0]) for row in rows if row and row[0])
+    existing_set = set(existing)
+    missing = [name for name in required if name not in existing_set]
+    detail["existing_tables"] = existing
+    detail["missing_tables"] = missing
+    return detail
 
 
 def get_fts_shadow_table_names(table_name: str) -> list[str]:

@@ -21,7 +21,11 @@ from agent.context_engine import ContextEngine
 
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
-from .escalation import _strip_reasoning_blocks, summarize_with_escalation
+from .escalation import (
+    SummaryCircuitBreaker,
+    _strip_reasoning_blocks,
+    summarize_with_escalation,
+)
 from .externalize import (
     build_transcript_gc_placeholder,
     extract_externalized_ref,
@@ -359,6 +363,10 @@ class LCMEngine(ContextEngine):
         self.emit_automatic_compaction_status = False
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
+        self._summary_circuit_breaker = SummaryCircuitBreaker(
+            failure_threshold=self._config.summary_circuit_breaker_failure_threshold,
+            cooldown_seconds=self._config.summary_circuit_breaker_cooldown_seconds,
+        )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
         self._last_compression_status = "idle"
@@ -762,6 +770,8 @@ class LCMEngine(ContextEngine):
                     token_budget=token_budget,
                     depth=0,
                     model=self._config.summary_model,
+                    fallback_models=self._config.summary_fallback_models,
+                    circuit_breaker=self._summary_circuit_breaker,
                     timeout=self._config.summary_timeout_ms / 1000,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
@@ -3581,6 +3591,8 @@ class LCMEngine(ContextEngine):
                 token_budget=token_budget,
                 depth=depth + 1,
                 model=self._config.summary_model,
+                fallback_models=self._config.summary_fallback_models,
+                circuit_breaker=self._summary_circuit_breaker,
                 timeout=self._config.summary_timeout_ms / 1000,
                 l2_budget_ratio=self._config.l2_budget_ratio,
                 l3_truncate_tokens=self._config.l3_truncate_tokens,

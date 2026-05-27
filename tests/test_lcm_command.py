@@ -1,5 +1,6 @@
 """Tests for /lcm command surface and diagnostics."""
 
+import json
 from pathlib import Path
 import importlib.util
 import sqlite3
@@ -7,6 +8,7 @@ import sys
 
 import pytest
 
+from hermes_lcm import tools as lcm_tools
 import hermes_lcm.command as command_mod
 from hermes_lcm.command import _fmt_size, handle_lcm_command
 from hermes_lcm.config import LCMConfig
@@ -25,6 +27,27 @@ def engine(tmp_path):
     e.context_length = 200000
     e.threshold_tokens = int(200000 * config.context_threshold)
     return e
+
+
+def _replace_with_header_only_sqlite_db(e: LCMEngine) -> Path:
+    """Replace the active DB file with a valid SQLite header and no tables."""
+    db_path = Path(e._store.db_path)
+    e.shutdown()
+    for path in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+        path.unlink(missing_ok=True)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+    e._store._conn = sqlite3.connect(str(db_path), timeout=5.0, check_same_thread=False)
+    e._dag._conn = sqlite3.connect(str(db_path), timeout=5.0, check_same_thread=False)
+    e._lifecycle._conn = sqlite3.connect(
+        str(db_path),
+        timeout=30.0,
+        check_same_thread=False,
+        isolation_level=None,
+    )
+    e._lifecycle._conn.row_factory = sqlite3.Row
+    return db_path
 
 
 def test_lcm_engine_declares_automatic_compaction_silent(engine):
@@ -182,6 +205,69 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "plugin_version: 0.12.0" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
+
+
+def test_lcm_doctor_flags_header_only_database_schema(engine):
+    db_path = _replace_with_header_only_sqlite_db(engine)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "LCM doctor" in result
+    assert "status: issues-found" in result
+    assert f"database_path: {db_path}" in result
+    assert "schema_core_tables: missing" in result
+    assert "schema_missing_tables:" in result
+    assert "messages" in result
+    assert "summary_nodes" in result
+    assert "lcm_lifecycle_state" in result
+    assert "verify HERMES_HOME/LCM_DATABASE_PATH point at the database inspected by Hermes" in result
+
+
+def test_lcm_doctor_tool_flags_header_only_database_schema(engine):
+    db_path = _replace_with_header_only_sqlite_db(engine)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    schema_check = next(check for check in doctor["checks"] if check["check"] == "schema_core_tables")
+
+    assert doctor["overall"] == "unhealthy"
+    assert schema_check["status"] == "fail"
+    assert schema_check["detail"]["database_path"] == str(db_path)
+    assert schema_check["detail"]["existing_tables"] == []
+    assert "messages" in schema_check["detail"]["missing_tables"]
+    assert "summary_nodes" in schema_check["detail"]["missing_tables"]
+    assert "lcm_lifecycle_state" in schema_check["detail"]["missing_tables"]
+
+
+def test_lcm_doctor_handles_closed_store_connection(engine):
+    db_path = Path(engine._store.db_path)
+    engine.shutdown()
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "LCM doctor" in result
+    assert "status: issues-found" in result
+    assert f"database_path: {db_path}" in result
+    assert "schema_core_tables: error:" in result
+    assert "LCM store connection is not initialized" in result
+
+
+def test_lcm_doctor_prioritizes_schema_inspection_error(engine, monkeypatch):
+    def _schema_error(_conn, *, database_path="", required_tables=()):
+        return {
+            "database_path": database_path,
+            "required_tables": ["messages"],
+            "existing_tables": [],
+            "missing_tables": ["messages"],
+            "error": "database disk image is malformed",
+        }
+
+    monkeypatch.setattr(command_mod, "inspect_lcm_schema_health", _schema_error)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "schema_core_tables: error: database disk image is malformed" in result
+    assert "schema_core_tables: missing" not in result
+    assert "verify SQLite can read sqlite_master for the database inspected by Hermes" in result
 
 
 def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path):

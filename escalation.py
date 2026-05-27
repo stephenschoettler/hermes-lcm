@@ -7,10 +7,14 @@ Level 3 (Fallback):   Deterministic truncation — no LLM, guaranteed convergenc
 Each level checks if Tokens(summary) < Tokens(source). If not, escalates.
 """
 
+from __future__ import annotations
+
 import inspect
 import logging
 import re
-from typing import List, Optional
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from .model_routing import apply_lcm_model_route
 from .tokens import count_tokens
@@ -30,6 +34,57 @@ _THINK_BLOCK_RE = re.compile(
     r"</(?P=tag)\s*>",
     re.IGNORECASE | re.DOTALL,
 )
+
+_DEFAULT_ROUTE_KEY = "<task-default>"
+
+
+@dataclass
+class SummaryCircuitBreaker:
+    """In-process circuit breaker for summary model routes.
+
+    The breaker is intentionally small and process-local. It prevents a hot
+    compression loop from repeatedly hitting a failing auxiliary route while
+    preserving deterministic L3 truncation as the final convergence fallback.
+    """
+
+    failure_threshold: int = 2
+    cooldown_seconds: int = 300
+    _failures: dict[str, int] = field(default_factory=dict)
+    _open_until: dict[str, float] = field(default_factory=dict)
+
+    def _key(self, model: str | None) -> str:
+        return (model or "").strip() or _DEFAULT_ROUTE_KEY
+
+    def allows(self, model: str | None, *, now: float | None = None) -> bool:
+        key = self._key(model)
+        current_time = time.monotonic() if now is None else now
+        opened_until = self._open_until.get(key, 0.0)
+        if opened_until <= current_time:
+            if key in self._open_until:
+                self._open_until.pop(key, None)
+            return True
+        return False
+
+    def record_success(self, model: str | None) -> None:
+        key = self._key(model)
+        self._failures.pop(key, None)
+        self._open_until.pop(key, None)
+
+    def record_failure(self, model: str | None, *, now: float | None = None) -> None:
+        key = self._key(model)
+        failures = self._failures.get(key, 0) + 1
+        self._failures[key] = failures
+        threshold = max(1, int(self.failure_threshold or 1))
+        if failures >= threshold:
+            current_time = time.monotonic() if now is None else now
+            cooldown = max(0, int(self.cooldown_seconds or 0))
+            self._open_until[key] = current_time + cooldown
+            logger.warning(
+                "LCM summary route circuit opened for %s after %d failure(s); cooldown=%ss",
+                key,
+                failures,
+                cooldown,
+            )
 
 
 def _strip_reasoning_blocks(text: str) -> str:
@@ -111,6 +166,58 @@ def _build_l2_focus_brief(focus_topic: str) -> str:
     )
 
 
+def _summary_model_chain(primary_model: str = "", fallback_models: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    chain: list[str] = []
+    for model in [primary_model, *(fallback_models or [])]:
+        normalized = (model or "").strip()
+        if normalized not in chain:
+            chain.append(normalized)
+    if not chain:
+        chain.append("")
+    return chain
+
+
+def _invoke_summary_llm_chain(
+    prompt: str,
+    max_tokens: int,
+    *,
+    model: str = "",
+    fallback_models: list[str] | tuple[str, ...] | None = None,
+    timeout: float | None = None,
+    circuit_breaker: SummaryCircuitBreaker | None = None,
+    accepts_result: Callable[[str], bool] | None = None,
+) -> Optional[str]:
+    chain = _summary_model_chain(model, fallback_models)
+    skipped = 0
+    for candidate_model in chain:
+        if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
+            skipped += 1
+            logger.warning(
+                "LCM summary route skipped by open circuit: %s",
+                candidate_model or _DEFAULT_ROUTE_KEY,
+            )
+            continue
+        try:
+            result = _invoke_summary_llm(
+                prompt,
+                max_tokens,
+                model=candidate_model,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            logger.warning("LLM summarization failed: %s", exc)
+            result = None
+        if result and (accepts_result is None or accepts_result(result)):
+            if circuit_breaker is not None:
+                circuit_breaker.record_success(candidate_model)
+            return result
+        if circuit_breaker is not None:
+            circuit_breaker.record_failure(candidate_model)
+    if skipped == len(chain):
+        logger.warning("LCM summary fallback chain exhausted: all routes are temporarily open")
+    return None
+
+
 def _build_l1_prompt(text: str, token_budget: int, depth: int,
                      focus_topic: str = "", custom_instructions: str = "") -> str:
     """Level 1: preserve details."""
@@ -189,6 +296,8 @@ def summarize_with_escalation(
     l3_truncate_tokens: int = 512,
     focus_topic: str = "",
     custom_instructions: str = "",
+    fallback_models: list[str] | tuple[str, ...] | None = None,
+    circuit_breaker: SummaryCircuitBreaker | None = None,
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
@@ -199,9 +308,17 @@ def summarize_with_escalation(
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,
                                  custom_instructions=custom_instructions)
-    l1_result = _invoke_summary_llm(l1_prompt, token_budget * 2, model=model, timeout=timeout)
+    l1_result = _invoke_summary_llm_chain(
+        l1_prompt,
+        token_budget * 2,
+        model=model,
+        fallback_models=fallback_models,
+        timeout=timeout,
+        circuit_breaker=circuit_breaker,
+        accepts_result=lambda result: count_tokens(result) < source_tokens,
+    )
 
-    if l1_result and count_tokens(l1_result) < source_tokens:
+    if l1_result:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
         return l1_result, 1
 
@@ -210,9 +327,17 @@ def summarize_with_escalation(
     l2_prompt = _build_l2_prompt(text, l2_budget,
                                  focus_topic=focus_topic,
                                  custom_instructions=custom_instructions)
-    l2_result = _invoke_summary_llm(l2_prompt, l2_budget * 2, model=model, timeout=timeout)
+    l2_result = _invoke_summary_llm_chain(
+        l2_prompt,
+        l2_budget * 2,
+        model=model,
+        fallback_models=fallback_models,
+        timeout=timeout,
+        circuit_breaker=circuit_breaker,
+        accepts_result=lambda result: count_tokens(result) < source_tokens,
+    )
 
-    if l2_result and count_tokens(l2_result) < source_tokens:
+    if l2_result:
         logger.debug("L2 summarization succeeded (%d tokens)", count_tokens(l2_result))
         return l2_result, 2
 

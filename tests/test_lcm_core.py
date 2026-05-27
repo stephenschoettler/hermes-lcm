@@ -289,6 +289,93 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert seen["provider"] == "lcpp"
         assert seen["model"] == "4B-Qwen3-2507-compressor"
 
+    def test_summary_fallback_chain_uses_next_model_after_primary_failure(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return None
+            return "fallback summary"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+        )
+
+        assert summary == "fallback summary"
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
+    def test_summary_fallback_chain_uses_next_model_after_non_compressing_primary(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return "primary verbose text " * 300
+            return "short fallback"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+        )
+
+        assert summary == "short fallback"
+        assert level == 1
+        assert calls == ["primary-model", "fallback-model"]
+
+
+    def test_summary_circuit_breaker_skips_temporarily_open_route(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummaryCircuitBreaker
+
+        calls = []
+        breaker = SummaryCircuitBreaker(failure_threshold=1, cooldown_seconds=60)
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            if model == "primary-model":
+                return None
+            return "fallback summary"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        first_summary, first_level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            circuit_breaker=breaker,
+        )
+        second_summary, second_level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            circuit_breaker=breaker,
+        )
+
+        assert (first_summary, first_level) == ("fallback summary", 1)
+        assert (second_summary, second_level) == ("fallback summary", 1)
+        assert calls == ["primary-model", "fallback-model", "fallback-model"]
+
     def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
         from hermes_lcm.extraction import _call_extraction_llm
 
@@ -364,6 +451,9 @@ class TestConfig:
         assert c.stateless_session_patterns_source == "default"
         assert c.ignore_message_patterns_source == "default"
         assert c.summary_model == ""
+        assert c.summary_fallback_models == []
+        assert c.summary_circuit_breaker_failure_threshold == 2
+        assert c.summary_circuit_breaker_cooldown_seconds == 300
         assert c.expansion_model == ""
         assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
@@ -379,6 +469,9 @@ class TestConfig:
             "^Cronjob Response:,^>>>Cronjob Response<<<:",
         )
         monkeypatch.setenv("LCM_EXPANSION_MODEL", "openai/gpt-5.4-mini")
+        monkeypatch.setenv("LCM_SUMMARY_FALLBACK_MODELS", "fast-model, reliable-model")
+        monkeypatch.setenv("LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD", "3")
+        monkeypatch.setenv("LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS", "120")
         monkeypatch.setenv("LCM_EXPANSION_CONTEXT_TOKENS", "64000")
         monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
@@ -409,6 +502,9 @@ class TestConfig:
         assert c.ignore_session_patterns_source == "env"
         assert c.stateless_session_patterns_source == "env"
         assert c.ignore_message_patterns_source == "env"
+        assert c.summary_fallback_models == ["fast-model", "reliable-model"]
+        assert c.summary_circuit_breaker_failure_threshold == 3
+        assert c.summary_circuit_breaker_cooldown_seconds == 120
         assert c.expansion_model == "openai/gpt-5.4-mini"
         assert c.expansion_context_tokens == 64_000
         assert c.summary_timeout_ms == 45_000

@@ -4,9 +4,16 @@ import json
 
 import pytest
 
-from benchmarking.fixtures import load_fixture, make_synthetic_fixture, parse_synthetic_fixture_spec
+from benchmarking.fixtures import (
+    fixture_from_dict,
+    load_fixture,
+    make_summary_failure_fixture,
+    make_synthetic_fixture,
+    parse_synthetic_fixture_spec,
+)
 from benchmarking.policies import load_policy
 from benchmarking.replay import run_replay
+from benchmarking.types import SummaryFailureMode
 
 
 def test_load_fixture_parses_canaries(tmp_path):
@@ -36,6 +43,64 @@ def test_load_fixture_rejects_missing_required_keys(tmp_path):
 
     with pytest.raises(ValueError, match="messages"):
         load_fixture(path)
+
+
+def test_fixture_preserves_benchmark_profile_metadata():
+    fixture = fixture_from_dict({
+        "name": "summary_timeout_probe",
+        "tags": ["synthetic", "summary_failure"],
+        "messages": [
+            {"role": "system", "content": "You are a test agent."},
+            {"role": "user", "content": "CANARY_TIMEOUT = VALUE_TIMEOUT"},
+        ],
+        "canaries": [
+            {"id": "CANARY_TIMEOUT", "value": "VALUE_TIMEOUT", "expected_query": "CANARY_TIMEOUT"},
+        ],
+        "benchmark_profile": {
+            "summary_level": 3,
+            "summary_failure_mode": "llm_timeout_then_truncate",
+        },
+    })
+
+    assert fixture.benchmark_profile == {
+        "summary_level": 3,
+        "summary_failure_mode": "llm_timeout_then_truncate",
+    }
+    assert fixture.to_dict()["benchmark_profile"] == fixture.benchmark_profile
+
+
+def test_make_summary_failure_fixture_marks_profile_and_tags():
+    fixture = make_summary_failure_fixture(
+        name="timeout_probe",
+        summary_level=3,
+        summary_failure_mode="llm_timeout_then_truncate",
+        message_pairs=4,
+        canary_count=1,
+        filler_words=6,
+    )
+
+    assert fixture.benchmark_profile == {
+        "summary_level": 3,
+        "summary_failure_mode": "llm_timeout_then_truncate",
+    }
+    assert "summary_failure" in fixture.tags
+    assert "timeout_probe_filler_5" in fixture.messages[1]["content"]
+
+
+def test_make_summary_failure_fixture_accepts_enum_failure_mode():
+    fixture = make_summary_failure_fixture(
+        name="timeout_probe",
+        summary_level=3,
+        summary_failure_mode=SummaryFailureMode.LLM_TIMEOUT_THEN_TRUNCATE,
+        message_pairs=4,
+        canary_count=1,
+        filler_words=6,
+    )
+
+    assert fixture.benchmark_profile == {
+        "summary_level": 3,
+        "summary_failure_mode": "llm_timeout_then_truncate",
+    }
 
 
 def test_make_synthetic_fixture_is_deterministic():
@@ -84,6 +149,22 @@ def test_parse_synthetic_fixture_spec_rejects_invalid_specs():
         parse_synthetic_fixture_spec("bad:251:1:5")
     with pytest.raises(ValueError, match="filler_words exceeds maximum"):
         parse_synthetic_fixture_spec("bad:1:1:2001")
+
+
+def test_committed_summary_failure_fixtures_load_profiles():
+    timeout_fixture = load_fixture("benchmarks/fixtures/summary_timeout_probe.json")
+    refusal_fixture = load_fixture("benchmarks/fixtures/summary_refusal_probe.json")
+
+    assert timeout_fixture.benchmark_profile == {
+        "summary_level": 3,
+        "summary_failure_mode": "llm_timeout_then_truncate",
+    }
+    assert refusal_fixture.benchmark_profile == {
+        "summary_level": 3,
+        "summary_failure_mode": "llm_refusal_then_truncate",
+    }
+    assert "summary_failure" in timeout_fixture.tags
+    assert timeout_fixture.canaries[0].expected_query == "CANARY_TIMEOUT"
 
 
 def test_committed_long_history_fixture_loads():
