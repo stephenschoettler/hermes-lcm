@@ -256,7 +256,13 @@ def test_register_continues_when_register_tool_raises_type_error():
 
 def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(monkeypatch):
     """Regression: registered tool handlers must forward kwargs (incl. messages=...)
-    to engine.handle_tool_call(), preserving equivalent current-turn ingest behavior."""
+    to engine.handle_tool_call(), preserving equivalent current-turn ingest behavior.
+
+    Note: This test uses a _CtxRecord with **kwargs to simulate a host that
+    supports message-forwarding. With the new gating logic, hosts with rigid
+    register_tool signatures will NOT have tools registered — they rely on
+    the native context-engine path instead.
+    """
     repo_root = Path(__file__).resolve().parent.parent
     module = _load_plugin_entrypoint_module("hermes_lcm_handler_forward")
 
@@ -267,7 +273,7 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
             self.engine = None
         def register_context_engine(self, engine):
             self.engine = engine
-        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
             registered[name] = handler
 
     ctx = _CtxRecord()

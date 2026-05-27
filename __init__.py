@@ -104,22 +104,28 @@ def register(ctx):
 
     register_tool_fn = getattr(ctx, "register_tool", None)
     if callable(register_tool_fn):
-        for schema, emoji in _LCM_TOOL_DEFS:
-            tname = schema.get("name", "")
-            if tname:
-                try:
-                    register_tool_fn(
-                        name=tname,
-                        toolset="context_engine",
-                        schema=schema,
-                        handler=_wrap_handler(tname, engine),
-                        description=schema.get("description", ""),
-                        emoji=emoji,
-                    )
-                except (TypeError, ValueError) as exc:
-                    logger.warning(
-                        "LCM tool registration for %s failed: %s", tname, exc
-                    )
+        if _host_supports_message_forwarding(ctx):
+            for schema, emoji in _LCM_TOOL_DEFS:
+                tname = schema.get("name", "")
+                if tname:
+                    try:
+                        register_tool_fn(
+                            name=tname,
+                            toolset="context_engine",
+                            schema=schema,
+                            handler=_wrap_handler(tname, engine),
+                            description=schema.get("description", ""),
+                            emoji=emoji,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        logger.warning(
+                            "LCM tool registration for %s failed: %s", tname, exc
+                        )
+        else:
+            logger.info(
+                "Host register_tool does not support message-forwarding — "
+                "LCM tools will use native context-engine schema injection"
+            )
     else:
         logger.info("ctx.register_tool unavailable — LCM tools registered as context engine only")
 
