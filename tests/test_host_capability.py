@@ -5,6 +5,17 @@ import sys
 from pathlib import Path
 
 
+EXPECTED_LCM_TOOLS = {
+    "lcm_grep",
+    "lcm_load_session",
+    "lcm_describe",
+    "lcm_expand",
+    "lcm_expand_query",
+    "lcm_status",
+    "lcm_doctor",
+}
+
+
 def _load_plugin_module(name: str):
     repo_root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
@@ -17,117 +28,109 @@ def _load_plugin_module(name: str):
 
 
 class TestHostCapabilityDetection:
-    """Verify _host_supports_message_forwarding() correctly inspects ctx."""
+    """Verify explicit host capability detection for registered lcm_* tools."""
 
-    def test_returns_false_when_ctx_lacks_register_tool(self):
-        """Host without register_tool cannot support message-forwarding."""
-        module = _load_plugin_module("hermes_lcm_cap_no_tool")
+    def test_returns_false_when_ctx_lacks_capability(self):
+        module = _load_plugin_module("hermes_lcm_cap_no_attr")
 
         class _Ctx:
             pass
 
-        assert module._host_supports_message_forwarding(_Ctx()) is False
+        assert module._host_forwards_registered_tool_messages(_Ctx()) is False
 
-    def test_returns_false_when_register_tool_does_not_accept_messages(self):
-        """Host whose register_tool doesn't forward kwargs cannot support messages."""
-        module = _load_plugin_module("hermes_lcm_cap_no_messages")
-
-        class _Ctx:
-            def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
-                pass  # No **kwargs, no messages param
-
-        assert module._host_supports_message_forwarding(_Ctx()) is False
-
-    def test_returns_true_when_register_tool_accepts_kwargs(self):
-        """Host whose register_tool accepts **kwargs may forward messages."""
-        module = _load_plugin_module("hermes_lcm_cap_kwargs")
+    def test_returns_false_when_capability_is_false(self):
+        module = _load_plugin_module("hermes_lcm_cap_false")
 
         class _Ctx:
-            def register_tool(self, name, toolset, schema, handler, **kwargs):
-                pass
+            context_engine_tool_handlers_receive_messages = False
 
-        assert module._host_supports_message_forwarding(_Ctx()) is True
+        assert module._host_forwards_registered_tool_messages(_Ctx()) is False
 
-    def test_returns_true_when_register_tool_has_messages_param(self):
-        """Host that explicitly declares messages param supports forwarding."""
-        module = _load_plugin_module("hermes_lcm_cap_messages_param")
+    def test_returns_true_when_capability_is_true(self):
+        module = _load_plugin_module("hermes_lcm_cap_true")
 
         class _Ctx:
-            def register_tool(self, name, toolset, schema, handler, messages=None, **kwargs):
-                pass
+            context_engine_tool_handlers_receive_messages = True
 
-        assert module._host_supports_message_forwarding(_Ctx()) is True
+        assert module._host_forwards_registered_tool_messages(_Ctx()) is True
+
+    def test_supports_callable_capability(self):
+        module = _load_plugin_module("hermes_lcm_cap_callable")
+
+        class _Ctx:
+            def context_engine_tool_handlers_receive_messages(self):
+                return True
+
+        assert module._host_forwards_registered_tool_messages(_Ctx()) is True
+
+    def test_callable_capability_failure_fails_closed(self):
+        module = _load_plugin_module("hermes_lcm_cap_callable_raises")
+
+        class _Ctx:
+            def context_engine_tool_handlers_receive_messages(self):
+                raise RuntimeError("host capability unavailable")
+
+        assert module._host_forwards_registered_tool_messages(_Ctx()) is False
 
 
 class TestRegistrationGating:
-    """Verify register() skips ctx.register_tool when host lacks message-forwarding."""
+    """Verify register() skips ctx.register_tool unless messages forwarding is explicit."""
 
-    def test_skips_register_tool_when_host_lacks_message_forwarding(self):
-        """Plugin should NOT call ctx.register_tool when host cannot forward messages."""
+    def test_skips_register_tool_without_explicit_message_forwarding(self):
         module = _load_plugin_module("hermes_lcm_gating_skip")
-
         registered_tools = []
 
         class _CtxNoForwarding:
-            """Host with register_tool but no **kwargs — cannot forward messages."""
             def __init__(self):
                 self.engine = None
+
             def register_context_engine(self, engine):
                 self.engine = engine
+
             def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
                 registered_tools.append(name)
 
         ctx = _CtxNoForwarding()
         module.register(ctx)
 
-        # Engine should still be registered (context engine path)
         assert ctx.engine is not None
         assert ctx.engine.name == "lcm"
-
-        # But NO lcm_* tools should be registered via ctx.register_tool
-        assert len(registered_tools) == 0, (
-            f"Expected no tools registered, but got: {registered_tools}"
+        assert registered_tools == []
+        assert EXPECTED_LCM_TOOLS.issubset(
+            {schema["name"] for schema in ctx.engine.get_tool_schemas()}
         )
 
-    def test_registers_tools_when_host_supports_message_forwarding(self):
-        """Plugin SHOULD call ctx.register_tool when host can forward messages."""
+    def test_registers_tools_when_host_explicitly_supports_message_forwarding(self):
         module = _load_plugin_module("hermes_lcm_gating_register")
-
         registered_tools = []
 
         class _CtxWithForwarding:
-            """Host with register_tool accepting **kwargs — can forward messages."""
+            context_engine_tool_handlers_receive_messages = True
+
             def __init__(self):
                 self.engine = None
+
             def register_context_engine(self, engine):
                 self.engine = engine
-            def register_tool(self, name, toolset, schema, handler, **kwargs):
+
+            def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
                 registered_tools.append(name)
 
         ctx = _CtxWithForwarding()
         module.register(ctx)
 
-        # Engine should be registered
         assert ctx.engine is not None
+        assert set(registered_tools) == EXPECTED_LCM_TOOLS
 
-        # All lcm_* tools should be registered
-        expected_tools = {
-            "lcm_grep", "lcm_load_session", "lcm_describe",
-            "lcm_expand", "lcm_expand_query", "lcm_status", "lcm_doctor"
-        }
-        assert set(registered_tools) == expected_tools
-
-    def test_existing_tests_still_pass_with_forwarding_capable_host(self):
-        """Regression: existing behavior preserved when host supports forwarding."""
-        module = _load_plugin_module("hermes_lcm_gating_existing")
+    def test_existing_context_engine_path_still_loads_without_register_tool(self):
+        module = _load_plugin_module("hermes_lcm_gating_no_register_tool")
 
         class _Ctx:
             def __init__(self):
                 self.engine = None
+
             def register_context_engine(self, engine):
                 self.engine = engine
-            def register_tool(self, name, toolset, schema, handler, **kwargs):
-                pass
 
         ctx = _Ctx()
         module.register(ctx)
@@ -136,78 +139,54 @@ class TestRegistrationGating:
 
 
 class TestHermesAgentRegression:
-    """Regression: Hermes Agent-shaped hosts must not have lcm_* tools shadowed."""
+    """Regression: Hermes Agent-shaped hosts must not shadow native LCM routing."""
 
     def test_hermes_agent_shaped_host_uses_context_engine_path(self):
-        """Simulate Hermes Agent: ctx.register_tool exists with rigid signature.
-
-        The plugin must NOT register lcm_* via ctx.register_tool, ensuring
-        agent_init adds them to _context_engine_tool_names and routes through
-        context_compressor.handle_tool_call(..., messages=messages).
-        """
         module = _load_plugin_module("hermes_lcm_hermes_agent_regression")
-
-        # Simulate Hermes Agent's ctx.register_tool with rigid signature
-        # (no **kwargs, no messages param)
         registered_via_tool = []
         registered_via_engine = []
 
         class _HermesAgentCtx:
-            """Mimics Hermes Agent's ctx shape."""
             def __init__(self):
                 self.engine = None
+
             def register_context_engine(self, engine):
                 self.engine = engine
-                # Simulate agent_init: collect tool schemas from engine
                 registered_via_engine.extend(
                     s["name"] for s in engine.get_tool_schemas()
                 )
+
             def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
                 registered_via_tool.append(name)
 
         ctx = _HermesAgentCtx()
         module.register(ctx)
 
-        # Engine must be registered
         assert ctx.engine is not None
-
-        # lcm_* tools must NOT be registered via ctx.register_tool
-        assert len(registered_via_tool) == 0, (
-            f"Hermes Agent-shaped host should not have lcm_* registered via "
-            f"ctx.register_tool, but got: {registered_via_tool}"
-        )
-
-        # lcm_* tools MUST be available via context-engine schema injection
-        expected_tools = {
-            "lcm_grep", "lcm_load_session", "lcm_describe",
-            "lcm_expand", "lcm_expand_query", "lcm_status", "lcm_doctor"
-        }
-        assert set(registered_via_engine) == expected_tools, (
-            f"Context engine should provide all lcm_* schemas, but got: {registered_via_engine}"
-        )
+        assert registered_via_tool == []
+        assert set(registered_via_engine) == EXPECTED_LCM_TOOLS
 
     def test_messages_forwarded_through_context_engine_path(self):
-        """Verify engine.handle_tool_call receives messages via context-engine path."""
         module = _load_plugin_module("hermes_lcm_messages_forward_regression")
 
         class _HermesAgentCtx:
             def __init__(self):
                 self.engine = None
+
             def register_context_engine(self, engine):
                 self.engine = engine
+
             def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
-                pass  # Rigid signature
+                raise AssertionError("Hermes Agent-shaped host must not register lcm_* tools")
 
         ctx = _HermesAgentCtx()
         module.register(ctx)
         assert ctx.engine is not None
 
-        # Simulate context-engine path: agent calls handle_tool_call with messages
         test_messages = [{"role": "user", "content": "test context"}]
         result = ctx.engine.handle_tool_call(
             "lcm_status", {}, messages=test_messages
         )
 
-        # Verify it succeeded (didn't crash due to missing messages)
         assert isinstance(result, str)
         assert len(result) > 0

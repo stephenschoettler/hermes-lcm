@@ -4,6 +4,17 @@ import subprocess
 import sys
 
 
+EXPECTED_LCM_TOOLS = {
+    "lcm_grep",
+    "lcm_load_session",
+    "lcm_describe",
+    "lcm_expand",
+    "lcm_expand_query",
+    "lcm_status",
+    "lcm_doctor",
+}
+
+
 def _load_plugin_entrypoint_module(module_name: str):
     repo_root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
@@ -53,16 +64,7 @@ def test_plugin_manifest_lists_all_registered_tools():
     repo_root = Path(__file__).resolve().parent.parent
     manifest = (repo_root / "plugin.yaml").read_text(encoding="utf-8")
 
-    expected_tools = {
-        "lcm_grep",
-        "lcm_load_session",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_expand_query",
-        "lcm_status",
-        "lcm_doctor",
-    }
-    for tool_name in expected_tools:
+    for tool_name in EXPECTED_LCM_TOOLS:
         assert f"  - {tool_name}\n" in manifest
 
 
@@ -149,15 +151,166 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     assert "plugin_git_dirty" in identity
 
     tool_names = {schema["name"] for schema in engine.get_tool_schemas()}
-    assert {
-        "lcm_grep",
-        "lcm_load_session",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_expand_query",
-        "lcm_status",
-        "lcm_doctor",
-    }.issubset(tool_names)
+    assert EXPECTED_LCM_TOOLS.issubset(tool_names)
+
+
+def test_plugin_entrypoint_registers_declared_lcm_tools():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_registration")
+    registered = []
+
+    class _Ctx:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered.append(
+                {
+                    "name": name,
+                    "toolset": toolset,
+                    "schema": schema,
+                    "handler": handler,
+                    "description": description,
+                    "emoji": emoji,
+                }
+            )
+
+    ctx = _Ctx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert {entry["name"] for entry in registered} == EXPECTED_LCM_TOOLS
+    assert {entry["toolset"] for entry in registered} == {"context_engine"}
+    for entry in registered:
+        assert entry["schema"]["name"] == entry["name"]
+        assert entry["description"] == entry["schema"].get("description", "")
+        assert callable(entry["handler"])
+
+
+def test_plugin_entrypoint_skips_registered_lcm_tools_without_message_forwarding():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_registration_unsafe_host")
+    registered = {}
+
+    class _HermesAgentLikeCtx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered[name] = {
+                "handler": handler,
+                "toolset": toolset,
+            }
+
+        def registry_dispatch(self, name, args):
+            return registered[name]["handler"](
+                args,
+                task_id="task-1",
+                user_task="find current turn",
+            )
+
+    ctx = _HermesAgentLikeCtx()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert registered == {}
+    assert EXPECTED_LCM_TOOLS.issubset({schema["name"] for schema in ctx.engine.get_tool_schemas()})
+
+
+def test_register_gracefully_degrades_when_host_lacks_register_tool():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_no_register_tool")
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+
+
+def test_register_gracefully_degrades_when_register_tool_hook_raises():
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_register_tool_raises")
+
+    class _CtxRaisesTool:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+            self.register_tool_calls = []
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            self.register_tool_calls.append(name)
+            raise TypeError("host register_tool signature mismatch")
+
+    ctx = _CtxRaisesTool()
+    module.register(ctx)
+
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+    assert ctx.register_tool_calls
+
+
+def test_registered_tool_handlers_route_through_engine_handle_tool_call(monkeypatch):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_tool_handler_route")
+    registered = {}
+
+    class _Ctx:
+        context_engine_tool_handlers_receive_messages = True
+
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered[name] = handler
+
+        def registry_dispatch(self, name, args, messages):
+            return registered[name](
+                args,
+                task_id="task-1",
+                user_task="find current turn",
+                messages=messages,
+            )
+
+    ctx = _Ctx()
+    module.register(ctx)
+    assert ctx.engine is not None
+    assert set(registered) == EXPECTED_LCM_TOOLS
+
+    calls = []
+
+    def spy_handle_tool_call(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return f"handled:{name}"
+
+    monkeypatch.setattr(ctx.engine, "handle_tool_call", spy_handle_tool_call)
+    messages = [{"role": "user", "content": "find current turn"}]
+
+    for tool_name in registered:
+        args = {"query": "current turn"}
+        assert ctx.registry_dispatch(tool_name, args, messages) == f"handled:{tool_name}"
+
+    assert {name for name, _, _ in calls} == EXPECTED_LCM_TOOLS
+    for name, args, kwargs in calls:
+        assert args == {"query": "current turn"}
+        assert kwargs["messages"] == messages
 
 
 def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails(tmp_path, monkeypatch):
@@ -240,6 +393,8 @@ def test_register_continues_when_register_tool_raises_type_error():
     module = _load_plugin_entrypoint_module("hermes_lcm_type_error_tool")
 
     class _CtxRaisingTool:
+        context_engine_tool_handlers_receive_messages = True
+
         def __init__(self):
             self.engine = None
         def register_context_engine(self, engine):
@@ -269,6 +424,8 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
     registered = {}  # tool_name -> handler
 
     class _CtxRecord:
+        context_engine_tool_handlers_receive_messages = True
+
         def __init__(self):
             self.engine = None
         def register_context_engine(self, engine):
