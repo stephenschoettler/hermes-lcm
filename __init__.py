@@ -6,6 +6,7 @@ that persists every message and provides structured retrieval tools.
 Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 """
 
+import inspect
 import logging
 import os
 
@@ -17,6 +18,34 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _host_supports_message_forwarding(ctx) -> bool:
+    """Check if the host's register_tool path supports message-forwarding.
+
+    Returns True if register_tool accepts **kwargs or an explicit messages param,
+    indicating the host may forward messages=... to registered tool handlers.
+    Returns False if register_tool is absent or has a rigid signature that
+    does not forward kwargs.
+    """
+    register_tool_fn = getattr(ctx, "register_tool", None)
+    if not callable(register_tool_fn):
+        return False
+
+    try:
+        sig = inspect.signature(register_tool_fn)
+    except (ValueError, TypeError):
+        # Cannot inspect — assume conservative (no forwarding)
+        return False
+
+    params = sig.parameters
+    # Check for **kwargs (VAR_KEYWORD) — host may forward anything
+    for param in params.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+
+    # Check for explicit messages parameter
+    return "messages" in params
 
 
 def register(ctx):
