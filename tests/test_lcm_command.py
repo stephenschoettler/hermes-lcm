@@ -162,7 +162,7 @@ def test_lcm_status_reports_runtime_identity(engine):
     repo_root = Path(__file__).resolve().parent.parent
 
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 0.12.0" in result
+    assert "plugin_version: 0.13.0" in result
     assert f"plugin_path: {repo_root}" in result
     assert "module_path:" in result
     assert "database_path_source: config.database_path" in result
@@ -202,7 +202,7 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "messages_fts: ok" in result
     assert "nodes_fts: ok" in result
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 0.12.0" in result
+    assert "plugin_version: 0.13.0" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
 
