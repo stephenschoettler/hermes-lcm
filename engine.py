@@ -3782,7 +3782,7 @@ class LCMEngine(ContextEngine):
                         skipped_tail_gap = True
                         continue
                     break
-                if skipped_tail_gap and kept_tail_reversed:
+                if skipped_tail_gap:
                     break
                 kept_tail_reversed.append(msg)
                 tail_token_total += msg_tokens

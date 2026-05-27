@@ -3306,6 +3306,37 @@ class TestAssemblyBudgetSelection:
             for msg in assembled
         )
 
+    def test_non_contiguous_raw_user_tail_replay_does_not_duplicate_durable_rows(self, tmp_path, monkeypatch):
+        engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=160)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "repeat user intent"},
+            {"role": "assistant", "content": "huge assistant output " * 400},
+        ]
+        engine._ingest_messages(messages)
+        assert engine._store.get_session_count("assembly-session") == len(messages)
+
+        assembled = engine._assemble_context(messages[0], messages[1:])
+        contents = "\n".join(str(msg.get("content", "")) for msg in assembled)
+        assert "repeat user intent" in contents
+        assert "huge assistant output" not in contents
+        assert not any(
+            msg.get("role") == "user" and msg.get("content") == "repeat user intent"
+            for msg in assembled
+        )
+
+        from hermes_lcm.engine import LCMEngine
+
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "assembly-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(assembled + [{"role": "user", "content": "new user after restart"}])
+
+        rows = replay._store.get_session_messages("assembly-session")
+        assert len(rows) == len(messages) + 1
+        assert [row["content"] for row in rows].count("repeat user intent") == 1
+        assert rows[-1]["content"] == "new user after restart"
+
     def test_non_contiguous_preserved_prompt_replay_does_not_duplicate_durable_rows(self, tmp_path, monkeypatch):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=450)
         messages = [

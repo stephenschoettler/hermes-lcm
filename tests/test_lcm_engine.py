@@ -8166,7 +8166,7 @@ class TestAssemblyGuardrails:
         config = LCMConfig(
             fresh_tail_count=10,
             database_path=str(tmp_path / "lcm_guardrail_newest.db"),
-            max_assembly_tokens=50,
+            max_assembly_tokens=120,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "guardrail-session"
@@ -8183,11 +8183,13 @@ class TestAssemblyGuardrails:
             {"role": "system", "content": "s" * 10},
             [
                 {"role": "user", "content": "a" * 20},
-                {"role": "assistant", "content": "b" * 60},
+                {"role": "assistant", "content": "b" * 140},
             ],
         )
 
-        assert [msg["content"] for msg in result[1:]] == ["a" * 20]
+        contents = [msg["content"] for msg in result[1:]]
+        assert any("a" * 20 in content for content in contents)
+        assert not any(msg.get("role") == "user" and msg.get("content") == "a" * 20 for msg in result[1:])
 
     def test_context_anchor_is_budgeted_under_max_assembly_tokens(self, tmp_path, monkeypatch):
         import importlib
