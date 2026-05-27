@@ -25,6 +25,7 @@ from .ingest_protection import (
     sensitive_pattern_status,
 )
 from .model_routing import apply_lcm_model_route
+from .presets import preset_status_payload
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .store import build_message_fts_spec
 
@@ -1585,6 +1586,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         },
         "source_lineage": source_lineage,
         "ingest_protection": full_status.get("ingest_protection", sensitive_pattern_status(engine._config)),
+        "preset_suggestion": preset_status_payload(engine),
         "ingest_reconciliation": ingest_reconciliation,
         "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
