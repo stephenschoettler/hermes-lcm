@@ -15,7 +15,7 @@ from .externalize import (
     load_externalized_payload,
 )
 from .dag import build_nodes_fts_spec
-from .db_bootstrap import check_external_content_fts_integrity
+from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
 from .extraction import sanitize_pre_compaction_content
 from .ingest_protection import (
     externalized_payload_stats,
@@ -25,6 +25,7 @@ from .ingest_protection import (
     sensitive_pattern_status,
 )
 from .model_routing import apply_lcm_model_route
+from .presets import preset_status_payload
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .store import build_message_fts_spec
 
@@ -1585,6 +1586,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         },
         "source_lineage": source_lineage,
         "ingest_protection": full_status.get("ingest_protection", sensitive_pattern_status(engine._config)),
+        "preset_suggestion": preset_status_payload(engine),
         "ingest_reconciliation": ingest_reconciliation,
         "runtime_identity": runtime_identity,
         "lifecycle": lifecycle,
@@ -1620,6 +1622,28 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
+    try:
+        conn = engine._store._conn
+        if conn is None:
+            raise RuntimeError("LCM store connection is not initialized")
+        schema_health = inspect_lcm_schema_health(
+            conn,
+            database_path=str(engine._store.db_path),
+        )
+        missing_tables = schema_health.get("missing_tables")
+        has_missing = isinstance(missing_tables, list) and bool(missing_tables)
+        checks.append({
+            "check": "schema_core_tables",
+            "status": "fail" if has_missing or schema_health.get("error") else "pass",
+            "detail": schema_health,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "schema_core_tables",
+            "status": "fail",
+            "detail": str(e),
+        })
+
     # 1b. FTS5 integrity, separated from generic SQLite integrity so malformed
     # inverted indexes point at the exact table and repair path.
     for check_name, conn, spec in (
@@ -1651,6 +1675,8 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "check": "sqlite_storage",
             "status": "pass" if quick_check_row and quick_check_row[0] == "ok" else "fail",
             "detail": {
+                "database_path": str(db_path),
+                "database_exists": db_path.exists(),
                 "journal_mode": journal_mode_row[0] if journal_mode_row else "unknown",
                 "quick_check": quick_check_row[0] if quick_check_row else "unknown",
                 "database_size_bytes": db_path.stat().st_size if db_path.exists() else 0,

@@ -8,7 +8,11 @@ import os
 import sqlite3
 from typing import Any
 
-from .db_bootstrap import external_content_fts_needs_repair, repair_external_content_fts
+from .db_bootstrap import (
+    external_content_fts_needs_repair,
+    inspect_lcm_schema_health,
+    repair_external_content_fts,
+)
 from .ingest_protection import externalized_payload_stats, scan_sqlite_payload_risks, sensitive_pattern_status
 from .dag import build_nodes_fts_spec
 from .presets import (
@@ -886,6 +890,14 @@ def _doctor_text(engine) -> str:
     dag_conn = engine._dag._conn
 
     issues: list[str] = []
+    schema_health = inspect_lcm_schema_health(store_conn, database_path=str(db_path))
+    schema_missing_raw = schema_health.get("missing_tables")
+    schema_missing_tables = [str(name) for name in schema_missing_raw] if isinstance(schema_missing_raw, list) else []
+    schema_existing_raw = schema_health.get("existing_tables")
+    schema_existing_tables = [str(name) for name in schema_existing_raw] if isinstance(schema_existing_raw, list) else []
+    schema_core_status = "error" if schema_health.get("error") else "missing" if schema_missing_tables else "ok"
+    if schema_missing_tables or schema_health.get("error"):
+        issues.append("schema_core_tables")
 
     def _safe_count(conn, query: str, issue_key: str) -> int | str:
         try:
@@ -988,6 +1000,21 @@ def _doctor_text(engine) -> str:
 
     observations: list[str] = []
     recommended_actions: list[str] = []
+
+    if schema_health.get("error"):
+        observations.append(f"schema_core_tables: error: {schema_health['error']}")
+        recommended_actions.append(
+            "verify SQLite can read sqlite_master for the database inspected by Hermes"
+        )
+    elif schema_missing_tables:
+        observations.append(
+            "schema_core_tables: missing " + ", ".join(schema_missing_tables)
+        )
+        recommended_actions.append(
+            "verify HERMES_HOME/LCM_DATABASE_PATH point at the database inspected by Hermes"
+        )
+    else:
+        observations.append("schema_core_tables: ok")
 
     if debt_rows:
         first = debt_rows[0]
@@ -1107,6 +1134,9 @@ def _doctor_text(engine) -> str:
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
         f"wal_size: {_fmt_size(wal_size)}",
+        f"schema_core_tables: {schema_core_status}",
+        f"schema_missing_tables: {', '.join(schema_missing_tables) or '(none)'}",
+        f"schema_existing_tables: {', '.join(schema_existing_tables) or '(none)'}",
         f"journal_mode: {journal_mode}",
         f"quick_check: {quick_check}",
         f"sqlite_integrity: {integrity}",

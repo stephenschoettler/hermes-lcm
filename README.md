@@ -301,6 +301,14 @@ LCM_LEAF_CHUNK_TOKENS=8000
 `target_after_compaction=0.55` is still benchmark provenance, not a runtime
 setting, because the engine does not expose that live knob yet.
 
+For dashboards and agents, `lcm_status` also exposes the same information under
+`preset_suggestion` as read-only JSON: suggested preset name/family, selection
+reason, match confidence, provenance, explicit override diagnostics, invalid
+override diagnostics, unsupported benchmark-only fields, and the dry-run delta.
+This surface is safe to consume without scraping slash-command text; it does not
+write files, mutate process state, expose local benchmark run paths, or apply
+`LCM_*` environment changes.
+
 ### FAQ: tuning LCM for large context windows
 
 Long-context models change the tuning problem. A 1M-token model does not mean
@@ -477,9 +485,10 @@ duplicate those payload bytes into `lcm.db`, FTS shadow tables, WAL files, or
 ordinary SQLite backups. If externalization fails, LCM logs a warning and leaves
 the original text inline rather than dropping data.
 
-`lcm_doctor` reports SQLite `journal_mode`, `quick_check`, database/WAL sizes,
-the largest content/tool-call rows, suspicious inline `data:*;base64` rows,
-suspicious long base64-looking rows, and aggregate externalized-payload stats.
+`lcm_doctor` reports the effective SQLite database path, core schema-table
+presence, SQLite `journal_mode`, `quick_check`, database/WAL sizes, the largest
+content/tool-call rows, suspicious inline `data:*;base64` rows, suspicious long
+base64-looking rows, and aggregate externalized-payload stats.
 Doctor output is metadata-only for these scans; it intentionally does not print
 raw payload previews.
 
