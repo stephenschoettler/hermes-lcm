@@ -92,6 +92,11 @@ _QUARANTINED_ASSISTANT_MIN_CHARS = 65_536
 _QUARANTINED_ASSISTANT_MIN_TOKENS = 1_000
 _WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _REPETITION_SEGMENT_SPLIT_RE = re.compile(r"(?:\n+|(?<=[.!?])\s+)")
+_HEARTBEAT_NOISE_RE = re.compile(
+    r"^(?:still\s+working|working\s+on\s+it|processing|checking|one\s+moment|ping|heartbeat|no\s+update)(?:[.!…\s-]*)$",
+    re.IGNORECASE,
+)
+_HEARTBEAT_NOISE_MAX_CHARS = 256
 _GENERIC_BASE64_MIN_CHARS = 4096
 _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*ref=([^;\]\s]+)\]")
 _SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
@@ -313,6 +318,25 @@ def _normalized_repetition_segments(text: str) -> list[str]:
         if len(normalized) >= 32:
             segments.append(normalized)
     return segments
+
+
+def heartbeat_noise_reason(role: str, text: str) -> str | None:
+    """Return a read-only doctor category for short heartbeat/progress noise.
+
+    This intentionally does not drive ingest protection or cleanup. It only
+    surfaces metadata-only candidates for operator review.
+    """
+    role = str(role or "")
+    if role not in {"assistant", "tool", "system"}:
+        return None
+    if not isinstance(text, str):
+        return None
+    normalized = re.sub(r"\s+", " ", text.strip())
+    if not normalized or len(normalized) > _HEARTBEAT_NOISE_MAX_CHARS:
+        return None
+    if _HEARTBEAT_NOISE_RE.match(normalized):
+        return "heartbeat_progress"
+    return None
 
 
 def assistant_output_quarantine_reason(text: str) -> str | None:
@@ -1086,6 +1110,37 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
         if len(suspicious_repetitive_assistant_rows) >= limit:
             break
 
+    heartbeat_noise_rows = []
+    for row in conn.execute(
+        """
+        SELECT store_id, session_id, source, role, COALESCE(length(content), 0) AS content_len, content
+        FROM messages
+        WHERE role IN ('assistant', 'tool', 'system')
+          AND COALESCE(length(content), 0) BETWEEN 1 AND ?
+          AND (
+            lower(trim(content)) GLOB 'still working*'
+            OR lower(trim(content)) GLOB 'working on it*'
+            OR lower(trim(content)) GLOB 'processing*'
+            OR lower(trim(content)) GLOB 'checking*'
+            OR lower(trim(content)) GLOB 'one moment*'
+            OR lower(trim(content)) GLOB 'ping*'
+            OR lower(trim(content)) GLOB 'heartbeat*'
+            OR lower(trim(content)) GLOB 'no update*'
+          )
+        ORDER BY store_id ASC
+        LIMIT ?
+        """,
+        (_HEARTBEAT_NOISE_MAX_CHARS, candidate_cap),
+    ).fetchall():
+        _store_id, _session_id, _source, role, _length, value = row
+        reason = heartbeat_noise_reason(str(role or ""), value if isinstance(value, str) else "")
+        if reason:
+            heartbeat_noise_rows.append(
+                make_row(row, field="content", length_key="content_len", category=reason)
+            )
+        if len(heartbeat_noise_rows) >= limit:
+            break
+
     return {
         "largest_content_rows": [
             make_row(row, field="content", length_key="content_len", category="largest_content")
@@ -1106,6 +1161,7 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
         "suspicious_base64_like_rows": generic_rows,
         "quarantined_assistant_rows": quarantined_assistant_rows,
         "suspicious_repetitive_assistant_rows": suspicious_repetitive_assistant_rows,
+        "heartbeat_noise_rows": heartbeat_noise_rows,
     }
 
 def externalized_payload_stats(config, hermes_home: str = "") -> dict[str, Any]:

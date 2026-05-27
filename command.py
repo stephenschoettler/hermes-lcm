@@ -970,6 +970,7 @@ def _doctor_text(engine) -> str:
             "suspicious_base64_like_rows": [],
             "quarantined_assistant_rows": [],
             "suspicious_repetitive_assistant_rows": [],
+            "heartbeat_noise_rows": [],
         }
         externalized_stats = {
             "externalized_payload_count": 0,
@@ -1155,6 +1156,7 @@ def _doctor_text(engine) -> str:
         f"suspicious_base64_like_rows: {payload_risks['suspicious_base64_like_rows']}",
         f"quarantined_assistant_rows: {payload_risks['quarantined_assistant_rows']}",
         f"suspicious_repetitive_assistant_rows: {payload_risks['suspicious_repetitive_assistant_rows']}",
+        f"heartbeat_noise_rows: {payload_risks['heartbeat_noise_rows']}",
         f"sensitive_patterns_enabled: {_fmt_bool(protection.get('enabled'))}",
         f"sensitive_patterns: {', '.join(protection.get('patterns') or []) or '(none)'}",
         f"sensitive_patterns_source: {protection.get('source', 'default')}",

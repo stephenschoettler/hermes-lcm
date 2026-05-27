@@ -207,6 +207,64 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "plugin_git_commit:" in result
 
 
+def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+    engine._store.append("heartbeat-session", {"role": "user", "content": "Still working..."}, token_estimate=2)
+    before = engine._store.get_session_count("heartbeat-session")
+
+    result = handle_lcm_command("doctor", engine)
+    after = engine._store.get_session_count("heartbeat-session")
+
+    assert after == before
+    assert "heartbeat_noise_rows:" in result
+    assert "heartbeat_progress" in result
+    assert "Still working" not in result
+
+
+def test_lcm_doctor_tool_reports_heartbeat_noise_as_read_only_payload_detail(engine):
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+    engine._store.append("heartbeat-session", {"role": "user", "content": "Still working..."}, token_estimate=2)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    payload = next(check for check in doctor["checks"] if check["check"] == "payload_storage")
+    rows = payload["detail"]["heartbeat_noise_rows"]
+
+    assert payload["status"] == "warn"
+    assert rows == [
+        {
+            "store_id": 1,
+            "session_id": "heartbeat-session",
+            "source": "unknown",
+            "role": "assistant",
+            "field": "content",
+            "length": 16,
+            "content_len": 16,
+            "suspicious_category": "heartbeat_progress",
+        }
+    ]
+    assert "Still working" not in json.dumps(payload)
+
+
+def test_lcm_doctor_finds_heartbeat_noise_after_many_short_nonmatches(engine):
+    for idx in range(120):
+        engine._store.append(
+            "heartbeat-session",
+            {"role": "assistant", "content": f"normal short status {idx}"},
+            token_estimate=2,
+        )
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    payload = next(check for check in doctor["checks"] if check["check"] == "payload_storage")
+    rows = payload["detail"]["heartbeat_noise_rows"]
+
+    assert payload["status"] == "warn"
+    assert len(rows) == 1
+    assert rows[0]["suspicious_category"] == "heartbeat_progress"
+    assert rows[0]["store_id"] == 121
+    assert "Still working" not in json.dumps(payload)
+
+
 def test_lcm_doctor_flags_header_only_database_schema(engine):
     db_path = _replace_with_header_only_sqlite_db(engine)
 
