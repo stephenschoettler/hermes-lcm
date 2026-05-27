@@ -958,6 +958,9 @@ def test_register_skips_slash_command_when_host_context_has_no_register_command(
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
+
     ctx = _Ctx()
     module.register(ctx)
 
@@ -985,6 +988,9 @@ def test_register_skips_lcm_slash_command_by_default(tmp_path, monkeypatch):
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
 
         def register_command(self, name, handler, description=""):
             self.commands[name] = (handler, description)
@@ -1017,6 +1023,9 @@ def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, mon
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
 
         def register_command(self, name, handler, description=""):
             self.commands[name] = (handler, description)

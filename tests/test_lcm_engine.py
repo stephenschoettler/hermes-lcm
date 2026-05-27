@@ -8080,7 +8080,7 @@ class TestAssemblyGuardrails:
 
         assert [msg["content"] for msg in result[1:]] == ["b" * 20, "c" * 20]
 
-    def test_max_assembly_tokens_keeps_tail_contiguous_with_varied_sizes(self, tmp_path, monkeypatch):
+    def test_max_assembly_tokens_does_not_emit_raw_messages_across_droppable_assistant_gap(self, tmp_path, monkeypatch):
         import importlib
 
         config = LCMConfig(
@@ -8110,7 +8110,7 @@ class TestAssemblyGuardrails:
 
         assert [msg["content"] for msg in result[1:]] == ["c" * 20]
 
-    def test_summary_budget_keeps_summary_order_contiguous(self, tmp_path, monkeypatch):
+    def test_summary_budget_skips_oversized_summary_and_keeps_later_fit_part(self, tmp_path, monkeypatch):
         import importlib
         from hermes_lcm.dag import SummaryNode
 
@@ -8158,15 +8158,15 @@ class TestAssemblyGuardrails:
         summary_blob = result[1]["content"]
         assert "A" * 15 in summary_blob
         assert "B" * 120 not in summary_blob
-        assert "C" * 10 not in summary_blob
+        assert "C" * 10 in summary_blob
 
-    def test_max_assembly_tokens_drops_oversized_newest_tail_message(self, tmp_path, monkeypatch):
+    def test_max_assembly_tokens_drops_oversized_newest_assistant_and_keeps_user_prompt(self, tmp_path, monkeypatch):
         import importlib
 
         config = LCMConfig(
             fresh_tail_count=10,
             database_path=str(tmp_path / "lcm_guardrail_newest.db"),
-            max_assembly_tokens=50,
+            max_assembly_tokens=120,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "guardrail-session"
@@ -8183,11 +8183,13 @@ class TestAssemblyGuardrails:
             {"role": "system", "content": "s" * 10},
             [
                 {"role": "user", "content": "a" * 20},
-                {"role": "assistant", "content": "b" * 60},
+                {"role": "assistant", "content": "b" * 140},
             ],
         )
 
-        assert result[1:] == []
+        contents = [msg["content"] for msg in result[1:]]
+        assert any("a" * 20 in content for content in contents)
+        assert not any(msg.get("role") == "user" and msg.get("content") == "a" * 20 for msg in result[1:])
 
     def test_context_anchor_is_budgeted_under_max_assembly_tokens(self, tmp_path, monkeypatch):
         import importlib
@@ -8446,8 +8448,8 @@ class TestAssemblyGuardrails:
 
         messages = [
             {"role": "system", "content": "s" * 10},
-            {"role": "user", "content": "a" * 20},
-            {"role": "assistant", "content": "b" * 80},
+            {"role": "assistant", "content": "a" * 20},
+            {"role": "user", "content": "b" * 80},
         ]
 
         result = instance.compress(messages, current_tokens=110)
@@ -8488,8 +8490,8 @@ class TestAssemblyGuardrails:
 
         failed_messages = [
             {"role": "system", "content": "s" * 10},
-            {"role": "user", "content": "a" * 20},
-            {"role": "assistant", "content": "b" * 80},
+            {"role": "assistant", "content": "a" * 20},
+            {"role": "user", "content": "b" * 80},
         ]
         instance.compress(failed_messages, current_tokens=110)
         assert instance.get_status()["overflow_recovery_failed"]

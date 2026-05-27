@@ -2775,6 +2775,19 @@ class LCMEngine(ContextEngine):
                 and len(candidate_messages) >= raw_session_count
                 and raw_session_count > 1
             )
+            has_preserved_objective_scaffold = any(
+                str(msg.get("role") or "") != "system"
+                and (normalize_content_value(msg.get("content")) or "").lstrip().startswith(
+                    _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
+                )
+                for msg in candidate_messages
+            )
+            candidate_suffix_has_user_turn = any(identity[0] == "user" for identity in candidate_prefix)
+            has_scaffold_suffix_replay = (
+                matches_sanitized_tail
+                and has_preserved_objective_scaffold
+                and not candidate_suffix_has_user_turn
+            )
             has_raw_cleanup_replay = (
                 matches_raw_tail
                 and has_scaffold_evidence
@@ -2782,7 +2795,7 @@ class LCMEngine(ContextEngine):
                 and len(candidate_prefix) >= max(1, self._config.fresh_tail_count)
                 and raw_suffix_needs_cleanup_equivalence
             )
-            if has_effective_full_replay or has_raw_full_replay or has_raw_cleanup_replay:
+            if has_effective_full_replay or has_raw_full_replay or has_scaffold_suffix_replay or has_raw_cleanup_replay:
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
 
@@ -3749,6 +3762,8 @@ class LCMEngine(ContextEngine):
 
         tail_selected = tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
+        if anchor_source is None:
+            anchor_source = tail_messages
         anchor_part: Optional[str] = None
         summary_budget = None
         if assembly_cap is not None:
@@ -3759,9 +3774,15 @@ class LCMEngine(ContextEngine):
                 tail_messages,
                 insert_missing_tool_stubs=False,
             )
+            skipped_tail_gap = False
             for msg in reversed(tail_for_selection):
                 msg_tokens = count_message_tokens(msg)
                 if used + tail_token_total + msg_tokens > assembly_cap:
+                    if self._is_budget_droppable_tail_message(msg):
+                        skipped_tail_gap = True
+                        continue
+                    break
+                if skipped_tail_gap:
                     break
                 kept_tail_reversed.append(msg)
                 tail_token_total += msg_tokens
@@ -3809,7 +3830,7 @@ class LCMEngine(ContextEngine):
                     if count_message_tokens(candidate_msg) > summary_budget:
                         if part == anchor_part:
                             continue
-                        break
+                        continue
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
@@ -3844,6 +3865,24 @@ class LCMEngine(ContextEngine):
             result = self._sanitize_active_context_messages(trimmed_result)
 
         return result
+
+    def _is_budget_droppable_tail_message(self, message: Dict[str, Any]) -> bool:
+        """Return whether an over-budget tail message may be evicted.
+
+        User turns are prompt-bearing context and stop tail selection when they
+        cannot fit. Assistant/tool turns are derived context; if one bulky turn
+        blocks older prompt material, skip it and keep scanning for budgetable
+        user intent or compact status that still fits.
+        """
+        role = message.get("role")
+        if role not in {"assistant", "tool"}:
+            return False
+        content = normalize_content_value(message.get("content")) or ""
+        if _PRESERVED_TODO_CONTEXT_PREFIX in content:
+            return False
+        if _PRESERVED_OBJECTIVE_CONTEXT_PREFIX in content:
+            return False
+        return True
 
     def _finalize_forced_overflow_result(
         self,

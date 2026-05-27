@@ -12,8 +12,9 @@ def _load_plugin_entrypoint_module(module_name: str):
         submodule_search_locations=[str(repo_root)],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    assert spec is not None
     assert spec.loader is not None
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -27,6 +28,9 @@ def _register_plugin_engine(module_name: str):
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            pass
 
     ctx = _Ctx()
     module.register(ctx)
@@ -170,7 +174,6 @@ def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails
     monkeypatch.setattr(engine_module.subprocess, "run", fail_git)
 
     identity = engine_module._git_runtime_identity(checkout)
-
     assert identity["plugin_git_commit"] == ""
     assert identity["plugin_git_branch"] == ""
     assert identity["plugin_git_dirty"] is None
@@ -178,24 +181,27 @@ def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails
 
 
 def test_git_runtime_identity_reports_untracked_files_as_dirty(tmp_path, monkeypatch):
-    module_name = "hermes_lcm_packaging_entrypoint_git_untracked_dirty"
+    module_name = "hermes_lcm_packaging_entrypoint_git_untracked"
     _register_plugin_engine(module_name)
     engine_module = sys.modules[f"{module_name}.engine"]
 
     checkout = tmp_path / "checkout"
     (checkout / ".git").mkdir(parents=True)
+    (checkout / "untracked.txt").write_text("hi", encoding="utf-8")
 
-    def fake_git(args, **kwargs):
-        if "status" in args:
-            assert "--untracked-files=no" not in args
-            return subprocess.CompletedProcess(args, 0, stdout="?? scratch.txt\n", stderr="")
-        if args[-2:] == ["rev-parse", "HEAD"]:
-            return subprocess.CompletedProcess(args, 0, stdout="abc123\n", stderr="")
-        if args[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
-            return subprocess.CompletedProcess(args, 0, stdout="main\n", stderr="")
-        if args[-4:] == ["config", "--get", "remote.origin.url"]:
-            return subprocess.CompletedProcess(args, 0, stdout="https://github.com/example/repo.git\n", stderr="")
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="unexpected")
+    called = []
+
+    def fake_git(*args, **kwargs):
+        cmd = args[0]
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="?? untracked.txt\n", stderr="")
+        if cmd[-2:] == ["rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+        if cmd[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="main\n", stderr="")
+        if cmd[-4:] == ["config", "--get", "remote.origin.url"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/example/repo.git\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unexpected")
 
     monkeypatch.setattr(engine_module.subprocess, "run", fake_git)
 
@@ -209,3 +215,96 @@ def test_plugin_entrypoint_registration_is_repeatable_and_returns_lcm_engine():
 
     assert engine is not None
     assert engine.name == "lcm"
+
+
+def test_register_gracefully_degrades_when_host_lacks_register_tool():
+    """Guard regression: register() must not raise when ctx lacks register_tool."""
+    repo_root = Path(__file__).resolve().parent.parent
+    module = _load_plugin_entrypoint_module("hermes_lcm_no_register_tool")
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    # Must not raise AttributeError on hosts without register_tool
+    module.register(ctx)
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+
+
+def test_register_continues_when_register_tool_raises_type_error():
+    """Regression: register() must not abort when register_tool exists but raises TypeError."""
+    module = _load_plugin_entrypoint_module("hermes_lcm_type_error_tool")
+
+    class _CtxRaisingTool:
+        def __init__(self):
+            self.engine = None
+        def register_context_engine(self, engine):
+            self.engine = engine
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            raise TypeError("host register_tool signature mismatch")
+
+    ctx = _CtxRaisingTool()
+    # Must not raise — should log warning and continue
+    module.register(ctx)
+    assert ctx.engine is not None
+    assert ctx.engine.name == "lcm"
+
+
+def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(monkeypatch):
+    """Regression: registered tool handlers must forward kwargs (incl. messages=...)
+    to engine.handle_tool_call(), preserving equivalent current-turn ingest behavior.
+
+    Note: This test uses a _CtxRecord with **kwargs to simulate a host that
+    supports message-forwarding. With the new gating logic, hosts with rigid
+    register_tool signatures will NOT have tools registered — they rely on
+    the native context-engine path instead.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    module = _load_plugin_entrypoint_module("hermes_lcm_handler_forward")
+
+    registered = {}  # tool_name -> handler
+
+    class _CtxRecord:
+        def __init__(self):
+            self.engine = None
+        def register_context_engine(self, engine):
+            self.engine = engine
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
+            registered[name] = handler
+
+    ctx = _CtxRecord()
+    module.register(ctx)
+    assert ctx.engine is not None
+
+    # Spy on handle_tool_call
+    calls = []
+    original_handle = ctx.engine.handle_tool_call
+    def spy_handle(name, args, **kwargs):
+        calls.append((name, args, kwargs))
+        return original_handle(name, args, **kwargs)
+    monkeypatch.setattr(ctx.engine, "handle_tool_call", spy_handle)
+
+    # Call each registered handler with messages=... kwarg
+    test_messages = [{"role": "user", "content": "test"}]
+    for tool_name in ("lcm_grep", "lcm_status", "lcm_doctor"):
+        handler = registered.get(tool_name)
+        assert handler is not None, f"handler for {tool_name} not registered"
+        result = handler({"query": tool_name}, messages=test_messages)
+        assert isinstance(result, str), f"{tool_name} handler should return str"
+        assert len(result) > 0, f"{tool_name} handler should return non-empty result"
+
+    # Verify handle_tool_call was invoked for each
+    called_names = {c[0] for c in calls}
+    assert "lcm_grep" in called_names
+    assert "lcm_status" in called_names
+    assert "lcm_doctor" in called_names
+
+    # Verify messages=... kwarg was forwarded
+    for name, args, kwargs in calls:
+        assert "messages" in kwargs, f"{name}: messages kwarg not forwarded"
+        # Depending on whether engine passes it through, at minimum verify it arrived
+        assert kwargs["messages"] == test_messages, f"{name}: messages content mismatch"
