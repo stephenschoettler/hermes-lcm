@@ -2787,7 +2787,6 @@ class LCMEngine(ContextEngine):
                 matches_sanitized_tail
                 and has_preserved_objective_scaffold
                 and not candidate_suffix_has_user_turn
-                and cursor < len(messages)
             )
             has_raw_cleanup_replay = (
                 matches_raw_tail

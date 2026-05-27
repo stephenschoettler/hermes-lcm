@@ -3342,6 +3342,12 @@ class TestAssemblyBudgetSelection:
 
         from hermes_lcm.engine import LCMEngine
 
+        replay_no_delta = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_no_delta._session_id = "assembly-session"
+        replay_no_delta._ingest_cursor_needs_reconcile = True
+        replay_no_delta._ingest_messages(assembled)
+        assert replay_no_delta._store.get_session_count("assembly-session") == len(messages)
+
         replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
         replay._session_id = "assembly-session"
         replay._ingest_cursor_needs_reconcile = True
