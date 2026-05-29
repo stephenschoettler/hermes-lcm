@@ -9,6 +9,12 @@
 
 > Bounded context, unbounded memory. Nothing is ever lost.
 
+## Demo
+
+[Watch the short Hermes-LCM explainer](docs/hermes-lcm-demo.mp4).
+
+A short explainer showing how Hermes-LCM persists sessions, compacts older turns into a summary DAG, and keeps exact details recoverable with tools like `lcm_grep`, `lcm_expand_query`, and `lcm_doctor`.
+
 Based on the [LCM paper](https://papers.voltropy.com/LCM) by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 Inspired by [lossless-claw](https://github.com/martian-engineering/lossless-claw) for OpenClaw.
 
