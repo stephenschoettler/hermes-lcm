@@ -1,5 +1,46 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Testing
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+
+# IDE / Editor
+.zed/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CodeGraph
+.codegraph/
+
+# Pi agent state
+.pi/
+
+# SQLite databases (test artifacts)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
 # Test stubs
 agent/
@@ -7,3 +48,15 @@ agent/
 # Benchmark outputs
 benchmarks/runs/
 *.lcm-benchmark-result.json
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Internal documentation
+internal docs/
+docs/plans/

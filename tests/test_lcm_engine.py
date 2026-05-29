@@ -5045,6 +5045,79 @@ class TestSessionRollover:
         assert engine._dag.get_session_nodes("attacker-new") == []
         assert engine._session_id == "attacker-new"
 
+    def test_compression_boundary_skip_preserves_compaction_state(self, engine):
+        """Regression test: skip-carry-over path must preserve compaction state
+        to prevent re-compaction cascade loop.
+
+        When DM Topics cause session ID mismatch (old_session_id != bound session),
+        the skip-carry-over path is taken. This path must preserve
+        _last_compacted_store_id and _ingest_cursor to prevent the new session
+        from re-ingesting and re-compacting already-compacted messages.
+        """
+        # Bind engine to session-a and simulate post-compaction state
+        engine.on_session_start("session-a", platform="telegram", context_length=200000)
+        engine._last_compacted_store_id = 42
+        engine._ingest_cursor = 7
+
+        # Trigger skip-carry-over path: old_session_id != bound session
+        # This simulates DM Topics scenario where gateway detects session split
+        # but the engine's bound session differs from the gateway's old session
+        engine.on_session_start(
+            "session-b",
+            old_session_id="session-c",  # Different from bound "session-a"
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # Verify state preserved (not zeroed)
+        assert engine._session_id == "session-b"
+        assert engine._last_compacted_store_id == 42
+        assert engine._ingest_cursor == 7
+
+    def test_compression_boundary_skip_preserves_ingest_cursor(self, engine):
+        """Regression test: skip-carry-over path must preserve _ingest_cursor
+        to prevent re-ingestion of already-persisted messages.
+
+        When _ingest_cursor is zeroed, _ingest_messages() will re-ingest ALL
+        messages from the beginning, inflating the message count and triggering
+        re-compaction. This is the root cause of the cascade loop.
+        """
+        # Bind engine and simulate post-compaction state
+        engine.on_session_start("session-a", platform="telegram", context_length=200000)
+        engine._ingest_cursor = 100
+
+        # Trigger skip-carry-over path
+        engine.on_session_start(
+            "session-b",
+            old_session_id="session-c",
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # Verify cursor preserved (not zeroed)
+        # If cursor is zero, _ingest_messages() will re-ingest all messages
+        # and trigger re-compaction cascade
+        assert engine._ingest_cursor == 100
+
+    def test_compression_cooldown_prevents_cascade_after_boundary_skip(self, engine):
+        """Regression test: compression cooldown must prevent immediate
+        re-compression after boundary skip, even if tokens exceed threshold.
+
+        This is defense-in-depth: even if state preservation (Option A) works,
+        the cooldown provides an additional safety net against cascade loops.
+        """
+        # Bind engine and set threshold
+        engine.on_session_start("session-a", platform="telegram", context_length=200000)
+        engine.threshold_tokens = 100000
+
+        # Simulate boundary skip with cooldown timestamp
+        engine._last_boundary_skip_time = time.time()
+
+        # Verify cooldown blocks compression even above threshold
+        assert not engine.should_compress(200000)  # Way above threshold
+
     def test_live_auxiliary_child_session_does_not_rebind_shared_engine(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
         hermes_home.mkdir()
@@ -7377,8 +7450,10 @@ class TestSessionRollover:
         assert engine._session_id == "new-hermes-session"
         assert engine._conversation_id == "conversation-b"
         assert engine.compression_count == 0
-        assert engine._last_compacted_store_id == 0
-        assert engine._ingest_cursor == 0
+        # Compaction state is preserved to prevent re-compaction cascade.
+        # See: test_compression_boundary_skip_preserves_compaction_state
+        assert engine._last_compacted_store_id == source_store_id
+        assert engine._ingest_cursor == 2
         assert engine._store.get_session_count("lcm-source") == 1
         assert engine._store.get_session_count("new-hermes-session") == 0
         assert engine._store.get_session_count("old-hermes-session") == 1
@@ -7420,8 +7495,10 @@ class TestSessionRollover:
         assert engine.last_prompt_tokens == 0
         assert engine.last_completion_tokens == 0
         assert engine.last_total_tokens == 0
-        assert engine._last_compacted_store_id == 0
-        assert engine._ingest_cursor == 0
+        # Compaction state is preserved to prevent re-compaction cascade.
+        # See: test_compression_boundary_skip_preserves_compaction_state
+        assert engine._last_compacted_store_id == 42
+        assert engine._ingest_cursor == 7
 
     def test_compression_boundary_reassigns_externalized_payload_session_metadata(self, tmp_path):
         config = LCMConfig(
