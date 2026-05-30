@@ -1,14 +1,43 @@
 """Public lcm_* tool contract drift guards."""
 
 import ast
+import importlib
 import inspect
+import sys
 import textwrap
 from pathlib import Path
+from types import ModuleType
 
 import hermes_lcm.schemas as schemas
 import hermes_lcm.tools as lcm_tools
 from hermes_lcm.config import LCMConfig
-from hermes_lcm.engine import LCMEngine
+
+
+def _import_lcm_engine():
+    try:
+        return getattr(importlib.import_module("hermes_lcm.engine"), "LCMEngine")
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"agent", "agent.context_engine"}:
+            raise
+        agent_module = sys.modules.get("agent")
+        if agent_module is None:
+            agent_module = ModuleType("agent")
+            agent_module.__path__ = []
+            sys.modules["agent"] = agent_module
+
+        context_engine_module = ModuleType("agent.context_engine")
+
+        class ContextEngine:
+            pass
+
+        setattr(context_engine_module, "ContextEngine", ContextEngine)
+        sys.modules["agent.context_engine"] = context_engine_module
+        setattr(agent_module, "context_engine", context_engine_module)
+        sys.modules.pop("hermes_lcm.engine", None)
+        return getattr(importlib.import_module("hermes_lcm.engine"), "LCMEngine")
+
+
+LCMEngine = _import_lcm_engine()
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
