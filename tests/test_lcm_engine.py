@@ -5045,49 +5045,17 @@ class TestSessionRollover:
         assert engine._dag.get_session_nodes("attacker-new") == []
         assert engine._session_id == "attacker-new"
 
-    def test_compression_boundary_skip_preserves_compaction_state(self, engine):
-        """Regression test: skip-carry-over path must preserve compaction state
-        to prevent re-compaction cascade loop.
+    def test_compression_boundary_skip_uses_new_session_cursor_for_fresh_messages(self, engine):
+        """Unproven boundary skips must not trust stale cursor/frontier state.
 
-        When DM Topics cause session ID mismatch (old_session_id != bound session),
-        the skip-carry-over path is taken. This path must preserve
-        _last_compacted_store_id and _ingest_cursor to prevent the new session
-        from re-ingesting and re-compacting already-compacted messages.
+        If the bound session cannot be proven to be the carry-over source, the
+        new session must persist its own fresh messages rather than inheriting a
+        cursor that makes them look already ingested.
         """
-        # Bind engine to session-a and simulate post-compaction state
         engine.on_session_start("session-a", platform="telegram", context_length=200000)
         engine._last_compacted_store_id = 42
-        engine._ingest_cursor = 7
+        engine._ingest_cursor = 3
 
-        # Trigger skip-carry-over path: old_session_id != bound session
-        # This simulates DM Topics scenario where gateway detects session split
-        # but the engine's bound session differs from the gateway's old session
-        engine.on_session_start(
-            "session-b",
-            old_session_id="session-c",  # Different from bound "session-a"
-            boundary_reason="compression",
-            platform="telegram",
-            context_length=200000,
-        )
-
-        # Verify state preserved (not zeroed)
-        assert engine._session_id == "session-b"
-        assert engine._last_compacted_store_id == 42
-        assert engine._ingest_cursor == 7
-
-    def test_compression_boundary_skip_preserves_ingest_cursor(self, engine):
-        """Regression test: skip-carry-over path must preserve _ingest_cursor
-        to prevent re-ingestion of already-persisted messages.
-
-        When _ingest_cursor is zeroed, _ingest_messages() will re-ingest ALL
-        messages from the beginning, inflating the message count and triggering
-        re-compaction. This is the root cause of the cascade loop.
-        """
-        # Bind engine and simulate post-compaction state
-        engine.on_session_start("session-a", platform="telegram", context_length=200000)
-        engine._ingest_cursor = 100
-
-        # Trigger skip-carry-over path
         engine.on_session_start(
             "session-b",
             old_session_id="session-c",
@@ -5096,27 +5064,72 @@ class TestSessionRollover:
             context_length=200000,
         )
 
-        # Verify cursor preserved (not zeroed)
-        # If cursor is zero, _ingest_messages() will re-ingest all messages
-        # and trigger re-compaction cascade
-        assert engine._ingest_cursor == 100
+        fresh_messages = [
+            {"role": "user", "content": "fresh session-b question"},
+            {"role": "assistant", "content": "fresh session-b answer"},
+        ]
+        replay = engine._ingest_messages(fresh_messages)
+
+        assert replay == fresh_messages
+        assert engine._session_id == "session-b"
+        assert engine._last_compacted_store_id == 0
+        assert engine._ingest_cursor == len(fresh_messages)
+        assert engine._store.get_session_count("session-b") == len(fresh_messages)
+        assert [row["content"] for row in engine._store.get_session_messages("session-b")] == [
+            "fresh session-b question",
+            "fresh session-b answer",
+        ]
+
+    def test_compression_boundary_skip_preflight_cooldown_is_lossless(self, engine):
+        """Preflight should ingest fresh messages but not request compression during cooldown."""
+        engine.on_session_start("session-a", platform="telegram", context_length=200000)
+        engine._last_compacted_store_id = 42
+        engine._ingest_cursor = 3
+        engine.on_session_start(
+            "session-b",
+            old_session_id="session-c",
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+        engine.threshold_tokens = 1
+        engine._config.leaf_chunk_tokens = 1
+        engine._config.dynamic_leaf_chunk_enabled = False
+        engine._config.fresh_tail_count = 1
+
+        fresh_messages = [
+            {"role": "user", "content": f"fresh preflight payload {idx}"}
+            for idx in range(6)
+        ]
+
+        assert engine.should_compress_preflight(fresh_messages) is False
+        assert engine._store.get_session_count("session-b") == len(fresh_messages)
+        assert engine._ingest_cursor == len(fresh_messages)
+
+    def test_compression_boundary_skip_preflight_cooldown_blocks_replay_diff(self, engine, monkeypatch):
+        engine.on_session_start("session-a", platform="telegram", context_length=200000)
+        engine.on_session_start(
+            "session-b",
+            old_session_id="session-c",
+            boundary_reason="compression",
+            platform="telegram",
+            context_length=200000,
+        )
+        messages = [{"role": "assistant", "content": "raw assistant output"}]
+
+        def replay_diff(_messages):
+            return [{"role": "assistant", "content": "sanitized assistant output"}]
+
+        monkeypatch.setattr(engine, "_ingest_messages", replay_diff)
+
+        assert engine.should_compress_preflight(messages) is False
 
     def test_compression_cooldown_prevents_cascade_after_boundary_skip(self, engine):
-        """Regression test: compression cooldown must prevent immediate
-        re-compression after boundary skip, even if tokens exceed threshold.
-
-        This is defense-in-depth: even if state preservation (Option A) works,
-        the cooldown provides an additional safety net against cascade loops.
-        """
-        # Bind engine and set threshold
         engine.on_session_start("session-a", platform="telegram", context_length=200000)
         engine.threshold_tokens = 100000
-
-        # Simulate boundary skip with cooldown timestamp
         engine._last_boundary_skip_time = time.time()
 
-        # Verify cooldown blocks compression even above threshold
-        assert not engine.should_compress(200000)  # Way above threshold
+        assert not engine.should_compress(200000)
 
     def test_live_auxiliary_child_session_does_not_rebind_shared_engine(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"
@@ -7450,10 +7463,8 @@ class TestSessionRollover:
         assert engine._session_id == "new-hermes-session"
         assert engine._conversation_id == "conversation-b"
         assert engine.compression_count == 0
-        # Compaction state is preserved to prevent re-compaction cascade.
-        # See: test_compression_boundary_skip_preserves_compaction_state
-        assert engine._last_compacted_store_id == source_store_id
-        assert engine._ingest_cursor == 2
+        assert engine._last_compacted_store_id == 0
+        assert engine._ingest_cursor == 0
         assert engine._store.get_session_count("lcm-source") == 1
         assert engine._store.get_session_count("new-hermes-session") == 0
         assert engine._store.get_session_count("old-hermes-session") == 1
@@ -7495,10 +7506,8 @@ class TestSessionRollover:
         assert engine.last_prompt_tokens == 0
         assert engine.last_completion_tokens == 0
         assert engine.last_total_tokens == 0
-        # Compaction state is preserved to prevent re-compaction cascade.
-        # See: test_compression_boundary_skip_preserves_compaction_state
-        assert engine._last_compacted_store_id == 42
-        assert engine._ingest_cursor == 7
+        assert engine._last_compacted_store_id == 0
+        assert engine._ingest_cursor == 0
 
     def test_compression_boundary_reassigns_externalized_payload_session_metadata(self, tmp_path):
         config = LCMConfig(

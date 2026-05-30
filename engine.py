@@ -606,23 +606,25 @@ class LCMEngine(ContextEngine):
             return 0.0
         return self.last_cache_read_tokens / self.last_prompt_tokens
 
+    def _compression_boundary_cooldown_active(self) -> bool:
+        """Return true while a boundary skip is in its short no-compress window."""
+        if self._last_boundary_skip_time <= 0:
+            return False
+        elapsed = time.time() - self._last_boundary_skip_time
+        if elapsed < 60:
+            logger.debug(
+                "LCM compression cooldown active: %.1f seconds since boundary skip",
+                elapsed,
+            )
+            return True
+        self._last_boundary_skip_time = 0
+        return False
+
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
-        # Cooldown after compression boundary skip to prevent cascade.
-        # This is defense-in-depth: even with preserved state, the cooldown
-        # provides an additional safety net against cascade loops.
-        if self._last_boundary_skip_time > 0:
-            elapsed = time.time() - self._last_boundary_skip_time
-            if elapsed < 60:  # 60-second cooldown
-                logger.debug(
-                    "LCM compression cooldown active: %.1f seconds since boundary skip",
-                    elapsed,
-                )
-                return False
-            else:
-                # Cooldown expired, reset timestamp
-                self._last_boundary_skip_time = 0
+        if self._compression_boundary_cooldown_active():
+            return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
             return True
@@ -641,7 +643,11 @@ class LCMEngine(ContextEngine):
             except Exception as e:
                 logger.warning("Ingest during preflight: %s", e)
         if replay_messages is not None and replay_messages != messages:
+            if self._compression_boundary_cooldown_active():
+                return False
             return True
+        if self._compression_boundary_cooldown_active():
+            return False
         from .tokens import count_messages_tokens
         rough = count_messages_tokens(messages)
         if self._should_force_overflow_recovery(observed_tokens=rough):
@@ -1623,11 +1629,7 @@ class LCMEngine(ContextEngine):
         self._last_boundary_skip_time = 0
 
     def _reset_compaction_progress(self) -> None:
-        """Reset compaction progress markers.
-
-        WARNING: Do NOT call on boundary skip. Zeroing _last_compacted_store_id
-        and _ingest_cursor causes re-compaction cascade loops.
-        """
+        """Reset process-local compaction markers for a fresh/unproven session."""
         self._last_compacted_store_id = 0
         self._ingest_cursor = 0
         self._ingest_cursor_needs_reconcile = False
@@ -1637,8 +1639,8 @@ class LCMEngine(ContextEngine):
         """Reset all session-scoped runtime state.
 
         Calls both _reset_session_counters and _reset_compaction_progress.
-        Use _reset_session_counters alone on boundary skip to preserve
-        compaction progress.
+        Proven carry-over paths must restore/advance state from the verified
+        source lifecycle after rebinding.
         """
         self._reset_session_counters()
         self._reset_compaction_progress()
@@ -1849,28 +1851,14 @@ class LCMEngine(ContextEngine):
                 previous_session_id,
             )
             self._finalize_pending_reset_boundary(previous_session_id)
-            # Preserve compaction state to prevent re-compaction cascade loop.
-            # When DM Topics cause session ID mismatch, the skip-carry-over path
-            # is taken. Zeroing _last_compacted_store_id and _ingest_cursor
-            # would cause the new session to re-ingest and re-compact all messages.
-            # Use _reset_session_counters instead of _reset_session_scoped_runtime_state
-            # to preserve compaction progress.
-            saved_compacted_id = self._last_compacted_store_id
-            saved_ingest_cursor = self._ingest_cursor
-            self._reset_session_counters()
-            # Set cooldown timestamp to prevent immediate re-compression.
-            # This is defense-in-depth: even with preserved state, the cooldown
-            # provides an additional safety net against cascade loops.
+            self._reset_session_scoped_runtime_state()
             self._last_boundary_skip_time = time.time()
             self._apply_session_start_metadata(session_id, kwargs)
             self._bind_lifecycle_state(
                 session_id,
                 conversation_id=kwargs.get("conversation_id"),
             )
-            # Restore compaction state after _bind_lifecycle_state, which
-            # overwrites _last_compacted_store_id with frontier_store_id.
-            self._last_compacted_store_id = saved_compacted_id
-            self._ingest_cursor = saved_ingest_cursor
+            self._schedule_ingest_cursor_reconciliation()
             self._clear_pending_reset_boundary()
             self._log_session_filter_diagnostics()
             return
