@@ -139,6 +139,16 @@ python scripts/lcm_stress_check.py \
   --json
 ```
 
+For a longer manual lifecycle soak pass, use the `soak` tier. It is intentionally not a default CI gate:
+
+```bash
+python scripts/lcm_stress_check.py \
+  --output /tmp/hermes-lcm-stress-soak-$(date +%Y%m%d-%H%M%S) \
+  --tier soak \
+  --scenario lifecycle_soak_and_profile_rebinds \
+  --json
+```
+
 The stress runner currently covers:
 
 - multi-cycle compaction with planted canary recall through `lcm_grep` and `lcm_expand`
@@ -146,6 +156,7 @@ The stress runner currently covers:
 - current/all/explicit session scope and `lcm_load_session` pagination
 - punctuation/unicode/FTS-hostile query fuzzing with bounded fallback behavior
 - concurrent reader/writer smoke while compaction is active
+- lifecycle soak across `/new` rollover, restart/rebind, Hermes home profile rebinding, SQLite WAL growth checks, and externalized-payload accumulation
 
 Generated artifacts:
 

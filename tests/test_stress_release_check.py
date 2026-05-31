@@ -82,6 +82,7 @@ def test_stress_cli_smoke_writes_results_summary_and_uses_output_sandbox(tmp_pat
         "cross_session_scope_and_pagination",
         "query_fuzz_no_crash",
         "concurrent_read_write_smoke",
+        "lifecycle_soak_and_profile_rebinds",
     }
     assert all(case["ok"] is True for case in results["cases"].values())
     assert str(output_dir) in serialized
@@ -105,6 +106,34 @@ def test_stress_cli_rejects_existing_file_output_path(tmp_path):
 
     with pytest.raises(SystemExit, match="Output path exists and is not a directory"):
         cli.main(["--output", str(output_file), "--tier", "smoke"])
+
+
+@pytest.mark.filterwarnings("ignore:.*__package__ != __spec__.*:DeprecationWarning")
+def test_lifecycle_soak_scenario_exercises_rollover_restart_rebind_and_payloads(tmp_path):
+    from benchmarking import stress
+
+    output_dir = tmp_path / "lifecycle-soak"
+
+    result = stress.run_stress_check(
+        output_dir=output_dir,
+        tier="smoke",
+        scenarios=["lifecycle_soak_and_profile_rebinds"],
+    )
+
+    case = result["cases"]["lifecycle_soak_and_profile_rebinds"]
+    assert result["failure_count"] == 0
+    assert case["ok"] is True
+    assert case["rollover_count"] >= 1
+    assert case["restart_cycles"] >= 1
+    assert case["profile_rebind_checks"]["profile_a_db"] != case["profile_rebind_checks"]["profile_b_db"]
+    assert case["profile_rebind_checks"]["profile_a_recall"] is True
+    assert case["profile_rebind_checks"]["profile_b_isolated_from_a"] is True
+    assert case["externalized_payload_count"] >= 1
+    assert case["wal_max_bytes"] >= 0
+    assert case["wal_max_bytes"] <= case["wal_soft_limit_bytes"]
+    assert case["lifecycle_fragmentation"]["lifecycle_rows"] >= 1
+    for externalized_file in case["externalized_files"]:
+        _assert_path_under(externalized_file, output_dir)
 
 
 def test_stress_run_blanks_provider_keys_and_restores_environment(tmp_path, monkeypatch):

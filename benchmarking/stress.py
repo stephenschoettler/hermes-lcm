@@ -30,6 +30,7 @@ DEFAULT_SCENARIOS = (
     "cross_session_scope_and_pagination",
     "query_fuzz_no_crash",
     "concurrent_read_write_smoke",
+    "lifecycle_soak_and_profile_rebinds",
 )
 
 
@@ -43,6 +44,11 @@ class StressTier:
     fuzz_repetitions: int
     concurrent_turns: int
     reader_threads: int
+    lifecycle_turns_per_session: int
+    lifecycle_rollovers: int
+    lifecycle_restart_every: int
+    lifecycle_externalize_every: int
+    lifecycle_wal_soft_limit_bytes: int
 
 
 TIERS = {
@@ -55,6 +61,11 @@ TIERS = {
         fuzz_repetitions=2,
         concurrent_turns=24,
         reader_threads=2,
+        lifecycle_turns_per_session=8,
+        lifecycle_rollovers=1,
+        lifecycle_restart_every=6,
+        lifecycle_externalize_every=4,
+        lifecycle_wal_soft_limit_bytes=5_000_000,
     ),
     "release": StressTier(
         name="release",
@@ -65,6 +76,26 @@ TIERS = {
         fuzz_repetitions=8,
         concurrent_turns=90,
         reader_threads=4,
+        lifecycle_turns_per_session=28,
+        lifecycle_rollovers=3,
+        lifecycle_restart_every=14,
+        lifecycle_externalize_every=5,
+        lifecycle_wal_soft_limit_bytes=20_000_000,
+    ),
+    "soak": StressTier(
+        name="soak",
+        multi_turns=360,
+        multi_compress_every=12,
+        multi_sample_indexes=(0, 1, 2, 17, 44, 88, 123, 179, 241, 359),
+        scope_turns_per_session=36,
+        fuzz_repetitions=12,
+        concurrent_turns=160,
+        reader_threads=6,
+        lifecycle_turns_per_session=80,
+        lifecycle_rollovers=5,
+        lifecycle_restart_every=20,
+        lifecycle_externalize_every=4,
+        lifecycle_wal_soft_limit_bytes=75_000_000,
     ),
 }
 
@@ -412,6 +443,49 @@ def _db_counts(db_path: Path) -> dict[str, int]:
     return out
 
 
+def _sqlite_artifact_bytes(db_path: Path) -> dict[str, int]:
+    paths = [db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")]
+    return {path.name: path.stat().st_size if path.exists() else 0 for path in paths}
+
+
+def _sqlite_artifact_total_bytes(db_path: Path) -> int:
+    return sum(_sqlite_artifact_bytes(db_path).values())
+
+
+def _externalized_payload_files(hermes_home: str | Path) -> list[Path]:
+    payload_dir = Path(hermes_home) / "lcm-large-outputs"
+    if not payload_dir.exists():
+        return []
+    return sorted(payload_dir.glob("*.json"))
+
+
+def _json_contains(payload: Any, *needles: str) -> bool:
+    serialized = json.dumps(payload, ensure_ascii=False)
+    return all(needle in serialized for needle in needles)
+
+
+def _tool_recall_contains(
+    run: StressRun,
+    engine: Any,
+    query: str,
+    *needles: str,
+    args: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    grep_args = {"query": query, "limit": 5, **(args or {})}
+    grep = run.call_tool(engine, "lcm_grep", grep_args)
+    if _json_contains(grep, *needles):
+        return True, {"grep": grep, "expanded": []}
+    expanded_samples: list[dict[str, Any]] = []
+    for result in grep.get("results", []) + grep.get("matches", []) + grep.get("data", []):
+        if not isinstance(result, dict) or not result.get("store_id"):
+            continue
+        expanded = run.call_tool(engine, "lcm_expand", {"store_id": int(result["store_id"]), "max_tokens": 800})
+        expanded_samples.append({"store_id": int(result["store_id"]), "expand": expanded})
+        if _json_contains(expanded, *needles):
+            return True, {"grep": grep, "expanded": expanded_samples}
+    return False, {"grep": grep, "expanded": expanded_samples}
+
+
 def _db_text_dump(db_path: Path) -> str:
     con = sqlite3.connect(db_path)
     parts: list[str] = []
@@ -716,10 +790,278 @@ def _case_concurrent_read_write_smoke(run: StressRun) -> None:
         engine.shutdown()
 
 
+def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
+    _ensure_hermes_lcm_package(run.plugin_dir)
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.engine import LCMEngine
+    from hermes_lcm.tokens import count_messages_tokens
+
+    case = "lifecycle_soak_and_profile_rebinds"
+    case_dir = run.sandbox_dir / case
+    hermes_home = case_dir / "primary-home"
+    db_path = case_dir / "lcm.db"
+    conversation_id = "conv-lifecycle-soak"
+    current_session = "lifecycle-session-000"
+    cfg = LCMConfig(
+        database_path=str(db_path),
+        fresh_tail_count=5,
+        leaf_chunk_tokens=120,
+        context_threshold=0.50,
+        incremental_max_depth=3,
+        condensation_fanin=2,
+        dynamic_leaf_chunk_enabled=True,
+        dynamic_leaf_chunk_max=300,
+        deferred_maintenance_enabled=True,
+        deferred_maintenance_max_passes=3,
+        critical_budget_pressure_ratio=0.70,
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=400,
+        large_output_transcript_gc_enabled=True,
+        new_session_retain_depth=-1,
+    )
+
+    def new_engine() -> Any:
+        engine = LCMEngine(config=cfg, hermes_home=str(hermes_home))
+        engine.update_model("stress-model", 4_000, provider="benchmark")
+        return engine
+
+    def lifecycle_messages_for_session(session_idx: int) -> list[dict[str, Any]]:
+        return [{"role": "system", "content": f"lifecycle system anchor session={session_idx}"}]
+
+    def append_turn(messages: list[dict[str, Any]], session_idx: int, turn_idx: int) -> None:
+        cid = f"CANARY_LIFECYCLE_{session_idx:02d}_{turn_idx:03d}"
+        val = f"VALUE_LIFECYCLE_{session_idx:02d}_{turn_idx:03d}"
+        messages.append({
+            "role": "user",
+            "content": f"session={session_idx} turn={turn_idx} {cid} = {val} lifecycle restart rollover payload " + ("alpha " * 20),
+        })
+        if turn_idx % max(1, run.tier.lifecycle_externalize_every) == 0:
+            tool_call_id = f"lifecycle-call-{session_idx}-{turn_idx}"
+            blob = base64.b64encode((f"{cid} {val} " + ("PAYLOAD " * 220)).encode()).decode()
+            messages.append({
+                "role": "assistant",
+                "content": f"collecting large lifecycle payload for {cid}",
+                "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": "collect_payload", "arguments": json.dumps({"canary": cid})}}],
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": "collect_payload",
+                "content": json.dumps({"canary": cid, "value": val, "data_url": "data:text/plain;base64," + blob}),
+            })
+        else:
+            messages.append({"role": "assistant", "content": f"ack lifecycle {cid} {val}"})
+
+    engine = new_engine()
+    messages = lifecycle_messages_for_session(0)
+    rollovers = 0
+    restarts = 0
+    wal_max_bytes = 0
+    total_turns = 0
+    compressed_lengths: list[int] = []
+    try:
+        engine.on_session_start(current_session, platform="cli", conversation_id=conversation_id, hermes_home=str(hermes_home))
+        for session_idx in range(run.tier.lifecycle_rollovers + 1):
+            current_session = f"lifecycle-session-{session_idx:03d}"
+            if engine._session_id != current_session:
+                engine.on_session_start(current_session, platform="cli", conversation_id=conversation_id, hermes_home=str(hermes_home))
+            for turn_idx in range(run.tier.lifecycle_turns_per_session):
+                append_turn(messages, session_idx, turn_idx)
+                total_turns += 1
+                if turn_idx % 4 == 3:
+                    messages = engine.compress(messages, current_tokens=max(4_200, count_messages_tokens(messages)))
+                    compressed_lengths.append(len(messages))
+                    wal_max_bytes = max(wal_max_bytes, _sqlite_artifact_bytes(db_path).get(f"{db_path.name}-wal", 0))
+                if total_turns % max(1, run.tier.lifecycle_restart_every) == 0:
+                    engine.shutdown()
+                    restarts += 1
+                    engine = new_engine()
+                    engine.on_session_start(current_session, platform="cli", conversation_id=conversation_id, hermes_home=str(hermes_home))
+                    restart_ok, restart_probe = _tool_recall_contains(
+                        run,
+                        engine,
+                        "CANARY_LIFECYCLE_00_000",
+                        "CANARY_LIFECYCLE_00_000",
+                        "VALUE_LIFECYCLE_00_000",
+                        args={"session_scope": "all", "limit": 5},
+                    )
+                    if not restart_ok:
+                        run.fail(case, "restart_lost_old_canary", "Restart/rebind within a live session lost early lifecycle recall", {"probe": restart_probe, "session": current_session})
+            if session_idx < run.tier.lifecycle_rollovers:
+                old_session = current_session
+                new_session = f"lifecycle-session-{session_idx + 1:03d}"
+                carried = engine.rollover_session(
+                    old_session,
+                    new_session,
+                    previous_messages=messages,
+                    carry_over_context=True,
+                    hermes_home=str(hermes_home),
+                )
+                rollovers += 1
+                run.record(case, f"rollover_{session_idx}_carried_nodes", carried)
+                current_session = new_session
+                messages = lifecycle_messages_for_session(session_idx + 1)
+        messages = engine.compress(messages, current_tokens=max(4_200, count_messages_tokens(messages)))
+        engine.on_session_end(current_session, messages)
+
+        early_ok, early = _tool_recall_contains(
+            run,
+            engine,
+            "CANARY_LIFECYCLE_00_000",
+            "CANARY_LIFECYCLE_00_000",
+            "VALUE_LIFECYCLE_00_000",
+            args={"session_scope": "all", "limit": 10},
+        )
+        explicit_old_ok, explicit_old = _tool_recall_contains(
+            run,
+            engine,
+            "CANARY_LIFECYCLE_00_000",
+            "CANARY_LIFECYCLE_00_000",
+            "VALUE_LIFECYCLE_00_000",
+            args={"session_scope": "session", "session_id": "lifecycle-session-000", "limit": 10},
+        )
+        last_cid = f"CANARY_LIFECYCLE_{run.tier.lifecycle_rollovers:02d}_{run.tier.lifecycle_turns_per_session - 1:03d}"
+        last_val = f"VALUE_LIFECYCLE_{run.tier.lifecycle_rollovers:02d}_{run.tier.lifecycle_turns_per_session - 1:03d}"
+        latest_ok, latest = _tool_recall_contains(
+            run,
+            engine,
+            last_cid,
+            last_cid,
+            last_val,
+            args={"session_scope": "all", "limit": 10},
+        )
+        if not early_ok:
+            run.fail(case, "rollover_all_scope_lost_early_canary", "Lifecycle rollover/soak failed to retain old-session recall in all scope", {"grep": early})
+        if not explicit_old_ok:
+            run.fail(case, "rollover_explicit_scope_lost_early_canary", "Lifecycle rollover/soak failed explicit old-session recall", {"grep": explicit_old})
+        if not latest_ok:
+            run.fail(case, "latest_session_canary_missing", "Lifecycle soak lost latest-session canary recall", {"grep": latest, "canary": last_cid})
+
+        payload_files = _externalized_payload_files(hermes_home)
+        if not payload_files:
+            run.fail(case, "externalized_payloads_missing", "Lifecycle soak did not create externalized payload files under sandboxed Hermes home", {"hermes_home": str(hermes_home)})
+        payload_errors: list[dict[str, Any]] = []
+        for path in payload_files:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                payload_errors.append({"path": str(path), "error": traceback.format_exc()})
+                continue
+            if not payload.get("content") or not payload.get("session_id"):
+                payload_errors.append({"path": str(path), "payload_keys": sorted(payload)})
+        if payload_errors:
+            run.fail(case, "externalized_payload_metadata_invalid", "Externalized payload files were unreadable or missing recovery metadata", {"errors": payload_errors[:10]})
+
+        wal_max_bytes = max(wal_max_bytes, _sqlite_artifact_bytes(db_path).get(f"{db_path.name}-wal", 0))
+        if wal_max_bytes > run.tier.lifecycle_wal_soft_limit_bytes:
+            run.fail(case, "wal_growth_exceeded_soft_limit", "Lifecycle soak SQLite WAL grew past the tier soft limit", {"wal_max_bytes": wal_max_bytes, "soft_limit": run.tier.lifecycle_wal_soft_limit_bytes})
+        doctor = run.call_tool(engine, "lcm_doctor", {})
+        if "error" in doctor:
+            run.fail(case, "doctor_error_after_lifecycle_soak", "lcm_doctor returned an error after lifecycle soak", {"doctor": doctor})
+        fragmentation = engine._lifecycle.get_fragmentation_stats()
+        if fragmentation.get("lifecycle_rows", 0) < 1:
+            run.fail(case, "lifecycle_state_missing", "Lifecycle soak produced messages without lifecycle state rows", {"fragmentation": fragmentation})
+
+        run.record(case, "rollover_count", rollovers)
+        run.record(case, "restart_cycles", restarts)
+        run.record(case, "turns_total", total_turns)
+        run.record(case, "compressed_lengths", compressed_lengths[-20:])
+        run.record(case, "db_counts", _db_counts(db_path))
+        run.record(case, "sqlite_artifact_bytes", _sqlite_artifact_bytes(db_path))
+        run.record(case, "sqlite_artifact_total_bytes", _sqlite_artifact_total_bytes(db_path))
+        run.record(case, "wal_max_bytes", wal_max_bytes)
+        run.record(case, "wal_soft_limit_bytes", run.tier.lifecycle_wal_soft_limit_bytes)
+        run.record(case, "externalized_payload_count", len(payload_files))
+        run.record(case, "externalized_files", [str(path) for path in payload_files[:20]])
+        run.record(case, "old_canary_all_scope", early)
+        run.record(case, "old_canary_explicit_scope", explicit_old)
+        run.record(case, "latest_canary_all_scope", latest)
+        run.record(case, "doctor", doctor)
+        run.record(case, "lifecycle_fragmentation", fragmentation)
+    finally:
+        try:
+            engine.shutdown()
+        except Exception:
+            pass
+
+    run.record(case, "profile_rebind_checks", _profile_rebind_probe(run, case))
+
+
+def _profile_rebind_probe(run: StressRun, case: str) -> dict[str, Any]:
+    _ensure_hermes_lcm_package(run.plugin_dir)
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.engine import LCMEngine
+    from hermes_lcm.tokens import count_messages_tokens
+
+    root = run.sandbox_dir / case / "profiles"
+    profile_a = root / "profile-a"
+    profile_b = root / "profile-b"
+    cfg = LCMConfig(
+        fresh_tail_count=3,
+        leaf_chunk_tokens=40,
+        context_threshold=0.50,
+        dynamic_leaf_chunk_enabled=False,
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=300,
+        large_output_transcript_gc_enabled=True,
+    )
+    engine = LCMEngine(config=cfg, hermes_home=str(profile_a))
+    engine.update_model("stress-model", 4_000, provider="benchmark")
+    try:
+        engine.on_session_start("profile-a-session", platform="cli", conversation_id="profile-a-conv", hermes_home=str(profile_a))
+        messages_a = [
+            {"role": "system", "content": "profile A system"},
+            {"role": "user", "content": "CANARY_PROFILE_A_000 = VALUE_PROFILE_A_000 " + ("profile-a " * 15)},
+            {"role": "assistant", "content": "ack CANARY_PROFILE_A_000 VALUE_PROFILE_A_000"},
+        ]
+        messages_a = engine.compress(messages_a, current_tokens=max(4_200, count_messages_tokens(messages_a)))
+        engine.on_session_end("profile-a-session", messages_a)
+        profile_a_db = str(engine._store.db_path)
+
+        engine.on_session_start("profile-b-session", platform="cli", conversation_id="profile-b-conv", hermes_home=str(profile_b))
+        profile_b_db = str(engine._store.db_path)
+        messages_b = [
+            {"role": "system", "content": "profile B system"},
+            {"role": "user", "content": "CANARY_PROFILE_B_000 = VALUE_PROFILE_B_000 " + ("profile-b " * 15)},
+            {"role": "assistant", "content": "ack CANARY_PROFILE_B_000 VALUE_PROFILE_B_000"},
+        ]
+        messages_b = engine.compress(messages_b, current_tokens=max(4_200, count_messages_tokens(messages_b)))
+        engine.on_session_end("profile-b-session", messages_b)
+        profile_b_probe_for_a = run.call_tool(engine, "lcm_grep", {"query": "CANARY_PROFILE_A_000", "session_scope": "all", "limit": 5})
+
+        engine.on_session_start("profile-a-session-2", platform="cli", conversation_id="profile-a-conv-2", hermes_home=str(profile_a))
+        profile_a_recall, profile_a_probe = _tool_recall_contains(
+            run,
+            engine,
+            "CANARY_PROFILE_A_000",
+            "CANARY_PROFILE_A_000",
+            "VALUE_PROFILE_A_000",
+            args={"session_scope": "all", "limit": 5},
+        )
+        profile_b_isolated_from_a = not _json_contains(profile_b_probe_for_a, "CANARY_PROFILE_A_000", "VALUE_PROFILE_A_000")
+        if not profile_a_recall:
+            run.fail(case, "profile_rebind_lost_original_profile", "Profile rebind back to profile A failed to recover profile A data", {"grep": profile_a_probe})
+        if not profile_b_isolated_from_a:
+            run.fail(case, "profile_rebind_cross_profile_leak", "Profile B database saw profile A content after Hermes home rebind", {"grep": profile_b_probe_for_a})
+        if profile_a_db == profile_b_db:
+            run.fail(case, "profile_rebind_database_path_not_switched", "Hermes-home profile rebind did not switch SQLite database path", {"profile_a_db": profile_a_db, "profile_b_db": profile_b_db})
+        return {
+            "profile_a_db": profile_a_db,
+            "profile_b_db": profile_b_db,
+            "profile_a_recall": profile_a_recall,
+            "profile_b_isolated_from_a": profile_b_isolated_from_a,
+            "profile_a_probe": profile_a_probe,
+            "profile_b_probe_for_a": profile_b_probe_for_a,
+        }
+    finally:
+        engine.shutdown()
+
+
 _SCENARIO_FUNCTIONS: dict[str, Callable[[StressRun], None]] = {
     "multi_cycle_canary_recall": _case_multi_cycle_canary_recall,
     "redaction_and_externalization_boundaries": _case_redaction_and_externalization_boundaries,
     "cross_session_scope_and_pagination": _case_cross_session_scope_and_pagination,
     "query_fuzz_no_crash": _case_query_fuzz_no_crash,
     "concurrent_read_write_smoke": _case_concurrent_read_write_smoke,
+    "lifecycle_soak_and_profile_rebinds": _case_lifecycle_soak_and_profile_rebinds,
 }
