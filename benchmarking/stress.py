@@ -111,7 +111,7 @@ class StressRun:
 
     @contextlib.contextmanager
     def patched_summarizers(self) -> Iterator[None]:
-        _ensure_hermes_lcm_package(self.plugin_dir)
+        _ensure_hermes_lcm_package(self.plugin_dir, reload_submodules=True)
         import hermes_lcm.engine as engine_mod
         import hermes_lcm.tools as tools_mod
 
@@ -282,12 +282,27 @@ def deterministic_expand_answer(*, prompt: str, context_blocks: list[dict[str, A
     return "Deterministic expansion answer. " + ("; ".join(canaries[:20]) if canaries else "No canaries found.")
 
 
-def _ensure_hermes_lcm_package(plugin_dir: Path) -> None:
+def _clear_hermes_lcm_submodules(pkg: str = "hermes_lcm") -> None:
+    package = sys.modules.get(pkg)
+    prefix = f"{pkg}."
+    for name in list(sys.modules):
+        if not name.startswith(prefix):
+            continue
+        sys.modules.pop(name, None)
+        if package is not None:
+            child_name = name[len(prefix):].split(".", 1)[0]
+            if hasattr(package, child_name):
+                delattr(package, child_name)
+
+
+def _ensure_hermes_lcm_package(plugin_dir: Path, *, reload_submodules: bool = False) -> None:
     pkg = "hermes_lcm"
     if pkg in sys.modules:
         module = sys.modules[pkg]
         module_path = Path(getattr(module, "__path__", [plugin_dir])[0]).resolve()
         if module_path == plugin_dir.resolve():
+            if reload_submodules:
+                _clear_hermes_lcm_submodules(pkg)
             return
         for name in list(sys.modules):
             if name == pkg or name.startswith(f"{pkg}."):

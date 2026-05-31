@@ -6,6 +6,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -138,6 +140,27 @@ def test_stress_run_blanks_provider_keys_and_restores_environment(tmp_path, monk
     assert os.environ["OPENAI_API_KEY"] == "live-openai"
     assert os.environ["OPENROUTER_API_KEY"] == "live-openrouter"
     assert os.environ["ANTHROPIC_API_KEY"] == "live-anthropic"
+
+
+@pytest.mark.filterwarnings("ignore:.*__package__ != __spec__.*:DeprecationWarning")
+def test_stress_runner_reloads_partial_hermes_lcm_submodules(tmp_path, monkeypatch):
+    from benchmarking import stress
+
+    partial_engine = types.ModuleType("hermes_lcm.engine")
+    partial_engine.__file__ = str(Path(__file__).resolve().parents[1] / "engine.py")
+    monkeypatch.setitem(sys.modules, "hermes_lcm.engine", partial_engine)
+
+    def module_probe(run):
+        import hermes_lcm.engine as engine_mod
+
+        run.record("module_probe", "has_summarizer", hasattr(engine_mod, "summarize_with_escalation"))
+
+    monkeypatch.setitem(stress._SCENARIO_FUNCTIONS, "module_probe", module_probe)
+
+    result = stress.run_stress_check(output_dir=tmp_path / "partial-module-run", tier="smoke", scenarios=["module_probe"])
+
+    assert result["failure_count"] == 0
+    assert result["cases"]["module_probe"]["has_summarizer"] is True
 
 
 def test_stress_cli_exits_nonzero_when_any_case_fails(tmp_path, monkeypatch):
