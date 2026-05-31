@@ -119,6 +119,42 @@ The export contract is intentionally aggregate-only:
 
 The export omits per-run `metrics` rows because they can include local `database_path` and `hermes_home` values. Raw transcript content is never included by default.
 
+## Stress release checks
+
+Use the deterministic stress check before release cuts or risky context-engine changes. It is offline by default, patches summarization in-process, writes all SQLite and payload artifacts under the requested output directory, and exits non-zero when any scenario records a failure.
+
+```bash
+python scripts/lcm_stress_check.py \
+  --output /tmp/hermes-lcm-stress-$(date +%Y%m%d-%H%M%S) \
+  --tier release \
+  --json
+```
+
+For a quick local smoke pass:
+
+```bash
+python scripts/lcm_stress_check.py \
+  --output /tmp/hermes-lcm-stress-smoke \
+  --tier smoke \
+  --json
+```
+
+The stress runner currently covers:
+
+- multi-cycle compaction with planted canary recall through `lcm_grep` and `lcm_expand`
+- sensitive-pattern redaction plus large-output externalization boundary checks
+- current/all/explicit session scope and `lcm_load_session` pagination
+- punctuation/unicode/FTS-hostile query fuzzing with bounded fallback behavior
+- concurrent reader/writer smoke while compaction is active
+
+Generated artifacts:
+
+- `results/stress-results.json`, full machine-readable case output
+- `stress-summary.md`, concise operator summary
+- `sandbox/`, isolated Hermes home, SQLite databases, and externalized payload files
+
+Hard gates for release use: `failure_count == 0`, no live profile writes, no raw configured secrets in SQLite rows/file bytes or externalized payload files, all planted non-secret canaries retrievable according to their scope, `lcm_doctor` healthy after stress, and artifact hashes recorded in `stress-results.json`. The JSON records a canonical hash for `stress-results.json` with the self-referential `artifact_hashes` field excluded, plus direct hashes for non-self-referential artifacts such as `stress-summary.md`.
+
 ## Preset provenance and dry-run surface
 
 The shipped preset catalog is inspectable from the `/lcm` command surface when slash commands are enabled:
