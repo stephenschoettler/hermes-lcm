@@ -1763,44 +1763,78 @@ class LCMEngine(ContextEngine):
         source_state = old_state
 
         if previous_session_id and previous_session_id != old_session_id:
-            bound_state = self._lifecycle.get_by_session(previous_session_id)
-            bound_conversation_matches = bool(
-                bound_state
-                and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+            # Hermes passes the session that actually crossed the compression
+            # boundary as old_session_id. A different bound session can be a
+            # short-lived subagent/cron/WebUI side channel that ran after the
+            # foreground compaction. Prefer the host-authoritative source when
+            # durable lifecycle + DAG evidence proves it belongs to LCM, then
+            # fall back to the older bound-session recovery path.
+            old_has_summary_nodes = bool(self._dag.get_session_nodes(old_session_id))
+            old_conversation_matches = bool(
+                old_state
                 and (
                     not requested_conversation_id
-                    or bound_state.conversation_id == requested_conversation_id
+                    or old_state.conversation_id == requested_conversation_id
                 )
             )
-            bound_is_active_source = bool(
-                bound_state and bound_state.current_session_id == previous_session_id
+            old_is_active_source = bool(
+                old_state and old_state.current_session_id == old_session_id
             )
-            bound_is_finalized_source = bool(
-                bound_state
-                and bound_state.current_session_id is None
-                and bound_state.last_finalized_session_id == previous_session_id
+            old_is_finalized_source = bool(
+                old_state
+                and old_state.current_session_id is None
+                and old_state.last_finalized_session_id == old_session_id
             )
-            bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
-            if (
-                bound_conversation_matches
-                and (bound_is_active_source or bound_is_finalized_source)
-                and bound_has_summary_nodes
-            ):
-                source_session_id = previous_session_id
-                source_state = bound_state
+            old_is_authoritative_source = bool(
+                old_has_summary_nodes
+                and old_conversation_matches
+                and (old_is_active_source or old_is_finalized_source)
+            )
+            if old_is_authoritative_source:
                 logger.warning(
-                    "LCM compression boundary using bound session %s as carry-over source; host old_session_id=%s does not match",
-                    previous_session_id,
+                    "LCM compression boundary using host old_session_id %s as carry-over source despite bound session drift=%s",
                     old_session_id,
+                    previous_session_id,
                 )
             else:
-                source_session_id = ""
-                source_state = None
+                bound_state = self._lifecycle.get_by_session(previous_session_id)
+                bound_conversation_matches = bool(
+                    bound_state
+                    and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+                    and (
+                        not requested_conversation_id
+                        or bound_state.conversation_id == requested_conversation_id
+                    )
+                )
+                bound_is_active_source = bool(
+                    bound_state and bound_state.current_session_id == previous_session_id
+                )
+                bound_is_finalized_source = bool(
+                    bound_state
+                    and bound_state.current_session_id is None
+                    and bound_state.last_finalized_session_id == previous_session_id
+                )
+                bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
+                if (
+                    bound_conversation_matches
+                    and (bound_is_active_source or bound_is_finalized_source)
+                    and bound_has_summary_nodes
+                ):
+                    source_session_id = previous_session_id
+                    source_state = bound_state
+                    logger.warning(
+                        "LCM compression boundary using bound session %s as carry-over source; host old_session_id=%s does not match",
+                        previous_session_id,
+                        old_session_id,
+                    )
+                else:
+                    source_session_id = ""
+                    source_state = None
 
         conversation_id = (
             kwargs.get("conversation_id")
-            or self._conversation_id
             or (source_state.conversation_id if source_state else None)
+            or self._conversation_id
             or source_session_id
             or old_session_id
             or session_id

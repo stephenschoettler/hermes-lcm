@@ -7314,6 +7314,90 @@ class TestSessionRollover:
         expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": source_node_id}))
         assert expanded["expanded"][0]["content"] == "important LCM-bound context"
 
+    def test_compression_boundary_prefers_active_bound_source_over_stale_finalized_host(self, engine):
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="shared-conversation",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "active bound context must move"},
+            token_estimate=17,
+            source="telegram",
+        )
+        stale_host_store_id = engine._store.append(
+            "old-hermes-session",
+            {"role": "user", "content": "stale finalized host context must stay put"},
+            token_estimate=11,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="active bound summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        stale_host_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-hermes-session",
+            depth=0,
+            summary="stale finalized host summary should not move",
+            token_count=5,
+            source_token_count=11,
+            source_ids=[stale_host_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._lifecycle.record_rollover(
+            "shared-conversation",
+            old_session_id="old-hermes-session",
+            new_session_id="lcm-source",
+            finalized_frontier_store_id=stale_host_store_id,
+        )
+        engine._lifecycle.advance_frontier(
+            "shared-conversation",
+            "lcm-source",
+            source_store_id,
+        )
+        lifecycle_before = engine._lifecycle.get_by_conversation("shared-conversation")
+        assert lifecycle_before is not None
+        assert lifecycle_before.current_session_id == "lcm-source"
+        assert lifecycle_before.last_finalized_session_id == "old-hermes-session"
+        engine.compression_count = 2
+        engine.last_prompt_tokens = 1000
+        engine.last_completion_tokens = 50
+        engine.last_total_tokens = 1050
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "new-hermes-session"
+        assert engine._conversation_id == "shared-conversation"
+        assert engine._store.get_session_count("lcm-source") == 0
+        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("old-hermes-session") == 1
+        assert engine._dag.get_session_nodes("lcm-source") == []
+        new_nodes = engine._dag.get_session_nodes("new-hermes-session")
+        assert len(new_nodes) == 1
+        assert new_nodes[0].node_id == source_node_id
+        stale_host_node = engine._dag.get_node(stale_host_node_id)
+        assert stale_host_node is not None
+        assert stale_host_node.session_id == "old-hermes-session"
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": source_node_id}))
+        assert expanded["expanded"][0]["content"] == "active bound context must move"
+
     def test_compression_boundary_uses_finalized_bound_lcm_source_when_host_old_session_differs(self, engine):
         engine.on_session_start("lcm-source", platform="telegram", context_length=200000)
         source_store_id = engine._store.append(
@@ -7481,6 +7565,71 @@ class TestSessionRollover:
         conversation_b = engine._lifecycle.get_by_conversation("conversation-b")
         assert conversation_b is not None
         assert conversation_b.current_session_id == "new-hermes-session"
+
+    def test_compression_boundary_prefers_host_old_session_when_bound_session_drifted(self, engine):
+        engine.on_session_start(
+            "foreground-old",
+            conversation_id="foreground-conversation",
+            platform="telegram",
+            context_length=200000,
+        )
+        store_id = engine._store.append(
+            "foreground-old",
+            {"role": "user", "content": "foreground DAG must survive drift"},
+            token_estimate=17,
+            source="telegram",
+        )
+        node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-old",
+            depth=0,
+            summary="foreground summary before drift",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = store_id
+        engine._lifecycle.advance_frontier(
+            "foreground-conversation",
+            "foreground-old",
+            store_id,
+        )
+
+        # A short-lived session binds after the foreground compaction. It has no
+        # DAG nodes and is not the host-authoritative session that compressed.
+        engine.on_session_start(
+            "short-lived-auxiliary",
+            conversation_id="auxiliary-conversation",
+            platform="cron",
+            context_length=200000,
+        )
+        assert engine._session_id == "short-lived-auxiliary"
+        assert engine._dag.get_session_nodes("short-lived-auxiliary") == []
+
+        engine.on_session_start(
+            "foreground-new",
+            boundary_reason="compression",
+            old_session_id="foreground-old",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        assert engine._session_id == "foreground-new"
+        assert engine._conversation_id == "foreground-conversation"
+        assert engine._store.get_session_count("foreground-old") == 0
+        assert engine._store.get_session_count("foreground-new") == 1
+        assert engine._dag.get_session_nodes("foreground-old") == []
+        new_nodes = engine._dag.get_session_nodes("foreground-new")
+        assert [node.node_id for node in new_nodes] == [node_id]
+        assert engine._last_compacted_store_id == store_id
+        lifecycle = engine._lifecycle.get_by_conversation("foreground-conversation")
+        assert lifecycle is not None
+        assert lifecycle.current_session_id == "foreground-new"
+        assert lifecycle.last_finalized_session_id == "foreground-old"
+        assert lifecycle.current_frontier_store_id == store_id
+        expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
+        assert expanded["expanded"][0]["content"] == "foreground DAG must survive drift"
 
     def test_compression_boundary_mismatch_resets_session_scoped_state(self, engine):
         engine.on_session_start("bound-session", platform="telegram", context_length=200000)
