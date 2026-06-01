@@ -124,11 +124,17 @@ def test_lifecycle_soak_scenario_exercises_rollover_restart_rebind_and_payloads(
     assert result["failure_count"] == 0
     assert case["ok"] is True
     assert case["rollover_count"] >= 1
+    assert case["rollover_0_carried_nodes"] > 0
+    assert case["rollover_0_current_scope_probe"]["ok"] is True
+    assert case["old_canary_current_scope_ok"] is True
     assert case["restart_cycles"] >= 1
     assert case["profile_rebind_checks"]["profile_a_db"] != case["profile_rebind_checks"]["profile_b_db"]
     assert case["profile_rebind_checks"]["profile_a_recall"] is True
     assert case["profile_rebind_checks"]["profile_b_isolated_from_a"] is True
     assert case["externalized_payload_count"] >= 1
+    assert case["externalized_payload_integrity_checked"] == case["externalized_payload_count"]
+    assert case["externalized_payload_integrity_samples"]
+    assert all(item["expanded_ok"] is True for item in case["externalized_payload_integrity_samples"])
     assert case["wal_max_bytes"] >= 0
     assert case["wal_max_bytes"] <= case["wal_soft_limit_bytes"]
     assert case["lifecycle_fragmentation"]["lifecycle_rows"] >= 1

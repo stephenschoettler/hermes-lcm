@@ -828,6 +828,8 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
     def lifecycle_messages_for_session(session_idx: int) -> list[dict[str, Any]]:
         return [{"role": "system", "content": f"lifecycle system anchor session={session_idx}"}]
 
+    expected_externalized_payloads: dict[str, str] = {}
+
     def append_turn(messages: list[dict[str, Any]], session_idx: int, turn_idx: int) -> None:
         cid = f"CANARY_LIFECYCLE_{session_idx:02d}_{turn_idx:03d}"
         val = f"VALUE_LIFECYCLE_{session_idx:02d}_{turn_idx:03d}"
@@ -836,6 +838,7 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
             "content": f"session={session_idx} turn={turn_idx} {cid} = {val} lifecycle restart rollover payload " + ("alpha " * 20),
         })
         if turn_idx % max(1, run.tier.lifecycle_externalize_every) == 0:
+            expected_externalized_payloads[cid] = val
             tool_call_id = f"lifecycle-call-{session_idx}-{turn_idx}"
             blob = base64.b64encode((f"{cid} {val} " + ("PAYLOAD " * 220)).encode()).decode()
             messages.append({
@@ -899,6 +902,33 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
                 )
                 rollovers += 1
                 run.record(case, f"rollover_{session_idx}_carried_nodes", carried)
+                if carried <= 0:
+                    run.fail(
+                        case,
+                        "rollover_carry_over_missing",
+                        "Lifecycle rollover carried no summary nodes into the new session",
+                        {"old_session": old_session, "new_session": new_session, "carried_nodes": carried},
+                    )
+                current_scope_ok, current_scope_probe = _tool_recall_contains(
+                    run,
+                    engine,
+                    "CANARY_LIFECYCLE_00_000",
+                    "CANARY_LIFECYCLE_00_000",
+                    "VALUE_LIFECYCLE_00_000",
+                    args={"limit": 10},
+                )
+                run.record(
+                    case,
+                    f"rollover_{session_idx}_current_scope_probe",
+                    {"ok": current_scope_ok, "probe": current_scope_probe},
+                )
+                if not current_scope_ok:
+                    run.fail(
+                        case,
+                        "rollover_immediate_current_scope_lost_early_canary",
+                        "Lifecycle rollover lost early canary from the new session's default/current scope",
+                        {"old_session": old_session, "new_session": new_session, "probe": current_scope_probe},
+                    )
                 current_session = new_session
                 messages = lifecycle_messages_for_session(session_idx + 1)
         messages = engine.compress(messages, current_tokens=max(4_200, count_messages_tokens(messages)))
@@ -911,6 +941,14 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
             "CANARY_LIFECYCLE_00_000",
             "VALUE_LIFECYCLE_00_000",
             args={"session_scope": "all", "limit": 10},
+        )
+        current_ok, current = _tool_recall_contains(
+            run,
+            engine,
+            "CANARY_LIFECYCLE_00_000",
+            "CANARY_LIFECYCLE_00_000",
+            "VALUE_LIFECYCLE_00_000",
+            args={"limit": 10},
         )
         explicit_old_ok, explicit_old = _tool_recall_contains(
             run,
@@ -932,6 +970,8 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
         )
         if not early_ok:
             run.fail(case, "rollover_all_scope_lost_early_canary", "Lifecycle rollover/soak failed to retain old-session recall in all scope", {"grep": early})
+        if not current_ok:
+            run.fail(case, "rollover_current_scope_lost_early_canary", "Lifecycle rollover/soak failed to retain carried old-session recall in the current/default scope", {"grep": current})
         if not explicit_old_ok:
             run.fail(case, "rollover_explicit_scope_lost_early_canary", "Lifecycle rollover/soak failed explicit old-session recall", {"grep": explicit_old})
         if not latest_ok:
@@ -941,16 +981,56 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
         if not payload_files:
             run.fail(case, "externalized_payloads_missing", "Lifecycle soak did not create externalized payload files under sandboxed Hermes home", {"hermes_home": str(hermes_home)})
         payload_errors: list[dict[str, Any]] = []
+        payload_integrity_errors: list[dict[str, Any]] = []
+        payload_integrity_checks: list[dict[str, Any]] = []
         for path in payload_files:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 payload_errors.append({"path": str(path), "error": traceback.format_exc()})
                 continue
-            if not payload.get("content") or not payload.get("session_id"):
+            content = payload.get("content")
+            session_id = str(payload.get("session_id") or "")
+            if not isinstance(content, str) or not content or not session_id:
                 payload_errors.append({"path": str(path), "payload_keys": sorted(payload)})
+                continue
+            matching_pairs = [
+                {"canary": cid, "value": val}
+                for cid, val in expected_externalized_payloads.items()
+                if cid in content and val in content
+            ]
+            if not matching_pairs:
+                payload_integrity_errors.append({
+                    "path": str(path),
+                    "session_id": session_id,
+                    "content_preview": content[:200],
+                    "expected_canaries_sample": list(expected_externalized_payloads)[:10],
+                })
+                continue
+            pair = matching_pairs[0]
+            engine.on_session_start(session_id, platform="cli", conversation_id=conversation_id, hermes_home=str(hermes_home))
+            expanded = run.call_tool(engine, "lcm_expand", {"externalized_ref": path.name, "max_tokens": 20_000})
+            expanded_ok = _json_contains(expanded, pair["canary"], pair["value"])
+            payload_integrity_checks.append({
+                "ref": path.name,
+                "session_id": session_id,
+                "canary": pair["canary"],
+                "value": pair["value"],
+                "expanded_ok": expanded_ok,
+            })
+            if not expanded_ok:
+                payload_integrity_errors.append({
+                    "path": str(path),
+                    "session_id": session_id,
+                    "canary": pair["canary"],
+                    "value": pair["value"],
+                    "expanded": expanded,
+                })
+        engine.on_session_start(current_session, platform="cli", conversation_id=conversation_id, hermes_home=str(hermes_home))
         if payload_errors:
             run.fail(case, "externalized_payload_metadata_invalid", "Externalized payload files were unreadable or missing recovery metadata", {"errors": payload_errors[:10]})
+        if payload_integrity_errors:
+            run.fail(case, "externalized_payload_integrity_invalid", "Externalized payload files lost their planted lifecycle canary/value or normal recovery path", {"errors": payload_integrity_errors[:10]})
 
         wal_max_bytes = max(wal_max_bytes, _sqlite_artifact_bytes(db_path).get(f"{db_path.name}-wal", 0))
         if wal_max_bytes > run.tier.lifecycle_wal_soft_limit_bytes:
@@ -973,7 +1053,11 @@ def _case_lifecycle_soak_and_profile_rebinds(run: StressRun) -> None:
         run.record(case, "wal_soft_limit_bytes", run.tier.lifecycle_wal_soft_limit_bytes)
         run.record(case, "externalized_payload_count", len(payload_files))
         run.record(case, "externalized_files", [str(path) for path in payload_files[:20]])
+        run.record(case, "externalized_payload_integrity_checked", len(payload_integrity_checks))
+        run.record(case, "externalized_payload_integrity_samples", payload_integrity_checks[:20])
         run.record(case, "old_canary_all_scope", early)
+        run.record(case, "old_canary_current_scope", current)
+        run.record(case, "old_canary_current_scope_ok", current_ok)
         run.record(case, "old_canary_explicit_scope", explicit_old)
         run.record(case, "latest_canary_all_scope", latest)
         run.record(case, "doctor", doctor)
