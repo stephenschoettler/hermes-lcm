@@ -1839,16 +1839,22 @@ class LCMEngine(ContextEngine):
             or old_session_id
             or session_id
         )
+        process_local_frontier = (
+            int(self._last_compacted_store_id or 0)
+            if source_session_id and previous_session_id == source_session_id
+            else 0
+        )
+        pending_reset_frontier = int(
+            self._pending_reset_frontier_store_id
+            if self._pending_reset_session_id
+            and self._pending_reset_session_id == source_session_id
+            else 0
+        )
         frontier = max(
-            int(self._last_compacted_store_id or 0),
+            process_local_frontier,
             int(source_state.current_frontier_store_id if source_state else 0),
             int(source_state.last_finalized_frontier_store_id if source_state else 0),
-            int(
-                self._pending_reset_frontier_store_id
-                if self._pending_reset_session_id
-                and self._pending_reset_session_id in {source_session_id, old_session_id, previous_session_id}
-                else 0
-            ),
+            pending_reset_frontier,
         )
         can_reassign = bool(
             source_session_id

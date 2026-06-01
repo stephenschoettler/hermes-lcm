@@ -7631,6 +7631,94 @@ class TestSessionRollover:
         expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
         assert expanded["expanded"][0]["content"] == "foreground DAG must survive drift"
 
+    def test_compression_boundary_scopes_frontier_to_host_old_session_when_bound_session_drifted(self, engine):
+        engine.on_session_start(
+            "foreground-old",
+            conversation_id="foreground-conversation",
+            platform="telegram",
+            context_length=200000,
+        )
+        fg_store_id = engine._store.append(
+            "foreground-old",
+            {"role": "user", "content": "foreground frontier must stay scoped"},
+            token_estimate=17,
+            source="telegram",
+        )
+        fg_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-old",
+            depth=0,
+            summary="foreground scoped frontier summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[fg_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = fg_store_id
+        engine._lifecycle.advance_frontier(
+            "foreground-conversation",
+            "foreground-old",
+            fg_store_id,
+        )
+
+        engine.on_session_start(
+            "aux-old",
+            conversation_id="aux-conversation",
+            platform="cron",
+            context_length=200000,
+        )
+        aux_store_id = engine._store.append(
+            "aux-old",
+            {"role": "user", "content": "auxiliary frontier must not leak"},
+            token_estimate=13,
+            source="cron",
+        )
+        aux_node_id = engine._dag.add_node(SummaryNode(
+            session_id="aux-old",
+            depth=0,
+            summary="auxiliary summary should stay put",
+            token_count=5,
+            source_token_count=13,
+            source_ids=[aux_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        assert aux_store_id > fg_store_id
+        engine._last_compacted_store_id = aux_store_id
+        engine._lifecycle.advance_frontier(
+            "aux-conversation",
+            "aux-old",
+            aux_store_id,
+        )
+
+        engine.on_session_start(
+            "foreground-new",
+            boundary_reason="compression",
+            old_session_id="foreground-old",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        lifecycle = engine._lifecycle.get_by_conversation("foreground-conversation")
+        assert lifecycle is not None
+        assert lifecycle.current_session_id == "foreground-new"
+        assert lifecycle.last_finalized_session_id == "foreground-old"
+        assert lifecycle.current_frontier_store_id == fg_store_id
+        assert lifecycle.last_finalized_frontier_store_id == fg_store_id
+        assert engine._last_compacted_store_id == fg_store_id
+        assert engine._store.get_session_count("foreground-old") == 0
+        assert engine._store.get_session_count("foreground-new") == 1
+        assert engine._store.get_session_count("aux-old") == 1
+        assert engine._dag.get_session_nodes("foreground-old") == []
+        new_nodes = engine._dag.get_session_nodes("foreground-new")
+        assert [node.node_id for node in new_nodes] == [fg_node_id]
+        aux_node = engine._dag.get_node(aux_node_id)
+        assert aux_node is not None
+        assert aux_node.session_id == "aux-old"
+        aux_state = engine._lifecycle.get_by_conversation("aux-conversation")
+        assert aux_state is not None
+        assert aux_state.current_frontier_store_id == aux_store_id
+
     def test_compression_boundary_mismatch_resets_session_scoped_state(self, engine):
         engine.on_session_start("bound-session", platform="telegram", context_length=200000)
         engine.compression_count = 3
