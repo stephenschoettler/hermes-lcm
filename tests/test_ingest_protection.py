@@ -592,6 +592,67 @@ def test_ingest_does_not_mutate_input_message(tmp_path):
     assert message == original
 
 
+def test_ingest_preserves_provider_active_context_while_protecting_storage(tmp_path):
+    engine = _engine(tmp_path)
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "inspect this image"},
+            {"type": "image_url", "image_url": {"url": DATA_URI}},
+        ],
+    }
+
+    active = engine._ingest_messages([deepcopy(message)])
+
+    assert active == [message]
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "data:image" not in content
+    refs = extract_ingest_externalized_refs(content)
+    assert len(refs) == 1
+    assert _expand_ref(engine, refs[0])["content"] == DATA_URI
+
+
+def test_tool_result_ingest_preserves_active_context_while_protecting_storage(tmp_path):
+    engine = _engine(tmp_path)
+    message = {"role": "tool", "tool_call_id": "call_media", "content": "tool saw " + DATA_URI}
+
+    active = engine._ingest_messages([deepcopy(message)])
+
+    assert active == [message]
+    _store_id, content, _tool_calls = _single_message_row(engine, role="tool")
+    assert "data:image" not in content
+    ref = _extract_ref(content)
+    assert _expand_ref(engine, ref)["content"] == DATA_URI
+
+
+def test_preflight_storage_protection_does_not_force_noop_compaction(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm.db"),
+        large_output_externalization_path=str(tmp_path / "externalized"),
+        context_threshold=0.0001,
+        fresh_tail_count=64,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "home"))
+    engine.on_session_start(
+        "preflight-storage-protection-session",
+        platform="cli",
+        conversation_id="preflight-storage-protection-conversation",
+        context_length=200_000,
+    )
+    messages = [
+        {"role": "system", "content": "system anchor"},
+        {"role": "user", "content": "see image " + DATA_URI},
+    ]
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is False
+    assert engine.should_compress_preflight(deepcopy(messages)) is False
+    assert engine._last_compression_status == "noop"
+    assert engine._last_compression_noop_reason == "no eligible raw backlog outside fresh tail"
+    assert engine._store.count_session_load_messages(engine.current_session_id) == 2
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert "data:image" not in content
+
+
 def test_ingest_protection_is_idempotent_for_existing_placeholder(tmp_path):
     engine = _engine(tmp_path)
     engine._store.append(engine.current_session_id, {"role": "user", "content": DATA_URI})

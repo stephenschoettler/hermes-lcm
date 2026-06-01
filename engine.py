@@ -3142,15 +3142,14 @@ class LCMEngine(ContextEngine):
             estimates,
             source=self._session_platform,
         )
-        active_replay_messages = list(replay_messages)
-        for (absolute_idx, replay_msg), protected_msg in zip(messages_to_store_with_index, protected_messages):
-            active_msg = dict(protected_msg)
-            if "content" not in replay_msg and active_msg.get("content") in (None, ""):
-                active_msg.pop("content", None)
-            active_replay_messages[absolute_idx] = active_msg
         self._ingest_cursor = n
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
-        return active_replay_messages
+        # ``protected_messages`` are storage-only: they may replace inline media,
+        # tool outputs, or base64 substrings with externalized placeholders. The
+        # provider-facing active replay must keep usable original payloads (after
+        # active-only quarantine/redaction above), otherwise image/tool turns can
+        # be corrupted and storage protection alone can trigger no-op compaction.
+        return replay_messages
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         """Map current raw messages back to store_ids in stable store order.
