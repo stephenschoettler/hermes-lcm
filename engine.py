@@ -1758,63 +1758,140 @@ class LCMEngine(ContextEngine):
     ) -> None:
         previous_session_id = self._session_id
         requested_conversation_id = kwargs.get("conversation_id")
-        old_state = self._lifecycle.get_by_session(old_session_id)
-        source_session_id = old_session_id
-        source_state = old_state
+        session_state = self._lifecycle.get_by_session(old_session_id)
+        conversation_state = self._lifecycle.get_by_conversation(old_session_id)
 
-        if previous_session_id and previous_session_id != old_session_id:
-            bound_state = self._lifecycle.get_by_session(previous_session_id)
-            bound_conversation_matches = bool(
-                bound_state
-                and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+        def _state_conversation_matches(state: Any) -> bool:
+            return bool(
+                state
                 and (
                     not requested_conversation_id
-                    or bound_state.conversation_id == requested_conversation_id
+                    or state.conversation_id == requested_conversation_id
                 )
             )
-            bound_is_active_source = bool(
-                bound_state and bound_state.current_session_id == previous_session_id
-            )
-            bound_is_finalized_source = bool(
-                bound_state
-                and bound_state.current_session_id is None
-                and bound_state.last_finalized_session_id == previous_session_id
-            )
-            bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
+
+        def _has_summary_nodes(candidate_session_id: str | None) -> bool:
+            return bool(candidate_session_id and self._dag.get_session_nodes(candidate_session_id))
+
+        def _host_source_from_conversation_state(state: Any) -> tuple[str, Any]:
+            if not _state_conversation_matches(state):
+                return "", None
+            if state.current_session_id == old_session_id and _has_summary_nodes(old_session_id):
+                return old_session_id, state
             if (
-                bound_conversation_matches
-                and (bound_is_active_source or bound_is_finalized_source)
-                and bound_has_summary_nodes
+                state.conversation_id == old_session_id
+                and state.current_session_id
+                and _has_summary_nodes(state.current_session_id)
             ):
-                source_session_id = previous_session_id
-                source_state = bound_state
+                return state.current_session_id, state
+            if (
+                state.current_session_id is None
+                and state.last_finalized_session_id
+                and _has_summary_nodes(state.last_finalized_session_id)
+            ):
+                return state.last_finalized_session_id, state
+            return "", None
+
+        def _host_source_from_session_state(state: Any) -> tuple[str, Any]:
+            if not _state_conversation_matches(state):
+                return "", None
+            if state.current_session_id == old_session_id and _has_summary_nodes(old_session_id):
+                return old_session_id, state
+            if (
+                state.current_session_id is None
+                and state.last_finalized_session_id == old_session_id
+                and _has_summary_nodes(old_session_id)
+            ):
+                return old_session_id, state
+            return "", None
+
+        host_source_session_id, host_source_state = _host_source_from_conversation_state(
+            conversation_state
+        )
+        if not host_source_session_id:
+            host_source_session_id, host_source_state = _host_source_from_session_state(
+                session_state
+            )
+
+        source_session_id = host_source_session_id or old_session_id
+        source_state = host_source_state or session_state
+
+        if previous_session_id and previous_session_id != old_session_id:
+            # Hermes passes the session that actually crossed the compression
+            # boundary as old_session_id. A different bound session can be a
+            # short-lived subagent/cron/WebUI side channel that ran after the
+            # foreground compaction. Prefer the host-authoritative source when
+            # durable lifecycle + DAG evidence proves it belongs to LCM, then
+            # fall back to the older bound-session recovery path. When the host
+            # old_session_id is the durable conversation id, use that row's
+            # current/finalized LCM source instead of unrelated auxiliary rows
+            # where the id appears only as last_finalized_session_id.
+            if host_source_session_id:
                 logger.warning(
-                    "LCM compression boundary using bound session %s as carry-over source; host old_session_id=%s does not match",
-                    previous_session_id,
+                    "LCM compression boundary using host old_session_id %s as carry-over source=%s despite bound session drift=%s",
                     old_session_id,
+                    host_source_session_id,
+                    previous_session_id,
                 )
             else:
-                source_session_id = ""
-                source_state = None
+                bound_state = self._lifecycle.get_by_session(previous_session_id)
+                bound_conversation_matches = bool(
+                    bound_state
+                    and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+                    and (
+                        not requested_conversation_id
+                        or bound_state.conversation_id == requested_conversation_id
+                    )
+                )
+                bound_is_active_source = bool(
+                    bound_state and bound_state.current_session_id == previous_session_id
+                )
+                bound_is_finalized_source = bool(
+                    bound_state
+                    and bound_state.current_session_id is None
+                    and bound_state.last_finalized_session_id == previous_session_id
+                )
+                bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
+                if (
+                    bound_conversation_matches
+                    and (bound_is_active_source or bound_is_finalized_source)
+                    and bound_has_summary_nodes
+                ):
+                    source_session_id = previous_session_id
+                    source_state = bound_state
+                    logger.warning(
+                        "LCM compression boundary using bound session %s as carry-over source; host old_session_id=%s does not match",
+                        previous_session_id,
+                        old_session_id,
+                    )
+                else:
+                    source_session_id = ""
+                    source_state = None
 
         conversation_id = (
             kwargs.get("conversation_id")
-            or self._conversation_id
             or (source_state.conversation_id if source_state else None)
+            or self._conversation_id
             or source_session_id
             or old_session_id
             or session_id
         )
+        process_local_frontier = (
+            int(self._last_compacted_store_id or 0)
+            if source_session_id and previous_session_id == source_session_id
+            else 0
+        )
+        pending_reset_frontier = int(
+            self._pending_reset_frontier_store_id
+            if self._pending_reset_session_id
+            and self._pending_reset_session_id == source_session_id
+            else 0
+        )
         frontier = max(
-            int(self._last_compacted_store_id or 0),
+            process_local_frontier,
             int(source_state.current_frontier_store_id if source_state else 0),
             int(source_state.last_finalized_frontier_store_id if source_state else 0),
-            int(
-                self._pending_reset_frontier_store_id
-                if self._pending_reset_session_id
-                and self._pending_reset_session_id in {source_session_id, old_session_id, previous_session_id}
-                else 0
-            ),
+            pending_reset_frontier,
         )
         can_reassign = bool(
             source_session_id
