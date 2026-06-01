@@ -1758,9 +1758,63 @@ class LCMEngine(ContextEngine):
     ) -> None:
         previous_session_id = self._session_id
         requested_conversation_id = kwargs.get("conversation_id")
-        old_state = self._lifecycle.get_by_session(old_session_id)
-        source_session_id = old_session_id
-        source_state = old_state
+        session_state = self._lifecycle.get_by_session(old_session_id)
+        conversation_state = self._lifecycle.get_by_conversation(old_session_id)
+
+        def _state_conversation_matches(state: Any) -> bool:
+            return bool(
+                state
+                and (
+                    not requested_conversation_id
+                    or state.conversation_id == requested_conversation_id
+                )
+            )
+
+        def _has_summary_nodes(candidate_session_id: str | None) -> bool:
+            return bool(candidate_session_id and self._dag.get_session_nodes(candidate_session_id))
+
+        def _host_source_from_conversation_state(state: Any) -> tuple[str, Any]:
+            if not _state_conversation_matches(state):
+                return "", None
+            if state.current_session_id == old_session_id and _has_summary_nodes(old_session_id):
+                return old_session_id, state
+            if (
+                state.conversation_id == old_session_id
+                and state.current_session_id
+                and _has_summary_nodes(state.current_session_id)
+            ):
+                return state.current_session_id, state
+            if (
+                state.current_session_id is None
+                and state.last_finalized_session_id
+                and _has_summary_nodes(state.last_finalized_session_id)
+            ):
+                return state.last_finalized_session_id, state
+            return "", None
+
+        def _host_source_from_session_state(state: Any) -> tuple[str, Any]:
+            if not _state_conversation_matches(state):
+                return "", None
+            if state.current_session_id == old_session_id and _has_summary_nodes(old_session_id):
+                return old_session_id, state
+            if (
+                state.current_session_id is None
+                and state.last_finalized_session_id == old_session_id
+                and _has_summary_nodes(old_session_id)
+            ):
+                return old_session_id, state
+            return "", None
+
+        host_source_session_id, host_source_state = _host_source_from_conversation_state(
+            conversation_state
+        )
+        if not host_source_session_id:
+            host_source_session_id, host_source_state = _host_source_from_session_state(
+                session_state
+            )
+
+        source_session_id = host_source_session_id or old_session_id
+        source_state = host_source_state or session_state
 
         if previous_session_id and previous_session_id != old_session_id:
             # Hermes passes the session that actually crossed the compression
@@ -1768,32 +1822,15 @@ class LCMEngine(ContextEngine):
             # short-lived subagent/cron/WebUI side channel that ran after the
             # foreground compaction. Prefer the host-authoritative source when
             # durable lifecycle + DAG evidence proves it belongs to LCM, then
-            # fall back to the older bound-session recovery path.
-            old_has_summary_nodes = bool(self._dag.get_session_nodes(old_session_id))
-            old_conversation_matches = bool(
-                old_state
-                and (
-                    not requested_conversation_id
-                    or old_state.conversation_id == requested_conversation_id
-                )
-            )
-            old_is_active_source = bool(
-                old_state and old_state.current_session_id == old_session_id
-            )
-            old_is_finalized_source = bool(
-                old_state
-                and old_state.current_session_id is None
-                and old_state.last_finalized_session_id == old_session_id
-            )
-            old_is_authoritative_source = bool(
-                old_has_summary_nodes
-                and old_conversation_matches
-                and (old_is_active_source or old_is_finalized_source)
-            )
-            if old_is_authoritative_source:
+            # fall back to the older bound-session recovery path. When the host
+            # old_session_id is the durable conversation id, use that row's
+            # current/finalized LCM source instead of unrelated auxiliary rows
+            # where the id appears only as last_finalized_session_id.
+            if host_source_session_id:
                 logger.warning(
-                    "LCM compression boundary using host old_session_id %s as carry-over source despite bound session drift=%s",
+                    "LCM compression boundary using host old_session_id %s as carry-over source=%s despite bound session drift=%s",
                     old_session_id,
+                    host_source_session_id,
                     previous_session_id,
                 )
             else:

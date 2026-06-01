@@ -7719,6 +7719,79 @@ class TestSessionRollover:
         assert aux_state is not None
         assert aux_state.current_frontier_store_id == aux_store_id
 
+    def test_compression_boundary_uses_conversation_row_when_auxiliary_rows_reference_host_id(self, engine):
+        engine.on_session_start(
+            "foreground-active",
+            conversation_id="host-conversation",
+            platform="telegram",
+            context_length=200000,
+        )
+        fg_store_id = engine._store.append(
+            "foreground-active",
+            {"role": "user", "content": "foreground conversation row must win"},
+            token_estimate=17,
+            source="telegram",
+        )
+        fg_node_id = engine._dag.add_node(SummaryNode(
+            session_id="foreground-active",
+            depth=0,
+            summary="foreground active summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[fg_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine._last_compacted_store_id = fg_store_id
+        engine._lifecycle.advance_frontier(
+            "host-conversation",
+            "foreground-active",
+            fg_store_id,
+        )
+
+        # Auxiliary lifecycle rows can reference the host conversation id as a
+        # finalized session. They must not outrank the real conversation row
+        # just because their updated_at is newer.
+        engine._lifecycle.record_rollover(
+            "auxiliary-conversation",
+            old_session_id="host-conversation",
+            new_session_id="drifted-auxiliary",
+            finalized_frontier_store_id=99,
+        )
+        engine.on_session_start(
+            "drifted-auxiliary",
+            conversation_id="auxiliary-conversation",
+            platform="cron",
+            context_length=200000,
+        )
+        wrong_state = engine._lifecycle.get_by_session("host-conversation")
+        assert wrong_state is not None
+        assert wrong_state.conversation_id == "auxiliary-conversation"
+
+        engine.on_session_start(
+            "foreground-new",
+            boundary_reason="compression",
+            old_session_id="host-conversation",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        lifecycle = engine._lifecycle.get_by_conversation("host-conversation")
+        assert lifecycle is not None
+        assert lifecycle.current_session_id == "foreground-new"
+        assert lifecycle.last_finalized_session_id == "foreground-active"
+        assert lifecycle.current_frontier_store_id == fg_store_id
+        assert lifecycle.last_finalized_frontier_store_id == fg_store_id
+        assert engine._store.get_session_count("foreground-active") == 0
+        assert engine._store.get_session_count("foreground-new") == 1
+        assert engine._dag.get_session_nodes("foreground-active") == []
+        new_nodes = engine._dag.get_session_nodes("foreground-new")
+        assert [node.node_id for node in new_nodes] == [fg_node_id]
+        aux_state = engine._lifecycle.get_by_conversation("auxiliary-conversation")
+        assert aux_state is not None
+        assert aux_state.current_session_id == "drifted-auxiliary"
+        assert aux_state.last_finalized_session_id == "host-conversation"
+
     def test_compression_boundary_mismatch_resets_session_scoped_state(self, engine):
         engine.on_session_start("bound-session", platform="telegram", context_length=200000)
         engine.compression_count = 3
