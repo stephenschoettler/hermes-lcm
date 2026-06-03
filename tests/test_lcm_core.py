@@ -2281,6 +2281,33 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_lifecycle_fragmentation_stats_does_not_classify_legacy_lcm_rows_without_lifecycle_state(self, tmp_path):
+        db_path = tmp_path / "legacy-lcm-without-lifecycle.db"
+        store = MessageStore(db_path)
+        dag = SummaryDAG(db_path)
+        state = LifecycleStateStore(db_path)
+        store.append("legacy-message-session", {"role": "user", "content": "legacy"}, source="cli")
+        dag.add_node(SummaryNode(
+            session_id="legacy-node-session",
+            depth=0,
+            summary="legacy summary",
+            token_count=5,
+            source_token_count=5,
+            source_ids=[],
+            source_type="messages",
+            created_at=1.0,
+        ))
+
+        stats = state.get_fragmentation_stats()
+
+        assert stats["lifecycle_rows"] == 0
+        assert stats["message_sessions_without_lifecycle_reference"] == 1
+        assert stats["node_sessions_without_lifecycle_reference"] == 1
+        assert stats["classification"]["status"] == "pass"
+        assert stats["classification"]["categories"] == []
+
+        state.close()
+
     def test_lifecycle_fragmentation_stats_treats_last_finalized_message_session_as_referenced(self, tmp_path):
         db_path = tmp_path / "lifecycle-finalized-message-reference.db"
         store = MessageStore(db_path)

@@ -423,6 +423,7 @@ class LifecycleStateStore:
                 stats["state_db_error"] = f"state database not found: {path}"
 
         stats["classification"] = self._classify_fragmentation(
+            lifecycle_rows=stats["lifecycle_rows"],
             lifecycle_current_sessions=lifecycle_current_sessions,
             lifecycle_last_finalized_sessions=lifecycle_last_finalized_sessions,
             message_sessions=message_sessions,
@@ -438,6 +439,7 @@ class LifecycleStateStore:
     @staticmethod
     def _classify_fragmentation(
         *,
+        lifecycle_rows: int,
         lifecycle_current_sessions: set[str],
         lifecycle_last_finalized_sessions: set[str],
         message_sessions: set[str],
@@ -487,20 +489,21 @@ class LifecycleStateStore:
             description="Lifecycle finalized-session references that no longer have raw messages or summary nodes in LCM.",
             recommended_action="Inspect samples before cleanup; only remove with an explicit backup-first lifecycle cleanup flow.",
         )
-        add_category(
-            "lcm_message_sessions_without_lifecycle_reference",
-            message_sessions - lifecycle_referenced_sessions,
-            severity="notice",
-            description="Raw-message sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
-            recommended_action="Usually safe as historical retained context; investigate only if the sessions should belong to an active conversation.",
-        )
-        add_category(
-            "lcm_node_sessions_without_lifecycle_reference",
-            node_sessions - lifecycle_referenced_sessions,
-            severity="notice",
-            description="Summary-node sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
-            recommended_action="Usually safe as historical retained context; verify expand/search still work before considering cleanup.",
-        )
+        if lifecycle_rows > 0:
+            add_category(
+                "lcm_message_sessions_without_lifecycle_reference",
+                message_sessions - lifecycle_referenced_sessions,
+                severity="notice",
+                description="Raw-message sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
+                recommended_action="Usually safe as historical retained context; investigate only if the sessions should belong to an active conversation.",
+            )
+            add_category(
+                "lcm_node_sessions_without_lifecycle_reference",
+                node_sessions - lifecycle_referenced_sessions,
+                severity="notice",
+                description="Summary-node sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
+                recommended_action="Usually safe as historical retained context; verify expand/search still work before considering cleanup.",
+            )
 
         if state_db_read_success:
             add_category(
