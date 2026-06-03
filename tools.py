@@ -14,6 +14,7 @@ from .externalize import (
     find_externalized_payload_for_message,
     load_externalized_payload,
 )
+from .diagnostics import _has_lifecycle_fragmentation, _state_db_path_for_engine
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
 from .extraction import sanitize_pre_compaction_content
@@ -67,39 +68,6 @@ def _combined_result_sort_key(result: dict[str, Any], sort: str) -> tuple:
     if result.get("type") == "message":
         return (-sort_timestamp, type_bias, role_bias, rank_value, 0.0, float("inf"))
     return (-sort_timestamp, type_bias, 0, rank_value, 0.0, role_bias)
-
-
-def _state_db_path_for_engine(engine: "LCMEngine") -> Path:
-    hermes_home = getattr(engine, "_hermes_home", "") or ""
-    if hermes_home:
-        return Path(hermes_home).expanduser() / "state.db"
-    db_path = Path(getattr(engine._store, "db_path", Path.home() / ".hermes" / "lcm.db"))
-    return db_path.parent / "state.db"
-
-
-def _has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
-    direct_mismatch_keys = (
-        "lifecycle_current_missing_in_lcm_any",
-        "lifecycle_last_finalized_missing_in_lcm_any",
-        "lifecycle_current_missing_in_state",
-        "lifecycle_last_finalized_missing_in_state",
-        "lcm_message_sessions_missing_in_state",
-        "lcm_node_sessions_missing_in_state",
-    )
-    lifecycle_rows = int(stats.get("lifecycle_rows", 0) or 0)
-    missing_lifecycle_reference_keys = (
-        "message_sessions_without_lifecycle_reference",
-        "node_sessions_without_lifecycle_reference",
-    )
-    return (
-        any(int(stats.get(key, 0) or 0) > 0 for key in direct_mismatch_keys)
-        or (
-            lifecycle_rows > 0
-            and any(int(stats.get(key, 0) or 0) > 0 for key in missing_lifecycle_reference_keys)
-        )
-        or (bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error")))
-    )
-
 
 def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
     engine = kwargs.get("engine")

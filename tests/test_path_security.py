@@ -59,12 +59,14 @@ def test_hermes_home_outside_allowed_base_rejected(monkeypatch):
         allowed_base = tmpdir
         monkeypatch.setenv("LCM_HERMES_BASE_DIR", allowed_base)
 
-        from hermes_lcm.command import _state_db_path_for_engine
+        from hermes_lcm.command import _state_db_path_for_engine as command_state_db_path
+        from hermes_lcm.tools import _state_db_path_for_engine as tools_state_db_path
 
         # Create a mock engine with hermes_home outside allowed base
         class MockEngine:
             _hermes_home = "/etc"
 
         engine = MockEngine()
-        with pytest.raises(ValueError, match="not within allowed base"):
-            _state_db_path_for_engine(engine)
+        for state_db_path_for_engine in (command_state_db_path, tools_state_db_path):
+            with pytest.raises(ValueError, match="not within allowed base"):
+                state_db_path_for_engine(engine)
