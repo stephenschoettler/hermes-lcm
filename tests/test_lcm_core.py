@@ -2259,6 +2259,21 @@ class TestLifecycleStateStore:
         assert stats["state_sessions_missing_in_lcm_any"] == 1
         assert stats["state_db_checked"] is True
         assert stats["state_db_error"] == ""
+        classification = stats["classification"]
+        assert classification["status"] == "warn"
+        assert classification["read_only"] is True
+        assert classification["summary"] == "4 lifecycle fragmentation categories need review"
+        categories = {item["name"]: item for item in classification["categories"]}
+        assert categories["stale_lifecycle_current"]["count"] == 1
+        assert categories["stale_lifecycle_current"]["sample_session_ids"] == ["missing-current"]
+        assert categories["stale_lifecycle_finalized"]["count"] == 1
+        assert categories["stale_lifecycle_finalized"]["sample_session_ids"] == ["missing-final"]
+        assert categories["lcm_node_sessions_missing_in_state"]["count"] == 1
+        assert categories["lcm_node_sessions_missing_in_state"]["sample_session_ids"] == ["node-only"]
+        assert categories["state_only_sessions"]["count"] == 1
+        assert categories["state_only_sessions"]["sample_session_ids"] == ["state-only"]
+        assert categories["stale_lifecycle_current"]["recommended_action"]
+        assert not any(item["name"] == "lcm_message_sessions_without_lifecycle_reference" for item in classification["categories"])
 
         # Read-only diagnostic: no lifecycle rows were mutated or removed.
         assert state.row_count() == 2
@@ -2284,15 +2299,28 @@ class TestLifecycleStateStore:
         assert stats["message_sessions_without_lifecycle_current"] == 1
         assert stats["message_sessions_without_lifecycle_reference"] == 0
         assert stats["node_sessions_without_lifecycle_reference"] == 0
+        assert stats["classification"]["status"] == "pass"
+        assert stats["classification"]["categories"] == []
 
         state.close()
 
     def test_lifecycle_fragmentation_stats_reports_existing_malformed_state_db(self, tmp_path):
         db_path = tmp_path / "lifecycle-malformed-state.db"
         state_db = tmp_path / "state.db"
-        MessageStore(db_path)
-        SummaryDAG(db_path)
+        store = MessageStore(db_path)
+        dag = SummaryDAG(db_path)
         state = LifecycleStateStore(db_path)
+        store.append("message-session", {"role": "user", "content": "stored"}, source="cli")
+        dag.add_node(SummaryNode(
+            session_id="node-session",
+            depth=0,
+            summary="stored node",
+            token_count=5,
+            source_token_count=5,
+            source_ids=[],
+            source_type="messages",
+            created_at=1.0,
+        ))
         state_db.write_text("not sqlite")
 
         stats = state.get_fragmentation_stats(state_db_path=state_db)
@@ -2300,6 +2328,10 @@ class TestLifecycleStateStore:
         assert stats["state_db_checked"] is True
         assert stats["state_db_error"]
         assert stats["read_only"] is True
+        categories = {item["name"]: item for item in stats["classification"]["categories"]}
+        assert "lcm_message_sessions_missing_in_state" not in categories
+        assert "lcm_node_sessions_missing_in_state" not in categories
+        assert "state_only_sessions" not in categories
         assert state.row_count() == 0
 
         state.close()

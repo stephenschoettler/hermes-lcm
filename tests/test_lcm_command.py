@@ -479,6 +479,11 @@ def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(eng
     assert "current_missing_in_state=1" in result
     assert "node_sessions_missing_in_state=1" in result
     assert "state_sessions_missing_in_lcm_any=1" in result
+    assert "lifecycle_fragmentation_classification: warn; 4 categories need review" in result
+    assert "lifecycle_category stale_lifecycle_current: count=1 sample=missing-current" in result
+    assert "lifecycle_category stale_lifecycle_finalized: count=1 sample=missing-final" in result
+    assert "lifecycle_category lcm_node_sessions_missing_in_state: count=1 sample=node-missing-in-state" in result
+    assert "lifecycle_category state_only_sessions: count=1 sample=state-only" in result
     assert "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state" in result
     assert "read-only" in result
     assert engine._lifecycle.row_count() == 2

@@ -353,6 +353,8 @@ class LifecycleStateStore:
         message_sessions = _session_ids("SELECT DISTINCT session_id FROM messages WHERE session_id IS NOT NULL")
         node_sessions = _session_ids("SELECT DISTINCT session_id FROM summary_nodes WHERE session_id IS NOT NULL")
         lcm_any_sessions = message_sessions | node_sessions
+        state_sessions: set[str] = set()
+        state_db_read_success = False
         lifecycle_current_sessions = _session_ids(
             "SELECT DISTINCT current_session_id FROM lcm_lifecycle_state WHERE current_session_id IS NOT NULL"
         )
@@ -403,6 +405,7 @@ class LifecycleStateStore:
                     finally:
                         state_conn.close()
                     state_sessions = {str(row[0]) for row in state_rows if row[0]}
+                    state_db_read_success = True
                     stats.update({
                         "state_sessions_total": len(state_sessions),
                         "lifecycle_current_missing_in_state": len(lifecycle_current_sessions - state_sessions),
@@ -419,7 +422,122 @@ class LifecycleStateStore:
             else:
                 stats["state_db_error"] = f"state database not found: {path}"
 
+        stats["classification"] = self._classify_fragmentation(
+            lifecycle_current_sessions=lifecycle_current_sessions,
+            lifecycle_last_finalized_sessions=lifecycle_last_finalized_sessions,
+            message_sessions=message_sessions,
+            node_sessions=node_sessions,
+            lcm_any_sessions=lcm_any_sessions,
+            lifecycle_referenced_sessions=lifecycle_referenced_sessions,
+            state_sessions=state_sessions,
+            state_db_read_success=state_db_read_success,
+        )
+
         return stats
+
+    @staticmethod
+    def _classify_fragmentation(
+        *,
+        lifecycle_current_sessions: set[str],
+        lifecycle_last_finalized_sessions: set[str],
+        message_sessions: set[str],
+        node_sessions: set[str],
+        lcm_any_sessions: set[str],
+        lifecycle_referenced_sessions: set[str],
+        state_sessions: set[str],
+        state_db_read_success: bool,
+    ) -> dict[str, Any]:
+        """Bucket lifecycle mismatches into operator-readable read-only categories."""
+
+        def sample(session_ids: set[str], limit: int = 5) -> list[str]:
+            return sorted(session_ids)[:limit]
+
+        categories: list[dict[str, Any]] = []
+
+        def add_category(
+            name: str,
+            session_ids: set[str],
+            *,
+            severity: str,
+            description: str,
+            recommended_action: str,
+        ) -> None:
+            if not session_ids:
+                return
+            categories.append({
+                "name": name,
+                "severity": severity,
+                "count": len(session_ids),
+                "sample_session_ids": sample(session_ids),
+                "description": description,
+                "recommended_action": recommended_action,
+            })
+
+        add_category(
+            "stale_lifecycle_current",
+            lifecycle_current_sessions - lcm_any_sessions,
+            severity="warn",
+            description="Lifecycle current-session references that no longer have raw messages or summary nodes in LCM.",
+            recommended_action="Inspect samples before cleanup; these are often old or ephemeral lifecycle rows, not automatic corruption.",
+        )
+        add_category(
+            "stale_lifecycle_finalized",
+            lifecycle_last_finalized_sessions - lcm_any_sessions,
+            severity="warn",
+            description="Lifecycle finalized-session references that no longer have raw messages or summary nodes in LCM.",
+            recommended_action="Inspect samples before cleanup; only remove with an explicit backup-first lifecycle cleanup flow.",
+        )
+        add_category(
+            "lcm_message_sessions_without_lifecycle_reference",
+            message_sessions - lifecycle_referenced_sessions,
+            severity="notice",
+            description="Raw-message sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
+            recommended_action="Usually safe as historical retained context; investigate only if the sessions should belong to an active conversation.",
+        )
+        add_category(
+            "lcm_node_sessions_without_lifecycle_reference",
+            node_sessions - lifecycle_referenced_sessions,
+            severity="notice",
+            description="Summary-node sessions exist in LCM but are not referenced by current or finalized lifecycle state.",
+            recommended_action="Usually safe as historical retained context; verify expand/search still work before considering cleanup.",
+        )
+
+        if state_db_read_success:
+            add_category(
+                "lcm_message_sessions_missing_in_state",
+                message_sessions - state_sessions,
+                severity="notice",
+                description="LCM raw-message sessions are absent from the Hermes session database.",
+                recommended_action="Treat as retained or imported context unless the session should still be browsable in host session history.",
+            )
+            add_category(
+                "lcm_node_sessions_missing_in_state",
+                node_sessions - state_sessions,
+                severity="notice",
+                description="LCM summary-node sessions are absent from the Hermes session database.",
+                recommended_action="Keep read-only; this can happen after host session pruning while LCM retained summaries remain useful.",
+            )
+            add_category(
+                "state_only_sessions",
+                state_sessions - lcm_any_sessions,
+                severity="notice",
+                description="Hermes host sessions exist without raw messages or summary nodes in LCM.",
+                recommended_action="Usually benign for sessions outside LCM scope, ignored sessions, or sessions that never reached durable LCM ingest.",
+            )
+
+        warn_count = sum(1 for item in categories if item["severity"] == "warn")
+        status = "warn" if warn_count else ("notice" if categories else "pass")
+        summary = (
+            "no lifecycle fragmentation categories detected"
+            if not categories
+            else f"{len(categories)} lifecycle fragmentation categories need review"
+        )
+        return {
+            "read_only": True,
+            "status": status,
+            "summary": summary,
+            "categories": categories,
+        }
 
     def record_debt(
         self,

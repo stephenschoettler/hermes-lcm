@@ -1089,6 +1089,19 @@ def _doctor_text(engine) -> str:
         )
         if lifecycle_stats.get("state_db_error"):
             observations.append(f"lifecycle_fragmentation_state_db_error: {lifecycle_stats['state_db_error']}")
+        classification = lifecycle_stats.get("classification") or {}
+        categories = classification.get("categories") or []
+        if classification:
+            observations.append(
+                "lifecycle_fragmentation_classification: "
+                f"{classification.get('status', 'unknown')}; {len(categories)} categories need review"
+            )
+            for category in categories:
+                sample = ",".join(category.get("sample_session_ids") or []) or "(none)"
+                observations.append(
+                    "lifecycle_category "
+                    f"{category.get('name')}: count={category.get('count', 0)} sample={sample}"
+                )
         if _has_lifecycle_fragmentation(lifecycle_stats):
             recommended_actions.append(
                 "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state"
