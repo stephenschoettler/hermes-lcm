@@ -599,6 +599,26 @@ class TestConfig:
 
         assert c.summary_timeout_ms == 120_000
 
+    def test_from_env_auxiliary_timeout_without_pyyaml_ignores_sibling_timeout(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n"
+            "  compression:\n"
+            "    model: gpt-5.5\n"
+            "  extraction:\n"
+            "    timeout: '120'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 60_000
+
     def test_from_env_lcm_threshold_env_overrides_hermes_config(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()

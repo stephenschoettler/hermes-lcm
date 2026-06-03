@@ -157,8 +157,12 @@ def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
                 continue
             if auxiliary_indent is None:
                 auxiliary_indent = indent
-            if indent == auxiliary_indent and stripped == "compression:":
-                in_compression = True
+            if indent == auxiliary_indent:
+                if stripped == "compression:":
+                    in_compression = True
+                    compression_indent = None
+                    continue
+                in_compression = False
                 compression_indent = None
                 continue
             if not in_compression:
