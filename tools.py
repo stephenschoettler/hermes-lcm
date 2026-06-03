@@ -1446,8 +1446,8 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     )
 
 
-def _summary_quality_stats(engine: "LCMEngine") -> dict[str, Any]:
-    """Return read-only summary compression quality diagnostics."""
+def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, Any]:
+    """Return read-only summary compression quality diagnostics for one session."""
     conn = engine._dag._conn
     if conn is None:
         raise RuntimeError("LCM DAG connection is not initialized")
@@ -1455,10 +1455,11 @@ def _summary_quality_stats(engine: "LCMEngine") -> dict[str, Any]:
         """
         SELECT node_id, session_id, depth, token_count, source_token_count
         FROM summary_nodes
-        WHERE token_count > 0 AND source_token_count > 0
+        WHERE session_id = ? AND token_count > 0 AND source_token_count > 0
         ORDER BY CAST(source_token_count AS REAL) / token_count DESC
         LIMIT 5
-        """
+        """,
+        (session_id,),
     ).fetchall()
     totals = conn.execute(
         """
@@ -1472,7 +1473,9 @@ def _summary_quality_stats(engine: "LCMEngine") -> dict[str, Any]:
                       AND CAST(source_token_count AS REAL) / token_count >= 400
                      THEN 1 ELSE 0 END)
         FROM summary_nodes
-        """
+        WHERE session_id = ?
+        """,
+        (session_id,),
     ).fetchone()
     total_nodes = int(totals[0] or 0)
     total_source_tokens = int(totals[1] or 0)
@@ -1497,6 +1500,7 @@ def _summary_quality_stats(engine: "LCMEngine") -> dict[str, Any]:
         })
     return {
         "total_nodes": total_nodes,
+        "session_id": session_id,
         "total_source_tokens": total_source_tokens,
         "total_summary_tokens": total_summary_tokens,
         "overall_compression_ratio": overall_ratio,
@@ -1823,7 +1827,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         })
 
     try:
-        summary_quality = _summary_quality_stats(engine)
+        summary_quality = _summary_quality_stats(engine, session_id)
         degraded_count = (
             summary_quality.get("extreme_ratio_nodes", 0)
             + summary_quality.get("tiny_large_source_nodes", 0)
