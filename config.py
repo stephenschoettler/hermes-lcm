@@ -116,6 +116,65 @@ def _hermes_compression_threshold(default: float) -> float:
         return default
 
 
+def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
+    """Read Hermes auxiliary.compression.timeout when no LCM override is present.
+
+    Hermes uses seconds for the auxiliary compression timeout, while LCM stores
+    the summary timeout in milliseconds. Aligning the default keeps LCM summary
+    calls from timing out earlier than the host compression route unless
+    ``LCM_SUMMARY_TIMEOUT_MS`` is explicitly configured.
+    """
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    cfg_path = home / "config.yaml"
+    try:
+        text = cfg_path.read_text()
+        if yaml is not None:
+            cfg = yaml.safe_load(text) or {}
+            auxiliary = cfg.get("auxiliary") or {}
+            compression = auxiliary.get("compression") or {}
+            value = compression.get("timeout")
+            if value is None:
+                return default
+            return int(float(value) * 1000)
+
+        in_auxiliary = False
+        in_compression = False
+        auxiliary_indent = None
+        compression_indent = None
+        for raw_line in text.splitlines():
+            line = raw_line.split("#", 1)[0].rstrip()
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip(" \t"))
+            stripped = line.strip()
+            if indent == 0:
+                in_auxiliary = stripped == "auxiliary:"
+                in_compression = False
+                auxiliary_indent = None
+                compression_indent = None
+                continue
+            if not in_auxiliary:
+                continue
+            if auxiliary_indent is None:
+                auxiliary_indent = indent
+            if indent == auxiliary_indent and stripped == "compression:":
+                in_compression = True
+                compression_indent = None
+                continue
+            if not in_compression:
+                continue
+            if compression_indent is None:
+                compression_indent = indent
+            if indent != compression_indent or ":" not in stripped:
+                continue
+            key, raw_value = stripped.split(":", 1)
+            if key == "timeout":
+                return int(float(raw_value.strip().strip("'\"")) * 1000)
+        return default
+    except Exception:
+        return default
+
+
 @dataclass
 class LCMConfig:
     """All tunables for the LCM engine."""
@@ -323,7 +382,10 @@ class LCMConfig:
         )
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
         c.expansion_context_tokens = _int("LCM_EXPANSION_CONTEXT_TOKENS", c.expansion_context_tokens)
-        c.summary_timeout_ms = _int("LCM_SUMMARY_TIMEOUT_MS", c.summary_timeout_ms)
+        c.summary_timeout_ms = _int(
+            "LCM_SUMMARY_TIMEOUT_MS",
+            _hermes_auxiliary_compression_timeout_ms(c.summary_timeout_ms),
+        )
         c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
         c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)

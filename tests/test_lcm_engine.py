@@ -222,6 +222,7 @@ def test_lcm_tool_status_includes_optional_cache_usage_metrics(engine):
     assert payload["last_compression_noop_reason"] == ""
     assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
     assert payload["runtime_identity"]["database_path_source"] == "config.database_path"
+    assert payload["config"]["summary_timeout_ms"] == 60_000
 
 
 def test_update_model_updates_runtime_metadata_and_context_window(engine):
@@ -727,6 +728,28 @@ def test_lcm_doctor_json_includes_runtime_identity(engine):
     assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
     assert payload["runtime_identity"]["plugin_version"] == "0.15.0"
     assert "plugin_git_commit" in payload["runtime_identity"]
+
+
+def test_lcm_doctor_warns_on_extreme_summary_compression_ratios(engine):
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=0,
+        summary="tiny",
+        token_count=100,
+        source_token_count=180_000,
+        source_ids=[],
+        source_type="messages",
+        created_at=1.0,
+    ))
+
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+    check = next(item for item in payload["checks"] if item["check"] == "summary_quality")
+
+    assert check["status"] == "warn"
+    assert check["detail"]["extreme_ratio_nodes"] == 1
+    assert check["detail"]["tiny_large_source_nodes"] == 1
+    assert check["detail"]["worst_nodes"][0]["node_id"] == 1
+    assert check["detail"]["worst_nodes"][0]["compression_ratio"] == 1800.0
 
 class TestEscalationStripReasoning:
     """Regression tests for thinking-model reasoning-tag stripping in

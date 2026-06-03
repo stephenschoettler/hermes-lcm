@@ -1446,6 +1446,76 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     )
 
 
+def _summary_quality_stats(engine: "LCMEngine") -> dict[str, Any]:
+    """Return read-only summary compression quality diagnostics."""
+    conn = engine._dag._conn
+    if conn is None:
+        raise RuntimeError("LCM DAG connection is not initialized")
+    rows = conn.execute(
+        """
+        SELECT node_id, session_id, depth, token_count, source_token_count
+        FROM summary_nodes
+        WHERE token_count > 0 AND source_token_count > 0
+        ORDER BY CAST(source_token_count AS REAL) / token_count DESC
+        LIMIT 5
+        """
+    ).fetchall()
+    totals = conn.execute(
+        """
+        SELECT
+            COUNT(*),
+            COALESCE(SUM(source_token_count), 0),
+            COALESCE(SUM(token_count), 0),
+            SUM(CASE WHEN token_count > 0 AND source_token_count >= 100000
+                      AND token_count < 500 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN token_count > 0
+                      AND CAST(source_token_count AS REAL) / token_count >= 400
+                     THEN 1 ELSE 0 END)
+        FROM summary_nodes
+        """
+    ).fetchone()
+    total_nodes = int(totals[0] or 0)
+    total_source_tokens = int(totals[1] or 0)
+    total_summary_tokens = int(totals[2] or 0)
+    tiny_large_source_nodes = int(totals[3] or 0)
+    extreme_ratio_nodes = int(totals[4] or 0)
+    overall_ratio = (
+        round(total_source_tokens / total_summary_tokens, 1)
+        if total_summary_tokens > 0
+        else 0.0
+    )
+    worst_nodes = []
+    for node_id, session_id, depth, token_count, source_token_count in rows:
+        ratio = round(float(source_token_count) / float(token_count), 1) if token_count else 0.0
+        worst_nodes.append({
+            "node_id": int(node_id),
+            "session_id": session_id,
+            "depth": int(depth),
+            "source_token_count": int(source_token_count or 0),
+            "token_count": int(token_count or 0),
+            "compression_ratio": ratio,
+        })
+    return {
+        "total_nodes": total_nodes,
+        "total_source_tokens": total_source_tokens,
+        "total_summary_tokens": total_summary_tokens,
+        "overall_compression_ratio": overall_ratio,
+        "extreme_ratio_threshold": 400,
+        "tiny_large_source_threshold": {
+            "source_token_count_min": 100000,
+            "token_count_max": 500,
+        },
+        "extreme_ratio_nodes": extreme_ratio_nodes,
+        "tiny_large_source_nodes": tiny_large_source_nodes,
+        "worst_nodes": worst_nodes,
+        "recommendation": (
+            "Inspect worst_nodes with lcm_expand; tiny summaries for very large sources often indicate degraded fallback summarization."
+            if extreme_ratio_nodes or tiny_large_source_nodes
+            else "summary compression ratios are within the diagnostic thresholds"
+        ),
+    }
+
+
 def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     """Quick health overview of the LCM engine for the current session."""
     engine = _require_engine(kwargs)
@@ -1534,6 +1604,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
             "summary_model": engine._config.summary_model or "(auxiliary)",
+            "summary_timeout_ms": engine._config.summary_timeout_ms,
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "session_filters": {
@@ -1747,6 +1818,24 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "orphaned_dag_nodes",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    try:
+        summary_quality = _summary_quality_stats(engine)
+        degraded_count = (
+            summary_quality.get("extreme_ratio_nodes", 0)
+            + summary_quality.get("tiny_large_source_nodes", 0)
+        )
+        checks.append({
+            "check": "summary_quality",
+            "status": "warn" if degraded_count else "pass",
+            "detail": summary_quality,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "summary_quality",
             "status": "fail",
             "detail": str(e),
         })

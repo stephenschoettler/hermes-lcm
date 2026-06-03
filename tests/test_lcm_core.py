@@ -557,6 +557,48 @@ class TestConfig:
 
         assert c.context_threshold == 0.68
 
+    def test_from_env_reads_hermes_auxiliary_compression_timeout_when_lcm_env_missing(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: 120\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 120_000
+
+    def test_from_env_summary_timeout_env_overrides_hermes_auxiliary_timeout(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: 120\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_SUMMARY_TIMEOUT_MS", "45000")
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 45_000
+
+    def test_from_env_reads_auxiliary_timeout_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "auxiliary:\n  compression:\n    timeout: '120'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.summary_timeout_ms == 120_000
+
     def test_from_env_lcm_threshold_env_overrides_hermes_config(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
