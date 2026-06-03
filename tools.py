@@ -1455,8 +1455,13 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
         """
         SELECT node_id, session_id, depth, token_count, source_token_count
         FROM summary_nodes
-        WHERE session_id = ? AND token_count > 0 AND source_token_count > 0
-        ORDER BY CAST(source_token_count AS REAL) / token_count DESC
+        WHERE session_id = ? AND source_token_count > 0
+        ORDER BY
+            CASE WHEN token_count <= 0 THEN 1 ELSE 0 END DESC,
+            CASE WHEN token_count > 0
+                 THEN CAST(source_token_count AS REAL) / token_count
+                 ELSE source_token_count
+            END DESC
         LIMIT 5
         """,
         (session_id,),
@@ -1467,7 +1472,7 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
             COUNT(*),
             COALESCE(SUM(source_token_count), 0),
             COALESCE(SUM(token_count), 0),
-            SUM(CASE WHEN token_count > 0 AND source_token_count >= 100000
+            SUM(CASE WHEN source_token_count >= 100000
                       AND token_count < 500 THEN 1 ELSE 0 END),
             SUM(CASE WHEN token_count > 0
                       AND CAST(source_token_count AS REAL) / token_count >= 400
@@ -1489,7 +1494,11 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
     )
     worst_nodes = []
     for node_id, session_id, depth, token_count, source_token_count in rows:
-        ratio = round(float(source_token_count) / float(token_count), 1) if token_count else 0.0
+        ratio = (
+            round(float(source_token_count) / float(token_count), 1)
+            if token_count and token_count > 0
+            else None
+        )
         worst_nodes.append({
             "node_id": int(node_id),
             "session_id": session_id,

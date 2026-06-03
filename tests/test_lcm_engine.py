@@ -785,6 +785,27 @@ def test_lcm_doctor_summary_quality_ignores_other_sessions(engine):
     assert check["detail"]["tiny_large_source_nodes"] == 0
     assert check["detail"]["worst_nodes"][0]["session_id"] == "test-session"
 
+def test_lcm_doctor_summary_quality_flags_zero_token_large_source(engine):
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=0,
+        summary="",
+        token_count=0,
+        source_token_count=180_000,
+        source_ids=[],
+        source_type="messages",
+        created_at=1.0,
+    ))
+
+    payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
+    check = next(item for item in payload["checks"] if item["check"] == "summary_quality")
+
+    assert check["status"] == "warn"
+    assert check["detail"]["tiny_large_source_nodes"] == 1
+    assert check["detail"]["extreme_ratio_nodes"] == 0
+    assert check["detail"]["worst_nodes"][0]["token_count"] == 0
+    assert check["detail"]["worst_nodes"][0]["compression_ratio"] is None
+
 class TestEscalationStripReasoning:
     """Regression tests for thinking-model reasoning-tag stripping in
     escalation._call_llm_for_summary. Some thinking models (MiniMax-M2.7,
