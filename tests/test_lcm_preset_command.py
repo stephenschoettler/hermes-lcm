@@ -59,6 +59,29 @@ def test_lcm_preset_show_exposes_codex_provenance_without_mutating_config(tmp_pa
     assert before == (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
 
 
+def test_lcm_preset_show_exposes_spark_provenance_without_mutating_config(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    engine = _engine(tmp_path, context_length=128_000)
+    before = (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+    result = handle_lcm_command("preset show codex_spark_context", engine)
+
+    assert "LCM preset show" in result
+    assert "preset: codex_spark_context" in result
+    assert "policy_version: 1" in result
+    assert "benchmark_version: 2" in result
+    assert "fixture_suite: spark_pressure_probe:42:4:1000" in result
+    assert "score: 92.5" in result
+    assert "baseline_score: 72.5" in result
+    assert "policy_path: benchmarks/policies/codex_spark_context.yaml" in result
+    assert "large context windows near 128k tokens" in result
+    assert "LCM_CONTEXT_THRESHOLD=0.75" in result
+    assert "LCM_FRESH_TAIL_COUNT=16" in result
+    assert "LCM_LEAF_CHUNK_TOKENS=8000" in result
+    assert "runtime_mutation: no" in result
+    assert before == (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+
 def test_lcm_preset_suggest_reports_explicit_operator_config_precedence(tmp_path, monkeypatch):
     _clear_preset_env(monkeypatch)
     monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "99")
@@ -73,6 +96,22 @@ def test_lcm_preset_suggest_reports_explicit_operator_config_precedence(tmp_path
     assert "match_confidence: context-only" in result
     assert "explicit_overrides: LCM_FRESH_TAIL_COUNT" in result
     assert "LCM_FRESH_TAIL_COUNT: keep explicit value 99 (preset 24)" in result
+    assert "note: suggestion only; no live config was changed" in result
+
+
+def test_lcm_preset_suggest_reports_spark_for_128k_context_window(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    engine = _engine(tmp_path, context_length=128_000)
+
+    result = handle_lcm_command("preset suggest", engine)
+
+    assert "LCM preset suggest" in result
+    assert "suggested_preset: codex_spark_context" in result
+    assert "reason: context-window match for GPT/Codex Spark candidate; verify provider/model family before applying" in result
+    assert "match_confidence: context-only" in result
+    assert "LCM_CONTEXT_THRESHOLD=0.75" in result
+    assert "LCM_FRESH_TAIL_COUNT=16" in result
+    assert "LCM_LEAF_CHUNK_TOKENS=8000" in result
     assert "note: suggestion only; no live config was changed" in result
 
 
@@ -107,6 +146,23 @@ def test_lcm_preset_apply_requires_dry_run_and_does_not_mutate_config(tmp_path, 
     assert "LCM_LEAF_CHUNK_TOKENS=8000" in dry_run
     assert "unsupported_runtime_fields: target_after_compaction=0.55" in dry_run
     assert "note: no live config was changed" in dry_run
+    assert before == (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+
+def test_lcm_preset_apply_spark_dry_run_uses_benchmarked_128k_values(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    engine = _engine(tmp_path, context_length=128_000)
+    before = (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
+
+    result = handle_lcm_command("preset apply codex_spark_context --dry-run", engine)
+
+    assert "LCM preset apply" in result
+    assert "status: dry-run" in result
+    assert "preset: codex_spark_context" in result
+    assert "LCM_CONTEXT_THRESHOLD=0.75" in result
+    assert "LCM_FRESH_TAIL_COUNT=16" in result
+    assert "LCM_LEAF_CHUNK_TOKENS=8000" in result
+    assert "unsupported_runtime_fields: target_after_compaction=0.55" in result
     assert before == (engine._config.context_threshold, engine._config.fresh_tail_count, engine._config.leaf_chunk_tokens)
 
 

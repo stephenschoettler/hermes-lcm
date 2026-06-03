@@ -84,11 +84,50 @@ _CODEX_GPT_LONG_CONTEXT = LCMPreset(
     ),
 )
 
+_CODEX_SPARK_CONTEXT = LCMPreset(
+    name="codex_spark_context",
+    family="GPT/Codex Spark 128k",
+    description="Benchmark-backed candidate for GPT-5.3 Codex Spark / 128k Codex-style routes.",
+    policy_path="benchmarks/policies/codex_spark_context.yaml",
+    policy_version="1",
+    runtime_env={
+        "context_threshold": 0.75,
+        "fresh_tail_count": 16,
+        "leaf_chunk_tokens": 8_000,
+    },
+    unsupported_runtime_fields={
+        "target_after_compaction": 0.55,
+    },
+    applies_to=(
+        "GPT-5.3 Codex Spark on Codex OAuth routes",
+        "large context windows near 128k tokens",
+        "workloads where Spark's smaller effective window needs more post-compaction headroom",
+    ),
+    provenance={
+        "benchmark_version": "2",
+        "fixture_suite": ["spark_pressure_probe:42:4:1000"],
+        "metric_summary": {
+            "score": 92.5,
+            "baseline_score": 72.5,
+            "retrieval_canary_recall": 1.0,
+            "baseline_repeated_compaction_risk_count": 1,
+            "candidate_repeated_compaction_risk_count": 0,
+            "candidate_min_post_compaction_headroom_tokens": 39_704,
+            "candidate_prompt_tokens_after": 56_296,
+        },
+        "evidence": "Deterministic 128k pressure replay; 16-message tail avoided repeated compaction risk with 39,704 token headroom.",
+    },
+    notes=(
+        "Benchmark-only candidate for the 128k Codex Spark route. "
+        "No live provider tuning or automatic config mutation is performed."
+    ),
+)
+
 
 def shipped_presets() -> list[LCMPreset]:
     """Return the shipped, inspectable preset catalog."""
 
-    return [_CODEX_GPT_LONG_CONTEXT]
+    return [_CODEX_GPT_LONG_CONTEXT, _CODEX_SPARK_CONTEXT]
 
 
 def get_preset(name: str | None = None) -> LCMPreset | None:
@@ -282,6 +321,11 @@ def suggest_preset_for_engine(engine: Any) -> tuple[LCMPreset | None, str]:
         return (
             _CODEX_GPT_LONG_CONTEXT,
             "context-window match for GPT/Codex candidate; verify provider/model family before applying",
+        )
+    if 110_000 <= context_length < 200_000:
+        return (
+            _CODEX_SPARK_CONTEXT,
+            "context-window match for GPT/Codex Spark candidate; verify provider/model family before applying",
         )
     return None, f"no shipped benchmarked preset matches context_length {context_length}"
 

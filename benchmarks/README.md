@@ -35,6 +35,7 @@ When no `--policy` is supplied, the harness loads built-in policies:
 
 - `baseline_272k`, current long-context baseline
 - `codex_gpt_long_context`, initial GPT/Codex long-context benchmark candidate
+- `codex_spark_context`, GPT-5.3 Codex Spark / 128k benchmark candidate
 - `pressure_smoke`, a deliberately small benchmark-only policy that proves pressure/chatter metrics trigger compaction
 
 The committed policy files in `benchmarks/policies/` are the canonical benchmark inputs. Compare the GPT/Codex candidate against baseline with committed fixtures:
@@ -60,11 +61,21 @@ python scripts/lcm_benchmark.py \
   --json
 ```
 
+The 128k Spark preset uses the same pressure-probe shape with a smaller fresh tail to preserve post-compaction headroom under the lower trigger:
+
+```bash
+python scripts/lcm_benchmark.py \
+  --synthetic-fixture spark_pressure_probe:42:4:1000 \
+  --policy benchmarks/policies/codex_spark_context.yaml \
+  --output benchmarks/runs/codex-spark-pressure \
+  --json
+```
+
 Synthetic fixture specs use `name:pairs:canaries:filler_words` and are deterministic. They are bounded to 250 message pairs and 2,000 filler words so typos do not create huge benchmark outputs. Benchmark output directories should be fresh or cleaned between runs because the harness refuses to reuse non-empty per-run directories.
 
 The committed `summary_timeout_probe` and `summary_refusal_probe` fixtures are small pilot fixtures for summary-provider failure-mode accounting. Their `benchmark_profile` records `summary_level` and `summary_failure_mode` metadata so reports can group timeout/refusal fallback scenarios without embedding provider calls or secrets in fixture content.
 
-`codex_gpt_long_context` is a benchmark candidate and now has an inspectable dry-run preset surface. `pressure_smoke` is not a runtime preset recommendation. It is a control policy for validating benchmark signals.
+`codex_gpt_long_context` and `codex_spark_context` are benchmark candidates and now have inspectable dry-run preset surfaces. `pressure_smoke` is not a runtime preset recommendation. It is a control policy for validating benchmark signals.
 
 ## Output files
 

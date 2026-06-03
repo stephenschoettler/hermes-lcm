@@ -46,6 +46,16 @@ def builtin_policies() -> list[LCMPolicy]:
             notes="Initial benchmark candidate for GPT/Codex long-context routes.",
         ),
         LCMPolicy(
+            name="codex_spark_context",
+            context_length=128_000,
+            context_threshold=0.75,
+            fresh_tail_count=16,
+            leaf_chunk_tokens=8_000,
+            target_after_compaction=0.55,
+            policy_version="1",
+            notes="Benchmark candidate for GPT-5.3 Codex Spark / 128k Codex-style routes.",
+        ),
+        LCMPolicy(
             name="pressure_smoke",
             context_length=300,
             context_threshold=0.30,

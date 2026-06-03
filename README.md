@@ -282,8 +282,10 @@ mutations. With `LCM_ENABLE_SLASH_COMMAND=true`, use:
 
 ```text
 /lcm preset show codex_gpt_long_context
+/lcm preset show codex_spark_context
 /lcm preset suggest
 /lcm preset apply codex_gpt_long_context --dry-run
+/lcm preset apply codex_spark_context --dry-run
 ```
 
 `/lcm preset show` reports the shipped preset metadata, benchmark provenance,
@@ -296,11 +298,17 @@ write files, change process state, or override explicit parseable
 preset-managed `LCM_*` environment variables. Invalid preset-managed env values
 are reported as invalid instead of being treated as active runtime overrides.
 
-The current `codex_gpt_long_context` dry-run preview is:
+The current runtime preset dry-run previews are:
 
 ```text
+# codex_gpt_long_context: near-272k GPT/Codex routes
 LCM_CONTEXT_THRESHOLD=0.75
 LCM_FRESH_TAIL_COUNT=24
+LCM_LEAF_CHUNK_TOKENS=8000
+
+# codex_spark_context: near-128k GPT-5.3 Codex Spark routes
+LCM_CONTEXT_THRESHOLD=0.75
+LCM_FRESH_TAIL_COUNT=16
 LCM_LEAF_CHUNK_TOKENS=8000
 ```
 

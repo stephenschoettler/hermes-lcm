@@ -1,0 +1,12 @@
+name: codex_spark_context
+context_length: 128000
+context_threshold: 0.75
+fresh_tail_count: 16
+leaf_chunk_tokens: 8000
+condensation_fanin: 4
+incremental_max_depth: 1
+dynamic_leaf_chunk_enabled: false
+target_after_compaction: 0.55
+min_turns_between_compactions: 0
+policy_version: "1"
+notes: "Benchmark candidate for GPT-5.3 Codex Spark / 128k Codex-style routes."

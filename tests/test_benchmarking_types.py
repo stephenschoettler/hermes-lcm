@@ -109,6 +109,12 @@ def test_builtin_policies_include_baseline_codex_policy_and_pressure_smoke():
     assert policies["codex_gpt_long_context"].leaf_chunk_tokens == 8_000
     assert policies["codex_gpt_long_context"].target_after_compaction == 0.55
     assert policies["codex_gpt_long_context"].policy_version == "1"
+    assert policies["codex_spark_context"].context_length == 128_000
+    assert policies["codex_spark_context"].context_threshold == 0.75
+    assert policies["codex_spark_context"].fresh_tail_count == 16
+    assert policies["codex_spark_context"].leaf_chunk_tokens == 8_000
+    assert policies["codex_spark_context"].target_after_compaction == 0.55
+    assert policies["codex_spark_context"].policy_version == "1"
     assert policies["pressure_smoke"].context_length < 1_000
     assert policies["pressure_smoke"].policy_version == "1"
 
@@ -121,11 +127,20 @@ def test_committed_codex_gpt_long_context_policy_matches_builtin_policy():
     assert "benchmark candidate" in policy.notes
 
 
+def test_committed_codex_spark_context_policy_matches_builtin_policy():
+    policy = load_policy("benchmarks/policies/codex_spark_context.yaml")
+    builtin = {item.name: item for item in builtin_policies()}["codex_spark_context"]
+
+    assert policy == builtin
+    assert "GPT-5.3 Codex Spark" in policy.notes
+
+
 def test_committed_policy_files_match_builtin_policies():
     builtins = {item.name: item for item in builtin_policies()}
     policy_paths = [
         "benchmarks/policies/baseline.yaml",
         "benchmarks/policies/codex_gpt_long_context.yaml",
+        "benchmarks/policies/codex_spark_context.yaml",
         "benchmarks/policies/pressure_smoke.yaml",
     ]
 
