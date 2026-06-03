@@ -13,7 +13,12 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     repair_external_content_fts,
 )
-from .ingest_protection import externalized_payload_stats, scan_sqlite_payload_risks, sensitive_pattern_status
+from .ingest_protection import (
+    externalized_payload_stats,
+    scan_externalized_payload_integrity,
+    scan_sqlite_payload_risks,
+    sensitive_pattern_status,
+)
 from .dag import build_nodes_fts_spec
 from .presets import (
     explicit_operator_overrides,
@@ -961,6 +966,11 @@ def _doctor_text(engine) -> str:
     try:
         payload_risks = scan_sqlite_payload_risks(store_conn)
         externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
+        externalized_integrity = scan_externalized_payload_integrity(
+            store_conn,
+            engine._config,
+            hermes_home=engine._hermes_home,
+        )
     except Exception:  # pragma: no cover - defensive
         payload_risks = {
             "largest_content_rows": [],
@@ -979,6 +989,14 @@ def _doctor_text(engine) -> str:
             "externalized_payload_dir": "",
             "latest_externalized_payload_path": "",
             "latest_externalized_payload_mtime": 0,
+        }
+        externalized_integrity = {
+            "externalized_payload_refs_total": 0,
+            "externalized_payload_refs_existing": 0,
+            "externalized_payload_refs_missing": 0,
+            "externalized_payload_files_unreferenced": 0,
+            "missing_externalized_payload_refs": [],
+            "unreferenced_externalized_payload_files": [],
         }
         issues.append("payload_storage")
     clean_scan = _scan_clean_candidates(engine)
@@ -1001,6 +1019,7 @@ def _doctor_text(engine) -> str:
 
     observations: list[str] = []
     recommended_actions: list[str] = []
+    missing_externalized_refs = int(externalized_integrity.get("externalized_payload_refs_missing", 0) or 0)
 
     if schema_health.get("error"):
         observations.append(f"schema_core_tables: error: {schema_health['error']}")
@@ -1036,6 +1055,15 @@ def _doctor_text(engine) -> str:
         recommended_actions.append("create a safety snapshot first with `/lcm backup`")
     else:
         observations.append("cleanup_candidates: none")
+
+    if missing_externalized_refs:
+        issues.append("payload_storage")
+        observations.append(
+            f"payload_storage: {missing_externalized_refs} externalized payload ref(s) point to missing JSON files"
+        )
+        recommended_actions.append(
+            "inspect missing externalized payload refs and restore from backups if needed"
+        )
 
     try:
         source_stats = engine._store.get_source_stats()
@@ -1179,6 +1207,12 @@ def _doctor_text(engine) -> str:
         f"externalized_payload_bytes: {externalized_stats['externalized_payload_bytes']}",
         f"externalized_payload_chars: {externalized_stats['externalized_payload_chars']}",
         f"latest_externalized_payload_path: {externalized_stats['latest_externalized_payload_path'] or '(none)'}",
+        f"externalized_payload_refs_total: {externalized_integrity['externalized_payload_refs_total']}",
+        f"externalized_payload_refs_existing: {externalized_integrity['externalized_payload_refs_existing']}",
+        f"externalized_payload_refs_missing: {externalized_integrity['externalized_payload_refs_missing']}",
+        f"externalized_payload_files_unreferenced: {externalized_integrity['externalized_payload_files_unreferenced']}",
+        f"missing_externalized_payload_refs: {externalized_integrity['missing_externalized_payload_refs']}",
+        f"unreferenced_externalized_payload_files: {externalized_integrity['unreferenced_externalized_payload_files']}",
     ]
     if issues:
         lines.append(f"issues: {', '.join(issues)}")

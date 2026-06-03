@@ -245,6 +245,38 @@ def test_lcm_doctor_tool_reports_heartbeat_noise_as_read_only_payload_detail(eng
     assert "Still working" not in json.dumps(payload)
 
 
+def test_lcm_doctor_text_reports_missing_externalized_payload_refs(engine):
+    storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
+    storage_dir.mkdir(parents=True)
+    (storage_dir / "referenced.json").write_text(json.dumps({"content": "stored", "content_chars": 6}))
+    (storage_dir / "unreferenced.json").write_text(json.dumps({"content": "orphaned", "content_chars": 8}))
+    engine._store.append(
+        "externalized-integrity-session",
+        {
+            "role": "assistant",
+            "content": "\n".join(
+                [
+                    "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=6; bytes=6; ref=referenced.json]",
+                    "[GC'd externalized payload: kind=raw_payload; role=assistant; chars=10; ref=missing.json]",
+                ]
+            ),
+        },
+        token_estimate=2,
+    )
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "externalized_payload_refs_total: 2" in result
+    assert "externalized_payload_refs_existing: 1" in result
+    assert "externalized_payload_refs_missing: 1" in result
+    assert "externalized_payload_files_unreferenced: 1" in result
+    assert "missing_externalized_payload_refs:" in result
+    assert "missing.json" in result
+    assert "inspect missing externalized payload refs and restore from backups if needed" in result
+    assert "stored" not in result
+    assert "orphaned" not in result
+
+
 def test_lcm_doctor_finds_heartbeat_noise_after_many_short_nonmatches(engine):
     for idx in range(120):
         engine._store.append(

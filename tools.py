@@ -21,6 +21,7 @@ from .ingest_protection import (
     externalized_payload_stats,
     extract_ingest_externalized_refs,
     restore_ingest_payload_placeholders,
+    scan_externalized_payload_integrity,
     scan_sqlite_payload_risks,
     sensitive_pattern_status,
 )
@@ -1685,6 +1686,11 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         })
         payload_risks = scan_sqlite_payload_risks(engine._store._conn)
         externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
+        externalized_integrity = scan_externalized_payload_integrity(
+            engine._store._conn,
+            engine._config,
+            hermes_home=engine._hermes_home,
+        )
         suspicious_count = (
             len(payload_risks["suspicious_data_uri_content_rows"])
             + len(payload_risks["suspicious_data_uri_tool_calls_rows"])
@@ -1692,12 +1698,14 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             + len(payload_risks["suspicious_repetitive_assistant_rows"])
             + len(payload_risks["heartbeat_noise_rows"])
         )
+        missing_externalized_refs = int(externalized_integrity.get("externalized_payload_refs_missing", 0) or 0)
         checks.append({
             "check": "payload_storage",
-            "status": "warn" if suspicious_count else "pass",
+            "status": "warn" if suspicious_count or missing_externalized_refs else "pass",
             "detail": {
                 **payload_risks,
                 **externalized_stats,
+                **externalized_integrity,
             },
         })
     except Exception as e:

@@ -15,12 +15,15 @@ import json
 import logging
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any, Dict, List
 
 from .externalize import (
     externalize_ingest_payload,
     extract_externalized_ref,
+    extract_externalized_refs,
     find_externalized_payload_for_message,
+    get_large_output_storage_dir,
     is_externalized_placeholder,
     load_externalized_payload,
     maybe_externalize_payload,
@@ -146,6 +149,21 @@ def extract_ingest_externalized_refs(text: str) -> list[str]:
     for match in _INGEST_PLACEHOLDER_RE.finditer(text):
         ref = match.group(1).strip()
         if ref and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _is_basename_ref(ref: str) -> bool:
+    return bool(ref) and "/" not in ref and "\\" not in ref and Path(ref).name == ref
+
+
+def extract_all_externalized_payload_refs(text: str) -> list[str]:
+    """Return deduplicated refs from recognized externalized payload placeholders."""
+    if not isinstance(text, str) or not text:
+        return []
+    refs: list[str] = []
+    for ref in extract_ingest_externalized_refs(text) + extract_externalized_refs(text):
+        if _is_basename_ref(ref) and ref not in refs:
             refs.append(ref)
     return refs
 
@@ -962,6 +980,65 @@ def protect_messages_for_ingest(
         )
         for message in messages
     ]
+
+
+def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
+    """Compare externalized payload refs stored in messages with JSON files.
+
+    This is intentionally read-only and metadata-only. It does not open payload
+    files except through directory metadata, and row samples never include raw
+    message content or tool-call arguments.
+    """
+
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    existing_files: set[str] = set()
+    if storage_dir.exists() and storage_dir.is_dir():
+        existing_files = {path.name for path in storage_dir.glob("*.json") if path.is_file()}
+
+    referenced_refs: set[str] = set()
+    first_location_by_ref: dict[str, dict[str, Any]] = {}
+    for store_id, session_id, source, role, content, tool_calls in conn.execute(
+        """
+        SELECT store_id, session_id, source, role, content, tool_calls
+        FROM messages
+        WHERE COALESCE(content, '') LIKE '%ref=%]%'
+           OR COALESCE(tool_calls, '') LIKE '%ref=%]%'
+        ORDER BY store_id ASC
+        """
+    ).fetchall():
+        for field, value in (("content", content), ("tool_calls", tool_calls)):
+            if not isinstance(value, str):
+                continue
+            for ref in extract_all_externalized_payload_refs(value):
+                referenced_refs.add(ref)
+                first_location_by_ref.setdefault(
+                    ref,
+                    {
+                        "store_id": int(store_id),
+                        "session_id": session_id,
+                        "source": source,
+                        "role": role,
+                        "field": field,
+                        "externalized_ref": ref,
+                    },
+                )
+
+    missing_refs = sorted(ref for ref in referenced_refs if ref not in existing_files)
+    existing_ref_count = sum(1 for ref in referenced_refs if ref in existing_files)
+    unreferenced_files = sorted(ref for ref in existing_files if ref not in referenced_refs)
+
+    return {
+        "externalized_payload_refs_total": len(referenced_refs),
+        "externalized_payload_refs_existing": existing_ref_count,
+        "externalized_payload_refs_missing": len(missing_refs),
+        "externalized_payload_files_unreferenced": len(unreferenced_files),
+        "missing_externalized_payload_refs": [
+            first_location_by_ref[ref] for ref in missing_refs[:limit] if ref in first_location_by_ref
+        ],
+        "unreferenced_externalized_payload_files": [
+            {"externalized_ref": ref} for ref in unreferenced_files[:limit]
+        ],
+    }
 
 
 def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:

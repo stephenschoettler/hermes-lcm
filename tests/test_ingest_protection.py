@@ -18,8 +18,18 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 import hermes_lcm.engine as lcm_engine_module
 from hermes_lcm.extraction import sanitize_pre_compaction_tool_arguments
-from hermes_lcm.externalize import build_transcript_gc_placeholder, externalize_ingest_payload, extract_externalized_ref
-from hermes_lcm.ingest_protection import extract_ingest_externalized_refs, redact_sensitive_text
+from hermes_lcm.externalize import (
+    build_transcript_gc_placeholder,
+    externalize_ingest_payload,
+    extract_externalized_ref,
+    extract_externalized_refs,
+)
+from hermes_lcm.ingest_protection import (
+    extract_all_externalized_payload_refs,
+    extract_ingest_externalized_refs,
+    redact_sensitive_text,
+    scan_externalized_payload_integrity,
+)
 from hermes_lcm.tokens import count_messages_tokens
 
 
@@ -337,6 +347,34 @@ def test_extract_externalized_ref_recovers_tool_and_non_tool_placeholders():
     ]
 
     assert [extract_externalized_ref(value) for value in placeholders] == [
+        "tool.json",
+        "tool-gc.json",
+        "raw.json",
+        "raw-gc.json",
+    ]
+
+
+def test_extract_all_externalized_payload_refs_recovers_real_placeholders_only():
+    text = "\n".join(
+        [
+            "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=1; bytes=1; ref=ingest.json]",
+            "[Externalized tool output: tool_call_id=call_1; chars=1200; bytes=1200; ref=tool.json]",
+            "[GC'd externalized tool output: tool_call_id=call_1; chars=1200; ref=tool-gc.json]",
+            "[Externalized payload: kind=raw_payload; role=assistant; chars=1200; bytes=1200; ref=raw.json]",
+            "[GC'd externalized payload: kind=raw_payload; role=assistant; chars=1200; ref=raw-gc.json]",
+            "docs mention ref=docs.json without the real placeholder prefix",
+            "[Externalized payload example: ref=example.json]",
+            "[Externalized payload: kind=raw_payload; role=assistant; chars=1; ref=nested/not-basename.json]",
+            "[Externalized payload: kind=raw_payload; role=assistant; chars=1; ref=nested\\not-basename.json]",
+            "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=1; bytes=1; ref=../escape.json]",
+            "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=1; bytes=1; ref=..\\escape.json]",
+            "[Externalized tool output: tool_call_id=call_1; chars=1200; bytes=1200; ref=tool.json]",
+        ]
+    )
+
+    assert extract_externalized_refs(text) == ["tool.json", "tool-gc.json", "raw.json", "raw-gc.json"]
+    assert extract_all_externalized_payload_refs(text) == [
+        "ingest.json",
         "tool.json",
         "tool-gc.json",
         "raw.json",
@@ -1650,6 +1688,151 @@ def test_lcm_doctor_reports_externalized_payload_stats(tmp_path):
     externalized_check = next(check for check in json_result["checks"] if check["check"] == "payload_storage")
     assert externalized_check["detail"]["externalized_payload_count"] == 1
     assert externalized_check["detail"]["externalized_payload_bytes"] > 0
+
+
+def test_externalized_payload_integrity_scan_reports_missing_and_unreferenced_refs_without_payload_previews(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    for ref, content in {
+        "ingest-present.json": "present ingest payload",
+        "legacy-present.json": "present legacy payload",
+        "orphan.json": "UNREFERENCED_RAW_PAYLOAD",
+    }.items():
+        (storage_dir / ref).write_text(json.dumps({"content": content, "content_chars": len(content)}))
+
+    content = "\n".join(
+        [
+            "[Externalized LCM ingest payload: kind=ingest_payload; field=content; chars=1; bytes=1; ref=ingest-present.json]",
+            "[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref=missing-raw.json]",
+            "[Externalized payload: kind=raw_payload; role=assistant; chars=1; ref=nested/not-counted.json]",
+            "docs mention ref=doc-only.json but not in a real placeholder",
+        ]
+    )
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "arguments": "[GC'd externalized tool output: tool_call_id=call_1; chars=1; ref=legacy-present.json]"
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            content,
+            None,
+            tool_calls,
+            None,
+            1.0,
+            5,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+    before_rows = engine._store._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    before_files = sorted(path.name for path in storage_dir.glob("*.json"))
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert engine._store._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == before_rows
+    assert sorted(path.name for path in storage_dir.glob("*.json")) == before_files
+    assert detail["externalized_payload_refs_total"] == 3
+    assert detail["externalized_payload_refs_existing"] == 2
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["externalized_payload_files_unreferenced"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "telegram",
+            "role": "assistant",
+            "field": "content",
+            "externalized_ref": "missing-raw.json",
+        }
+    ]
+    assert detail["unreferenced_externalized_payload_files"] == [{"externalized_ref": "orphan.json"}]
+    encoded = json.dumps(detail)
+    assert "UNREFERENCED_RAW_PAYLOAD" not in encoded
+    assert "doc-only.json" not in encoded
+    assert "not-counted.json" not in encoded
+
+
+def test_externalized_payload_integrity_scan_detects_embedded_content_placeholder_with_trailing_text(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "user",
+            "see image [Externalized LCM ingest payload: kind=media_payload; field=content; chars=1; bytes=1; ref=missing-embedded.json] please inspect",
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "telegram",
+            "role": "user",
+            "field": "content",
+            "externalized_ref": "missing-embedded.json",
+        }
+    ]
+
+
+def test_lcm_doctor_warns_on_missing_externalized_payload_refs_when_inline_payloads_are_clean(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref=missing-doctor.json]",
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    json_result = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+
+    payload_check = next(check for check in json_result["checks"] if check["check"] == "payload_storage")
+    assert payload_check["status"] == "warn"
+    assert payload_check["detail"]["suspicious_data_uri_content_rows"] == []
+    assert payload_check["detail"]["suspicious_base64_like_rows"] == []
+    assert payload_check["detail"]["externalized_payload_refs_total"] == 1
+    assert payload_check["detail"]["externalized_payload_refs_missing"] == 1
+    assert payload_check["detail"]["missing_externalized_payload_refs"][0]["externalized_ref"] == "missing-doctor.json"
 
 
 BROKEN_ASSISTANT_MARKER = "BROKEN_ASSISTANT_LOOP_MARKER_196"

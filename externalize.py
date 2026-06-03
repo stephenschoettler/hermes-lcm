@@ -138,15 +138,20 @@ def build_transcript_gc_placeholder(summary: Dict[str, Any]) -> str:
 
 
 def extract_externalized_ref(text: str) -> str | None:
-    if not text:
-        return None
-    match = _EXTERNALIZED_REF_RE.search(text)
-    if not match:
-        return None
-    ref = match.group(1).strip()
-    if not ref or Path(ref).name != ref:
-        return None
-    return ref
+    refs = extract_externalized_refs(text)
+    return refs[0] if refs else None
+
+
+def extract_externalized_refs(text: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    refs: list[str] = []
+    for match in _EXTERNALIZED_REF_RE.finditer(text):
+        ref = match.group(1).strip()
+        if not ref or "/" in ref or "\\" in ref or Path(ref).name != ref or ref in refs:
+            continue
+        refs.append(ref)
+    return refs
 
 
 def is_externalized_placeholder(text: str) -> bool:
