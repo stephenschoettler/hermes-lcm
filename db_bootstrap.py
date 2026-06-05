@@ -48,27 +48,34 @@ class ExternalContentFtsSpec:
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
-    """Configure SQLite connection for crash-safe multi-process WAL usage.
+    """Configure SQLite connection for improved crash safety with WAL.
 
     In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
     every process opens its own sqlite3.Connection pointing at the same
-    lcm.db file.  These settings ensure the database survives unexpected
-    termination of any one process without corrupting the B-tree.
+    lcm.db file.  These settings improve durability and WAL hygiene but do
+    NOT fully solve inter-process WAL coordination — that requires graceful
+    application-level shutdown (see ``MessageStore.close()`` etc.).
 
     Key design decisions:
     - journal_mode=WAL  : writes go to a separate log; readers never block.
-    - synchronous=FULL  : fsync before every write transaction commit so the
-                          WAL survives power loss / crash.  WAL + FULL is
-                          crash-safe by SQLite guarantee.
-    - wal_autocheckpoint=500 : after 500 WAL pages (~2 MB) SQLite will
-                               automatically checkpoint.  Keeps WAL bounded
-                               even if a long-lived session forgets to close.
-    - journal_size_limit=67108864 (64 MiB) : once the WAL grows past this
-                                              threshold SQLite forces a
-                                              passive checkpoint to cap it.
+    - synchronous=FULL  : fsync both the WAL and the WAL index before every
+                          write transaction commit.  WAL + FULL is the only
+                          combination SQLite guarantees survives power loss
+                          without data loss (NORMAL may lose the WAL index).
+    - wal_autocheckpoint=500 : after 500 WAL pages (~2 MB) SQLite will try
+                               an automatic passive checkpoint.  This is a
+                               best-effort hint — it is silently skipped when
+                               another connection holds a read transaction.
+                               Under checkpoint starvation WAL can grow well
+                               beyond this trigger.
+    - journal_size_limit=67108864 (64 MiB) : limits the WAL file size after
+                                             a successful checkpoint or reset.
+                                             It does NOT force a checkpoint
+                                             or cap growth while another
+                                             connection holds an old WAL
+                                             end mark.
     - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM
-                                              instead of re-reading disk.
+                                              readers cache WAL pages in RAM.
     """
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
