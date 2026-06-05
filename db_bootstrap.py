@@ -7,6 +7,7 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -301,9 +302,14 @@ def _integrity_check_interval_hours() -> float:
     if raw is None:
         return DEFAULT_INTEGRITY_CHECK_INTERVAL_HOURS
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         return DEFAULT_INTEGRITY_CHECK_INTERVAL_HOURS
+    if not math.isfinite(value):
+        # nan/inf would suppress startup checks indefinitely once a marker
+        # exists; treat non-finite values as invalid.
+        return DEFAULT_INTEGRITY_CHECK_INTERVAL_HOURS
+    return value
 
 
 def _integrity_marker_key(spec: ExternalContentFtsSpec) -> str:
@@ -357,14 +363,21 @@ def _should_run_integrity_check(
 
 
 def _fts_needs_rebuild(
-    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    now: float | None = None,
+    throttle: bool = False,
 ) -> bool:
     if _fts_needs_rebuild_structural(conn, spec):
         return True
     # Structurally sound: the FTS5 integrity-check is O(index size) and was the
-    # dominant startup cost on large databases (issue #235). Throttle it to at
-    # most once per interval; structural checks above still run every startup.
-    if not _should_run_integrity_check(conn, spec, now=now):
+    # dominant startup cost on large databases (issue #235). On the startup path
+    # (``throttle=True``) skip it when already checked within the interval.
+    # Explicit repair (e.g. ``/lcm doctor repair apply``) uses ``throttle=False``
+    # so it always runs the deep check and can fix same-row-count drift that the
+    # structural checks cannot see.
+    if throttle and not _should_run_integrity_check(conn, spec, now=now):
         return False
     result = check_external_content_fts_integrity(conn, spec)
     if result["status"] == "pass":
@@ -474,11 +487,15 @@ def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalCo
 
 
 def repair_external_content_fts(
-    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    now: float | None = None,
+    throttle: bool = False,
 ) -> dict[str, bool]:
     rebuilt = False
     degraded = False
-    if _fts_needs_rebuild(conn, spec, now=now):
+    if _fts_needs_rebuild(conn, spec, now=now, throttle=throttle):
         db_path = conn.execute("PRAGMA database_list").fetchone()
         if db_path:
             db_file = db_path[2]
@@ -520,7 +537,9 @@ def repair_external_content_fts(
 def ensure_external_content_fts(
     conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
 ) -> None:
-    repair_external_content_fts(conn, spec, now=now)
+    # Startup path: throttle the deep integrity-check. Explicit repair callers
+    # use ``repair_external_content_fts(..., throttle=False)`` for a forced check.
+    repair_external_content_fts(conn, spec, now=now, throttle=True)
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:

@@ -176,3 +176,56 @@ def test_external_content_desync_detected_via_docsize(tmp_path):
     conn.execute("INSERT INTO messages(content) VALUES ('untracked row')")
     assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is True
     conn.close()
+
+
+def test_explicit_repair_fixes_same_count_corruption_despite_fresh_marker(tmp_path, monkeypatch):
+    """`/lcm doctor repair apply` must deep-check/repair regardless of throttle.
+
+    Regression for review on PR #236: the startup throttle must not leak into
+    the explicit repair path. Same-row-count stale drift passes structural
+    checks but fails the FTS5 integrity-check; with a fresh marker the throttle
+    would otherwise skip the repair entirely.
+    """
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)  # build + fresh marker (startup path)
+
+    # Content changes but the index does not (spec has no update trigger): the
+    # row count is unchanged, so structural checks pass, but the indexed tokens
+    # are stale and the integrity-check fails.
+    conn.execute(
+        "UPDATE messages SET content = 'completely different searchable text' WHERE store_id = 1"
+    )
+    assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is False
+    assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "fail"
+
+    # Explicit repair (doctor path) is unthrottled and must rebuild + fix it.
+    repaired = db_bootstrap.repair_external_content_fts(conn, spec)
+    assert repaired["rebuilt"] is True
+    assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+    conn.close()
+
+
+def test_startup_throttle_still_skips_explicitly(tmp_path, monkeypatch, integrity_calls):
+    """The throttle remains available on the startup path via throttle=True."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)  # build + fresh marker
+    integrity_calls.clear()
+
+    db_bootstrap.repair_external_content_fts(conn, spec, throttle=True)
+
+    assert integrity_calls == []  # fresh marker -> throttled path skips deep check
+    conn.close()
+
+
+def test_non_finite_interval_falls_back_to_default(monkeypatch):
+    """nan/inf must not parse as a valid interval (would suppress checks forever)."""
+    for value in ("nan", "inf", "-inf", "Infinity"):
+        monkeypatch.setenv(INTERVAL_ENV, value)
+        assert (
+            db_bootstrap._integrity_check_interval_hours()
+            == db_bootstrap.DEFAULT_INTEGRITY_CHECK_INTERVAL_HOURS
+        )
