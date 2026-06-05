@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
 import time
 from typing import Iterable, Sequence
@@ -459,9 +460,8 @@ def _drop_fts_artifacts(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) 
 def _check_disk_space(db_path: str) -> bool:
     try:
         parent = os.path.dirname(os.path.abspath(db_path)) or "."
-        usage = os.statvfs(parent)
-        return usage.f_bavail * usage.f_frsize >= _MIN_DISK_SPACE_BYTES
-    except OSError:
+        return shutil.disk_usage(parent).free >= _MIN_DISK_SPACE_BYTES
+    except (OSError, AttributeError):
         return True
 
 
