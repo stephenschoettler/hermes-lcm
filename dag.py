@@ -601,13 +601,17 @@ class SummaryDAG:
             search_rank=row[12] if len(row) > 12 else None,
         )
 
-    def close(self):
+    def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                pass
             conn.close()
             self._conn = None
 
-    def __del__(self):  # pragma: no cover - defensive resource cleanup
+    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
             self.close()
         except Exception:

@@ -1015,13 +1015,21 @@ class MessageStore:
 
     # -- Lifecycle ----------------------------------------------------------
 
-    def close(self):
+    def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
+            # Graceful shutdown: checkpoint WAL so other processes don't see
+            # an incomplete transaction log when we release the connection.
+            # We use PASSIVE so we don't block if another reader is active —
+            # it will just leave remaining WAL pages for the next writer.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
 
-    def __del__(self):  # pragma: no cover - defensive resource cleanup
+    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
             self.close()
         except Exception:

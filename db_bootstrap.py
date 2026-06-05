@@ -48,8 +48,34 @@ class ExternalContentFtsSpec:
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
+    """Configure SQLite connection for crash-safe multi-process WAL usage.
+
+    In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
+    every process opens its own sqlite3.Connection pointing at the same
+    lcm.db file.  These settings ensure the database survives unexpected
+    termination of any one process without corrupting the B-tree.
+
+    Key design decisions:
+    - journal_mode=WAL  : writes go to a separate log; readers never block.
+    - synchronous=FULL  : fsync before every write transaction commit so the
+                          WAL survives power loss / crash.  WAL + FULL is
+                          crash-safe by SQLite guarantee.
+    - wal_autocheckpoint=500 : after 500 WAL pages (~2 MB) SQLite will
+                               automatically checkpoint.  Keeps WAL bounded
+                               even if a long-lived session forgets to close.
+    - journal_size_limit=67108864 (64 MiB) : once the WAL grows past this
+                                              threshold SQLite forces a
+                                              passive checkpoint to cap it.
+    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
+                                              readers cache WAL pages in RAM
+                                              instead of re-reading disk.
+    """
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA wal_autocheckpoint=500")
+    conn.execute("PRAGMA journal_size_limit=67108864")
+    conn.execute("PRAGMA mmap_size=268435456")
 
 
 def ensure_metadata_table(conn: sqlite3.Connection) -> None:
