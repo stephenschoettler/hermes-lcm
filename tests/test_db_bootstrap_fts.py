@@ -14,6 +14,7 @@ the index first, then exercise the existing-index path.
 
 import sqlite3
 import time
+import types
 
 import pytest
 
@@ -229,3 +230,20 @@ def test_non_finite_interval_falls_back_to_default(monkeypatch):
             db_bootstrap._integrity_check_interval_hours()
             == db_bootstrap.DEFAULT_INTEGRITY_CHECK_INTERVAL_HOURS
         )
+
+
+def test_check_disk_space_uses_portable_fallback_when_statvfs_is_unavailable(monkeypatch, tmp_path):
+    """Windows lacks os.statvfs, so startup FTS repair must not crash there."""
+    monkeypatch.delattr(db_bootstrap.os, "statvfs", raising=False)
+    monkeypatch.setattr(
+        db_bootstrap,
+        "shutil",
+        types.SimpleNamespace(
+            disk_usage=lambda path: types.SimpleNamespace(
+                free=db_bootstrap._MIN_DISK_SPACE_BYTES
+            )
+        ),
+        raising=False,
+    )
+
+    assert db_bootstrap._check_disk_space(str(tmp_path / "lcm.db")) is True
