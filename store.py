@@ -1018,10 +1018,9 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown: checkpoint WAL so other processes don't see
-            # an incomplete transaction log when we release the connection.
-            # We use PASSIVE so we don't block if another reader is active —
-            # it will just leave remaining WAL pages for the next writer.
+            # Graceful shutdown hygiene: checkpoint committed WAL frames before
+            # releasing the connection.  This does not run on crash/kill, and
+            # PASSIVE can leave frames behind when another reader is active.
             try:
                 conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error:

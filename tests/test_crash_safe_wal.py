@@ -1,12 +1,12 @@
-"""Tests for crash-safe WAL configuration and graceful close behavior.
+"""Tests for WAL durability configuration and graceful-close hygiene.
 
 These tests verify the PRAGMAs applied by ``configure_connection()`` and
 the best-effort passive WAL checkpoint performed by ``close()`` on all three
 SQLite helpers.
 
-Covers the regression described in PR #237 — multi-process deployments where
-one process can die without checkpointing its WAL, leaving sibling processes
-with an incomplete log.
+This covers the PR #237 hardening path without overclaiming it: graceful close
+can checkpoint committed WAL frames best-effort, while unexpected process death
+still depends on SQLite WAL recovery.
 """
 
 from __future__ import annotations

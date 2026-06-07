@@ -49,13 +49,15 @@ class ExternalContentFtsSpec:
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
-    """Configure SQLite connection for improved crash safety with WAL.
+    """Configure SQLite connection for WAL durability and hygiene.
 
     In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
     every process opens its own sqlite3.Connection pointing at the same
-    lcm.db file.  These settings improve durability and WAL hygiene but do
-    NOT fully solve inter-process WAL coordination — that requires graceful
-    application-level shutdown (see ``MessageStore.close()`` etc.).
+    lcm.db file.  These settings improve committed-write durability and WAL
+    hygiene, but do NOT make sibling processes safe from an unexpected process
+    death.  Abnormal exit still depends on normal SQLite WAL recovery;
+    application-level checkpoints only run during graceful shutdown (see
+    ``MessageStore.close()`` etc.).
 
     Key design decisions:
     - journal_mode=WAL  : writes go to a separate log; readers never block.
