@@ -4,6 +4,7 @@ Implements the ContextEngine ABC. Replaces the built-in ContextCompressor
 with a DAG-based summarization system that preserves every message.
 """
 
+import copy
 import inspect
 import json
 import logging
@@ -386,6 +387,25 @@ class LCMEngine(ContextEngine):
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
         self._auxiliary_session_lock = threading.RLock()
+
+    def clone_for_agent(self) -> "LCMEngine":
+        """Return a fresh runtime engine for one AIAgent instance.
+
+        Hermes registers plugin context engines process-wide, while gateway
+        runtimes may keep multiple cached AIAgent instances alive at once
+        (different platforms, chats, cron jobs, etc.).  LCM stores mutable
+        session binding and ingest cursor state on the engine object itself, so
+        sharing one registered instance across agents can let one conversation
+        rebind another conversation's raw-message ingest and lifecycle state.
+
+        The clone shares the same durable SQLite database path/configuration,
+        but gets independent session/cursor/lifecycle runtime state. Hermes core
+        calls update_model() on the returned engine before on_session_start().
+        """
+        return type(self)(
+            config=copy.deepcopy(self._config),
+            hermes_home=self._hermes_home,
+        )
 
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
         """Resolve the SQLite path for the active Hermes profile/home."""

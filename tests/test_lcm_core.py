@@ -4457,3 +4457,58 @@ class TestExtraction:
             assert "s2" in content
         finally:
             ext_module._call_extraction_llm = original
+
+
+class TestLCMEngineCloning:
+    def test_clone_for_agent_isolates_session_binding_while_sharing_store(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-clone.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        first_agent = prototype.clone_for_agent()
+        second_agent = prototype.clone_for_agent()
+        assert first_agent is not prototype
+        assert second_agent is not prototype
+        assert first_agent is not second_agent
+
+        first_agent.on_session_start(
+            "agent-a-session",
+            platform="alpha",
+            conversation_id="agent:main:alpha:dm:1",
+        )
+        second_agent.on_session_start(
+            "agent-b-session",
+            platform="beta",
+            conversation_id="agent:main:beta:dm:2",
+        )
+
+        first_agent.on_session_end(
+            "agent-a-session",
+            [
+                {"role": "user", "content": "alpha question"},
+                {"role": "assistant", "content": "alpha answer"},
+            ],
+        )
+
+        rows = sqlite3.connect(config.database_path).execute(
+            "SELECT session_id, source, role, content FROM messages ORDER BY store_id"
+        ).fetchall()
+        assert rows == [
+            ("agent-a-session", "alpha", "user", "alpha question"),
+            ("agent-a-session", "alpha", "assistant", "alpha answer"),
+        ]
+
+        lifecycle = LifecycleStateStore(config.database_path)
+        try:
+            first_state = lifecycle.get_by_conversation("agent:main:alpha:dm:1")
+            second_state = lifecycle.get_by_conversation("agent:main:beta:dm:2")
+            assert first_state is not None
+            assert first_state.current_session_id is None
+            assert first_state.last_finalized_session_id == "agent-a-session"
+            assert second_state is not None
+            assert second_state.current_session_id == "agent-b-session"
+            assert second_state.last_finalized_session_id is None
+        finally:
+            lifecycle.close()
+            for engine in (prototype, first_agent, second_agent):
+                engine.shutdown()
