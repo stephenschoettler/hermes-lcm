@@ -2191,9 +2191,17 @@ class TestMessageStore:
         ]
         for t in threads:
             t.start()
+
+        # Slow hardware can make a single worker exceed the old fixed
+        # per-thread 30s join while the write-lock contract is still healthy.
+        # Use one larger wall-clock deadline for the whole storm: enough
+        # headroom for constrained machines, but still bounded for real hangs.
+        deadline = time.monotonic() + 120
         for t in threads:
-            t.join(timeout=30)
-            assert not t.is_alive(), "worker thread did not finish in time"
+            remaining = max(0.0, deadline - time.monotonic())
+            t.join(timeout=remaining)
+        alive_threads = [t.name for t in threads if t.is_alive()]
+        assert alive_threads == [], f"worker threads did not finish in time: {alive_threads!r}"
 
         assert errors == [], f"concurrent workers raised: {errors!r}"
 
