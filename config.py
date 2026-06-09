@@ -311,7 +311,7 @@ class LCMConfig:
     expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
-    database_path: str = ""       # empty = auto (~/.hermes/lcm.db)
+    database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)
