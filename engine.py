@@ -386,6 +386,14 @@ class LCMEngine(ContextEngine):
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
         self._auxiliary_session_lock = threading.RLock()
+        # Hermes gateways can run many conversations concurrently in one
+        # process while the plugin manager exposes one shared context-engine
+        # instance. Keep mutable compression/session cursors scoped by logical
+        # conversation so one thread cannot steal another thread's _session_id
+        # before compress() persists raw rows or DAG nodes.
+        self._runtime_state_lock = threading.RLock()
+        self._runtime_state_by_conversation: dict[str, dict[str, Any]] = {}
+        self._runtime_conversation_by_session: dict[str, str] = {}
 
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
         """Resolve the SQLite path for the active Hermes profile/home."""
@@ -416,6 +424,132 @@ class LCMEngine(ContextEngine):
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
+    def _runtime_state_field_names(self) -> tuple[str, ...]:
+        """Fields that are process-local but logically scoped to one chat/thread."""
+        return (
+            "_session_id",
+            "_session_platform",
+            "_foreground_session_id",
+            "_foreground_session_platform",
+            "_foreground_conversation_id",
+            "_conversation_id",
+            "_session_match_keys",
+            "_session_ignored",
+            "_session_stateless",
+            "_ignored_message_count",
+            "_last_compacted_store_id",
+            "_ingest_cursor",
+            "_ingest_cursor_needs_reconcile",
+            "_last_ingest_reconciliation",
+            "last_prompt_tokens",
+            "last_completion_tokens",
+            "last_total_tokens",
+            "last_input_tokens",
+            "last_output_tokens",
+            "last_cache_read_tokens",
+            "last_cache_write_tokens",
+            "last_reasoning_tokens",
+            "cache_metrics_available",
+            "compression_count",
+            "_context_probed",
+            "_context_probe_persistable",
+            "_last_overflow_recovery_failed",
+            "_last_condensation_suppressed_reason",
+            "_last_compression_status",
+            "_last_compression_noop_reason",
+            "_last_boundary_skip_time",
+            "_pending_reset_session_id",
+            "_pending_reset_conversation_id",
+            "_pending_reset_frontier_store_id",
+        )
+
+    def _capture_runtime_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {}
+        for name in self._runtime_state_field_names():
+            value = getattr(self, name)
+            if isinstance(value, list):
+                value = list(value)
+            elif isinstance(value, dict):
+                value = dict(value)
+            state[name] = value
+        return state
+
+    def _restore_runtime_state(self, state: dict[str, Any]) -> None:
+        for name, value in state.items():
+            if isinstance(value, list):
+                value = list(value)
+            elif isinstance(value, dict):
+                value = dict(value)
+            setattr(self, name, value)
+
+    def _remember_runtime_state_for_current_binding(self) -> None:
+        conversation_id = str(self._conversation_id or "")
+        session_id = str(self._session_id or "")
+        if not conversation_id:
+            return
+        self._runtime_state_by_conversation[conversation_id] = self._capture_runtime_state()
+        if session_id:
+            self._runtime_conversation_by_session[session_id] = conversation_id
+
+    def _forget_all_runtime_states(self) -> None:
+        self._runtime_state_by_conversation.clear()
+        self._runtime_conversation_by_session.clear()
+
+    def _gateway_context_value(self, name: str) -> str:
+        try:
+            import importlib
+
+            session_context = importlib.import_module("gateway.session_context")
+            get_session_env = getattr(session_context, "get_session_env")
+            return str(get_session_env(name, "") or "")
+        except Exception:
+            return str(os.environ.get(name, "") or "")
+
+    def _resolve_runtime_conversation_id(
+        self,
+        *,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> str:
+        explicit_conversation_id = str(conversation_id or "")
+        if explicit_conversation_id:
+            return explicit_conversation_id
+
+        session_key = self._gateway_context_value("HERMES_SESSION_KEY")
+        if session_key in self._runtime_state_by_conversation:
+            return session_key
+
+        explicit_session_id = str(session_id or "")
+        for candidate in (
+            explicit_session_id,
+            self._gateway_context_value("HERMES_SESSION_ID"),
+        ):
+            if candidate and candidate in self._runtime_conversation_by_session:
+                return self._runtime_conversation_by_session[candidate]
+
+        return str(self._conversation_id or "")
+
+    @contextmanager
+    def _scoped_runtime_state(
+        self,
+        *,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> Iterator[None]:
+        """Bind the shared engine to the caller's conversation for one operation."""
+        with self._runtime_state_lock:
+            target_conversation_id = self._resolve_runtime_conversation_id(
+                session_id=session_id,
+                conversation_id=conversation_id,
+            )
+            target_state = self._runtime_state_by_conversation.get(target_conversation_id)
+            if target_state is not None and self._conversation_id != target_conversation_id:
+                self._restore_runtime_state(target_state)
+            try:
+                yield
+            finally:
+                self._remember_runtime_state_for_current_binding()
+
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
         self._session_id = ""
@@ -427,6 +561,7 @@ class LCMEngine(ContextEngine):
         self._session_match_keys = []
         self._session_ignored = False
         self._session_stateless = False
+        self._forget_all_runtime_states()
         self._clear_pending_reset_boundary()
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
@@ -599,6 +734,8 @@ class LCMEngine(ContextEngine):
         self.last_cache_read_tokens = int(usage.get("cache_read_tokens", 0) or 0)
         self.last_cache_write_tokens = int(usage.get("cache_write_tokens", 0) or 0)
         self.last_reasoning_tokens = int(usage.get("reasoning_tokens", 0) or 0)
+        with self._runtime_state_lock:
+            self._remember_runtime_state_for_current_binding()
 
     @property
     def cache_read_ratio(self) -> float:
@@ -820,8 +957,29 @@ class LCMEngine(ContextEngine):
 
         raise RuntimeError("adaptive leaf rescue exhausted without a valid chunk")
 
-    def compress(self, messages: List[Dict[str, Any]],
-                 current_tokens: int = None,
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+        *,
+        session_id: str | None = None,
+        conversation_id: str | None = None,
+        **_host_kwargs: Any,
+    ) -> List[Dict[str, Any]]:
+        """Main compaction entry point with conversation-scoped runtime binding."""
+        with self._scoped_runtime_state(
+            session_id=session_id,
+            conversation_id=conversation_id,
+        ):
+            return self._compress_bound(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+            )
+
+    def _compress_bound(self, messages: List[Dict[str, Any]],
+                 current_tokens: Optional[int] = None,
                  focus_topic: Optional[str] = None) -> List[Dict[str, Any]]:
         """Main compaction entry point.
 
@@ -1954,6 +2112,19 @@ class LCMEngine(ContextEngine):
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        conversation_id = str(kwargs.get("conversation_id") or "")
+        with self._runtime_state_lock:
+            target_conversation_id = self._resolve_runtime_conversation_id(
+                session_id=session_id,
+                conversation_id=conversation_id or None,
+            )
+            target_state = self._runtime_state_by_conversation.get(target_conversation_id)
+            if target_state is not None and self._conversation_id != target_conversation_id:
+                self._restore_runtime_state(target_state)
+            self._on_session_start_bound(session_id, **kwargs)
+            self._remember_runtime_state_for_current_binding()
+
+    def _on_session_start_bound(self, session_id: str, **kwargs) -> None:
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
