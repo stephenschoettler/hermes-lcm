@@ -3657,6 +3657,68 @@ class TestEngineCompress:
         assert instance._last_compression_status == "noop"
         assert "raw store lineage" in instance._last_compression_noop_reason
 
+    def test_compress_reassembles_backed_active_summary_marker_on_noop(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Backed active summaries must stay visible when scaffold cleanup no-ops."""
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+            database_path=str(tmp_path / "lcm_backed_active_summary.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("backed-summary-session", platform="telegram", context_length=200000)
+
+        summary_text = "backed compressed details\nExpand for details about: backed prior"
+        node_id = instance._dag.add_node(
+            SummaryNode(
+                session_id="backed-summary-session",
+                depth=0,
+                summary=summary_text,
+                token_count=3,
+                source_token_count=50,
+                source_ids=[1],
+                source_type="messages",
+                created_at=time.time(),
+                earliest_at=time.time(),
+                latest_at=time.time(),
+                expand_hint="backed prior",
+            )
+        )
+        instance._ingest_cursor = 3
+        instance._ingest_cursor_needs_reconcile = False
+
+        def fail_summary(**_kwargs):
+            raise AssertionError("backed active summaries should be reassembled, not summarized")
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_summary)
+
+        active_summary_marker = (
+            f"[Recent Summary (d0, node {node_id})]\n"
+            f"{summary_text}\n"
+            "[Expand for details: backed prior]"
+        )
+        messages = [
+            {"role": "assistant", "content": active_summary_marker},
+            {"role": "user", "content": "fresh tail question"},
+            {"role": "assistant", "content": "fresh tail answer"},
+        ]
+
+        try:
+            result = instance.compress(messages)
+            nodes = instance._dag.get_session_nodes("backed-summary-session")
+        finally:
+            instance.shutdown()
+
+        assert result == messages
+        assert len(nodes) == 1
+        assert nodes[0].node_id == node_id
+        assert instance._ingest_cursor == len(result)
+        assert instance._last_compression_status == "sanitized"
+        assert instance._last_compression_noop_reason == ""
+
     def test_compress_handles_multimodal_first_user_message_without_system(self, engine, monkeypatch):
         """Gateway sessions may pass conversation messages without a leading system prompt."""
         def mock_summary(**kwargs):

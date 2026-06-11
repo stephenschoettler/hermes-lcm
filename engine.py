@@ -1061,16 +1061,29 @@ class LCMEngine(ContextEngine):
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
                 )
-            sanitized_messages = self._sanitize_active_context_messages(
-                working_messages,
-                insert_missing_tool_stubs=False,
-            )
+            if dropped_replayed_scaffold_messages:
+                leading_anchor_count = self._leading_anchor_count(working_messages)
+                anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+                self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+                try:
+                    sanitized_messages = self._assemble_context(
+                        working_messages[0] if leading_anchor_count else None,
+                        working_messages[leading_anchor_count:],
+                        assembly_cap_override=recovery_assembly_cap,
+                    )
+                finally:
+                    self._pending_context_anchor_messages = None
+            else:
+                sanitized_messages = self._sanitize_active_context_messages(
+                    working_messages,
+                    insert_missing_tool_stubs=False,
+                )
             if sanitized_messages != working_messages:
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized
-                # context, keeping the old cursor could make the next appended
-                # messages look already ingested. This applies to content-only
-                # cleanup as well as dropped-message cleanup.
+                # or reassembled context, keeping the old cursor could make the
+                # next appended messages look already ingested. This applies to
+                # content-only cleanup as well as dropped-message cleanup.
                 self._ingest_cursor = len(sanitized_messages)
                 self._last_compression_status = "sanitized"
                 self._last_compression_noop_reason = ""
