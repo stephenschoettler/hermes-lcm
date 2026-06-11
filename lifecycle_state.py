@@ -660,66 +660,81 @@ class LifecycleStateStore:
             Number of rows deleted.
         """
         conn = self._conn
+        assert conn is not None
         protected = {str(s) for s in (protected_session_ids or ()) if s}
 
-        sessions_with_data: set[str] = set()
-        tables = {
-            row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sessions_with_data: set[str] = set()
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "messages" in tables:
+                for row in conn.execute(
+                    "SELECT DISTINCT session_id FROM messages"
+                ).fetchall():
+                    sessions_with_data.add(str(row[0]))
+            if "summary_nodes" in tables:
+                for row in conn.execute(
+                    "SELECT DISTINCT session_id FROM summary_nodes"
+                ).fetchall():
+                    sessions_with_data.add(str(row[0]))
+
+            now = time.time()
+            max_age_seconds = (
+                float(max_age_hours) * 3600.0
+                if max_age_hours is not None
+                else None
+            )
+            deleted = 0
+
+            rows = conn.execute(
+                "SELECT * FROM lcm_lifecycle_state"
             ).fetchall()
-        }
-        if "messages" in tables:
-            for row in conn.execute(
-                "SELECT DISTINCT session_id FROM messages"
-            ).fetchall():
-                sessions_with_data.add(str(row[0]))
-        if "summary_nodes" in tables:
-            for row in conn.execute(
-                "SELECT DISTINCT session_id FROM summary_nodes"
-            ).fetchall():
-                sessions_with_data.add(str(row[0]))
+            for row in rows:
+                cur = str(row["current_session_id"] or "")
+                fin = str(row["last_finalized_session_id"] or "")
 
-        now = time.time()
-        max_age_seconds = (
-            float(max_age_hours) * 3600.0
-            if max_age_hours is not None
-            else None
-        )
-        deleted = 0
-
-        rows = conn.execute(
-            "SELECT * FROM lcm_lifecycle_state"
-        ).fetchall()
-        for row in rows:
-            cur = str(row["current_session_id"] or "")
-            fin = str(row["last_finalized_session_id"] or "")
-
-            if ((cur and cur in sessions_with_data)
-                    or (fin and fin in sessions_with_data)):
-                continue
-
-            refs = {r for r in (cur, fin) if r}
-            if refs & protected:
-                continue
-
-            if max_age_seconds is not None:
-                row_age = (
-                    row["current_bound_at"]
-                    or row["last_finalized_at"]
-                    or row["updated_at"]
-                )
-                if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                if ((cur and cur in sessions_with_data)
+                        or (fin and fin in sessions_with_data)):
                     continue
 
-            conn.execute(
-                "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                (row["conversation_id"],),
-            )
-            deleted += 1
+                refs = {r for r in (cur, fin) if r}
+                if refs & protected:
+                    continue
 
-        if deleted:
-            conn.commit()
-        return deleted
+                if max_age_seconds is not None:
+                    row_age = (
+                        row["current_bound_at"]
+                        or row["last_finalized_at"]
+                        or row["updated_at"]
+                    )
+                    if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                        continue
+
+                # Recheck emptiness right before deletion to prevent race conditions
+                # where a concurrent write adds data after our initial snapshot.
+                cur_has_data = cur in sessions_with_data
+                fin_has_data = fin in sessions_with_data
+                if cur_has_data or fin_has_data:
+                    continue
+
+                conn.execute(
+                    "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (row["conversation_id"],),
+                )
+                deleted += 1
+
+            if deleted:
+                conn.commit()
+            else:
+                conn.rollback()
+            return deleted
+        except Exception:
+            conn.rollback()
+            raise
 
     def delete_safe_rows_for_sessions(
         self,

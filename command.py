@@ -1480,6 +1480,17 @@ def _doctor_clean_lifecycle_apply_text(engine) -> str:
             "note: no rows were deleted",
         ])
 
+    backup = _backup_database(engine)
+    if not backup["ok"]:
+        return "\n".join([
+            "LCM doctor clean lifecycle apply",
+            "status: error",
+            "error: failed to create backup before destructive cleanup",
+            f"database_path: {backup['db_path']}",
+            f"backup_error: {backup['error']}",
+            "note: no rows were deleted",
+        ])
+
     before = engine._lifecycle.row_count()
     protected = {str(getattr(engine, "_session_id", "") or "")}
     protected = {s for s in protected if s}
@@ -1492,7 +1503,9 @@ def _doctor_clean_lifecycle_apply_text(engine) -> str:
         return "\n".join([
             "LCM doctor clean lifecycle apply",
             "status: error",
-            f"error: {exc}",
+            "error: failed to prune empty sessions",
+            f"backup_path: {backup['backup_path']}",
+            f"prune_error: {exc}",
             "note: no rows were deleted",
         ])
 
@@ -1503,6 +1516,8 @@ def _doctor_clean_lifecycle_apply_text(engine) -> str:
         f"lifecycle_rows_before: {before}",
         f"lifecycle_rows_deleted: {deleted}",
         f"lifecycle_rows_remaining: {after}",
+        f"backup_path: {backup['backup_path']}",
+        f"backup_size_bytes: {backup['backup_size']}",
         "note: only empty lifecycle rows were deleted — messages and nodes untouched",
     ])
 
