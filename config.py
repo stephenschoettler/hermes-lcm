@@ -319,6 +319,20 @@ class LCMConfig:
     # Safety gate: destructive `/lcm doctor clean apply` workflow is disabled by default.
     doctor_clean_apply_enabled: bool = False
 
+    # -- Lifecycle GC ---
+    # Enables automatic pruning of lifecycle rows for sessions that never
+    # ingested any messages or nodes (gateway restart orphans, ephemeral
+    # cron ticks, etc.).  Runs at session-start when the lifecycle table
+    # exceeds ``empty_lifecycle_gc_threshold`` rows.
+    empty_lifecycle_gc_enabled: bool = True
+    # Number of lifecycle rows at which the GC pass fires.  Default 200
+    # so fresh installs skip the work until enough churn has occurred.
+    empty_lifecycle_gc_threshold: int = 200
+    # Optional age guard for GC — ``None`` deletes all empty rows
+    # regardless of age; set to e.g. 24 to preserve recent rows for
+    # debugging.
+    empty_lifecycle_gc_max_age_hours: float | None = None
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -416,6 +430,21 @@ class LCMConfig:
             "LCM_DOCTOR_CLEAN_APPLY_ENABLED",
             c.doctor_clean_apply_enabled,
         )
+
+        c.empty_lifecycle_gc_enabled = _parse_bool_env(
+            "LCM_EMPTY_LIFECYCLE_GC_ENABLED",
+            c.empty_lifecycle_gc_enabled,
+        )
+        c.empty_lifecycle_gc_threshold = _int(
+            "LCM_EMPTY_LIFECYCLE_GC_THRESHOLD",
+            c.empty_lifecycle_gc_threshold,
+        )
+        raw_max_age = os.environ.get("LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS")
+        if raw_max_age is not None:
+            try:
+                c.empty_lifecycle_gc_max_age_hours = float(raw_max_age)
+            except (TypeError, ValueError):
+                pass
 
         raw_ignore = os.environ.get("LCM_IGNORE_SESSION_PATTERNS")
         if raw_ignore is not None:

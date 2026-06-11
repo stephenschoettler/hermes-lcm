@@ -658,7 +658,7 @@ def test_get_status_exposes_runtime_identity_for_loaded_plugin_tree(tmp_path):
 
     assert identity["engine"] == "lcm"
     assert identity["plugin_name"] == "hermes-lcm"
-    assert identity["plugin_version"] == "0.16.2"
+    assert identity["plugin_version"] == "0.16.3"
     assert Path(identity["plugin_path"]) == repo_root
     assert Path(identity["module_path"]).name == "engine.py"
     assert Path(identity["database_path"]) == db_path
@@ -684,11 +684,11 @@ def test_plugin_metadata_refreshes_when_manifest_changes(tmp_path, monkeypatch):
 
     initial = engine_mod._plugin_metadata()
     assert initial["name"] == "hermes-lcm"
-    assert initial["version"] == "0.16.2"
+    assert initial["version"] == "0.16.3"
 
-    updated = original.replace('version: "0.16.2"', 'version: "9.9.9-test"')
+    updated = original.replace('version: "0.16.3"', 'version: "9.9.9-test"')
     if updated == original:
-        updated = original.replace('version: 0.16.2', 'version: 9.9.9-test')
+        updated = original.replace('version: 0.16.3', 'version: 9.9.9-test')
     assert updated != original
 
     try:
@@ -726,7 +726,7 @@ def test_lcm_doctor_json_includes_runtime_identity(engine):
     payload = json.loads(engine.handle_tool_call("lcm_doctor", {}))
 
     assert payload["runtime_identity"]["plugin_name"] == "hermes-lcm"
-    assert payload["runtime_identity"]["plugin_version"] == "0.16.2"
+    assert payload["runtime_identity"]["plugin_version"] == "0.16.3"
     assert "plugin_git_commit" in payload["runtime_identity"]
 
 
@@ -8684,6 +8684,48 @@ class TestSessionRollover:
         recovered = restarted._lifecycle.get_by_conversation(old_conversation_id)
         assert recovered is not None
         assert recovered.current_session_id == "active-session"
+
+    def test_bind_lifecycle_gc_prunes_empty_rows_above_threshold(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_lifecycle.db"),
+            empty_lifecycle_gc_enabled=True,
+            empty_lifecycle_gc_threshold=1,
+        )
+        engine = LCMEngine(config=config)
+
+        # Create orphan rows by binding sessions with no data
+        for i in range(5):
+            engine._lifecycle.bind_session(f"orphan-{i}")
+        assert engine._lifecycle.row_count() == 5
+
+        # Bind to a new session — should trigger GC since threshold(1) < 5
+        engine.on_session_start("live-session", platform="cli", context_length=200000)
+        # All 5 empty rows should be pruned, leaving only the live one
+        assert engine._lifecycle.row_count() == 1
+        state = engine._lifecycle.get_by_conversation("live-session")
+        assert state is not None
+        assert state.current_session_id == "live-session"
+
+    def test_bind_lifecycle_gc_skips_when_below_threshold(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_below_threshold.db"),
+            empty_lifecycle_gc_enabled=True,
+            empty_lifecycle_gc_threshold=10,
+        )
+        engine = LCMEngine(config=config)
+
+        # Create 3 orphan rows — below threshold of 10
+        for i in range(3):
+            engine._lifecycle.bind_session(f"orphan-{i}")
+
+        engine.on_session_start("live-session", platform="cli", context_length=200000)
+        # Should NOT prune because 4 < threshold(10)
+        assert engine._lifecycle.row_count() == 4
+        engine.shutdown()
 
     def test_frontier_marker_only_advances_after_successful_leaf_compaction(self, engine, monkeypatch):
         engine.on_session_start("frontier-session", platform="cli", context_length=200000)

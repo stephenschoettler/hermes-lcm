@@ -1176,6 +1176,31 @@ class LCMEngine(ContextEngine):
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
 
+        # Garbage-collect empty lifecycle rows when the table exceeds threshold.
+        # Gateway restarts, ephemeral cron ticks, and crash-loops all create
+        # lifecycle rows that never ingest data — prune them here so they
+        # don't accumulate forever.
+        if (
+            self._config.empty_lifecycle_gc_enabled
+            and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
+        ):
+            protected = {str(self._session_id)} if self._session_id else None
+            max_age = self._config.empty_lifecycle_gc_max_age_hours
+            try:
+                deleted = self._lifecycle.prune_empty_sessions(
+                    protected_session_ids=protected,
+                    max_age_hours=max_age,
+                )
+            except Exception:
+                deleted = 0
+            if deleted:
+                logger.info(
+                    "LCM pruned %d lifecycle rows with zero stored data "
+                    "(table exceeded threshold of %d rows)",
+                    deleted,
+                    self._config.empty_lifecycle_gc_threshold,
+                )
+
     def _persist_frontier_marker(self) -> None:
         if not self._session_id or not self._conversation_id:
             return

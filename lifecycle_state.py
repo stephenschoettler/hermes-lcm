@@ -635,6 +635,92 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    def prune_empty_sessions(
+        self,
+        *,
+        protected_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+        max_age_hours: float | None = None,
+    ) -> int:
+        """Delete lifecycle rows for sessions with no stored data.
+
+        A row is eligible when BOTH referenced session IDs
+        (``current_session_id`` and ``last_finalized_session_id``)
+        have zero messages AND zero summary_nodes in the main store.
+
+        Only the lifecycle table is modified — messages, nodes, and FTS
+        indexes are untouched (they already contain no data for these sessions).
+
+        Args:
+            protected_session_ids: Sessions that must never be deleted
+                (typically the actively-bound engine session).
+            max_age_hours: Only delete rows older than this many hours.
+                ``None`` means delete all eligible rows regardless of age.
+
+        Returns:
+            Number of rows deleted.
+        """
+        conn = self._conn
+        protected = {str(s) for s in (protected_session_ids or ()) if s}
+
+        sessions_with_data: set[str] = set()
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "messages" in tables:
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM messages"
+            ).fetchall():
+                sessions_with_data.add(str(row[0]))
+        if "summary_nodes" in tables:
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM summary_nodes"
+            ).fetchall():
+                sessions_with_data.add(str(row[0]))
+
+        now = time.time()
+        max_age_seconds = (
+            float(max_age_hours) * 3600.0
+            if max_age_hours is not None
+            else None
+        )
+        deleted = 0
+
+        rows = conn.execute(
+            "SELECT * FROM lcm_lifecycle_state"
+        ).fetchall()
+        for row in rows:
+            cur = str(row["current_session_id"] or "")
+            fin = str(row["last_finalized_session_id"] or "")
+
+            if ((cur and cur in sessions_with_data)
+                    or (fin and fin in sessions_with_data)):
+                continue
+
+            refs = {r for r in (cur, fin) if r}
+            if refs & protected:
+                continue
+
+            if max_age_seconds is not None:
+                row_age = (
+                    row["current_bound_at"]
+                    or row["last_finalized_at"]
+                    or row["updated_at"]
+                )
+                if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                    continue
+
+            conn.execute(
+                "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                (row["conversation_id"],),
+            )
+            deleted += 1
+
+        if deleted:
+            conn.commit()
+        return deleted
+
     def delete_safe_rows_for_sessions(
         self,
         session_ids: set[str] | list[str] | tuple[str, ...],

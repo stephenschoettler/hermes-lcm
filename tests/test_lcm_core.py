@@ -2545,6 +2545,100 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_prune_empty_sessions_deletes_row_with_zero_data(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-empty.db")
+        state.bind_session("orphan-session")
+        assert state.row_count() == 1
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 1
+        assert state.row_count() == 0
+        state.close()
+
+    def test_prune_empty_sessions_preserves_row_with_messages(self, tmp_path):
+        db_path = tmp_path / "prune-msg.db"
+        state = LifecycleStateStore(db_path)
+        store = MessageStore(db_path)
+        store.append("live-session", {"role": "user", "content": "hello"}, source="cli")
+        state.bind_session("live-session")
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_preserves_row_with_nodes(self, tmp_path):
+        db_path = tmp_path / "prune-node.db"
+        state = LifecycleStateStore(db_path)
+        dag = SummaryDAG(db_path)
+        dag.add_node(SummaryNode(
+            session_id="live-session", depth=0, summary="test",
+            token_count=5, source_ids=[1], source_type="messages",
+        ))
+        state.bind_session("live-session")
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_respects_protected_sessions(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-protected.db")
+        state.bind_session("protected-session")
+
+        deleted = state.prune_empty_sessions(
+            protected_session_ids={"protected-session"},
+        )
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_respects_max_age_hours(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-age.db")
+        state.bind_session("old-orphan")
+
+        # Recent row should survive with max_age_hours=1
+        deleted = state.prune_empty_sessions(max_age_hours=1)
+        assert deleted == 0
+        assert state.row_count() == 1
+        state.close()
+
+    def test_prune_empty_sessions_handles_mixed_state(self, tmp_path):
+        db_path = tmp_path / "prune-mixed.db"
+        state = LifecycleStateStore(db_path)
+        store = MessageStore(db_path)
+        store.append("live-session", {"role": "user", "content": "hello"}, source="cli")
+        state.bind_session("live-session")
+        state.bind_session("orphan-1")
+        state.bind_session("orphan-2")
+        assert state.row_count() == 3
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 2
+        assert state.row_count() == 1
+        remaining = state.get_by_conversation("live-session")
+        assert remaining is not None
+        state.close()
+
+    def test_prune_empty_sessions_returns_zero_on_no_candidates(self, tmp_path):
+        db_path = tmp_path / "prune-nocand.db"
+        state = LifecycleStateStore(db_path)
+        store = MessageStore(db_path)
+        store.append("s1", {"role": "user", "content": "hi"}, source="cli")
+        state.bind_session("s1")
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
+        state.close()
+
+    def test_prune_empty_sessions_handles_empty_table(self, tmp_path):
+        state = LifecycleStateStore(tmp_path / "prune-empty-table.db")
+        assert state.row_count() == 0
+
+        deleted = state.prune_empty_sessions()
+        assert deleted == 0
+        state.close()
+
 
 class TestDbBootstrapGuards:
     def test_sanitize_fts5_query_preserves_balanced_phrase_quotes(self):
