@@ -3612,6 +3612,51 @@ class TestEngineCompress:
         assert engine._last_compression_status == "sanitized"
         assert engine._last_compression_noop_reason == ""
 
+    def test_compress_drops_unbacked_active_summary_marker_without_leaf_node(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Synthetic active summaries must not become leaf nodes with source_ids=[]."""
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+            database_path=str(tmp_path / "lcm_unbacked_active_summary.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("summary-marker-session", platform="telegram", context_length=200000)
+        instance._ingest_cursor = 3
+        instance._ingest_cursor_needs_reconcile = False
+
+        def fail_summary(**_kwargs):
+            raise AssertionError("unbacked synthetic summaries must not be summarized as raw leaves")
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_summary)
+
+        active_summary_marker = (
+            "[Recent Summary (d0, node 123)]\n"
+            + ("prior compressed details " * 1000)
+            + "\n[Expand for details: prior details]"
+        )
+        messages = [
+            {"role": "assistant", "content": active_summary_marker},
+            {"role": "user", "content": "fresh tail question"},
+            {"role": "assistant", "content": "fresh tail answer"},
+        ]
+
+        try:
+            result = instance.compress(messages)
+            nodes = instance._dag.get_session_nodes("summary-marker-session")
+        finally:
+            instance.shutdown()
+
+        assert result == messages[1:]
+        assert len(result) < len(messages)
+        assert instance._ingest_cursor == len(result)
+        assert nodes == []
+        assert instance._last_compression_status == "noop"
+        assert "raw store lineage" in instance._last_compression_noop_reason
+
     def test_compress_handles_multimodal_first_user_message_without_system(self, engine, monkeypatch):
         """Gateway sessions may pass conversation messages without a leading system prompt."""
         def mock_summary(**kwargs):
