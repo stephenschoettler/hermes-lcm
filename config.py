@@ -62,13 +62,16 @@ def _config_bool_disabled(value) -> bool:
 
 
 def _hermes_compression_threshold(default: float) -> float:
-    """Read Hermes compression.threshold when no LCM env override is present.
+    """Read lcm.context_threshold or Hermes compression.threshold from config.yaml.
+
+    Priority when no ``LCM_CONTEXT_THRESHOLD`` env var is set:
+      1. ``lcm.context_threshold`` (LCM-specific override in config.yaml)
+      2. ``compression.threshold`` (Hermes global setting, unless compression disabled)
 
     Hermes gateways may load ``~/.hermes/config.yaml`` without exporting every
-    setting into the process environment. Falling back to the main Hermes
-    compression threshold keeps LCM aligned with the active agent config while
-    still allowing ``LCM_CONTEXT_THRESHOLD`` to override it explicitly. Disabled
-    Hermes compression should not leak its threshold into LCM.
+    setting into the process environment. The ``lcm.context_threshold`` key lets
+    operators tune LCM compaction independently of the Hermes compression setting.
+    Disabled Hermes compression should not leak its threshold into LCM.
     """
     home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     cfg_path = home / "config.yaml"
@@ -76,16 +79,22 @@ def _hermes_compression_threshold(default: float) -> float:
         text = cfg_path.read_text()
         if yaml is not None:
             cfg = yaml.safe_load(text) or {}
+            # lcm.context_threshold takes priority over compression.threshold
+            lcm_val = (cfg.get("lcm") or {}).get("context_threshold")
+            if lcm_val is not None:
+                return float(lcm_val)
             compression = cfg.get("compression") or {}
             if _config_bool_disabled(compression.get("enabled")):
                 return default
-            value = compression.get("threshold")
-            if value is None:
-                return default
-            return float(value)
+            comp_val = compression.get("threshold")
+            if comp_val is not None:
+                return float(comp_val)
+            return default
 
+        in_lcm = False
+        lcm_indent = None
         in_compression = False
-        direct_indent = None
+        comp_indent = None
         compression_disabled = False
         threshold_value = None
         for raw_line in text.splitlines():
@@ -93,22 +102,32 @@ def _hermes_compression_threshold(default: float) -> float:
             if not line.strip():
                 continue
             if not line.startswith((" ", "\t")):
-                in_compression = line.strip() == "compression:"
-                direct_indent = None
-                continue
-            if not in_compression:
+                stripped = line.strip()
+                in_lcm = stripped == "lcm:"
+                in_compression = stripped == "compression:"
+                lcm_indent = None
+                comp_indent = None
                 continue
             indent = len(line) - len(line.lstrip(" \t"))
-            if direct_indent is None:
-                direct_indent = indent
-            if indent != direct_indent or ":" not in line:
+            if in_lcm:
+                if lcm_indent is None:
+                    lcm_indent = indent
+                if indent == lcm_indent and ":" in line:
+                    key, raw_value = line.strip().split(":", 1)
+                    if key == "context_threshold":
+                        return float(raw_value.strip().strip("'\""))
                 continue
-            key, raw_value = line.strip().split(":", 1)
-            value = raw_value.strip().strip("'\"")
-            if key == "enabled" and _config_bool_disabled(value):
-                compression_disabled = True
-            elif key == "threshold":
-                threshold_value = value
+            if in_compression:
+                if comp_indent is None:
+                    comp_indent = indent
+                if indent != comp_indent or ":" not in line:
+                    continue
+                key, raw_value = line.strip().split(":", 1)
+                value = raw_value.strip().strip("'\"")
+                if key == "enabled" and _config_bool_disabled(value):
+                    compression_disabled = True
+                elif key == "threshold":
+                    threshold_value = value
         if compression_disabled or threshold_value is None:
             return default
         return float(threshold_value)
@@ -184,15 +203,15 @@ class LCMConfig:
     """All tunables for the LCM engine."""
 
     # -- Fresh tail: recent messages never compacted ---
-    fresh_tail_count: int = 64
+    fresh_tail_count: int = 32
 
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers
     leaf_chunk_tokens: int = 20_000
     # Fraction of context window that triggers compaction (0.0–1.0)
-    context_threshold: float = 0.75
+    context_threshold: float = 0.35
     # Max condensation depth (-1 = unlimited, 0 = leaf only)
-    incremental_max_depth: int = 1
+    incremental_max_depth: int = 3
     # How many same-depth summaries trigger condensation
     condensation_fanin: int = 4
     # When enabled, leaf compaction may use a larger working chunk size based on backlog pressure
@@ -292,7 +311,7 @@ class LCMConfig:
     expansion_timeout_ms: int = 120_000
 
     # -- Storage ---
-    database_path: str = ""       # empty = auto (~/.hermes/lcm.db)
+    database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
     # -- Session carry-over ---
     # Depth retained after /new (-1 = all, 0 = nothing, 2 = keep d2+)

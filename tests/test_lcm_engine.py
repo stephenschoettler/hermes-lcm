@@ -7644,6 +7644,408 @@ class TestSessionRollover:
         assert conversation_b is not None
         assert conversation_b.current_session_id == "new-hermes-session"
 
+    # ── Sibling-chain fallback tests (PR #242, zero-DAG host) ──
+
+    def test_compression_boundary_sibling_chain_zero_dag_host_positive(
+        self, engine,
+    ):
+        """Active bound sibling with zero-DAG host — fallback activates."""
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="conversation-a",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "sibling chain context must move"},
+            token_estimate=17,
+            source="telegram",
+        )
+        stale_host_store_id = engine._store.append(
+            "old-hermes-session",
+            {"role": "user", "content": "stale host context must stay"},
+            token_estimate=11,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="sibling chain summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        # Stale host gets zero DAG nodes — the trigger condition
+        engine.compression_count = 3
+        engine.last_prompt_tokens = 1000
+        engine.last_completion_tokens = 50
+        engine.last_total_tokens = 1050
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        engine._lifecycle.record_rollover(
+            "conversation-a",
+            old_session_id="old-hermes-session",
+            new_session_id="lcm-source",
+            finalized_frontier_store_id=0,
+        )
+        engine._lifecycle.advance_frontier(
+            "conversation-a",
+            "lcm-source",
+            source_store_id,
+        )
+        # Verify active bound with parent=old-hermes-session
+        conv_a = engine._lifecycle.get_by_conversation("conversation-a")
+        assert conv_a is not None
+        assert conv_a.current_session_id == "lcm-source"
+        assert conv_a.last_finalized_session_id == "old-hermes-session"
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",
+            conversation_id="conversation-b",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # Fallback activated — nodes transferred
+        assert engine._session_id == "new-hermes-session"
+        assert engine._conversation_id == "conversation-a"  # source wins
+        assert engine.compression_count == 3
+        assert engine._last_compacted_store_id == source_store_id
+        assert engine._ingest_cursor == 2
+        assert engine._store.get_session_count("lcm-source") == 0
+        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("old-hermes-session") == 1
+        assert engine._dag.get_session_nodes("lcm-source") == []
+        new_nodes = engine._dag.get_session_nodes("new-hermes-session")
+        assert len(new_nodes) == 1
+        assert new_nodes[0].node_id == source_node_id
+        # Stale host message stays put (zero DAG means no node to check)
+        assert engine._store.get_session_count("old-hermes-session") == 1
+        # Content verifiable
+        expanded = json.loads(
+            engine.handle_tool_call("lcm_expand", {"node_id": source_node_id}),
+        )
+        assert expanded["expanded"][0]["content"] == "sibling chain context must move"
+
+    def test_compression_boundary_sibling_chain_bound_no_dag_negative(
+        self, engine,
+    ):
+        """Bound source has no DAG — fallback deactivated."""
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="conversation-a",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "context should not transfer"},
+            token_estimate=17,
+            source="telegram",
+        )
+        # Zero DAG for bound session
+        engine.compression_count = 3
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        engine._lifecycle.finalize_session(
+            "conversation-a",
+            "lcm-source",
+            frontier_store_id=source_store_id,
+        )
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",  # zero DAG
+            conversation_id="conversation-b",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # Fallback rejected — bound_has_summary_nodes guard failed
+        assert engine.compression_count == 0  # reset
+        assert engine._last_compacted_store_id == 0
+        assert engine._store.get_session_count("lcm-source") == 1
+        assert engine._store.get_session_count("new-hermes-session") == 0
+
+    def test_compression_boundary_sibling_chain_parent_mismatch_negative(
+        self, engine,
+    ):
+        """Bound session has different parent — fallback deactivated."""
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="conversation-a",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "parent mismatch context"},
+            token_estimate=17,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="parent mismatch summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine.compression_count = 3
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        # Finalize with a DIFFERENT parent from old_session_id
+        engine._lifecycle.finalize_session(
+            "conversation-a",
+            "lcm-source",
+            frontier_store_id=source_store_id,
+        )
+        # Override last_finalized — it will stay as "lcm-source", not
+        # matching "old-hermes-session" that we will pass as old_session_id
+        conv_a = engine._lifecycle.get_by_conversation("conversation-a")
+        assert conv_a.last_finalized_session_id == "lcm-source"
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="other-parent-session",  # different parent
+            conversation_id="conversation-b",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # Fallback rejected — bound_shares_parent_with_host guard failed
+        assert engine.compression_count == 0
+        assert engine._last_compacted_store_id == 0
+        assert engine._store.get_session_count("lcm-source") == 1
+
+    def test_compression_boundary_sibling_chain_host_has_dag_negative(
+        self, engine,
+    ):
+        """Host old_session_id has DAG — falls to host-authoritative path."""
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="conversation-a",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "bound source context"},
+            token_estimate=17,
+            source="telegram",
+        )
+        host_store_id = engine._store.append(
+            "old-hermes-session",
+            {"role": "user", "content": "host DAG must survive"},
+            token_estimate=11,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="bound summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        host_node_id = engine._dag.add_node(SummaryNode(
+            session_id="old-hermes-session",
+            depth=0,
+            summary="host summary must stay",
+            token_count=5,
+            source_token_count=11,
+            source_ids=[host_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine.compression_count = 3
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        engine._lifecycle.finalize_session(
+            "conversation-a",
+            "lcm-source",
+            frontier_store_id=source_store_id,
+        )
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",  # HAS DAG
+            conversation_id="conversation-b",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # Sibling-chain fallback deactivated — host_has_no_dag guard failed
+        # Host DAG stays put
+        host_node = engine._dag.get_node(host_node_id)
+        assert host_node is not None
+        assert host_node.session_id == "old-hermes-session"
+        # Bound session NOT transferred
+        assert engine._store.get_session_count("lcm-source") == 1
+
+    def test_compression_boundary_sibling_chain_active_source_different_conv_id(
+        self, engine,
+    ):
+        """Active bound sibling with explicit conversation_id mismatch —
+        fallback activates despite mismatched conversations."""
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="conversation-x",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "active sibling with diff conv"},
+            token_estimate=17,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="active sibling with diff conv summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine.compression_count = 3
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        engine._lifecycle.record_rollover(
+            "conversation-x",
+            old_session_id="old-hermes-session",
+            new_session_id="lcm-source",
+            finalized_frontier_store_id=0,
+        )
+        engine._lifecycle.advance_frontier(
+            "conversation-x",
+            "lcm-source",
+            source_store_id,
+        )
+        # Verify active bound with parent=old-hermes-session
+        conv_x = engine._lifecycle.get_by_conversation("conversation-x")
+        assert conv_x.current_session_id == "lcm-source"
+        assert conv_x.last_finalized_session_id == "old-hermes-session"
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",
+            conversation_id="conversation-y",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # Fallback activated — nodes transferred, source conv wins
+        assert engine._conversation_id == "conversation-x"
+        assert engine.compression_count == 3
+        assert engine._store.get_session_count("lcm-source") == 0
+        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._dag.get_session_nodes("lcm-source") == []
+        new_nodes = engine._dag.get_session_nodes("new-hermes-session")
+        assert len(new_nodes) == 1
+        assert new_nodes[0].node_id == source_node_id
+
+    def test_compression_boundary_sibling_chain_source_none_kwargs_fallback(
+        self, engine,
+    ):
+        """source_state is None — conversation_id falls to kwargs."""
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",  # zero DAG, no bound
+            conversation_id="conversation-c",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # All guards fail — source_state is None
+        # conversation_id falls through: kwargs → self._conversation_id
+        assert engine._conversation_id == "conversation-c"
+
+    def test_compression_boundary_sibling_chain_conversation_id_regression(
+        self, engine,
+    ):
+        """Sibling-chain fallback → conversation_id from bound session,
+        NOT kwargs. Regression test for the bug stephenschoettler found."""
+        engine.on_session_start(
+            "lcm-source",
+            platform="telegram",
+            context_length=200000,
+            conversation_id="conversation-a",
+        )
+        source_store_id = engine._store.append(
+            "lcm-source",
+            {"role": "user", "content": "regression test context"},
+            token_estimate=17,
+            source="telegram",
+        )
+        source_node_id = engine._dag.add_node(SummaryNode(
+            session_id="lcm-source",
+            depth=0,
+            summary="regression test summary",
+            token_count=5,
+            source_token_count=17,
+            source_ids=[source_store_id],
+            source_type="messages",
+            created_at=time.time(),
+        ))
+        engine.compression_count = 3
+        engine._last_compacted_store_id = source_store_id
+        engine._ingest_cursor = 2
+        engine._lifecycle.record_rollover(
+            "conversation-a",
+            old_session_id="old-hermes-session",
+            new_session_id="lcm-source",
+            finalized_frontier_store_id=0,
+        )
+        engine._lifecycle.advance_frontier(
+            "conversation-a",
+            "lcm-source",
+            source_store_id,
+        )
+
+        engine.on_session_start(
+            "new-hermes-session",
+            boundary_reason="compression",
+            old_session_id="old-hermes-session",
+            conversation_id="conversation-b",
+            platform="telegram",
+            context_length=200000,
+        )
+
+        # KEY ASSERTION: conversation_id = "conversation-a" (source wins)
+        # NOT "conversation-b" (which kwargs would produce pre-fix)
+        assert engine._conversation_id == "conversation-a"
+        assert engine._session_id == "new-hermes-session"
+        assert engine.compression_count == 3
+        # Verify the lifecycle under conversation-a is aware of the new session
+        conv_a = engine._lifecycle.get_by_conversation("conversation-a")
+        assert conv_a is not None
+        assert conv_a.current_session_id == "new-hermes-session"
+        # conversation-b not created — session bound to conversation-a
+        conv_b = engine._lifecycle.get_by_conversation("conversation-b")
+        assert conv_b is None
+        # Nodes moved correctly
+        assert engine._dag.get_session_nodes("lcm-source") == []
+        new_nodes = engine._dag.get_session_nodes("new-hermes-session")
+        assert len(new_nodes) == 1
+        assert new_nodes[0].node_id == source_node_id
+
     def test_compression_boundary_prefers_host_old_session_when_bound_session_drifted(self, engine):
         engine.on_session_start(
             "foreground-old",

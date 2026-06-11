@@ -191,5 +191,5 @@ def test_lcm_preset_dry_run_does_not_honor_invalid_env_overrides(tmp_path, monke
     assert "explicit_overrides: (none)" in suggest
     assert "invalid_overrides: LCM_FRESH_TAIL_COUNT=abc" in suggest
     for result in (suggest, apply):
-        assert "LCM_FRESH_TAIL_COUNT=24 (invalid current value abc ignored by runtime; runtime value 64)" in result
+        assert "LCM_FRESH_TAIL_COUNT=24 (invalid current value abc ignored by runtime; runtime value 32)" in result
         assert "keep explicit value abc" not in result

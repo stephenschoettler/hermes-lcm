@@ -1885,12 +1885,42 @@ class LCMEngine(ContextEngine):
                         old_session_id,
                     )
                 else:
-                    source_session_id = ""
-                    source_state = None
+                    # Fallback: sibling chain with zero-DAG parent.
+                    # When stale old_session_id has no DAG nodes AND the
+                    # bound session belongs to a different conversation_id
+                    # but shares the same last_finalized_session_id
+                    # (parent) — prefer the bound session despite the
+                    # conversation_id mismatch. This handles the lifecycle
+                    # fork case where two sessions on the same channel
+                    # received different conversation_ids.
+                    bound_shares_parent_with_host = bool(
+                        bound_state
+                        and bound_state.last_finalized_session_id == old_session_id
+                    )
+                    host_has_no_dag = not bool(
+                        self._dag.get_session_nodes(old_session_id)
+                    )
+                    if (
+                        bound_shares_parent_with_host
+                        and host_has_no_dag
+                        and (bound_is_active_source or bound_is_finalized_source)
+                        and bound_has_summary_nodes
+                    ):
+                        source_session_id = previous_session_id
+                        source_state = bound_state
+                        logger.warning(
+                            "LCM compression boundary using bound session %s on sibling chain as carry-over source; host old_session_id=%s has zero DAG, parent=%s matches",
+                            previous_session_id,
+                            old_session_id,
+                            bound_state.last_finalized_session_id,
+                        )
+                    else:
+                        source_session_id = ""
+                        source_state = None
 
         conversation_id = (
-            kwargs.get("conversation_id")
-            or (source_state.conversation_id if source_state else None)
+            (source_state.conversation_id if source_state else None)
+            or kwargs.get("conversation_id")
             or self._conversation_id
             or source_session_id
             or old_session_id
