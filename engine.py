@@ -81,6 +81,13 @@ logger = logging.getLogger(__name__)
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 _PLUGIN_METADATA: dict[str, str] | None = None
 _SESSION_END_BUSY_TIMEOUT_MS = 50
+
+# Auto-focus topic derivation: infer a compact focus hint from the most recent
+# real user turns so that summarization can prioritise current user intent.
+# Mirrors Hermes upstream fix/compression-auto-focus-topic (#44674 branch).
+_AUTO_FOCUS_MAX_TURNS = 3
+_AUTO_FOCUS_TURN_MAX_CHARS = 260
+_AUTO_FOCUS_MAX_CHARS = 700
 _VISIBLE_TEXT_PART_TYPES = {"text", "input_text", "output_text"}
 _INTERNAL_ASSISTANT_PART_TYPES = {
     "analysis",
@@ -921,6 +928,13 @@ class LCMEngine(ContextEngine):
             if observed_prompt_tokens is not None and observed_prompt_tokens > 0
             else count_messages_tokens(messages)
         )
+
+        # Auto-derive focus topic from recent user turns when not explicitly
+        # provided.  This mirrors Hermes upstream fix/compression-auto-focus-topic
+        # so that automatic summarisation prioritises current user intent.
+        if focus_topic is None:
+            focus_topic = self._derive_auto_focus_topic(messages)
+
         noop_reason = "no eligible raw backlog outside fresh tail"
 
         while leaf_passes < max_leaf_passes:
@@ -4320,6 +4334,72 @@ class LCMEngine(ContextEngine):
         )
         pattern = rf"^{block}(?:\n\n---\n\n{block})*$"
         return re.fullmatch(pattern, content, flags=re.DOTALL) is not None
+
+    @classmethod
+    def _derive_auto_focus_topic(
+        cls,
+        messages: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Infer a compact focus hint from the most recent real user turns.
+
+        Walks the message list backwards, collecting up to
+        ``_AUTO_FOCUS_MAX_TURNS`` user messages (skipping context summaries
+        and empty turns).  Returns a brief text block suitable for injection
+        into the summarizer prompt as ``focus_topic``.
+
+        Mirrors Hermes upstream ``ContextCompressor._derive_auto_focus_topic``
+        from ``fix/compression-auto-focus-topic``.
+        """
+        candidates: list[str] = []
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            # Skip context compaction summaries — they are synthetic, not
+            # real user intent.
+            if cls._is_context_summary_content(content):
+                continue
+            text = (text_content_for_pattern_matching(content) or "").strip()
+            # Basic redaction of obvious secrets in focus hint. Full
+            # redact_sensitive_value needs a config object which is not
+            # available in this classmethod; this lightweight pass covers
+            # the most common patterns.
+            text = re.sub(
+                r"(api[_-]?key|token|password|secret)\s*[:=]\s*\S+",
+                r"\1: [REDACTED]",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if not text:
+                continue
+            text = " ".join(text.split())
+            if len(text) > _AUTO_FOCUS_TURN_MAX_CHARS:
+                text = text[: _AUTO_FOCUS_TURN_MAX_CHARS - 1].rstrip() + "…"
+            candidates.append(text)
+            if len(candidates) >= _AUTO_FOCUS_MAX_TURNS:
+                break
+
+        if not candidates:
+            return None
+
+        candidates.reverse()
+        focus = "Recent user focus:\n" + "\n".join(f"- {item}" for item in candidates)
+        if len(focus) > _AUTO_FOCUS_MAX_CHARS:
+            focus = focus[: _AUTO_FOCUS_MAX_CHARS - 1].rstrip() + "…"
+        return focus
+
+    @staticmethod
+    def _is_context_summary_content(content: Any) -> bool:
+        """Check whether message content is a synthetic context summary."""
+        if not isinstance(content, str):
+            return False
+        return (
+            "CONTEXT COMPACTION" in content
+            or "CONTEXT SUMMARY" in content
+            or "Earlier turns have been compacted" in content
+            or "Earlier turns were compacted" in content
+        )
 
     @staticmethod
     def _extract_expand_hint(summary: str) -> str:
