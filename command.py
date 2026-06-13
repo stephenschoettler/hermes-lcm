@@ -61,6 +61,8 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm doctor: run read-only LCM health checks",
         "- /lcm doctor clean: best-effort scan of obvious junk/noise session candidates without deleting anything",
         "- /lcm doctor clean apply: backup-first cleanup for safe pattern-matched candidates only",
+        "- /lcm doctor clean lifecycle: read-only scan for lifecycle rows with zero messages/nodes",
+        "- /lcm doctor clean lifecycle apply: backup-first cleanup of empty lifecycle rows only",
         "- /lcm doctor repair: read-only scan for SQLite/FTS index repair needs",
         "- /lcm doctor repair apply: backup-first repair/rebuild of message and summary FTS indexes",
         "- /lcm doctor source: read-only scan for legacy blank-source rows",

@@ -195,7 +195,7 @@ def test_lcm_status_reports_runtime_identity(engine):
     repo_root = Path(__file__).resolve().parent.parent
 
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 0.16.3" in result
+    assert "plugin_version: 0.16.2" in result
     assert f"plugin_path: {repo_root}" in result
     assert "module_path:" in result
     assert "database_path_source: config.database_path" in result
@@ -235,7 +235,7 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "messages_fts: ok" in result
     assert "nodes_fts: ok" in result
     assert "plugin_name: hermes-lcm" in result
-    assert "plugin_version: 0.16.3" in result
+    assert "plugin_version: 0.16.2" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
 
@@ -607,6 +607,8 @@ def test_lcm_help_on_unknown_subcommand(engine):
     assert "Unknown subcommand: wat" in result
     assert "/lcm status" in result
     assert "/lcm doctor" in result
+    assert "/lcm doctor clean lifecycle" in result
+    assert "/lcm doctor clean lifecycle apply" in result
 
 
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
@@ -614,6 +616,8 @@ def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
 
     assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `source`, `source apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
+    assert "/lcm doctor clean lifecycle" in result
+    assert "/lcm doctor clean lifecycle apply" in result
     assert "/lcm doctor repair" in result
     assert "/lcm doctor repair apply" in result
     assert "/lcm doctor source" in result

@@ -610,6 +610,8 @@ Available commands:
 - `/lcm doctor` - read-only health checks
 - `/lcm doctor clean` - read-only scan for obvious junk/noise session candidates
 - `/lcm doctor clean apply` - backup-first cleanup for safe pattern-matched candidates; requires `LCM_DOCTOR_CLEAN_APPLY_ENABLED=true`
+- `/lcm doctor clean lifecycle` - read-only scan for lifecycle rows with zero messages/nodes
+- `/lcm doctor clean lifecycle apply` - backup-first cleanup of empty lifecycle rows; requires `LCM_DOCTOR_CLEAN_APPLY_ENABLED=true`
 - `/lcm doctor repair` - read-only SQLite/FTS repair diagnostics
 - `/lcm doctor repair apply` - backup-first SQLite/FTS repair
 - `/lcm doctor source` - read-only scan for legacy blank-source rows
