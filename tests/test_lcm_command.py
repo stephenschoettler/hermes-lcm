@@ -24,8 +24,12 @@ def engine(tmp_path):
     e = LCMEngine(config=config, hermes_home=str(hermes_home))
     e._session_id = "test-session"
     e._session_platform = "telegram"
-    e.context_length = 200000
-    e.threshold_tokens = int(200000 * config.context_threshold)
+    e.update_model(
+        "gpt-test",
+        200000,
+        provider="openai-codex",
+        api_mode="responses",
+    )
     return e
 
 
@@ -66,8 +70,32 @@ def test_lcm_status_default_reports_current_session(engine):
     assert "last_cache_write_tokens: 0" in result
     assert "last_compression_status: idle" in result
     assert "last_compression_noop_reason: (none)" in result
+    assert "model: gpt-test" in result
+    assert "provider: openai-codex" in result
+    assert "context_length: 200000" in result
+    assert "context_length_source: update_model" in result
+    assert f"context_threshold: {engine._config.context_threshold}" in result
+    assert f"threshold_tokens: {int(200000 * engine._config.context_threshold)}" in result
     assert "store_messages: 0" in result
     assert "dag_nodes: 0" in result
+
+
+def test_lcm_status_json_reports_runtime_context_indicators(engine):
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert status["model"] == "gpt-test"
+    assert status["provider"] == "openai-codex"
+    assert status["context_length"] == 200000
+    assert status["context_length_source"] == "update_model"
+    assert status["context_threshold"] == engine._config.context_threshold
+    assert status["threshold_tokens"] == int(200000 * engine._config.context_threshold)
+    assert payload["model"] == "gpt-test"
+    assert payload["provider"] == "openai-codex"
+    assert payload["context_length"] == 200000
+    assert payload["context_length_source"] == "update_model"
+    assert payload["context_threshold"] == engine._config.context_threshold
+    assert payload["threshold_tokens"] == int(200000 * engine._config.context_threshold)
 
 
 def test_lcm_status_reports_last_compression_noop_reason(engine):
@@ -149,6 +177,11 @@ def test_lcm_status_explains_unbound_runtime_before_first_session(tmp_path):
     assert "LCM status" in result
     assert "session_id: (unbound)" in result
     assert "session_platform: (unbound)" in result
+    assert "model: (uninitialized)" in result
+    assert "provider: (uninitialized)" in result
+    assert "context_length: (uninitialized)" in result
+    assert "context_length_source: (uninitialized)" in result
+    assert f"context_threshold: {engine._config.context_threshold}" in result
     assert "threshold_tokens: (uninitialized)" in result
     assert "\nmessage_sessions_total:" not in result
     assert "\nmessages_total:" not in result

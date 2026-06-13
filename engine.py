@@ -2401,6 +2401,10 @@ class LCMEngine(ContextEngine):
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "model": self.model,
+            "provider": self.provider,
+            "context_length_source": self._context_length_source,
+            "context_threshold": self._config.context_threshold,
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id

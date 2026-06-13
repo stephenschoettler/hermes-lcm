@@ -95,6 +95,16 @@ def _status_text(engine) -> str:
     }
     protection = status.get("ingest_protection") or sensitive_pattern_status(engine._config)
 
+    uninitialized = "(uninitialized)"
+    unknown = "(unknown)"
+    model = (engine.model or unknown) if session_bound else uninitialized
+    provider = (engine.provider or unknown) if session_bound else uninitialized
+    context_length_source = (
+        (getattr(engine, "_context_length_source", "") or unknown)
+        if session_bound
+        else uninitialized
+    )
+
     lines = [
         "LCM status",
         f"engine: {status.get('engine', engine.name)}",
@@ -108,6 +118,8 @@ def _status_text(engine) -> str:
         f"hermes_home: {runtime_identity.get('hermes_home', '') or '(unset)'}",
         f"session_id: {engine.current_session_id or '(unbound)'}",
         f"session_platform: {engine.current_session_platform or ('(unbound)' if not session_bound else '(unknown)')}",
+        f"model: {model}",
+        f"provider: {provider}",
         f"database_path: {db_path}",
         f"database_path_source: {runtime_identity.get('database_path_source', '(unknown)')}",
         f"database_exists: {_fmt_bool(db_exists)}",
@@ -115,6 +127,9 @@ def _status_text(engine) -> str:
         f"compression_count: {engine.compression_count}",
         f"last_compression_status: {status.get('last_compression_status', 'idle')}",
         f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
+        f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",
+        f"context_length_source: {context_length_source}",
+        f"context_threshold: {engine._config.context_threshold}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
         f"last_input_tokens: {status.get('last_input_tokens', 0)}",
