@@ -21,22 +21,22 @@ class TestDeriveAutoFocusTopic:
         engine = LCMEngine(config=None)
         try:
             messages = [
-                {"role": "assistant", "content": "之前的回复1"},
-                {"role": "user", "content": "星野 检查config.yaml"},
-                {"role": "assistant", "content": "好的我来检查"},
-                {"role": "user", "content": "上下文压缩的老问题又出现了"},
-                {"role": "assistant", "content": "让我查一下"},
-                {"role": "user", "content": "好 走方案A"},
+                {"role": "assistant", "content": "Previous assistant reply"},
+                {"role": "user", "content": "Please check config.yaml"},
+                {"role": "assistant", "content": "Sure let me check"},
+                {"role": "user", "content": "The compression issue came up again"},
+                {"role": "assistant", "content": "Let me look into that"},
+                {"role": "user", "content": "Ok let's go with option A"},
             ]
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
             assert "Recent user focus:" in focus
-            assert "星野 检查config.yaml" in focus
-            assert "上下文压缩的老问题" in focus
-            assert "好 走方案A" in focus
+            assert "Please check config.yaml" in focus
+            assert "The compression issue came up again" in focus
+            assert "Ok let's go with option A" in focus
             # Assistant messages should not appear
-            assert "之前的回复1" not in focus
-            assert "好的我来检查" not in focus
+            assert "Previous assistant reply" not in focus
+            assert "Sure let me check" not in focus
         finally:
             engine.shutdown()
 
@@ -51,8 +51,8 @@ class TestDeriveAutoFocusTopic:
         engine = LCMEngine(config=None)
         try:
             messages = [
-                {"role": "assistant", "content": "回复1"},
-                {"role": "assistant", "content": "回复2"},
+                {"role": "assistant", "content": "Reply one"},
+                {"role": "assistant", "content": "Reply two"},
             ]
             assert engine._derive_auto_focus_topic(messages) is None
         finally:
@@ -64,16 +64,16 @@ class TestDeriveAutoFocusTopic:
         engine = LCMEngine(config=None)
         try:
             messages = [
-                {"role": "user", "content": "星野 检查config.yaml"},
-                {"role": "assistant", "content": "好的"},
-                {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] 摘要内容"},
-                {"role": "user", "content": "这是压缩后的真实消息"},
+                {"role": "user", "content": "Please check config.yaml"},
+                {"role": "assistant", "content": "Sure"},
+                {"role": "user", "content": "[CONTEXT COMPACTION -- REFERENCE ONLY] Old summary content"},
+                {"role": "user", "content": "This is the real message after compaction"},
             ]
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
-            assert "摘要内容" not in focus
-            assert "这是压缩后的真实消息" in focus
-            assert "星野 检查config.yaml" in focus
+            assert "Old summary content" not in focus
+            assert "This is the real message after compaction" in focus
+            assert "Please check config.yaml" in focus
         finally:
             engine.shutdown()
 
@@ -89,11 +89,11 @@ class TestDeriveAutoFocusTopic:
             for summary in summaries:
                 messages = [
                     {"role": "user", "content": summary},
-                    {"role": "user", "content": "真实消息"},
+                    {"role": "user", "content": "This is a real message"},
                 ]
                 focus = engine._derive_auto_focus_topic(messages)
                 assert focus is not None
-                assert "真实消息" in focus
+                assert "This is a real message" in focus
                 assert summary.split("]")[-1].strip() not in focus or summary not in focus
         finally:
             engine.shutdown()
@@ -106,18 +106,18 @@ class TestDeriveAutoFocusTopic:
         but we verify that _derive_auto_focus_topic itself produces output that
         would be replaced by an explicit focus_topic in the caller.
 
-        The actual guard is in compress(): ``if focus_topic is None`` — so
+        The actual guard is in compress(): ``if focus_topic is None`` -- so
         when focus_topic is provided, this method is never called.
         """
         engine = LCMEngine(config=None)
         try:
             messages = [
-                {"role": "user", "content": "一条用户消息"},
-                {"role": "user", "content": "另一条用户消息"},
+                {"role": "user", "content": "First user message"},
+                {"role": "user", "content": "Second user message"},
             ]
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
-            assert "一条用户消息" in focus
+            assert "First user message" in focus
         finally:
             engine.shutdown()
 
@@ -153,17 +153,17 @@ class TestDeriveAutoFocusTopic:
         engine = LCMEngine(config=None)
         try:
             messages = [
-                {"role": "user", "content": "消息4"},
-                {"role": "user", "content": "消息3"},
-                {"role": "user", "content": "消息2"},
-                {"role": "user", "content": "消息1"},
+                {"role": "user", "content": "Message four"},
+                {"role": "user", "content": "Message three"},
+                {"role": "user", "content": "Message two"},
+                {"role": "user", "content": "Message one"},
             ]
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
-            assert "消息1" in focus
-            assert "消息2" in focus
-            assert "消息3" in focus
-            assert "消息4" not in focus  # oldest is dropped
+            assert "Message one" in focus
+            assert "Message two" in focus
+            assert "Message three" in focus
+            assert "Message four" not in focus  # oldest is dropped
             assert focus.count("-") == 3  # exactly 3 bullet points
         finally:
             engine.shutdown()
@@ -174,12 +174,12 @@ class TestDeriveAutoFocusTopic:
         engine = LCMEngine(config=None)
         try:
             messages = [
-                {"role": "user", "content": "看这个图片"},
-                {"role": "user", "content": [{"type": "text", "text": "这个图片怎么样？"}]},
+                {"role": "user", "content": "Look at this image"},
+                {"role": "user", "content": [{"type": "text", "text": "How does this image look?"}]},
             ]
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
-            assert "图片" in focus
+            assert "image" in focus
         finally:
             engine.shutdown()
 
@@ -217,7 +217,7 @@ class TestDeriveAutoFocusTopic:
             redacted_messages = [
                 {
                     "role": "user",
-                    "content": "config: {\"api_key\": \"[REDACTED]\", \"endpoint\": \"http://example.com\"}",
+                    "content": 'config: {"api_key": "[REDACTED]", "endpoint": "http://example.com"}',
                 },
             ]
             focus = engine._derive_auto_focus_topic(redacted_messages)
@@ -275,7 +275,7 @@ class TestDeriveAutoFocusTopic:
         config.sensitive_patterns = ["api_key", "bearer_token", "password_assignment"]
         engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes-home"))
         try:
-            # Messages where content is a list (structured/multimodal) —
+            # Messages where content is a list (structured/multimodal) --
             # _redact_active_replay_messages uses parse_json_strings=False for content,
             # so the safety net in _derive_auto_focus_topic must catch these.
             messages = [
@@ -309,11 +309,11 @@ class TestDeriveAutoFocusTopic:
             messages = [
                 {"role": "user", "content": ""},
                 {"role": "user", "content": "   "},
-                {"role": "user", "content": "真实消息"},
+                {"role": "user", "content": "This is a real message"},
             ]
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
-            assert "真实消息" in focus
+            assert "This is a real message" in focus
             assert focus.count("-") == 1
         finally:
             engine.shutdown()
