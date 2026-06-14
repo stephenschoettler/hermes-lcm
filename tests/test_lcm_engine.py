@@ -8686,31 +8686,65 @@ class TestSessionRollover:
         assert recovered.current_session_id == "active-session"
 
     def test_bind_lifecycle_gc_prunes_empty_rows_above_threshold(self, tmp_path, monkeypatch):
-        import importlib
-
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_gc_lifecycle.db"),
             empty_lifecycle_gc_enabled=True,
             empty_lifecycle_gc_threshold=1,
         )
         engine = LCMEngine(config=config)
+        try:
+            # Create stale orphan rows by binding sessions with no data.
+            for i in range(5):
+                engine._lifecycle.bind_session(f"orphan-{i}")
+            stale_ts = time.time() - (25 * 3600)
+            engine._lifecycle._conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET current_bound_at = ?, updated_at = ?
+                """,
+                (stale_ts, stale_ts),
+            )
+            engine._lifecycle._conn.commit()
+            assert engine._lifecycle.row_count() == 5
 
-        # Create orphan rows by binding sessions with no data
-        for i in range(5):
-            engine._lifecycle.bind_session(f"orphan-{i}")
-        assert engine._lifecycle.row_count() == 5
+            # Bind to a new session — should trigger GC since threshold(1) < 5.
+            engine.on_session_start("live-session", platform="cli", context_length=200000)
+            # All 5 stale empty rows should be pruned, leaving only the live one.
+            assert engine._lifecycle.row_count() == 1
+            state = engine._lifecycle.get_by_conversation("live-session")
+            assert state is not None
+            assert state.current_session_id == "live-session"
+        finally:
+            engine.shutdown()
 
-        # Bind to a new session — should trigger GC since threshold(1) < 5
-        engine.on_session_start("live-session", platform="cli", context_length=200000)
-        # All 5 empty rows should be pruned, leaving only the live one
-        assert engine._lifecycle.row_count() == 1
-        state = engine._lifecycle.get_by_conversation("live-session")
-        assert state is not None
-        assert state.current_session_id == "live-session"
+    def test_bind_lifecycle_gc_preserves_recent_empty_active_session_from_other_engine(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_active_empty.db"),
+            empty_lifecycle_gc_enabled=True,
+            empty_lifecycle_gc_threshold=1,
+        )
+        engine_a = LCMEngine(config=config)
+        engine_b = LCMEngine(config=config)
+        try:
+            engine_a.on_session_start("active-other", platform="cli", context_length=200000)
+            assert engine_a._lifecycle.get_by_session("active-other") is not None
+
+            # A second engine sharing the same DB may start before the first
+            # engine has ingested its first message. Startup GC must not treat
+            # that recently-bound empty row as an orphan.
+            engine_b.on_session_start("gc-trigger", platform="cli", context_length=200000)
+
+            assert engine_a._lifecycle.get_by_session("active-other") is not None
+            assert engine_b._lifecycle.get_by_session("active-other") is not None
+
+            engine_a._ingest_messages([{"role": "user", "content": "first persisted message"}])
+            assert engine_a._store.get_session_count("active-other") == 1
+            assert engine_a._lifecycle.get_by_session("active-other") is not None
+        finally:
+            engine_a.shutdown()
+            engine_b.shutdown()
 
     def test_bind_lifecycle_gc_skips_when_below_threshold(self, tmp_path, monkeypatch):
-        import importlib
-
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_gc_below_threshold.db"),
             empty_lifecycle_gc_enabled=True,

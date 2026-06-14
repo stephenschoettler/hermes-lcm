@@ -328,10 +328,11 @@ class LCMConfig:
     # Number of lifecycle rows at which the GC pass fires.  Default 200
     # so fresh installs skip the work until enough churn has occurred.
     empty_lifecycle_gc_threshold: int = 200
-    # Optional age guard for GC — ``None`` deletes all empty rows
-    # regardless of age; set to e.g. 24 to preserve recent rows for
-    # debugging.
-    empty_lifecycle_gc_max_age_hours: float | None = None
+    # Age guard for automatic lifecycle GC. Startup GC must not delete
+    # recently-bound empty rows because another live engine may not have
+    # ingested its first message yet. Set to 0 only in trusted/test
+    # environments that intentionally want immediate empty-row pruning.
+    empty_lifecycle_gc_max_age_hours: float | None = 24.0
 
     @classmethod
     def from_env(cls) -> "LCMConfig":

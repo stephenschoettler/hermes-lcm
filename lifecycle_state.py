@@ -671,6 +671,22 @@ class LifecycleStateStore:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()
             }
+
+            def _session_has_data(session_id: str) -> bool:
+                if not session_id:
+                    return False
+                if "messages" in tables and conn.execute(
+                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone():
+                    return True
+                if "summary_nodes" in tables and conn.execute(
+                    "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
+                    (session_id,),
+                ).fetchone():
+                    return True
+                return False
+
             if "messages" in tables:
                 for row in conn.execute(
                     "SELECT DISTINCT session_id FROM messages"
@@ -714,11 +730,11 @@ class LifecycleStateStore:
                     if row_age is not None and (now - float(row_age)) < max_age_seconds:
                         continue
 
-                # Recheck emptiness right before deletion to prevent race conditions
-                # where a concurrent write adds data after our initial snapshot.
-                cur_has_data = cur in sessions_with_data
-                fin_has_data = fin in sessions_with_data
-                if cur_has_data or fin_has_data:
+                # Recheck against the tables right before deletion. BEGIN
+                # IMMEDIATE blocks concurrent writers while this transaction is
+                # open; this fresh query also keeps the safety check honest if
+                # the broad snapshot logic above changes later.
+                if _session_has_data(cur) or _session_has_data(fin):
                     continue
 
                 conn.execute(

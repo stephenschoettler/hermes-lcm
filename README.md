@@ -219,7 +219,7 @@ environment variables:
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires (default 200 so fresh installs skip the work) |
-| `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | empty | Optional age guard for GC — `None` deletes all empty rows regardless of age; set to e.g. 24 to preserve recent rows for debugging |
+| `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
 
 Advanced compaction, assembly, and extraction knobs are defined in `config.py`.
 
