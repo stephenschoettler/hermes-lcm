@@ -47,6 +47,7 @@ from .ingest_protection import (
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
+    redact_sensitive_text,
     redact_sensitive_value,
     restore_ingest_payload_placeholders,
     sensitive_pattern_status,
@@ -930,10 +931,11 @@ class LCMEngine(ContextEngine):
         )
 
         # Auto-derive focus topic from recent user turns when not explicitly
-        # provided.  This mirrors Hermes upstream fix/compression-auto-focus-topic
-        # so that automatic summarisation prioritises current user intent.
+        # provided.  Uses already-redacted ``working_messages`` so that the
+        # same configured redaction path covers derived focus text — preventing
+        # sensitive-value leakage from structured content or bearer-style text.
         if focus_topic is None:
-            focus_topic = self._derive_auto_focus_topic(messages)
+            focus_topic = self._derive_auto_focus_topic(working_messages)
 
         noop_reason = "no eligible raw backlog outside fresh tail"
 
@@ -4335,9 +4337,8 @@ class LCMEngine(ContextEngine):
         pattern = rf"^{block}(?:\n\n---\n\n{block})*$"
         return re.fullmatch(pattern, content, flags=re.DOTALL) is not None
 
-    @classmethod
     def _derive_auto_focus_topic(
-        cls,
+        self,
         messages: List[Dict[str, Any]],
     ) -> Optional[str]:
         """Infer a compact focus hint from the most recent real user turns.
@@ -4346,6 +4347,17 @@ class LCMEngine(ContextEngine):
         ``_AUTO_FOCUS_MAX_TURNS`` user messages (skipping context summaries
         and empty turns).  Returns a brief text block suitable for injection
         into the summarizer prompt as ``focus_topic``.
+
+        IMPORTANT: The ``messages`` parameter must be ``working_messages``
+        (output of ``_ingest_messages``), not raw messages.  ``working_messages``
+        has already been redacted by ``_redact_active_replay_messages``.
+
+        As an additional safety layer, text extracted by
+        ``text_content_for_pattern_matching`` is run through
+        ``redact_sensitive_text`` with the active config.  This covers
+        sensitive values that ``_redact_active_replay_messages`` misses
+        (e.g., dict/JSON token content deserialized into text,
+        bearer-style auth text that survived structured-content flattening).
 
         Mirrors Hermes upstream ``ContextCompressor._derive_auto_focus_topic``
         from ``fix/compression-auto-focus-topic``.
@@ -4358,19 +4370,16 @@ class LCMEngine(ContextEngine):
             content = msg.get("content")
             # Skip context compaction summaries — they are synthetic, not
             # real user intent.
-            if cls._is_context_summary_content(content):
+            if self._is_context_summary_content(content):
                 continue
             text = (text_content_for_pattern_matching(content) or "").strip()
-            # Basic redaction of obvious secrets in focus hint. Full
-            # redact_sensitive_value needs a config object which is not
-            # available in this classmethod; this lightweight pass covers
-            # the most common patterns.
-            text = re.sub(
-                r"(api[_-]?key|token|password|secret)\s*[:=]\s*\S+",
-                r"\1: [REDACTED]",
-                text,
-                flags=re.IGNORECASE,
-            )
+            # Additional redaction safety net: run extracted text through the
+            # configured redaction path.  _redact_active_replay_messages uses
+            # parse_json_strings=False for content, so structured content
+            # (dict/JSON tokens, bearer-style auth text) may not be fully
+            # covered.  This extra pass ensures the same redaction rules apply
+            # to whatever text is extracted for the focus topic.
+            text = redact_sensitive_text(text, self._config)
             if not text:
                 continue
             text = " ".join(text.split())
