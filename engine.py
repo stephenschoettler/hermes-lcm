@@ -4400,7 +4400,11 @@ class LCMEngine(ContextEngine):
 
     @staticmethod
     def _is_context_summary_content(content: Any) -> bool:
-        """Check whether message content is a synthetic context summary."""
+        """Check whether message content is a synthetic context summary.
+
+        Only checks string content — LCM/ Hermes compression summaries are
+        always stored as plain strings, never as structured multimodal parts.
+        """
         if not isinstance(content, str):
             return False
         return (

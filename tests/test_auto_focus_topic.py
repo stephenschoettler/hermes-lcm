@@ -9,8 +9,6 @@ Covers:
 - no leakage of configured sensitive values from structured content or bearer-style text
 """
 
-import json
-import pytest
 from hermes_lcm.engine import LCMEngine
 
 
@@ -103,16 +101,20 @@ class TestDeriveAutoFocusTopic:
     # --- Test 3: explicit focus_topic still wins ---
 
     def test_explicit_focus_topic_wins(self, tmp_path):
-        """When focus_topic is explicitly provided, auto-derive is skipped."""
+        """When focus_topic is explicitly provided at the compress() level,
+        auto-derive is skipped. We cannot test the full compress() path here,
+        but we verify that _derive_auto_focus_topic itself produces output that
+        would be replaced by an explicit focus_topic in the caller.
+
+        The actual guard is in compress(): ``if focus_topic is None`` — so
+        when focus_topic is provided, this method is never called.
+        """
         engine = LCMEngine(config=None)
         try:
             messages = [
                 {"role": "user", "content": "一条用户消息"},
                 {"role": "user", "content": "另一条用户消息"},
             ]
-            # In the actual compress() path, auto-derive only runs when
-            # focus_topic is None. We verify that the method itself works,
-            # and the compress() caller guards with `if focus_topic is None`.
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
             assert "一条用户消息" in focus
@@ -135,7 +137,7 @@ class TestDeriveAutoFocusTopic:
     def test_total_truncation(self, tmp_path):
         engine = LCMEngine(config=None)
         try:
-            # 3 long messages should exceed total limit
+            # 3 long messages should exceed total limit of _AUTO_FOCUS_MAX_CHARS (700)
             messages = [
                 {"role": "user", "content": "a" * 300},
                 {"role": "user", "content": "b" * 300},
@@ -143,7 +145,7 @@ class TestDeriveAutoFocusTopic:
             ]
             focus = engine._derive_auto_focus_topic(messages)
             assert focus is not None
-            assert len(focus) <= 720  # _AUTO_FOCUS_MAX_CHARS + margin
+            assert len(focus) <= 700  # _AUTO_FOCUS_MAX_CHARS exactly
         finally:
             engine.shutdown()
 
