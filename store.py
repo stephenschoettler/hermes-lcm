@@ -329,11 +329,11 @@ class MessageStore:
         )
 
         ids = []
-        ts = time.time()
         with self._write_lock, self._conn:
             for msg, est in zip(protected_messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
+                ts = time.time()  # ← Each message gets its own timestamp!
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, role, content, tool_call_id, tool_calls,

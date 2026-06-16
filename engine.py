@@ -648,6 +648,31 @@ class LCMEngine(ContextEngine):
         self._last_boundary_skip_time = 0
         return False
 
+    def ingest(self, messages: List[Dict[str, Any]]) -> None:
+        """Persist messages to the durable store every turn.
+
+        Called by the host (turn_context) so messages land in LCM
+        regardless of whether compression triggers — short WebUI
+        conversations never hit the compression threshold and never
+        expire like Telegram sessions do, so without this they'd never
+        be ingested.
+
+        Uses the same _ingest_messages cursor as compress(), so if
+        compression runs later the same turn, already-ingested messages
+        are skipped (no duplicates).
+        """
+        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+            return
+        if self._session_id and messages:
+            try:
+                self._ingest_messages(messages)
+                logger.debug(
+                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                    self._session_id, len(messages), self._ingest_cursor,
+                )
+            except Exception as e:
+                logger.warning("Ingest during per-turn ingest(): %s", e)
+
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
