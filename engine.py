@@ -651,7 +651,7 @@ class LCMEngine(ContextEngine):
     def ingest(self, messages: List[Dict[str, Any]]) -> None:
         """Persist messages to the durable store every turn.
 
-        Called by the host (turn_context) so messages land in LCM
+        Called by the post_llm_call plugin hook so messages land in LCM
         regardless of whether compression triggers — short WebUI
         conversations never hit the compression threshold and never
         expire like Telegram sessions do, so without this they'd never

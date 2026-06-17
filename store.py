@@ -333,7 +333,7 @@ class MessageStore:
             for msg, est in zip(protected_messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
-                ts = time.time()  # ← Each message gets its own timestamp!
+                ts = time.time()
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, role, content, tool_call_id, tool_calls,

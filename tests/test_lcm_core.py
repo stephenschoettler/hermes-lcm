@@ -2072,6 +2072,26 @@ class TestMessageStore:
         # unlimited search — i.e. the sort order is deterministic.
         assert [result["store_id"] for result in short_results] == [result["store_id"] for result in long_results[:5]]
 
+    def test_append_batch_timestamps_are_unique_per_row(self, store):
+        """Regression: each message in a batch must get its own timestamp.
+
+        The old code called time.time() once before the loop, giving every
+        message in the batch the same timestamp.  This broke date-based
+        queries (journal entries, time-range filtering).
+        """
+        n = 50
+        ids = store.append_batch(
+            "ts-sess",
+            [{"role": "user", "content": f"msg {i}"} for i in range(n)],
+        )
+        timestamps = [store.get(sid)["timestamp"] for sid in ids]
+        # All timestamps must be distinct — no two rows share the same value.
+        assert len(set(timestamps)) == n, (
+            f"Expected {n} unique timestamps, got {len(set(timestamps))}"
+        )
+        # Strictly non-decreasing (clock may tick between rows).
+        assert timestamps == sorted(timestamps)
+
     def test_search_hybrid_clamps_future_timestamps_consistently(self, store):
         now = time.time()
         future = now + (60 * 24 * 3600)

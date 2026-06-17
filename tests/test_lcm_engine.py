@@ -3505,6 +3505,110 @@ class TestEngineIngest:
         assert count == 2  # not duplicated
 
 
+class TestPerTurnIngest:
+    """Regression: per-turn ingest via post_llm_call hook."""
+
+    def test_below_threshold_turn_persists_without_compression(self, tmp_path):
+        """A short conversation that never hits the compression threshold
+        must still be persisted to the store when ingest() is called."""
+        config = LCMConfig(
+            database_path=str(tmp_path / "below-threshold.db"),
+            fresh_tail_count=4,
+            leaf_chunk_tokens=100,
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start("webui-short", platform="webui", context_length=200000)
+        try:
+            messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+            ]
+            # Simulate what the post_llm_call hook does
+            eng.ingest(messages)
+
+            count = eng._store.get_session_count("webui-short")
+            assert count == 3, f"Expected 3 messages persisted, got {count}"
+
+            # Verify compression did NOT fire
+            assert eng.compression_count == 0
+        finally:
+            eng.shutdown()
+
+    def test_ingest_then_compress_no_duplicate_rows(self, tmp_path):
+        """Ingesting via post_llm_call and then compressing in the same turn
+        must not produce duplicate rows.  The existing cursor dedup ensures
+        already-ingested messages are skipped."""
+        config = LCMConfig(
+            database_path=str(tmp_path / "no-dup.db"),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=50,
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start("dup-test", platform="webui", context_length=200000)
+        try:
+            # Build a long conversation that WILL trigger compression
+            messages = [{"role": "system", "content": "You are helpful."}]
+            for i in range(20):
+                messages.append({"role": "user", "content": f"Q{i}: " + "x" * 200})
+                messages.append({"role": "assistant", "content": f"A{i}: " + "y" * 200})
+
+            # Step 1: post_llm_call hook ingests
+            eng.ingest(messages)
+            count_after_ingest = eng._store.get_session_count("dup-test")
+            assert count_after_ingest > 0
+
+            # Step 2: preflight compression runs (same turn)
+            eng.compress(messages)
+            count_after_compress = eng._store.get_session_count("dup-test")
+
+            # No new rows from messages already ingested
+            assert count_after_compress == count_after_ingest, (
+                f"Duplicate rows: {count_after_compress} after compress vs "
+                f"{count_after_ingest} after ingest"
+            )
+        finally:
+            eng.shutdown()
+
+    def test_ignored_session_ingest_persists_nothing(self, tmp_path):
+        """Ingest must be a no-op for ignored sessions."""
+        config = LCMConfig(
+            database_path=str(tmp_path / "ignored-ingest.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start("cron_999", platform="cron", context_length=1000)
+        try:
+            messages = [
+                {"role": "user", "content": "ignored"},
+                {"role": "assistant", "content": "also ignored"},
+            ]
+            eng.ingest(messages)
+
+            assert eng._store.get_session_count("cron_999") == 0
+        finally:
+            eng.shutdown()
+
+    def test_stateless_session_ingest_persists_nothing(self, tmp_path):
+        """Ingest must be a no-op for stateless sessions."""
+        config = LCMConfig(
+            database_path=str(tmp_path / "stateless-ingest.db"),
+            stateless_session_patterns=["telegram:*"],
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start("debug", platform="telegram", context_length=1000)
+        try:
+            messages = [
+                {"role": "user", "content": "stateless"},
+                {"role": "assistant", "content": "also stateless"},
+            ]
+            eng.ingest(messages)
+
+            assert eng._store.get_session_count("debug") == 0
+        finally:
+            eng.shutdown()
+
+
 class TestEngineCompress:
     def _make_long_conversation(self, n_turns=20):
         """Build a conversation with enough messages to trigger compaction."""

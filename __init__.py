@@ -137,4 +137,30 @@ def register(ctx):
     else:
         logger.info("LCM slash command registration unavailable on this Hermes host; continuing without /lcm")
 
+    # Register a post_llm_call hook so every completed turn is persisted to
+    # the durable store, regardless of whether compression triggers.  Without
+    # this, short WebUI conversations (which never expire and may never hit
+    # the compression threshold) are invisible to LCM forever.
+    #
+    # The hook fires once per turn after the tool-calling loop completes and
+    # receives conversation_history including the assistant response.  The
+    # existing _ingest_messages cursor prevents duplicates if compress() runs
+    # later the same turn.
+    try:
+        from hermes_cli.plugins import get_plugin_manager as _get_pm
+        _mgr = _get_pm()
+
+        def _on_post_llm_call(**kwargs):
+            history = kwargs.get("conversation_history")
+            if history:
+                try:
+                    engine.ingest(history)
+                except Exception as exc:
+                    logger.debug("LCM post_llm_call ingest error: %s", exc)
+
+        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
+        logger.debug("LCM registered post_llm_call hook for per-turn ingest")
+    except Exception as exc:
+        logger.debug("LCM could not register post_llm_call hook: %s", exc)
+
     logger.info("LCM plugin loaded — lossless context management active")
