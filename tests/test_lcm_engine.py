@@ -12341,6 +12341,110 @@ class TestEngineTools:
         serialized_context = json.dumps(captured["context_blocks"])
         assert "PHOENIXRAWONLY appears only in the raw message" in serialized_context
 
+    def test_handle_expand_query_keeps_raw_snippets_out_of_synthesis_context(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "raw snippet answer"
+
+        def fake_store_search(query, session_id=None, limit=5):
+            return [
+                {
+                    "store_id": 123,
+                    "session_id": session_id or "test-session",
+                    "source": "telegram",
+                    "role": "user",
+                    "timestamp": 1,
+                    "content": "A",
+                    "snippet": "UNBUDGETED RAW SNIPPET LEAK",
+                    "search_rank": 1,
+                }
+            ]
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        monkeypatch.setattr(engine._store, "search", fake_store_search)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw detail?",
+                    "query": "anything",
+                    "max_tokens": 20,
+                    "context_max_tokens": 1,
+                },
+            )
+        )
+
+        serialized_context = json.dumps(captured["context_blocks"])
+        assert result["answer"] == "raw snippet answer"
+        assert result["raw_matches"][0]["snippet"] == "UNBUDGETED RAW SNIPPET LEAK"
+        assert "UNBUDGETED RAW SNIPPET LEAK" not in serialized_context
+        raw_block = next(block for block in captured["context_blocks"] if block["type"] == "raw_messages")
+        assert "snippet" not in raw_block["messages"][0]
+
+    def test_handle_expand_query_deduped_raw_hit_does_not_leak_snippet(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "deduped raw answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "DEDUPEDRAW message evidence"},
+        )
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="summary points at deduped raw evidence",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+
+        def fake_store_search(query, session_id=None, limit=5):
+            return [
+                {
+                    "store_id": store_id,
+                    "session_id": session_id or "test-session",
+                    "source": "telegram",
+                    "role": "user",
+                    "timestamp": 1,
+                    "content": "DEDUPEDRAW message evidence",
+                    "snippet": "DEDUPED RAW SNIPPET SHOULD NOT LEAK",
+                    "search_rank": 1,
+                }
+            ]
+
+        monkeypatch.setattr(engine._store, "search", fake_store_search)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw detail?",
+                    "node_ids": [node_id],
+                    "query": "DEDUPEDRAW",
+                    "max_tokens": 20,
+                    "context_max_tokens": 1000,
+                },
+            )
+        )
+
+        serialized_context = json.dumps(captured["context_blocks"])
+        assert result["answer"] == "deduped raw answer"
+        assert "DEDUPEDRAW message evidence" in serialized_context
+        assert "DEDUPED RAW SNIPPET SHOULD NOT LEAK" not in serialized_context
+        assert not any(block.get("type") == "raw_messages" for block in captured["context_blocks"])
+        assert result["raw_matches"] == []
+
     def test_handle_expand_query_raw_hit_truncation_returns_store_expand_cursor(self, engine, monkeypatch):
         import hermes_lcm.tokens as token_utils
 

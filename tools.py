@@ -700,7 +700,6 @@ def _collect_raw_match_context_block(
             "timestamp": row.get("timestamp", 0),
             **content_slice,
             "content_source": "raw_search_hit",
-            "snippet": row.get("snippet") or "",
             "search_rank": row.get("search_rank"),
         }
         if row.get("tool_call_id"):
