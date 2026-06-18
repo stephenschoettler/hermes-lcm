@@ -98,6 +98,214 @@ def test_lcm_status_json_reports_runtime_context_indicators(engine):
     assert payload["threshold_tokens"] == int(200000 * engine._config.context_threshold)
 
 
+def test_lcm_status_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=0,
+        summary="leaf",
+        token_count=10,
+        source_token_count=100,
+        source_ids=[1],
+        source_type="messages",
+        created_at=1.0,
+        expand_hint="Expand for details about: leaf",
+    ))
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=1,
+        summary="parent",
+        token_count=5,
+        source_token_count=100,
+        source_ids=[1],
+        source_type="nodes",
+        created_at=2.0,
+        expand_hint="Expand for details about: parent",
+    ))
+
+    def fail_get_session_nodes(*_args, **_kwargs):
+        raise AssertionError("status should use aggregate DAG queries")
+
+    monkeypatch.setattr(engine._dag, "get_session_nodes", fail_get_session_nodes)
+
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert status["dag_nodes"] == 2
+    assert payload["dag"]["total_nodes"] == 2
+    assert payload["dag"]["total_tokens"] == 15
+    assert payload["dag"]["depths"] == {
+        "d0": {"count": 1, "tokens": 10, "source_tokens": 100},
+        "d1": {"count": 1, "tokens": 5, "source_tokens": 100},
+    }
+
+
+def test_lcm_describe_overview_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
+    for idx in range(25):
+        engine._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary=f"leaf {idx}",
+            token_count=idx + 1,
+            source_token_count=10,
+            source_ids=[idx + 1],
+            source_type="messages",
+            created_at=float(idx + 1),
+            expand_hint=f"Expand for details about: leaf {idx}",
+        ))
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=1,
+        summary="parent",
+        token_count=7,
+        source_token_count=250,
+        source_ids=[1, 2],
+        source_type="nodes",
+        created_at=30.0,
+        expand_hint="Expand for details about: parent",
+    ))
+
+    def fail_get_session_nodes(*_args, **_kwargs):
+        raise AssertionError("describe overview should use aggregate DAG queries")
+
+    monkeypatch.setattr(engine._dag, "get_session_nodes", fail_get_session_nodes)
+
+    overview = json.loads(lcm_tools.lcm_describe({}, engine=engine))
+
+    assert overview["depths"]["d0"]["count"] == 25
+    assert overview["depths"]["d0"]["total_tokens"] == sum(range(1, 26))
+    assert overview["depths"]["d0"]["total_source_tokens"] == 250
+    assert len(overview["depths"]["d0"]["nodes"]) == 20
+    assert overview["depths"]["d1"]["count"] == 1
+    assert overview["depths"]["d1"]["nodes"][0]["expand_hint"] == "Expand for details about: parent"
+
+
+def test_lcm_status_and_describe_count_more_than_default_node_page(engine):
+    node_count = 1005
+    for idx in range(node_count):
+        engine._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary=f"leaf {idx}",
+            token_count=1,
+            source_token_count=2,
+            source_ids=[idx + 1],
+            source_type="messages",
+            created_at=float(idx + 1),
+            expand_hint=f"Expand for details about: leaf {idx}",
+        ))
+
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+    overview = json.loads(lcm_tools.lcm_describe({}, engine=engine))
+
+    assert status["dag_nodes"] == node_count
+    assert payload["dag"]["total_nodes"] == node_count
+    assert payload["dag"]["depths"]["d0"] == {
+        "count": node_count,
+        "tokens": node_count,
+        "source_tokens": node_count * 2,
+    }
+    assert overview["depths"]["d0"]["count"] == node_count
+    assert overview["depths"]["d0"]["total_tokens"] == node_count
+    assert overview["depths"]["d0"]["total_source_tokens"] == node_count * 2
+    assert len(overview["depths"]["d0"]["nodes"]) == 20
+
+
+def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n"
+        "  context_threshold: 0.61\n"
+        "  fresh_tail_count: 999\n"
+        "compression:\n"
+        "  threshold: 0.92\n"
+        "auxiliary:\n"
+        "  compression:\n"
+        "    timeout: 42\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+    monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+    monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "17")
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_sources.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("source-session", platform="telegram", context_length=100000)
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["config"]["fresh_tail_count"] == 17
+    assert payload["config"]["context_threshold"] == 0.61
+    assert payload["config"]["summary_timeout_ms"] == 42000
+    assert payload["config_sources"]["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
+    assert payload["config_sources"]["context_threshold"] == "config_yaml:lcm.context_threshold"
+    assert payload["config_sources"]["summary_timeout_ms"] == "config_yaml:auxiliary.compression.timeout"
+    assert "fresh_tail_count" in payload["ignored_config_yaml_lcm_keys"]
+
+
+def test_lcm_status_does_not_report_invalid_env_as_effective_source(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("LCM_LEAF_CHUNK_TOKENS", "not-an-int")
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_invalid_source.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("invalid-source-session", platform="telegram", context_length=100000)
+
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert payload["config"]["leaf_chunk_tokens"] == 20000
+    assert payload["config_sources"]["leaf_chunk_tokens"] == "default"
+    assert any("LCM_LEAF_CHUNK_TOKENS" in warning for warning in payload["config_source_warnings"])
+
+
+def test_lcm_status_text_reports_config_source_for_context_threshold(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("compression:\n  threshold: 0.44\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_text_source.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("text-source-session", platform="telegram", context_length=100000)
+
+    result = handle_lcm_command("status", engine)
+
+    assert "context_threshold: 0.44" in result
+    assert "context_threshold_source: config_yaml:compression.threshold" in result
+
+
+def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n"
+        "  context_threshold: 0.52\n"
+        "  leaf_chunk_tokens: 12345\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_doctor_source.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("doctor-source-session", platform="telegram", context_length=100000)
+
+    payload = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    config_check = next(c for c in payload["checks"] if c["check"] == "config_validation")
+
+    assert payload["overall"] == "warnings"
+    assert config_check["status"] == "warn"
+    assert any("lcm.leaf_chunk_tokens" in warning for warning in config_check["detail"])
+
+
 def test_lcm_status_reports_last_compression_noop_reason(engine):
     engine._last_compression_status = "noop"
     engine._last_compression_noop_reason = "no eligible raw backlog outside fresh tail"

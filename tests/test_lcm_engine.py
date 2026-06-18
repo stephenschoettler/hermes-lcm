@@ -4025,6 +4025,33 @@ class TestEngineCompress:
         finally:
             esc._call_llm_for_summary = original_fn
 
+    def test_source_mapping_finds_rows_after_default_session_message_limit(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_long_source_lineage.db"))
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("long-session", platform="cli", context_length=200000)
+
+            historical_messages = [
+                {"role": "user", "content": f"already compacted message {idx}"}
+                for idx in range(10_000)
+            ]
+            uncompacted_messages = [
+                {"role": "assistant", "content": f"uncompacted message {idx}"}
+                for idx in range(3)
+            ]
+            inserted_ids = instance._store.append_batch(
+                "long-session",
+                historical_messages + uncompacted_messages,
+                [1] * (len(historical_messages) + len(uncompacted_messages)),
+            )
+            instance._last_compacted_store_id = inserted_ids[9_999]
+
+            mapped_ids = instance._get_store_ids_for_messages(uncompacted_messages)
+
+            assert mapped_ids == inserted_ids[10_000:]
+        finally:
+            instance.shutdown()
+
     def test_compress_leaf_node_tracks_source_window_from_message_timestamps(self, engine):
         messages = self._make_long_conversation(20)
         engine._ingest_messages(messages)

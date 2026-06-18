@@ -96,6 +96,9 @@ def _status_text(engine) -> str:
         **({"error": source_stats.get("error")} if source_stats.get("error") else {}),
     }
     protection = status.get("ingest_protection") or sensitive_pattern_status(engine._config)
+    config_sources = status.get("config_sources") or {}
+    config_source_warnings = status.get("config_source_warnings") or []
+    ignored_config_yaml_lcm_keys = status.get("ignored_config_yaml_lcm_keys") or []
 
     uninitialized = "(uninitialized)"
     unknown = "(unknown)"
@@ -132,6 +135,7 @@ def _status_text(engine) -> str:
         f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",
         f"context_length_source: {context_length_source}",
         f"context_threshold: {engine._config.context_threshold}",
+        f"context_threshold_source: {config_sources.get('context_threshold', 'manual_or_default')}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
         f"last_input_tokens: {status.get('last_input_tokens', 0)}",
@@ -191,6 +195,13 @@ def _status_text(engine) -> str:
     if "stateless_session_patterns_source" in status:
         lines.append(
             f"stateless_session_patterns_source: {status.get('stateless_session_patterns_source')}"
+        )
+    if config_source_warnings:
+        lines.append("config_source_warnings: " + "; ".join(config_source_warnings))
+    if ignored_config_yaml_lcm_keys:
+        lines.append(
+            "ignored_config_yaml_lcm_keys: "
+            + ", ".join(f"lcm.{key}" for key in ignored_config_yaml_lcm_keys)
         )
     if source_stats.get("error"):
         lines.append(f"source_lineage_error: {source_stats['error']}")

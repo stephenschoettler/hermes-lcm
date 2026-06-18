@@ -2446,6 +2446,9 @@ class LCMEngine(ContextEngine):
             "provider": self.provider,
             "context_length_source": self._context_length_source,
             "context_threshold": self._config.context_threshold,
+            "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
+            "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
+            "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
@@ -2490,7 +2493,7 @@ class LCMEngine(ContextEngine):
             status["rotate_backup_error"] = str(exc)
         if session_id:
             status["store_messages"] = self._store.get_session_count(session_id)
-            status["dag_nodes"] = len(self._dag.get_session_nodes(session_id))
+            status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
             status["session_ignored"] = self.current_session_ignored
             status["session_stateless"] = self.current_session_stateless
@@ -3409,10 +3412,23 @@ class LCMEngine(ContextEngine):
         content from older already-compacted history cannot hijack the mapping.
         Synthetic summary messages simply fail to match and are skipped.
         """
-        candidates = [
-            stored for stored in self._store.get_session_messages(self._session_id)
-            if stored["store_id"] > self._last_compacted_store_id
-        ]
+        candidates: list[Dict[str, Any]] = []
+        next_candidate_after = self._last_compacted_store_id
+        candidates_exhausted = False
+
+        def ensure_candidate_loaded(index: int) -> bool:
+            nonlocal next_candidate_after, candidates_exhausted
+            while index >= len(candidates) and not candidates_exhausted:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=next_candidate_after,
+                )
+                if not page:
+                    candidates_exhausted = True
+                    break
+                candidates.extend(page)
+                next_candidate_after = page[-1]["store_id"]
+            return index < len(candidates)
 
         ids: list[int] = []
         store_idx = 0
@@ -3420,7 +3436,7 @@ class LCMEngine(ContextEngine):
             message_identity = self._message_replay_identity(msg)
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = store_idx
-            while probe_idx < len(candidates):
+            while ensure_candidate_loaded(probe_idx):
                 stored = candidates[probe_idx]
                 stored_identity = self._message_replay_identity(stored, stored_row=True)
                 if stored_identity == message_identity:

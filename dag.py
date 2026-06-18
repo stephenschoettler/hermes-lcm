@@ -306,6 +306,66 @@ class SummaryDAG:
         ).fetchone()
         return row[0] if row else 0
 
+    def get_session_node_count(self, session_id: str) -> int:
+        """Count summary nodes for a session without loading node rows."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+    def get_session_depth_stats(self, session_id: str) -> Dict[int, Dict[str, int]]:
+        """Aggregate per-depth node/token stats for a session."""
+        rows = self._conn.execute(
+            """SELECT depth,
+                      COUNT(*) AS count,
+                      COALESCE(SUM(token_count), 0) AS tokens,
+                      COALESCE(SUM(source_token_count), 0) AS source_tokens
+               FROM summary_nodes
+               WHERE session_id = ?
+               GROUP BY depth
+               ORDER BY depth""",
+            (session_id,),
+        ).fetchall()
+        return {
+            int(row[0]): {
+                "count": int(row[1] or 0),
+                "tokens": int(row[2] or 0),
+                "source_tokens": int(row[3] or 0),
+            }
+            for row in rows
+        }
+
+    def get_session_depth_samples(
+        self,
+        session_id: str,
+        *,
+        per_depth_limit: int = 20,
+        depths: List[int] | None = None,
+    ) -> Dict[int, List[SummaryNode]]:
+        """Return a bounded ordered sample of nodes per depth."""
+        if per_depth_limit <= 0:
+            return {}
+        if depths is None:
+            depth_rows = self._conn.execute(
+                """SELECT DISTINCT depth FROM summary_nodes
+                   WHERE session_id = ?
+                   ORDER BY depth""",
+                (session_id,),
+            ).fetchall()
+            depths = [int(row[0]) for row in depth_rows]
+
+        samples: Dict[int, List[SummaryNode]] = {}
+        for depth in depths:
+            rows = self._conn.execute(
+                """SELECT * FROM summary_nodes
+                   WHERE session_id = ? AND depth = ?
+                   ORDER BY created_at LIMIT ?""",
+                (session_id, depth, per_depth_limit),
+            ).fetchall()
+            samples[int(depth)] = [self._row_to_node(row) for row in rows]
+        return samples
+
     def get_uncondensed_at_depth(self, session_id: str, depth: int,
                                   limit: int = 100) -> List[SummaryNode]:
         """Get nodes at a depth that haven't been condensed yet.
