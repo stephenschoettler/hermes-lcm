@@ -142,6 +142,12 @@ def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:
 
 
 def _build_l1_focus_brief(focus_topic: str) -> str:
+    """Build L1 focus guidance with explicit demote instructions for stale topics.
+
+    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44674)
+    which adds "demote old topics" to prevent iterative compaction from keeping
+    completed topics alive and overriding the current active topic (issue #9631).
+    """
     topic = _normalized_focus_topic(focus_topic)
     if not topic:
         return ""
@@ -150,11 +156,21 @@ def _build_l1_focus_brief(focus_topic: str) -> str:
         f"Primary focus: {topic}\n"
         "Preserve concrete decisions, constraints, files, commands, identifiers, and current state for this focus.\n"
         "Spend roughly 60-70% of the summary budget on the focus when relevant.\n"
-        "Do not discard unrelated blockers or active tasks just because they are off-focus.\n"
+        "\n"
+        "Demote old / completed topics:\n"
+        "If the summary contains tasks, questions, or remaining work that are no longer active in the latest turns,\n"
+        "mark them as historical reference only. Use a section heading like '## Historical Remaining Work' or\n"
+        "'## Completed Actions (for reference only)' and frame them as STALE context. The agent must NOT resume\n"
+        "stale tasks unless the latest user message explicitly asks for it. If the old topic has been fully resolved,\n"
+        "reduce it to a one-line bullet or omit it entirely.\n"
     )
 
 
 def _build_l2_focus_brief(focus_topic: str) -> str:
+    """Build L2 focus guidance with explicit demote instructions for stale topics.
+
+    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44674).
+    """
     topic = _normalized_focus_topic(focus_topic)
     if not topic:
         return ""
@@ -163,6 +179,10 @@ def _build_l2_focus_brief(focus_topic: str) -> str:
         f"Primary focus: {topic}\n"
         "Prefer bullets that preserve decisions, blockers, files, commands, identifiers, and current state for this focus.\n"
         "Keep other active tasks only when they are current blockers or handoff state.\n"
+        "\n"
+        "Demote old / completed topics:\n"
+        "Mark any non-current tasks as historical/STALE. The agent must not act on them unless explicitly requested\n"
+        "by the latest user message. Reduce resolved topics to one-liners or drop them.\n"
     )
 
 
