@@ -517,6 +517,90 @@ def _expand_child_nodes(
     )
 
 
+def _collect_descendant_evidence_blocks(
+    engine: "LCMEngine",
+    node,
+    max_tokens: int,
+    *,
+    hydrate_externalized_content: bool = False,
+    max_depth: int = 4,
+    visited_node_ids: set[int] | None = None,
+    source_path: list[dict[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    if max_tokens <= 0 or max_depth <= 0 or node.source_type != "nodes":
+        return []
+    if visited_node_ids is None:
+        visited_node_ids = set()
+    if source_path is None:
+        source_path = []
+    visited_node_ids.add(int(node.node_id))
+
+    blocks: list[dict[str, Any]] = []
+    budget_used = 0
+    for source_index, child_id in enumerate(node.source_ids):
+        if budget_used >= max_tokens:
+            break
+        child = engine._dag.get_node(child_id)
+        if child is None or child.session_id != engine.current_session_id:
+            continue
+        child_node_id = int(child.node_id)
+        if child_node_id in visited_node_ids:
+            continue
+        child_path = [*source_path, {"node_id": int(node.node_id), "source_index": source_index}]
+        remaining_tokens = max(0, max_tokens - budget_used)
+        if child.source_type == "messages":
+            messages, pagination = _expand_message_sources(
+                engine,
+                child,
+                max_tokens=remaining_tokens,
+                hydrate_externalized_content=hydrate_externalized_content,
+            )
+            if messages or pagination.get("has_more"):
+                block = {
+                    "type": "child_messages",
+                    "parent_node_id": node.node_id,
+                    "node_id": child.node_id,
+                    "depth": child.depth,
+                    "source_index": source_index,
+                    "source_path": child_path,
+                    "messages": messages,
+                    "pagination": pagination,
+                }
+                blocks.append(block)
+                budget_used += _context_content_token_count([block])
+            continue
+
+        if child.source_type == "nodes":
+            children, pagination = _expand_child_nodes(engine, child, max_tokens=remaining_tokens)
+            if children or pagination.get("has_more"):
+                block = {
+                    "type": "descendant_child_nodes",
+                    "parent_node_id": node.node_id,
+                    "node_id": child.node_id,
+                    "depth": child.depth,
+                    "source_index": source_index,
+                    "source_path": child_path,
+                    "children": children,
+                    "pagination": pagination,
+                }
+                blocks.append(block)
+                budget_used += _context_content_token_count([block])
+            if budget_used >= max_tokens:
+                break
+            nested = _collect_descendant_evidence_blocks(
+                engine,
+                child,
+                max_tokens=max(0, max_tokens - budget_used),
+                hydrate_externalized_content=hydrate_externalized_content,
+                max_depth=max_depth - 1,
+                visited_node_ids={*visited_node_ids, child_node_id},
+                source_path=child_path,
+            )
+            blocks.extend(nested)
+            budget_used += _context_content_token_count(nested)
+    return blocks
+
+
 def _collect_context_blocks_for_node(
     engine: "LCMEngine",
     node,
@@ -566,8 +650,104 @@ def _collect_context_blocks_for_node(
                     "pagination": pagination,
                 }
             )
+        used_tokens = _context_content_token_count(blocks)
+        descendant_tokens = max(0, max_tokens - used_tokens)
+        if descendant_tokens > 0:
+            blocks.extend(
+                _collect_descendant_evidence_blocks(
+                    engine,
+                    node,
+                    max_tokens=descendant_tokens,
+                    hydrate_externalized_content=hydrate_externalized_content,
+                )
+            )
 
     return blocks
+
+
+def _collect_raw_match_context_block(
+    engine: "LCMEngine",
+    rows: list[dict[str, Any]],
+    max_tokens: int,
+    *,
+    exclude_store_ids: set[int] | None = None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    from .tokens import count_tokens
+
+    exclude_store_ids = exclude_store_ids or set()
+    messages: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
+    budget_used = 0
+    has_more = False
+    next_store_id: int | None = None
+    for row in rows:
+        store_id = row.get("store_id")
+        if store_id in exclude_store_ids:
+            continue
+        remaining_tokens = max(0, max_tokens - budget_used)
+        if remaining_tokens <= 0:
+            has_more = True
+            next_store_id = store_id if isinstance(store_id, int) else None
+            break
+        content = str(row.get("content") or "")
+        content_slice = _slice_content_for_response(content, remaining_tokens)
+        content = content_slice["content"]
+        item = {
+            "store_id": store_id,
+            "session_id": row.get("session_id") or "",
+            "source": row.get("source") or "",
+            "role": row.get("role"),
+            "timestamp": row.get("timestamp", 0),
+            **content_slice,
+            "content_source": "raw_search_hit",
+            "snippet": row.get("snippet") or "",
+            "search_rank": row.get("search_rank"),
+        }
+        if row.get("tool_call_id"):
+            item["tool_call_id"] = row.get("tool_call_id")
+        if row.get("tool_calls"):
+            item["tool_calls"] = row.get("tool_calls")
+        if row.get("tool_name"):
+            item["tool_name"] = row.get("tool_name")
+        messages.append(item)
+        matches.append(
+            {
+                "store_id": store_id,
+                "role": row.get("role"),
+                "snippet": row.get("snippet") or content[:300],
+                "search_rank": row.get("search_rank"),
+            }
+        )
+        budget_used += count_tokens(content)
+        if content_slice["has_more"]:
+            has_more = True
+            break
+
+    if not messages and not has_more:
+        return None, matches
+    block = {
+        "type": "raw_messages",
+        "messages": messages,
+        "pagination": {
+            "has_more": has_more,
+            "returned_sources": len(messages),
+            "total_sources": len(rows),
+            "next_store_id": next_store_id,
+        },
+    }
+    return block, matches
+
+
+def _collect_store_ids_from_context_blocks(blocks: list[dict[str, Any]]) -> set[int]:
+    store_ids: set[int] = set()
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        for message in block.get("messages", []) or []:
+            store_id = message.get("store_id")
+            if isinstance(store_id, int):
+                store_ids.add(store_id)
+    return store_ids
 
 
 def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
@@ -577,11 +757,11 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
     for block in blocks:
         if block.get("type") == "summary":
             total += count_tokens(str(block.get("summary") or ""))
-        elif block.get("type") == "messages":
+        elif block.get("type") in {"messages", "child_messages", "raw_messages"}:
             for message in block.get("messages", []):
                 total += count_tokens(str(message.get("content") or ""))
                 total += count_tokens(str(message.get("transcript_content") or ""))
-        elif block.get("type") == "child_nodes":
+        elif block.get("type") in {"child_nodes", "descendant_child_nodes"}:
             total += sum(count_tokens(str(child.get("summary") or "")) for child in block.get("children", []))
     return total
 
@@ -1258,11 +1438,13 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     max_results, max_results_error = _parse_int_arg("max_results", 5)
     if max_results_error:
         return json.dumps({"error": max_results_error})
+    max_results = max(1, int(max_results or 5))
 
     query = str(args.get("query") or "").strip()
     raw_node_ids = args.get("node_ids") or []
 
     nodes = []
+    raw_results: list[dict[str, Any]] = []
     if raw_node_ids:
         for node_id in raw_node_ids:
             try:
@@ -1274,17 +1456,19 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
                 nodes.append(node)
     elif query:
         nodes = engine._dag.search(query, session_id=engine.current_session_id, limit=max_results)
+        raw_results = engine._store.search(query, session_id=engine.current_session_id, limit=max_results)
     else:
         return json.dumps({"error": "Provide either query or node_ids"})
 
-    if not nodes:
+    if not nodes and not raw_results:
         return json.dumps(
             {
                 "prompt": prompt,
                 "query": query,
-                "answer": "No matching summaries found in the current session.",
+                "answer": "No matching summaries or raw messages found in the current session.",
                 "node_ids": [],
                 "matches": [],
+                "raw_matches": [],
             }
         )
 
@@ -1300,6 +1484,20 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         )
         context_blocks.extend(node_blocks)
         context_budget_used += _context_content_token_count(node_blocks)
+
+    raw_matches: list[dict[str, Any]] = []
+    if raw_results:
+        seen_store_ids = _collect_store_ids_from_context_blocks(context_blocks)
+        remaining_context_tokens = max(0, context_max_tokens - context_budget_used)
+        raw_block, raw_matches = _collect_raw_match_context_block(
+            engine,
+            raw_results,
+            max_tokens=remaining_context_tokens,
+            exclude_store_ids=seen_store_ids,
+        )
+        if raw_block is not None:
+            context_blocks.append(raw_block)
+            context_budget_used += _context_content_token_count([raw_block])
 
     context_pagination = []
     for block in context_blocks:
@@ -1317,14 +1515,14 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             )
             continue
 
-        if block_type == "child_nodes":
+        if block_type in {"child_nodes", "descendant_child_nodes"}:
             for child in block.get("children", []):
                 if child.get("summary_truncated"):
                     child_node_id = child.get("node_id")
                     context_pagination.append(
                         {
                             "node_id": block.get("node_id"),
-                            "type": "child_summary",
+                            "type": "child_summary" if block_type == "child_nodes" else "descendant_child_summary",
                             "child_node_id": child_node_id,
                             "source_index": child.get("source_index"),
                             "summary_truncated": True,
@@ -1341,7 +1539,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "type": block_type,
             "pagination": pagination,
         }
-        if block_type == "messages":
+        if block_type in {"messages", "child_messages"}:
             truncated_message = next(
                 (message for message in block.get("messages", []) if message.get("content_truncated")),
                 None,
@@ -1371,7 +1569,22 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
                     "source_offset": pagination.get("next_source_offset") or 0,
                     "content_offset": pagination.get("next_content_offset") or 0,
                 }
-        elif block_type == "child_nodes":
+        elif block_type == "raw_messages":
+            truncated_message = next(
+                (message for message in block.get("messages", []) if message.get("content_truncated")),
+                None,
+            )
+            if truncated_message:
+                item["store_id"] = truncated_message.get("store_id")
+                item["content_source"] = truncated_message.get("content_source")
+                item["expand_args"] = {
+                    "store_id": truncated_message.get("store_id"),
+                    "content_offset": truncated_message.get("next_content_offset") or 0,
+                }
+            elif pagination.get("next_store_id"):
+                item["store_id"] = pagination.get("next_store_id")
+                item["expand_args"] = {"store_id": pagination.get("next_store_id")}
+        elif block_type in {"child_nodes", "descendant_child_nodes"}:
             item["expand_args"] = {
                 "node_id": block.get("node_id"),
                 "source_offset": pagination.get("next_source_offset") or 0,
@@ -1408,6 +1621,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "context_pagination": context_pagination,
             "node_ids": node_ids,
             "matches": matches,
+            "raw_matches": raw_matches,
         }
         if include_timeout:
             payload["timeout_seconds"] = timeout
@@ -1447,6 +1661,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "context_pagination": context_pagination,
             "node_ids": node_ids,
             "matches": matches,
+            "raw_matches": raw_matches,
         }
     )
 

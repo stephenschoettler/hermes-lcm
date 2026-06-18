@@ -278,8 +278,9 @@ LCM_EXPAND_QUERY = {
     "name": "lcm_expand_query",
     "description": (
         "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt, and either "
-        "query matching summaries to expand or explicit node_ids to inspect. Uses the expansion path "
+        "query matching summaries/raw messages to expand or explicit node_ids to inspect. Uses the expansion path "
         "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
+        "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
         "Prefer this for questions about the active conversation after compaction; for cross-session recall, use session_search first."
     ),
     "parameters": {

@@ -12233,6 +12233,145 @@ class TestEngineTools:
         assert second["expanded"][0]["content_offset"] == 1
         assert second["pagination"]["next_content_offset"] == 2
 
+    def test_handle_expand_query_recursively_descends_parent_nodes_to_leaf_messages(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "recursive answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "LEAF RAW SECRET zeta detail"},
+        )
+        leaf_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="leaf summary mentions broad topic only",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+        middle_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=1,
+                summary="middle summary points at leaf",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[leaf_id],
+                source_type="nodes",
+                created_at=2,
+            )
+        )
+        parent_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=2,
+                summary="parent summary points at middle",
+                token_count=10,
+                source_token_count=30,
+                source_ids=[middle_id],
+                source_type="nodes",
+                created_at=3,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What exact leaf detail is present?",
+                    "node_ids": [parent_id],
+                    "max_tokens": 20,
+                    "context_max_tokens": 1000,
+                },
+            )
+        )
+
+        assert result["answer"] == "recursive answer"
+        serialized_context = json.dumps(captured["context_blocks"])
+        assert "LEAF RAW SECRET zeta detail" in serialized_context
+        assert any(block.get("type") == "child_messages" for block in captured["context_blocks"])
+
+    def test_handle_expand_query_uses_raw_hits_when_summary_search_misses(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "raw bridge answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "PHOENIXRAWONLY appears only in the raw message"},
+        )
+        engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="summary deliberately omits the distinctive raw identifier",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What mentions PHOENIX?",
+                    "query": "PHOENIXRAWONLY",
+                    "max_tokens": 20,
+                    "context_max_tokens": 1000,
+                },
+            )
+        )
+
+        assert result["answer"] == "raw bridge answer"
+        assert result["raw_matches"]
+        serialized_context = json.dumps(captured["context_blocks"])
+        assert "PHOENIXRAWONLY appears only in the raw message" in serialized_context
+
+    def test_handle_expand_query_raw_hit_truncation_returns_store_expand_cursor(self, engine, monkeypatch):
+        import hermes_lcm.tokens as token_utils
+
+        def fake_count_tokens(text):
+            return 0 if not text else len(text) + 1
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            return "raw cursor answer"
+
+        monkeypatch.setattr(token_utils, "count_tokens", fake_count_tokens)
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "PHOENIXRAWCURSOR has a longer raw detail"},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What mentions PHOENIX?",
+                    "query": "PHOENIXRAWCURSOR",
+                    "max_tokens": 20,
+                    "context_max_tokens": 1,
+                },
+            )
+        )
+
+        raw_page = next(item for item in result["context_pagination"] if item["type"] == "raw_messages")
+        assert raw_page["expand_args"] == {"store_id": store_id, "content_offset": 1}
+
     def test_handle_expand_query_advances_content_cursor_when_context_budget_cannot_fit_character(self, engine, monkeypatch):
         import hermes_lcm.tokens as token_utils
 
