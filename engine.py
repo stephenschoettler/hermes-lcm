@@ -3380,7 +3380,7 @@ class LCMEngine(ContextEngine):
                 active_replay_messages[absolute_idx] = active_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store.append_batch(
+        self._store._append_protected_batch(
             self._session_id,
             protected_messages,
             estimates,

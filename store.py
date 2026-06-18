@@ -318,19 +318,36 @@ class MessageStore:
                      token_estimates: List[int] | None = None,
                      source: str = "") -> List[int]:
         """Persist multiple messages in one transaction. Returns store_ids."""
-        if token_estimates is None:
-            token_estimates = [0] * len(messages)
-
         protected_messages = protect_messages_for_ingest(
             messages,
             config=self._ingest_protection_config,
             hermes_home=self._hermes_home,
             session_id=session_id,
         )
+        return self._append_protected_batch(
+            session_id,
+            protected_messages,
+            token_estimates,
+            source=source,
+        )
+
+    def _append_protected_batch(self, session_id: str,
+                                messages: List[Dict[str, Any]],
+                                token_estimates: List[int] | None = None,
+                                source: str = "") -> List[int]:
+        """Persist messages that already passed ingest protection.
+
+        This is an internal fast path for callers that need the protected form
+        before storage, for example to update active replay with raw-payload
+        stubs. Direct callers should use ``append_batch`` so storage-boundary
+        payload protection cannot be bypassed accidentally.
+        """
+        if token_estimates is None:
+            token_estimates = [0] * len(messages)
 
         ids = []
         with self._write_lock, self._conn:
-            for msg, est in zip(protected_messages, token_estimates):
+            for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()

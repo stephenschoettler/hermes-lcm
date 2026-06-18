@@ -17,6 +17,7 @@ from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 import hermes_lcm.engine as lcm_engine_module
+import hermes_lcm.store as lcm_store_module
 from hermes_lcm.extraction import sanitize_pre_compaction_tool_arguments
 from hermes_lcm.externalize import (
     build_transcript_gc_placeholder,
@@ -103,6 +104,37 @@ def _expand_ref(engine: LCMEngine, ref: str) -> dict:
 
 def _externalized_files(tmp_path: Path) -> list[Path]:
     return sorted((tmp_path / "externalized").glob("*.json"))
+
+
+def test_engine_ingest_does_not_reprotect_messages_in_store(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+
+    def fail_if_store_protects_again(*_args, **_kwargs):
+        raise AssertionError("engine ingest already protected this batch")
+
+    monkeypatch.setattr(lcm_store_module, "protect_messages_for_ingest", fail_if_store_protects_again)
+
+    engine._ingest_messages([{"role": "user", "content": "hello"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert content == "hello"
+
+
+def test_store_append_batch_still_protects_direct_callers(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    calls = []
+
+    def mark_protected(messages, **_kwargs):
+        calls.append(len(messages))
+        return [dict(message, content="protected by store") for message in messages]
+
+    monkeypatch.setattr(lcm_store_module, "protect_messages_for_ingest", mark_protected)
+
+    ids = engine._store.append_batch("direct-session", [{"role": "user", "content": "raw"}], [1])
+
+    assert calls == [1]
+    stored = engine._store.get(ids[0])
+    assert stored["content"] == "protected by store"
 
 
 def test_sensitive_patterns_disabled_by_default_preserves_lossless_raw_text(tmp_path):
