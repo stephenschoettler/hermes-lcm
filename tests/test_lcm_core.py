@@ -3598,7 +3598,11 @@ class TestEscalation:
         assert "Focus brief:" in prompt
         assert "Primary focus: database migrations" in prompt
         assert "Preserve concrete decisions, constraints, files, commands, identifiers, and current state for this focus." in prompt
-        assert "Do not discard unrelated blockers or active tasks just because they are off-focus." in prompt
+        assert "Demote old / completed topics:" in prompt
+        assert "STALE context" in prompt
+        assert "must NOT resume" in prompt
+        assert "## Historical Task Snapshot" in prompt
+        assert "## Historical Remaining Work" in prompt
 
     def test_focus_topic_builds_structured_l2_brief(self):
         from hermes_lcm.escalation import _build_l2_prompt
