@@ -12299,6 +12299,100 @@ class TestEngineTools:
         assert "LEAF RAW SECRET zeta detail" in serialized_context
         assert any(block.get("type") == "child_messages" for block in captured["context_blocks"])
 
+    def test_handle_expand_query_deep_parent_reaches_leaf_messages(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "deep recursive answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "DEEP LEAF RAW SECRET omega detail"},
+        )
+        child_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="leaf summary",
+                token_count=5,
+                source_token_count=5,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+        for depth in range(1, 7):
+            child_id = engine._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=depth,
+                    summary=f"depth {depth} summary",
+                    token_count=5,
+                    source_token_count=5 * (depth + 1),
+                    source_ids=[child_id],
+                    source_type="nodes",
+                    created_at=depth + 1,
+                )
+            )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What exact deep leaf detail is present?",
+                    "node_ids": [child_id],
+                    "max_tokens": 20,
+                    "context_max_tokens": 1000,
+                },
+            )
+        )
+
+        serialized_context = json.dumps(captured["context_blocks"])
+        assert result["answer"] == "deep recursive answer"
+        assert "DEEP LEAF RAW SECRET omega detail" in serialized_context
+        assert sum(block.get("type") == "descendant_child_nodes" for block in captured["context_blocks"]) >= 5
+        assert any(block.get("type") == "child_messages" for block in captured["context_blocks"])
+
+    def test_expand_query_descendant_collection_handles_zero_token_deep_chain_without_recursion(self, engine):
+        store_id = engine._store.append(
+            "test-session",
+            {"role": "user", "content": "ZERO TOKEN DEEP LEAF evidence"},
+        )
+        child_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="",
+                token_count=0,
+                source_token_count=0,
+                source_ids=[store_id],
+                source_type="messages",
+                created_at=1,
+            )
+        )
+        for depth in range(1, 1105):
+            child_id = engine._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=depth,
+                    summary="",
+                    token_count=0,
+                    source_token_count=0,
+                    source_ids=[child_id],
+                    source_type="nodes",
+                    created_at=depth + 1,
+                )
+            )
+
+        root = engine._dag.get_node(child_id)
+        blocks = lcm_tools._collect_context_blocks_for_node(engine, root, max_tokens=32000)
+
+        serialized_context = json.dumps(blocks)
+        assert "ZERO TOKEN DEEP LEAF evidence" in serialized_context
+        assert any(block.get("type") == "child_messages" for block in blocks)
+
     def test_handle_expand_query_uses_raw_hits_when_summary_search_misses(self, engine, monkeypatch):
         captured = {}
 

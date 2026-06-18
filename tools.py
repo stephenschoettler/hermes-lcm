@@ -523,30 +523,48 @@ def _collect_descendant_evidence_blocks(
     max_tokens: int,
     *,
     hydrate_externalized_content: bool = False,
-    max_depth: int = 4,
     visited_node_ids: set[int] | None = None,
     source_path: list[dict[str, int]] | None = None,
+    remaining_node_visits: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    if max_tokens <= 0 or max_depth <= 0 or node.source_type != "nodes":
+    if max_tokens <= 0 or node.source_type != "nodes":
         return []
     if visited_node_ids is None:
         visited_node_ids = set()
     if source_path is None:
         source_path = []
-    visited_node_ids.add(int(node.node_id))
+    if remaining_node_visits is None:
+        # Budget and cycle detection are the primary limits. Keep a high,
+        # budget-scaled guard so corrupt zero-token DAGs cannot make expansion
+        # walk an unbounded number of nodes while normal deep summaries still
+        # reach their leaf evidence.
+        remaining_node_visits = [max(64, int(max_tokens) * 4)]
+    if remaining_node_visits[0] <= 0:
+        return []
 
     blocks: list[dict[str, Any]] = []
     budget_used = 0
-    for source_index, child_id in enumerate(node.source_ids):
-        if budget_used >= max_tokens:
-            break
+    root_node_id = int(node.node_id)
+    stack: list[tuple[Any, list[dict[str, int]], set[int], int]] = [
+        (node, source_path, {*visited_node_ids, root_node_id}, 0)
+    ]
+
+    while stack and budget_used < max_tokens and remaining_node_visits[0] > 0:
+        current, current_path, current_visited, source_index = stack.pop()
+        if source_index >= len(current.source_ids):
+            continue
+
+        stack.append((current, current_path, current_visited, source_index + 1))
+        child_id = current.source_ids[source_index]
         child = engine._dag.get_node(child_id)
         if child is None or child.session_id != engine.current_session_id:
             continue
         child_node_id = int(child.node_id)
-        if child_node_id in visited_node_ids:
+        if child_node_id in current_visited:
             continue
-        child_path = [*source_path, {"node_id": int(node.node_id), "source_index": source_index}]
+
+        remaining_node_visits[0] -= 1
+        child_path = [*current_path, {"node_id": int(current.node_id), "source_index": source_index}]
         remaining_tokens = max(0, max_tokens - budget_used)
         if child.source_type == "messages":
             messages, pagination = _expand_message_sources(
@@ -558,7 +576,7 @@ def _collect_descendant_evidence_blocks(
             if messages or pagination.get("has_more"):
                 block = {
                     "type": "child_messages",
-                    "parent_node_id": node.node_id,
+                    "parent_node_id": current.node_id,
                     "node_id": child.node_id,
                     "depth": child.depth,
                     "source_index": source_index,
@@ -575,7 +593,7 @@ def _collect_descendant_evidence_blocks(
             if children or pagination.get("has_more"):
                 block = {
                     "type": "descendant_child_nodes",
-                    "parent_node_id": node.node_id,
+                    "parent_node_id": current.node_id,
                     "node_id": child.node_id,
                     "depth": child.depth,
                     "source_index": source_index,
@@ -585,19 +603,8 @@ def _collect_descendant_evidence_blocks(
                 }
                 blocks.append(block)
                 budget_used += _context_content_token_count([block])
-            if budget_used >= max_tokens:
-                break
-            nested = _collect_descendant_evidence_blocks(
-                engine,
-                child,
-                max_tokens=max(0, max_tokens - budget_used),
-                hydrate_externalized_content=hydrate_externalized_content,
-                max_depth=max_depth - 1,
-                visited_node_ids={*visited_node_ids, child_node_id},
-                source_path=child_path,
-            )
-            blocks.extend(nested)
-            budget_used += _context_content_token_count(nested)
+            if budget_used < max_tokens and remaining_node_visits[0] > 0:
+                stack.append((child, child_path, {*current_visited, child_node_id}, 0))
     return blocks
 
 
