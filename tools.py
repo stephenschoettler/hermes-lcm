@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -218,6 +219,53 @@ def _slice_content_for_response(content: str, max_tokens: int, content_offset: i
         "next_content_offset": next_content_offset if has_more else 0,
         "has_more": has_more,
     }
+
+
+def _query_terms_for_match_window(query: str | None) -> list[str]:
+    if not query:
+        return []
+    terms: list[str] = []
+    normalized_query = " ".join(re.findall(r"\w+", query))
+    if normalized_query:
+        terms.append(normalized_query)
+
+    def add_term(term: str) -> None:
+        term = term.strip()
+        if not term:
+            return
+        terms.append(term)
+        parts = [part for part in re.split(r"[^\w]+", term) if part]
+        if len(parts) > 1:
+            terms.append(" ".join(parts))
+        terms.extend(part for part in parts if len(part) >= 2)
+
+    for quoted in re.findall(r'"([^"]+)"', query):
+        add_term(quoted)
+    for token in re.findall(r"[\w][\w:-]*\*?", query):
+        token = token.rstrip("*").strip()
+        if not token or token.upper() in {"AND", "OR", "NOT", "NEAR"}:
+            continue
+        if ":" in token:
+            token = token.rsplit(":", 1)[-1]
+        if len(token) >= 2:
+            add_term(token)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for term in sorted(terms, key=len, reverse=True):
+        key = term.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(term)
+    return unique
+
+
+def _content_offset_for_query_match(content: str, query: str | None) -> int:
+    folded = content.casefold()
+    for term in _query_terms_for_match_window(query):
+        index = folded.find(term.casefold())
+        if index >= 0:
+            return index
+    return 0
 
 
 def _full_content_slice(content: str, content_offset: int = 0) -> dict[str, Any]:
@@ -688,6 +736,7 @@ def _collect_raw_match_context_block(
     rows: list[dict[str, Any]],
     max_tokens: int,
     *,
+    query: str | None = None,
     exclude_store_ids: set[int] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     from .tokens import count_tokens
@@ -708,7 +757,8 @@ def _collect_raw_match_context_block(
             next_store_id = store_id if isinstance(store_id, int) else None
             break
         content = str(row.get("content") or "")
-        content_slice = _slice_content_for_response(content, remaining_tokens)
+        match_offset = _content_offset_for_query_match(content, query)
+        content_slice = _slice_content_for_response(content, remaining_tokens, content_offset=match_offset)
         content = content_slice["content"]
         item = {
             "store_id": store_id,
@@ -722,6 +772,8 @@ def _collect_raw_match_context_block(
         }
         if row.get("tool_call_id"):
             item["tool_call_id"] = row.get("tool_call_id")
+        if match_offset:
+            item["match_window_offset"] = match_offset
         if row.get("tool_calls"):
             item["tool_calls_omitted"] = True
         if row.get("tool_name"):
@@ -1522,6 +1574,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             engine,
             raw_results,
             max_tokens=remaining_context_tokens,
+            query=query,
             exclude_store_ids=seen_store_ids,
         )
         if raw_block is not None:

@@ -12593,6 +12593,100 @@ class TestEngineTools:
         assert raw_item["tool_call_id"] == "call_123"
         assert raw_item["tool_name"] == "expensive_tool"
 
+    def test_handle_expand_query_raw_hit_context_windows_around_match(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "raw tail answer"
+
+        content = "prefix-noise " * 80 + "TAILMATCH exact evidence"
+
+        def fake_store_search(query, session_id=None, limit=5):
+            return [
+                {
+                    "store_id": 789,
+                    "session_id": session_id or "test-session",
+                    "source": "telegram",
+                    "role": "user",
+                    "timestamp": 1,
+                    "content": content,
+                    "snippet": "TAILMATCH exact evidence",
+                    "search_rank": 1,
+                }
+            ]
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        monkeypatch.setattr(engine._store, "search", fake_store_search)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw detail?",
+                    "query": "TAILMATCH",
+                    "max_tokens": 20,
+                    "context_max_tokens": 6,
+                },
+            )
+        )
+
+        raw_block = next(block for block in captured["context_blocks"] if block["type"] == "raw_messages")
+        raw_item = raw_block["messages"][0]
+        assert result["answer"] == "raw tail answer"
+        assert "TAILMATCH" in raw_item["content"]
+        assert raw_item["content_offset"] == content.index("TAILMATCH")
+        assert raw_item["match_window_offset"] == content.index("TAILMATCH")
+        assert "prefix-noise" not in raw_item["content"]
+
+    def test_handle_expand_query_raw_hit_match_window_uses_sanitized_query_terms(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "raw sanitized answer"
+
+        content = "match unrelated prefix-noise " * 40 + "tail match exact evidence"
+
+        def fake_store_search(query, session_id=None, limit=5):
+            return [
+                {
+                    "store_id": 790,
+                    "session_id": session_id or "test-session",
+                    "source": "telegram",
+                    "role": "user",
+                    "timestamp": 1,
+                    "content": content,
+                    "snippet": "tail match exact evidence",
+                    "search_rank": 1,
+                }
+            ]
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        monkeypatch.setattr(engine._store, "search", fake_store_search)
+
+        for query in ["tail-match", "tail.match", "tail/match", "tail:match", "tail(match)"]:
+            captured.clear()
+            result = json.loads(
+                engine.handle_tool_call(
+                    "lcm_expand_query",
+                    {
+                        "prompt": "What raw detail?",
+                        "query": query,
+                        "max_tokens": 20,
+                        "context_max_tokens": 6,
+                    },
+                )
+            )
+
+            raw_block = next(block for block in captured["context_blocks"] if block["type"] == "raw_messages")
+            raw_item = raw_block["messages"][0]
+            assert result["answer"] == "raw sanitized answer"
+            assert "tail match" in raw_item["content"]
+            assert raw_item["content_offset"] == content.index("tail match")
+            assert raw_item["match_window_offset"] == content.index("tail match")
+            assert "match unrelated" not in raw_item["content"]
+
     def test_handle_expand_query_raw_hit_truncation_returns_store_expand_cursor(self, engine, monkeypatch):
         import hermes_lcm.tokens as token_utils
 
