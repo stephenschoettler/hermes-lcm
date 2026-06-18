@@ -2446,6 +2446,9 @@ class LCMEngine(ContextEngine):
             "provider": self.provider,
             "context_length_source": self._context_length_source,
             "context_threshold": self._config.context_threshold,
+            "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
+            "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
+            "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
         })
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id

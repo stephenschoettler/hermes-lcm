@@ -2,6 +2,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 try:
     import yaml
@@ -45,6 +46,36 @@ def _parse_bool_env(key: str, default: bool) -> bool:
     return default
 
 
+def _parse_int_env_with_source(
+    key: str,
+    default: int,
+    *,
+    default_source: str = "default",
+) -> tuple[int, str, str | None]:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default, default_source, None
+    try:
+        return int(raw), f"env:{key}", None
+    except (TypeError, ValueError):
+        return default, default_source, f"invalid env {key}={raw!r} ignored"
+
+
+def _parse_float_env_with_source(
+    key: str,
+    default: float,
+    *,
+    default_source: str = "default",
+) -> tuple[float, str, str | None]:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default, default_source, None
+    try:
+        return float(raw), f"env:{key}", None
+    except (TypeError, ValueError):
+        return default, default_source, f"invalid env {key}={raw!r} ignored"
+
+
 def _config_bool_disabled(value) -> bool:
     if isinstance(value, bool):
         return value is False
@@ -61,6 +92,71 @@ def _config_bool_disabled(value) -> bool:
     return False
 
 
+def _hermes_config_path() -> Path:
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    return home / "config.yaml"
+
+
+def _load_hermes_config_yaml() -> dict[str, Any]:
+    cfg_path = _hermes_config_path()
+    try:
+        text = cfg_path.read_text()
+    except Exception:
+        return {}
+    if yaml is not None:
+        try:
+            loaded = yaml.safe_load(text) or {}
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    root: dict[str, Any] = {}
+    stack: list[tuple[int, dict[str, Any]]] = [(-1, root)]
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip() or ":" not in line:
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        key, raw_value = line.strip().split(":", 1)
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        value = raw_value.strip()
+        if not value:
+            child: dict[str, Any] = {}
+            parent[key] = child
+            stack.append((indent, child))
+            continue
+        value = value.strip("'\"")
+        lowered = value.lower()
+        if lowered in {"true", "yes", "on"}:
+            parsed: Any = True
+        elif lowered in {"false", "no", "off"}:
+            parsed = False
+        else:
+            try:
+                parsed = float(value) if "." in value else int(value)
+            except ValueError:
+                parsed = value
+        parent[key] = parsed
+    return root
+
+
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+
+
+def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
+    if not isinstance(lcm_section, dict):
+        return []
+    return sorted(
+        str(key)
+        for key in lcm_section
+        if str(key) not in _SUPPORTED_LCM_CONFIG_YAML_KEYS
+    )
+
+
 def _hermes_compression_threshold(default: float) -> float:
     """Read lcm.context_threshold or Hermes compression.threshold from config.yaml.
 
@@ -73,66 +169,29 @@ def _hermes_compression_threshold(default: float) -> float:
     operators tune LCM compaction independently of the Hermes compression setting.
     Disabled Hermes compression should not leak its threshold into LCM.
     """
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    cfg_path = home / "config.yaml"
-    try:
-        text = cfg_path.read_text()
-        if yaml is not None:
-            cfg = yaml.safe_load(text) or {}
-            # lcm.context_threshold takes priority over compression.threshold
-            lcm_val = (cfg.get("lcm") or {}).get("context_threshold")
-            if lcm_val is not None:
-                return float(lcm_val)
-            compression = cfg.get("compression") or {}
-            if _config_bool_disabled(compression.get("enabled")):
-                return default
-            comp_val = compression.get("threshold")
-            if comp_val is not None:
-                return float(comp_val)
-            return default
+    value, _source = _hermes_compression_threshold_with_source(default)
+    return value
 
-        in_lcm = False
-        lcm_indent = None
-        in_compression = False
-        comp_indent = None
-        compression_disabled = False
-        threshold_value = None
-        for raw_line in text.splitlines():
-            line = raw_line.split("#", 1)[0].rstrip()
-            if not line.strip():
-                continue
-            if not line.startswith((" ", "\t")):
-                stripped = line.strip()
-                in_lcm = stripped == "lcm:"
-                in_compression = stripped == "compression:"
-                lcm_indent = None
-                comp_indent = None
-                continue
-            indent = len(line) - len(line.lstrip(" \t"))
-            if in_lcm:
-                if lcm_indent is None:
-                    lcm_indent = indent
-                if indent == lcm_indent and ":" in line:
-                    key, raw_value = line.strip().split(":", 1)
-                    if key == "context_threshold":
-                        return float(raw_value.strip().strip("'\""))
-                continue
-            if in_compression:
-                if comp_indent is None:
-                    comp_indent = indent
-                if indent != comp_indent or ":" not in line:
-                    continue
-                key, raw_value = line.strip().split(":", 1)
-                value = raw_value.strip().strip("'\"")
-                if key == "enabled" and _config_bool_disabled(value):
-                    compression_disabled = True
-                elif key == "threshold":
-                    threshold_value = value
-        if compression_disabled or threshold_value is None:
-            return default
-        return float(threshold_value)
+
+def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
+    cfg = _load_hermes_config_yaml()
+    try:
+        lcm_section = cfg.get("lcm") or {}
+        if isinstance(lcm_section, dict):
+            lcm_val = lcm_section.get("context_threshold")
+            if lcm_val is not None:
+                return float(lcm_val), "config_yaml:lcm.context_threshold"
+        compression = cfg.get("compression") or {}
+        if not isinstance(compression, dict):
+            return default, "default"
+        if _config_bool_disabled(compression.get("enabled")):
+            return default, "default"
+        comp_val = compression.get("threshold")
+        if comp_val is not None:
+            return float(comp_val), "config_yaml:compression.threshold"
     except Exception:
-        return default
+        return default, "default"
+    return default, "default"
 
 
 def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
@@ -143,59 +202,25 @@ def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
     calls from timing out earlier than the host compression route unless
     ``LCM_SUMMARY_TIMEOUT_MS`` is explicitly configured.
     """
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    cfg_path = home / "config.yaml"
-    try:
-        text = cfg_path.read_text()
-        if yaml is not None:
-            cfg = yaml.safe_load(text) or {}
-            auxiliary = cfg.get("auxiliary") or {}
-            compression = auxiliary.get("compression") or {}
-            value = compression.get("timeout")
-            if value is None:
-                return default
-            return int(float(value) * 1000)
+    value, _source = _hermes_auxiliary_compression_timeout_ms_with_source(default)
+    return value
 
-        in_auxiliary = False
-        in_compression = False
-        auxiliary_indent = None
-        compression_indent = None
-        for raw_line in text.splitlines():
-            line = raw_line.split("#", 1)[0].rstrip()
-            if not line.strip():
-                continue
-            indent = len(line) - len(line.lstrip(" \t"))
-            stripped = line.strip()
-            if indent == 0:
-                in_auxiliary = stripped == "auxiliary:"
-                in_compression = False
-                auxiliary_indent = None
-                compression_indent = None
-                continue
-            if not in_auxiliary:
-                continue
-            if auxiliary_indent is None:
-                auxiliary_indent = indent
-            if indent == auxiliary_indent:
-                if stripped == "compression:":
-                    in_compression = True
-                    compression_indent = None
-                    continue
-                in_compression = False
-                compression_indent = None
-                continue
-            if not in_compression:
-                continue
-            if compression_indent is None:
-                compression_indent = indent
-            if indent != compression_indent or ":" not in stripped:
-                continue
-            key, raw_value = stripped.split(":", 1)
-            if key == "timeout":
-                return int(float(raw_value.strip().strip("'\"")) * 1000)
-        return default
+
+def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[int, str]:
+    cfg = _load_hermes_config_yaml()
+    try:
+        auxiliary = cfg.get("auxiliary") or {}
+        if not isinstance(auxiliary, dict):
+            return default, "default"
+        compression = auxiliary.get("compression") or {}
+        if not isinstance(compression, dict):
+            return default, "default"
+        value = compression.get("timeout")
+        if value is None:
+            return default, "default"
+        return int(float(value) * 1000), "config_yaml:auxiliary.compression.timeout"
     except Exception:
-        return default
+        return default, "default"
 
 
 @dataclass
@@ -334,6 +359,13 @@ class LCMConfig:
     # environments that intentionally want immediate empty-row pruning.
     empty_lifecycle_gc_max_age_hours: float | None = 24.0
 
+    # -- Diagnostics ---
+    # Field-level provenance for values loaded through from_env(). Manual
+    # LCMConfig(...) instances leave this empty and status treats them as manual/default.
+    config_sources: dict[str, str] = field(default_factory=dict)
+    config_source_warnings: list[str] = field(default_factory=list)
+    ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
+
     @classmethod
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
@@ -341,13 +373,31 @@ class LCMConfig:
         _int = _parse_int_env
         _float = _parse_float_env
         _str = lambda key, default: os.environ.get(key, default)
+        config_sources: dict[str, str] = {}
+        config_source_warnings: list[str] = []
 
-        c.fresh_tail_count = _int("LCM_FRESH_TAIL_COUNT", c.fresh_tail_count)
-        c.leaf_chunk_tokens = _int("LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens)
-        c.context_threshold = _float(
-            "LCM_CONTEXT_THRESHOLD",
-            _hermes_compression_threshold(c.context_threshold),
+        def _record(field: str, source: str, warning: str | None = None) -> None:
+            config_sources[field] = source
+            if warning:
+                config_source_warnings.append(warning)
+
+        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+
+        c.fresh_tail_count, source, warning = _parse_int_env_with_source(
+            "LCM_FRESH_TAIL_COUNT", c.fresh_tail_count
         )
+        _record("fresh_tail_count", source, warning)
+        c.leaf_chunk_tokens, source, warning = _parse_int_env_with_source(
+            "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens
+        )
+        _record("leaf_chunk_tokens", source, warning)
+        context_default, context_source = _hermes_compression_threshold_with_source(c.context_threshold)
+        c.context_threshold, source, warning = _parse_float_env_with_source(
+            "LCM_CONTEXT_THRESHOLD",
+            context_default,
+            default_source=context_source,
+        )
+        _record("context_threshold", source, warning)
         c.incremental_max_depth = _int("LCM_INCREMENTAL_MAX_DEPTH", c.incremental_max_depth)
         c.condensation_fanin = _int("LCM_CONDENSATION_FANIN", c.condensation_fanin)
         c.dynamic_leaf_chunk_enabled = _parse_bool_env(
@@ -420,10 +470,15 @@ class LCMConfig:
         )
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
         c.expansion_context_tokens = _int("LCM_EXPANSION_CONTEXT_TOKENS", c.expansion_context_tokens)
-        c.summary_timeout_ms = _int(
-            "LCM_SUMMARY_TIMEOUT_MS",
-            _hermes_auxiliary_compression_timeout_ms(c.summary_timeout_ms),
+        summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
+            c.summary_timeout_ms
         )
+        c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
+            "LCM_SUMMARY_TIMEOUT_MS",
+            summary_timeout_default,
+            default_source=summary_timeout_source,
+        )
+        _record("summary_timeout_ms", source, warning)
         c.expansion_timeout_ms = _int("LCM_EXPANSION_TIMEOUT_MS", c.expansion_timeout_ms)
         c.database_path = _str("LCM_DATABASE_PATH", c.database_path)
         c.new_session_retain_depth = _int("LCM_NEW_SESSION_RETAIN_DEPTH", c.new_session_retain_depth)
@@ -462,4 +517,6 @@ class LCMConfig:
             c.ignore_message_patterns = _parse_pattern_list(raw_ignore_messages)
             c.ignore_message_patterns_source = "env"
 
+        c.config_sources = config_sources
+        c.config_source_warnings = config_source_warnings
         return c

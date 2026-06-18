@@ -1570,6 +1570,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     source_lineage = full_status.get("source_lineage")
     runtime_identity = full_status.get("runtime_identity")
     ingest_reconciliation = full_status.get("ingest_reconciliation")
+    config_sources = full_status.get("config_sources") or {}
+    config_source_warnings = full_status.get("config_source_warnings") or []
+    ignored_config_yaml_lcm_keys = full_status.get("ignored_config_yaml_lcm_keys") or []
 
     # Filter classification for the session lcm_status is reporting on.
     # The engine encapsulates the foreground vs bound divergence; this tool
@@ -1624,6 +1627,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_timeout_ms": engine._config.summary_timeout_ms,
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
+        "config_sources": config_sources,
+        "config_source_warnings": config_source_warnings,
+        "ignored_config_yaml_lcm_keys": ignored_config_yaml_lcm_keys,
         "session_filters": {
             "ignored": engine.current_session_ignored,
             "stateless": engine.current_session_stateless,
@@ -1870,6 +1876,12 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         config_warnings.append("condensation_fanin < 2 creates excessive depth growth")
     if c.incremental_max_depth == 0:
         config_warnings.append("incremental_max_depth=0 disables condensation entirely")
+    for warning in getattr(c, "config_source_warnings", []) or []:
+        config_warnings.append(warning)
+    for key in getattr(c, "ignored_config_yaml_lcm_keys", []) or []:
+        config_warnings.append(
+            f"config.yaml lcm.{key} is not a supported LCM config.yaml key and was ignored; use the matching LCM_* env var if this setting is intentional"
+        )
 
     checks.append({
         "check": "config_validation",
