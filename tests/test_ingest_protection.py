@@ -19,11 +19,13 @@ from hermes_lcm.engine import LCMEngine
 import hermes_lcm.engine as lcm_engine_module
 import hermes_lcm.store as lcm_store_module
 from hermes_lcm.extraction import sanitize_pre_compaction_tool_arguments
+import hermes_lcm.externalize as externalize_module
 from hermes_lcm.externalize import (
     build_transcript_gc_placeholder,
     externalize_ingest_payload,
     extract_externalized_ref,
     extract_externalized_refs,
+    reassign_externalized_payloads,
 )
 from hermes_lcm.ingest_protection import (
     extract_all_externalized_payload_refs,
@@ -451,6 +453,114 @@ def test_ingest_payload_placeholder_sanitizes_custom_kind_metadata_before_ref(tm
     assert refs == [result["path"].name]
     assert result["path"].name.startswith("20")
     assert "ref=kind-bogus" not in result["path"].name
+
+
+def test_externalized_payload_write_fsyncs_file_and_parent_directory(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    file_fsync_calls = []
+    fsynced_dirs = []
+
+    monkeypatch.setattr(externalize_module.os, "fsync", lambda fd: file_fsync_calls.append(fd))
+    monkeypatch.setattr(externalize_module, "_fsync_directory", lambda path: fsynced_dirs.append(Path(path)))
+
+    result = externalize_ingest_payload(
+        "durable ingest payload" * 20,
+        role="user",
+        session_id=engine.current_session_id,
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+
+    assert result is not None
+    assert result["path"].exists()
+    assert file_fsync_calls
+    assert result["path"].parent in fsynced_dirs
+
+
+def test_first_externalized_payload_fsyncs_new_storage_directory_parent(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    fsynced_dirs = []
+
+    monkeypatch.setattr(externalize_module, "_fsync_directory", lambda path: fsynced_dirs.append(Path(path)))
+
+    result = externalize_ingest_payload(
+        "first durable ingest payload" * 20,
+        role="user",
+        session_id=engine.current_session_id,
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+
+    assert result is not None
+    assert tmp_path in fsynced_dirs
+    assert tmp_path / "externalized" in fsynced_dirs
+
+
+def test_externalized_payload_fsync_failure_keeps_ingest_payload_inline(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+
+    def fail_fsync(_fd):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(externalize_module.os, "fsync", fail_fsync)
+
+    result = externalize_ingest_payload(
+        "payload should stay inline when durability fails" * 20,
+        role="user",
+        session_id=engine.current_session_id,
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+
+    assert result is None
+    assert _externalized_files(tmp_path) == []
+
+
+def test_ingest_keeps_original_content_when_externalized_payload_durability_fails(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+
+    def fail_fsync(_fd):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(externalize_module.os, "fsync", fail_fsync)
+
+    engine._ingest_messages([{"role": "user", "content": "see image " + DATA_URI}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert DATA_URI in content
+    assert extract_ingest_externalized_refs(content) == []
+    assert _externalized_files(tmp_path) == []
+
+
+def test_externalized_payload_reassignment_fsyncs_replacement(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    result = externalize_ingest_payload(
+        "payload moved across compression boundary" * 20,
+        role="user",
+        session_id="old-session",
+        field_path="content",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+    assert result is not None
+
+    fsync_calls = []
+    monkeypatch.setattr(externalize_module.os, "fsync", lambda fd: fsync_calls.append(fd))
+
+    moved = reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=engine._config,
+        hermes_home=str(tmp_path),
+    )
+
+    assert moved == 1
+    assert len(fsync_calls) >= 3
+    payload = json.loads(result["path"].read_text(encoding="utf-8"))
+    assert payload["session_id"] == "new-session"
 
 
 def test_ingest_externalizes_plain_data_uri_user_content_before_sqlite_write(tmp_path):

@@ -45,6 +45,29 @@ def _content_digest_prefix(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    dir_fd = os.open(path, flags)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _missing_directory_components(path: Path) -> list[Path]:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return list(reversed(missing))
+
+
 def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool) -> Path:
     configured = getattr(config, "large_output_externalization_path", "") or ""
     if configured:
@@ -70,7 +93,10 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
             except ValueError:
                 raise ValueError(f"Path {path} is not within allowed base {allowed_base}")
     if create:
+        missing_dirs = _missing_directory_components(path)
         path.mkdir(parents=True, exist_ok=True)
+        for created_dir in missing_dirs:
+            _fsync_directory(created_dir.parent)
         try:
             path.chmod(0o700)
         except OSError as exc:
@@ -78,13 +104,26 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
     return path
 
 
+def _unlink_partial_payload(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not remove partial LCM externalized payload %s: %s", path, exc)
+
+
 def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
     data = json.dumps(payload, ensure_ascii=False, indent=2)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(data)
             fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
+    except OSError:
+        _unlink_partial_payload(path)
+        raise
     finally:
         if fd >= 0:
             os.close(fd)
@@ -211,6 +250,7 @@ def reassign_externalized_payloads(
         try:
             _write_externalized_payload(tmp_path, payload)
             tmp_path.replace(path)
+            _fsync_directory(path.parent)
         except OSError as exc:
             logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
             try:
