@@ -3412,10 +3412,23 @@ class LCMEngine(ContextEngine):
         content from older already-compacted history cannot hijack the mapping.
         Synthetic summary messages simply fail to match and are skipped.
         """
-        candidates = [
-            stored for stored in self._store.get_session_messages(self._session_id)
-            if stored["store_id"] > self._last_compacted_store_id
-        ]
+        candidates: list[Dict[str, Any]] = []
+        next_candidate_after = self._last_compacted_store_id
+        candidates_exhausted = False
+
+        def ensure_candidate_loaded(index: int) -> bool:
+            nonlocal next_candidate_after, candidates_exhausted
+            while index >= len(candidates) and not candidates_exhausted:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=next_candidate_after,
+                )
+                if not page:
+                    candidates_exhausted = True
+                    break
+                candidates.extend(page)
+                next_candidate_after = page[-1]["store_id"]
+            return index < len(candidates)
 
         ids: list[int] = []
         store_idx = 0
@@ -3423,7 +3436,7 @@ class LCMEngine(ContextEngine):
             message_identity = self._message_replay_identity(msg)
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = store_idx
-            while probe_idx < len(candidates):
+            while ensure_candidate_loaded(probe_idx):
                 stored = candidates[probe_idx]
                 stored_identity = self._message_replay_identity(stored, stored_row=True)
                 if stored_identity == message_identity:
