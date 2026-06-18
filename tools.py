@@ -517,6 +517,17 @@ def _expand_child_nodes(
     )
 
 
+def _bounded_source_path_payload(source_path: list[dict[str, int]]) -> dict[str, Any]:
+    path_tail = source_path[-8:]
+    payload: dict[str, Any] = {
+        "source_path": path_tail,
+        "source_path_depth": len(source_path),
+    }
+    if len(path_tail) < len(source_path):
+        payload["source_path_truncated"] = True
+    return payload
+
+
 def _collect_descendant_evidence_blocks(
     engine: "LCMEngine",
     node,
@@ -580,7 +591,7 @@ def _collect_descendant_evidence_blocks(
                     "node_id": child.node_id,
                     "depth": child.depth,
                     "source_index": source_index,
-                    "source_path": child_path,
+                    **_bounded_source_path_payload(child_path),
                     "messages": messages,
                     "pagination": pagination,
                 }
@@ -597,7 +608,7 @@ def _collect_descendant_evidence_blocks(
                     "node_id": child.node_id,
                     "depth": child.depth,
                     "source_index": source_index,
-                    "source_path": child_path,
+                    **_bounded_source_path_payload(child_path),
                     "children": children,
                     "pagination": pagination,
                 }
@@ -712,7 +723,7 @@ def _collect_raw_match_context_block(
         if row.get("tool_call_id"):
             item["tool_call_id"] = row.get("tool_call_id")
         if row.get("tool_calls"):
-            item["tool_calls"] = row.get("tool_calls")
+            item["tool_calls_omitted"] = True
         if row.get("tool_name"):
             item["tool_name"] = row.get("tool_name")
         messages.append(item)
@@ -763,7 +774,19 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
     for block in blocks:
         if block.get("type") == "summary":
             total += count_tokens(str(block.get("summary") or ""))
-        elif block.get("type") in {"messages", "child_messages", "raw_messages"}:
+        if "source_path" in block:
+            total += count_tokens(
+                json.dumps(
+                    {
+                        "source_path": block.get("source_path") or [],
+                        "source_path_depth": block.get("source_path_depth"),
+                        "source_path_truncated": block.get("source_path_truncated", False),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        if block.get("type") in {"messages", "child_messages", "raw_messages"}:
             for message in block.get("messages", []):
                 total += count_tokens(str(message.get("content") or ""))
                 total += count_tokens(str(message.get("transcript_content") or ""))

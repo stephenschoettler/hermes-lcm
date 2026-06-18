@@ -12390,8 +12390,14 @@ class TestEngineTools:
         blocks = lcm_tools._collect_context_blocks_for_node(engine, root, max_tokens=32000)
 
         serialized_context = json.dumps(blocks)
-        assert "ZERO TOKEN DEEP LEAF evidence" in serialized_context
-        assert any(block.get("type") == "child_messages" for block in blocks)
+        assert "ZERO TOKEN DEEP LEAF evidence" not in serialized_context
+        assert len(blocks) < 1105
+        assert lcm_tools._context_content_token_count(blocks) <= 33000
+        path_blocks = [block for block in blocks if "source_path" in block]
+        assert path_blocks
+        assert max(len(block["source_path"]) for block in path_blocks) <= 8
+        assert any(block.get("source_path_truncated") is True for block in path_blocks)
+        assert any(block.get("source_path_depth", 0) > len(block["source_path"]) for block in path_blocks)
 
     def test_handle_expand_query_uses_raw_hits_when_summary_search_misses(self, engine, monkeypatch):
         captured = {}
@@ -12538,6 +12544,54 @@ class TestEngineTools:
         assert "DEDUPED RAW SNIPPET SHOULD NOT LEAK" not in serialized_context
         assert not any(block.get("type") == "raw_messages" for block in captured["context_blocks"])
         assert result["raw_matches"] == []
+
+    def test_handle_expand_query_keeps_raw_tool_calls_out_of_synthesis_context(self, engine, monkeypatch):
+        captured = {}
+
+        def fake_synthesize(*, prompt, context_blocks, model, max_tokens, timeout):
+            captured["context_blocks"] = context_blocks
+            return "raw tool call answer"
+
+        def fake_store_search(query, session_id=None, limit=5):
+            return [
+                {
+                    "store_id": 456,
+                    "session_id": session_id or "test-session",
+                    "source": "telegram",
+                    "role": "assistant",
+                    "timestamp": 1,
+                    "content": "A",
+                    "tool_calls": [{"function": {"arguments": "UNBUDGETED TOOL ARGUMENT LEAK" * 20}}],
+                    "tool_call_id": "call_123",
+                    "tool_name": "expensive_tool",
+                    "search_rank": 1,
+                }
+            ]
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        monkeypatch.setattr(engine._store, "search", fake_store_search)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {
+                    "prompt": "What raw detail?",
+                    "query": "anything",
+                    "max_tokens": 20,
+                    "context_max_tokens": 1,
+                },
+            )
+        )
+
+        serialized_context = json.dumps(captured["context_blocks"])
+        raw_block = next(block for block in captured["context_blocks"] if block["type"] == "raw_messages")
+        raw_item = raw_block["messages"][0]
+        assert result["answer"] == "raw tool call answer"
+        assert "UNBUDGETED TOOL ARGUMENT LEAK" not in serialized_context
+        assert "tool_calls" not in raw_item
+        assert raw_item["tool_calls_omitted"] is True
+        assert raw_item["tool_call_id"] == "call_123"
+        assert raw_item["tool_name"] == "expensive_tool"
 
     def test_handle_expand_query_raw_hit_truncation_returns_store_expand_cursor(self, engine, monkeypatch):
         import hermes_lcm.tokens as token_utils
