@@ -2493,7 +2493,7 @@ class LCMEngine(ContextEngine):
             status["rotate_backup_error"] = str(exc)
         if session_id:
             status["store_messages"] = self._store.get_session_count(session_id)
-            status["dag_nodes"] = len(self._dag.get_session_nodes(session_id))
+            status["dag_nodes"] = self._dag.get_session_node_count(session_id)
             status["session_platform"] = self.current_session_platform
             status["session_ignored"] = self.current_session_ignored
             status["session_stateless"] = self.current_session_stateless

@@ -98,6 +98,119 @@ def test_lcm_status_json_reports_runtime_context_indicators(engine):
     assert payload["threshold_tokens"] == int(200000 * engine._config.context_threshold)
 
 
+def test_lcm_status_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=0,
+        summary="leaf",
+        token_count=10,
+        source_token_count=100,
+        source_ids=[1],
+        source_type="messages",
+        created_at=1.0,
+        expand_hint="Expand for details about: leaf",
+    ))
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=1,
+        summary="parent",
+        token_count=5,
+        source_token_count=100,
+        source_ids=[1],
+        source_type="nodes",
+        created_at=2.0,
+        expand_hint="Expand for details about: parent",
+    ))
+
+    def fail_get_session_nodes(*_args, **_kwargs):
+        raise AssertionError("status should use aggregate DAG queries")
+
+    monkeypatch.setattr(engine._dag, "get_session_nodes", fail_get_session_nodes)
+
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert status["dag_nodes"] == 2
+    assert payload["dag"]["total_nodes"] == 2
+    assert payload["dag"]["total_tokens"] == 15
+    assert payload["dag"]["depths"] == {
+        "d0": {"count": 1, "tokens": 10, "source_tokens": 100},
+        "d1": {"count": 1, "tokens": 5, "source_tokens": 100},
+    }
+
+
+def test_lcm_describe_overview_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
+    for idx in range(25):
+        engine._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary=f"leaf {idx}",
+            token_count=idx + 1,
+            source_token_count=10,
+            source_ids=[idx + 1],
+            source_type="messages",
+            created_at=float(idx + 1),
+            expand_hint=f"Expand for details about: leaf {idx}",
+        ))
+    engine._dag.add_node(SummaryNode(
+        session_id="test-session",
+        depth=1,
+        summary="parent",
+        token_count=7,
+        source_token_count=250,
+        source_ids=[1, 2],
+        source_type="nodes",
+        created_at=30.0,
+        expand_hint="Expand for details about: parent",
+    ))
+
+    def fail_get_session_nodes(*_args, **_kwargs):
+        raise AssertionError("describe overview should use aggregate DAG queries")
+
+    monkeypatch.setattr(engine._dag, "get_session_nodes", fail_get_session_nodes)
+
+    overview = json.loads(lcm_tools.lcm_describe({}, engine=engine))
+
+    assert overview["depths"]["d0"]["count"] == 25
+    assert overview["depths"]["d0"]["total_tokens"] == sum(range(1, 26))
+    assert overview["depths"]["d0"]["total_source_tokens"] == 250
+    assert len(overview["depths"]["d0"]["nodes"]) == 20
+    assert overview["depths"]["d1"]["count"] == 1
+    assert overview["depths"]["d1"]["nodes"][0]["expand_hint"] == "Expand for details about: parent"
+
+
+def test_lcm_status_and_describe_count_more_than_default_node_page(engine):
+    node_count = 1005
+    for idx in range(node_count):
+        engine._dag.add_node(SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary=f"leaf {idx}",
+            token_count=1,
+            source_token_count=2,
+            source_ids=[idx + 1],
+            source_type="messages",
+            created_at=float(idx + 1),
+            expand_hint=f"Expand for details about: leaf {idx}",
+        ))
+
+    status = engine.get_status()
+    payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+    overview = json.loads(lcm_tools.lcm_describe({}, engine=engine))
+
+    assert status["dag_nodes"] == node_count
+    assert payload["dag"]["total_nodes"] == node_count
+    assert payload["dag"]["depths"]["d0"] == {
+        "count": node_count,
+        "tokens": node_count,
+        "source_tokens": node_count * 2,
+    }
+    assert overview["depths"]["d0"]["count"] == node_count
+    assert overview["depths"]["d0"]["total_tokens"] == node_count
+    assert overview["depths"]["d0"]["total_source_tokens"] == node_count * 2
+    assert len(overview["depths"]["d0"]["nodes"]) == 20
+
+
 def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir()

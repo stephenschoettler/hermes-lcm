@@ -1007,26 +1007,31 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
         info = engine._dag.describe_subtree(node_id)
         return json.dumps(info)
 
-    all_nodes = engine._dag.get_session_nodes(session_id)
+    depth_stats = engine._dag.get_session_depth_stats(session_id)
+    depth_samples = engine._dag.get_session_depth_samples(
+        session_id,
+        per_depth_limit=20,
+        depths=list(depth_stats),
+    )
     overview = {
         "session_id": session_id,
         "store_message_count": engine._store.get_session_count(session_id),
         "depths": {},
     }
 
-    for depth in sorted({node.depth for node in all_nodes}):
-        nodes = [node for node in all_nodes if node.depth == depth]
+    for depth, stats in sorted(depth_stats.items()):
+        nodes = depth_samples.get(depth, [])
         overview["depths"][f"d{depth}"] = {
-            "count": len(nodes),
-            "total_tokens": sum(node.token_count for node in nodes),
-            "total_source_tokens": sum(node.source_token_count for node in nodes),
+            "count": stats["count"],
+            "total_tokens": stats["tokens"],
+            "total_source_tokens": stats["source_tokens"],
             "nodes": [
                 {
                     "node_id": node.node_id,
                     "token_count": node.token_count,
                     "expand_hint": node.expand_hint,
                 }
-                for node in nodes[:20]
+                for node in nodes
             ],
         }
 
@@ -1553,16 +1558,11 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     store_tokens = engine._store.get_session_token_total(session_id)
 
     # DAG stats by depth
-    all_nodes = engine._dag.get_session_nodes(session_id)
-    depths: dict[int, dict] = {}
-    for node in all_nodes:
-        d = depths.setdefault(node.depth, {"count": 0, "tokens": 0, "source_tokens": 0})
-        d["count"] += 1
-        d["tokens"] += node.token_count
-        d["source_tokens"] += node.source_token_count
+    depths = engine._dag.get_session_depth_stats(session_id)
 
     total_dag_tokens = sum(d["tokens"] for d in depths.values())
     total_source_tokens = sum(d["source_tokens"] for d in depths.values())
+    total_dag_nodes = sum(d["count"] for d in depths.values())
     compression_ratio = round(total_source_tokens / total_dag_tokens, 1) if total_dag_tokens > 0 else 0
     full_status = engine.get_status()
     lifecycle = full_status.get("lifecycle")
@@ -1603,7 +1603,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "estimated_tokens": store_tokens,
         },
         "dag": {
-            "total_nodes": len(all_nodes),
+            "total_nodes": total_dag_nodes,
             "total_tokens": total_dag_tokens,
             "compression_ratio": f"{compression_ratio}:1",
             "depths": {
