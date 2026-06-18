@@ -141,6 +141,22 @@ def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:
     return normalized[: max(0, max_chars - 1)].rstrip() + "…"
 
 
+# Historical section headings — mirror upstream hermes-agent constants so that
+# the summariser can use them as structural anchors for demoting stale content.
+# When a summary section carries one of these headings, the agent treats its
+# contents as reference-only and will NOT resume that work unless the latest
+# user message explicitly requests it.
+# (hermes-agent issue #9631 / PR #44674 — iterative compaction kept completed
+#  topics alive because no structural demote signal existed.)
+_HISTORICAL_HEADING_MARKERS = frozenset((
+    "## Historical Task Snapshot",
+    "## Historical In-Progress State",
+    "## Historical Pending User Asks",
+    "## Historical Remaining Work",
+    "## Completed Actions (historical)",
+))
+
+
 def _build_l1_focus_brief(focus_topic: str) -> str:
     """Build L1 focus guidance with explicit demote instructions for stale topics.
 
@@ -151,19 +167,19 @@ def _build_l1_focus_brief(focus_topic: str) -> str:
     topic = _normalized_focus_topic(focus_topic)
     if not topic:
         return ""
+    markers = " / ".join(f"'{m}'" for m in _HISTORICAL_HEADING_MARKERS)
     return (
         "Focus brief:\n"
         f"Primary focus: {topic}\n"
         "Preserve concrete decisions, constraints, files, commands, identifiers, and current state for this focus.\n"
-        "Spend roughly 60-70% of the summary budget on the focus when relevant.\n"
+        "Spend roughly 60-70% of the summary token budget on the focus when relevant.\n"
         "\n"
         "Demote old / completed topics:\n"
         "If the summary contains tasks, questions, or remaining work that are no longer active in the latest turns,\n"
-        "mark them as historical reference only. Use a section heading like '## Historical Remaining Work' or\n"
-        "'## Completed Actions (for reference only)' and frame them as STALE context. The agent must NOT resume\n"
-        "stale tasks unless the latest user message explicitly asks for it. If the old topic has been fully resolved,\n"
-        "reduce it to a one-line bullet or omit it entirely.\n"
-    )
+        "mark them under one of these historical headings: {markers}.\n"
+        "Frame them as STALE context — the agent must NOT resume that work unless the latest user message\n"
+        "explicitly asks for it. If fully resolved, reduce to a one-line bullet or omit.\n"
+    ).format(markers=markers)
 
 
 def _build_l2_focus_brief(focus_topic: str) -> str:
@@ -174,6 +190,7 @@ def _build_l2_focus_brief(focus_topic: str) -> str:
     topic = _normalized_focus_topic(focus_topic)
     if not topic:
         return ""
+    markers = " / ".join(f"'{m}'" for m in _HISTORICAL_HEADING_MARKERS)
     return (
         "Focus brief:\n"
         f"Primary focus: {topic}\n"
@@ -181,9 +198,10 @@ def _build_l2_focus_brief(focus_topic: str) -> str:
         "Keep other active tasks only when they are current blockers or handoff state.\n"
         "\n"
         "Demote old / completed topics:\n"
-        "Mark any non-current tasks as historical/STALE. The agent must not act on them unless explicitly requested\n"
-        "by the latest user message. Reduce resolved topics to one-liners or drop them.\n"
-    )
+        "Place non-current work under: {markers}.\n"
+        "These sections are STALE — the agent must not act on them unless the latest user message explicitly\n"
+        "requests it. Reduce resolved topics to one-liners or drop.\n"
+    ).format(markers=markers)
 
 
 def _summary_model_chain(primary_model: str = "", fallback_models: list[str] | tuple[str, ...] | None = None) -> list[str]:
