@@ -3603,6 +3603,9 @@ class TestEscalation:
         assert "must NOT resume" in prompt
         assert "## Historical Task Snapshot" in prompt
         assert "## Historical Remaining Work" in prompt
+        # Blocker / handoff exception
+        assert "Exception: active blockers or handoff state should NOT be demoted" in prompt
+        assert "Keep blockers and pending handoffs outside historical headings" in prompt
 
     def test_focus_topic_builds_structured_l2_brief(self):
         from hermes_lcm.escalation import _build_l2_prompt
@@ -3614,6 +3617,10 @@ class TestEscalation:
         assert "Primary focus: release blockers" in prompt
         assert "Prefer bullets that preserve decisions, blockers, files, commands, identifiers, and current state for this focus." in prompt
         assert "Keep other active tasks only when they are current blockers or handoff state." in prompt
+        # Demote + blocker exception
+        assert "Demote old / completed topics:" in prompt
+        assert "Exception: active blockers and pending handoff state should NOT be demoted" in prompt
+        assert "Keep them outside historical headings so the agent retains awareness" in prompt
 
     def test_focus_topic_is_normalized_and_bounded_in_prompts(self):
         from hermes_lcm.escalation import _build_l1_prompt

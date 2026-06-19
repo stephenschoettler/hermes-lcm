@@ -142,10 +142,12 @@ def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:
 
 
 # Historical section headings — mirror upstream hermes-agent constants so that
-# the summariser can use them as structural anchors for demoting stale content.
-# When a summary section carries one of these headings, the agent treats its
-# contents as reference-only and will NOT resume that work unless the latest
-# user message explicitly requests it.
+# the summariser has consistent structural anchors for grouping stale content.
+# These headings act as summariser guidance, not an enforced active-context
+# contract: _assemble_context() passes node.summary through as ordinary content,
+# so headings influence LLM attention rather than being hard reference-only
+# markers.  The practical effect is that LLMs naturally down-weight content
+# under "Historical" headings, but no code path enforces the boundary.
 # (hermes-agent issue #9631 / PR #44674 — iterative compaction kept completed
 #  topics alive because no structural demote signal existed.)
 _HISTORICAL_HEADING_MARKERS = frozenset((
@@ -179,6 +181,8 @@ def _build_l1_focus_brief(focus_topic: str) -> str:
         "mark them under one of these historical headings: {markers}.\n"
         "Frame them as STALE context — the agent must NOT resume that work unless the latest user message\n"
         "explicitly asks for it. If fully resolved, reduce to a one-line bullet or omit.\n"
+        "Exception: active blockers or handoff state should NOT be demoted even if they are absent from the\n"
+        "latest turns. Keep blockers and pending handoffs outside historical headings so the agent can still act on them.\n"
     ).format(markers=markers)
 
 
@@ -201,6 +205,8 @@ def _build_l2_focus_brief(focus_topic: str) -> str:
         "Place non-current work under: {markers}.\n"
         "These sections are STALE — the agent must not act on them unless the latest user message explicitly\n"
         "requests it. Reduce resolved topics to one-liners or drop.\n"
+        "Exception: active blockers and pending handoff state should NOT be demoted even when absent from recent\n"
+        "turns. Keep them outside historical headings so the agent retains awareness of unresolved constraints.\n"
     ).format(markers=markers)
 
 
