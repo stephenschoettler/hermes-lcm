@@ -33,7 +33,6 @@ from .externalize import (
     find_externalized_payload_for_message,
     load_externalized_payload,
     maybe_externalize_tool_output,
-    reassign_externalized_payloads,
 )
 from .extraction import (
     extract_before_compaction,
@@ -2056,21 +2055,17 @@ class LCMEngine(ContextEngine):
                 source_session_id,
                 frontier_store_id=frontier,
             )
-            moved_messages = self._store.reassign_session_messages(source_session_id, session_id)
+            # Compression rollover carries derived context forward, but raw
+            # messages remain owned by the session that produced them. Moving
+            # raw rows here makes session-scoped transcript recovery report the
+            # old/child session as missing even though its payload was only
+            # reassigned to the next compression segment.
             moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
-            moved_payloads = reassign_externalized_payloads(
-                source_session_id,
-                session_id,
-                config=self._config,
-                hermes_home=self._hermes_home,
-            )
             logger.debug(
-                "LCM compression boundary continued %s -> %s: moved %d messages, %d DAG nodes, %d externalized payloads",
+                "LCM compression boundary continued %s -> %s: carried %d DAG nodes; preserved raw message ownership",
                 source_session_id,
                 session_id,
-                moved_messages,
                 moved_nodes,
-                moved_payloads,
             )
         elif old_session_id:
             logger.warning(

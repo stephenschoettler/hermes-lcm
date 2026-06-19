@@ -5280,8 +5280,8 @@ class TestSessionRollover:
         assert moved == 1
         assert engine._session_id == "compress-rollover-new"
         assert engine._conversation_id == old_conversation_id
-        assert engine._store.get_session_count("compress-rollover-old") == 0
-        assert engine._store.get_session_count("compress-rollover-new") == 1
+        assert engine._store.get_session_count("compress-rollover-old") == 1
+        assert engine._store.get_session_count("compress-rollover-new") == 0
         assert engine._dag.get_session_nodes("compress-rollover-old") == []
         new_nodes = engine._dag.get_session_nodes("compress-rollover-new")
         assert [node.node_id for node in new_nodes] == [node_id]
@@ -5534,7 +5534,8 @@ class TestSessionRollover:
 
         assert engine._session_id == "foreground-continuation"
         assert engine._conversation_id == foreground_conversation_id
-        assert engine._store.get_session_count("foreground-continuation") == 1
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("foreground-continuation") == 0
         assert engine._dag.get_session_nodes("foreground-session") == []
         assert [
             node.node_id for node in engine._dag.get_session_nodes("foreground-continuation")
@@ -6237,7 +6238,8 @@ class TestSessionRollover:
         assert engine._session_id == "reused-continuation"
         assert engine._conversation_id == conversation_id
         assert engine._thread_context_session_id() == ""
-        assert engine._store.get_session_count("reused-continuation") == 1
+        assert engine._store.get_session_count("reused-session") == 1
+        assert engine._store.get_session_count("reused-continuation") == 0
         assert engine._dag.get_session_nodes("reused-session") == []
         assert [
             node.node_id for node in engine._dag.get_session_nodes("reused-continuation")
@@ -6615,7 +6617,8 @@ class TestSessionRollover:
         ]
         engine.on_session_end("background-review-session", background_messages)
 
-        assert engine._store.get_session_count("foreground-continuation") == 2
+        assert engine._store.get_session_count("foreground-session") == 1
+        assert engine._store.get_session_count("foreground-continuation") == 1
         assert engine._store.get_session_count("background-review-session") == 0
         assert not engine._thread_context_has_auxiliary_session("background-review-session")
 
@@ -7535,15 +7538,15 @@ class TestSessionRollover:
         assert engine.last_total_tokens == 1050
         assert engine._last_compacted_store_id == store_id
         assert engine._ingest_cursor == 2
-        assert engine._store.get_session_count("old-session") == 0
-        assert engine._store.get_session_count("new-session") == 1
+        assert engine._store.get_session_count("old-session") == 1
+        assert engine._store.get_session_count("new-session") == 0
         assert engine._dag.get_session_nodes("old-session") == []
         new_nodes = engine._dag.get_session_nodes("new-session")
         assert len(new_nodes) == 1
         assert new_nodes[0].summary == "pre-rollover summary"
 
         status = engine.get_status()
-        assert status["store_messages"] == 1
+        assert status["store_messages"] == 0
         assert status["dag_nodes"] == 1
         assert status["compression_count"] == 1
         assert status["lifecycle"]["current_session_id"] == "new-session"
@@ -7611,8 +7614,8 @@ class TestSessionRollover:
         assert engine.last_total_tokens == 1050
         assert engine._last_compacted_store_id == source_store_id
         assert engine._ingest_cursor == 2
-        assert engine._store.get_session_count("lcm-source") == 0
-        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("lcm-source") == 1
+        assert engine._store.get_session_count("new-hermes-session") == 0
         assert engine._store.get_session_count("old-hermes-session") == 1
         assert engine._dag.get_session_nodes("lcm-source") == []
         new_nodes = engine._dag.get_session_nodes("new-hermes-session")
@@ -7624,7 +7627,7 @@ class TestSessionRollover:
         assert stale_host_node.session_id == "old-hermes-session"
 
         status = engine.get_status()
-        assert status["store_messages"] == 1
+        assert status["store_messages"] == 0
         assert status["dag_nodes"] == 1
         assert status["compression_count"] == 2
         expanded = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": source_node_id}))
@@ -7701,8 +7704,8 @@ class TestSessionRollover:
 
         assert engine._session_id == "new-hermes-session"
         assert engine._conversation_id == "shared-conversation"
-        assert engine._store.get_session_count("lcm-source") == 0
-        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("lcm-source") == 1
+        assert engine._store.get_session_count("new-hermes-session") == 0
         assert engine._store.get_session_count("old-hermes-session") == 1
         assert engine._dag.get_session_nodes("lcm-source") == []
         new_nodes = engine._dag.get_session_nodes("new-hermes-session")
@@ -7784,8 +7787,8 @@ class TestSessionRollover:
         assert engine.last_total_tokens == 1050
         assert engine._last_compacted_store_id == source_store_id
         assert engine._ingest_cursor == 2
-        assert engine._store.get_session_count("lcm-source") == 0
-        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("lcm-source") == 1
+        assert engine._store.get_session_count("new-hermes-session") == 0
         assert engine._store.get_session_count("old-hermes-session") == 1
         assert engine._dag.get_session_nodes("lcm-source") == []
         new_nodes = engine._dag.get_session_nodes("new-hermes-session")
@@ -7955,8 +7958,8 @@ class TestSessionRollover:
         assert engine.compression_count == 3
         assert engine._last_compacted_store_id == source_store_id
         assert engine._ingest_cursor == 2
-        assert engine._store.get_session_count("lcm-source") == 0
-        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("lcm-source") == 1
+        assert engine._store.get_session_count("new-hermes-session") == 0
         assert engine._store.get_session_count("old-hermes-session") == 1
         assert engine._dag.get_session_nodes("lcm-source") == []
         new_nodes = engine._dag.get_session_nodes("new-hermes-session")
@@ -8191,8 +8194,8 @@ class TestSessionRollover:
         # Fallback activated — nodes transferred, source conv wins
         assert engine._conversation_id == "conversation-x"
         assert engine.compression_count == 3
-        assert engine._store.get_session_count("lcm-source") == 0
-        assert engine._store.get_session_count("new-hermes-session") == 1
+        assert engine._store.get_session_count("lcm-source") == 1
+        assert engine._store.get_session_count("new-hermes-session") == 0
         assert engine._dag.get_session_nodes("lcm-source") == []
         new_nodes = engine._dag.get_session_nodes("new-hermes-session")
         assert len(new_nodes) == 1
@@ -8335,8 +8338,8 @@ class TestSessionRollover:
 
         assert engine._session_id == "foreground-new"
         assert engine._conversation_id == "foreground-conversation"
-        assert engine._store.get_session_count("foreground-old") == 0
-        assert engine._store.get_session_count("foreground-new") == 1
+        assert engine._store.get_session_count("foreground-old") == 1
+        assert engine._store.get_session_count("foreground-new") == 0
         assert engine._dag.get_session_nodes("foreground-old") == []
         new_nodes = engine._dag.get_session_nodes("foreground-new")
         assert [node.node_id for node in new_nodes] == [node_id]
@@ -8424,8 +8427,8 @@ class TestSessionRollover:
         assert lifecycle.current_frontier_store_id == fg_store_id
         assert lifecycle.last_finalized_frontier_store_id == fg_store_id
         assert engine._last_compacted_store_id == fg_store_id
-        assert engine._store.get_session_count("foreground-old") == 0
-        assert engine._store.get_session_count("foreground-new") == 1
+        assert engine._store.get_session_count("foreground-old") == 1
+        assert engine._store.get_session_count("foreground-new") == 0
         assert engine._store.get_session_count("aux-old") == 1
         assert engine._dag.get_session_nodes("foreground-old") == []
         new_nodes = engine._dag.get_session_nodes("foreground-new")
@@ -8500,8 +8503,8 @@ class TestSessionRollover:
         assert lifecycle.last_finalized_session_id == "foreground-active"
         assert lifecycle.current_frontier_store_id == fg_store_id
         assert lifecycle.last_finalized_frontier_store_id == fg_store_id
-        assert engine._store.get_session_count("foreground-active") == 0
-        assert engine._store.get_session_count("foreground-new") == 1
+        assert engine._store.get_session_count("foreground-active") == 1
+        assert engine._store.get_session_count("foreground-new") == 0
         assert engine._dag.get_session_nodes("foreground-active") == []
         new_nodes = engine._dag.get_session_nodes("foreground-new")
         assert [node.node_id for node in new_nodes] == [fg_node_id]
@@ -8537,7 +8540,7 @@ class TestSessionRollover:
         assert engine._last_compacted_store_id == 0
         assert engine._ingest_cursor == 0
 
-    def test_compression_boundary_reassigns_externalized_payload_session_metadata(self, tmp_path):
+    def test_compression_boundary_preserves_externalized_payload_session_metadata(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_compression_externalized.db"),
             large_output_externalization_enabled=True,
@@ -8581,9 +8584,9 @@ class TestSessionRollover:
             context_length=200000,
         )
 
-        assert json.loads(payload_file.read_text())["session_id"] == "new-session"
+        assert json.loads(payload_file.read_text())["session_id"] == "old-session"
         result = json.loads(engine.handle_tool_call("lcm_expand", {"node_id": node_id}))
-        assert result["expanded"][0]["externalized"]["session_id"] == "new-session"
+        assert result["expanded"][0]["externalized"]["session_id"] == "old-session"
         assert result["expanded"][0]["externalized"]["tool_call_id"] == "call_big"
 
     def test_rollover_session_records_durable_lifecycle_state_idempotently(self, engine):
