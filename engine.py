@@ -84,7 +84,7 @@ _SESSION_END_BUSY_TIMEOUT_MS = 50
 
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
 # real user turns so that summarization can prioritise current user intent.
-# Mirrors Hermes upstream fix/compression-auto-focus-topic (#44674 branch).
+# Mirrors Hermes upstream fix/compression-auto-focus-topic (#44687 branch).
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700

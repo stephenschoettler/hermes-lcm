@@ -148,21 +148,21 @@ def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:
 # so headings influence LLM attention rather than being hard reference-only
 # markers.  The practical effect is that LLMs naturally down-weight content
 # under "Historical" headings, but no code path enforces the boundary.
-# (hermes-agent issue #9631 / PR #44674 — iterative compaction kept completed
+# (hermes-agent issue #9631 / PR #44687 — iterative compaction kept completed
 #  topics alive because no structural demote signal existed.)
-_HISTORICAL_HEADING_MARKERS = frozenset((
+_HISTORICAL_HEADING_MARKERS = (
     "## Historical Task Snapshot",
     "## Historical In-Progress State",
     "## Historical Pending User Asks",
     "## Historical Remaining Work",
     "## Completed Actions (historical)",
-))
+)
 
 
 def _build_l1_focus_brief(focus_topic: str) -> str:
     """Build L1 focus guidance with explicit demote instructions for stale topics.
 
-    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44674)
+    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44687)
     which adds "demote old topics" to prevent iterative compaction from keeping
     completed topics alive and overriding the current active topic (issue #9631).
     """
@@ -189,7 +189,7 @@ def _build_l1_focus_brief(focus_topic: str) -> str:
 def _build_l2_focus_brief(focus_topic: str) -> str:
     """Build L2 focus guidance with explicit demote instructions for stale topics.
 
-    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44674).
+    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44687).
     """
     topic = _normalized_focus_topic(focus_topic)
     if not topic:
