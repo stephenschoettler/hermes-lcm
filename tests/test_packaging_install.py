@@ -1,5 +1,6 @@
 from pathlib import Path
 import importlib.util
+import logging
 import subprocess
 import sys
 
@@ -53,11 +54,14 @@ def test_standalone_install_scripts_exist_and_are_shell_scripts():
 
     install_script = repo_root / "scripts" / "install.sh"
     update_script = repo_root / "scripts" / "update.sh"
+    validate_script = repo_root / "scripts" / "validate_release.sh"
 
     assert install_script.exists(), "scripts/install.sh should exist"
     assert update_script.exists(), "scripts/update.sh should exist"
+    assert validate_script.exists(), "scripts/validate_release.sh should exist"
     assert install_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
     assert update_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
+    assert validate_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
 
 
 def test_plugin_manifest_lists_all_registered_tools():
@@ -221,6 +225,34 @@ def test_plugin_entrypoint_skips_registered_lcm_tools_without_message_forwarding
     assert ctx.engine is not None
     assert registered == {}
     assert EXPECTED_LCM_TOOLS.issubset({schema["name"] for schema in ctx.engine.get_tool_schemas()})
+
+
+def test_capability_false_host_log_describes_expected_path_b_fallback(caplog):
+    module = _load_plugin_entrypoint_module("hermes_lcm_packaging_expected_path_b_fallback")
+    registered = []
+
+    class _HermesAgentV016LikeCtx:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_tool(self, name, toolset, schema, handler, description="", emoji=""):
+            registered.append(name)
+
+    ctx = _HermesAgentV016LikeCtx()
+    caplog.set_level(logging.INFO)
+
+    module.register(ctx)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert ctx.engine is not None
+    assert registered == []
+    assert EXPECTED_LCM_TOOLS.issubset({schema["name"] for schema in ctx.engine.get_tool_schemas()})
+    assert "LCM tools are available through context-engine schemas" in messages
+    assert "expected Path B fallback" in messages
+    assert "tool registration skipped because" not in messages
 
 
 def test_register_gracefully_degrades_when_host_lacks_register_tool():

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import builtins
+import importlib
 import importlib.util
 import json
 import sys
@@ -18,6 +20,49 @@ def _load_benchmark_cli():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _block_agent_imports(monkeypatch):
+    for name in list(sys.modules):
+        if name == "agent" or name.startswith("agent.") or name == "hermes_lcm" or name.startswith("hermes_lcm."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    real_import = builtins.__import__
+    real_import_module = importlib.import_module
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and (name == "agent" or name.startswith("agent.")) and name not in sys.modules:
+            missing = "agent.context_engine" if name.startswith("agent.") else "agent"
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return real_import(name, globals, locals, fromlist, level)
+
+    def blocked_import_module(name, package=None):
+        if name == "agent.context_engine" and name not in sys.modules:
+            raise ModuleNotFoundError("No module named 'agent.context_engine'", name=name)
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    monkeypatch.setattr(importlib, "import_module", blocked_import_module)
+
+
+def test_cli_synthetic_fixture_runs_without_hermes_agent_importable(tmp_path, monkeypatch):
+    cli = _load_benchmark_cli()
+    _block_agent_imports(monkeypatch)
+
+    result = cli.main([
+        "--synthetic-fixture",
+        "standalone_probe:2:1:3",
+        "--policy",
+        "benchmarks/policies/pressure_smoke.yaml",
+        "--output",
+        str(tmp_path),
+        "--allow-external-output",
+        "--json",
+    ])
+
+    assert result == 0
+    assert (tmp_path / "summary.json").exists()
+    assert not hasattr(sys.modules["agent.context_engine"], "__file__")
 
 
 def test_cli_accepts_synthetic_fixture_specs(tmp_path):

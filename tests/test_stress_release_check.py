@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import builtins
 import hashlib
+import importlib
 import importlib.util
 import json
 import os
@@ -23,6 +25,29 @@ def _load_stress_cli():
     return module
 
 
+def _block_agent_imports(monkeypatch):
+    for name in list(sys.modules):
+        if name == "agent" or name.startswith("agent.") or name == "hermes_lcm" or name.startswith("hermes_lcm."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+    real_import = builtins.__import__
+    real_import_module = importlib.import_module
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level == 0 and (name == "agent" or name.startswith("agent.")) and name not in sys.modules:
+            missing = "agent.context_engine" if name.startswith("agent.") else "agent"
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return real_import(name, globals, locals, fromlist, level)
+
+    def blocked_import_module(name, package=None):
+        if name == "agent.context_engine" and name not in sys.modules:
+            raise ModuleNotFoundError("No module named 'agent.context_engine'", name=name)
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    monkeypatch.setattr(importlib, "import_module", blocked_import_module)
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -36,6 +61,22 @@ def _canonical_results_hash(results: dict) -> str:
 
 def _assert_path_under(path_value: str, root: Path) -> None:
     assert Path(path_value).resolve().is_relative_to(root.resolve())
+
+
+def test_stress_cli_query_fuzz_runs_without_hermes_agent_importable(tmp_path, monkeypatch):
+    cli = _load_stress_cli()
+    _block_agent_imports(monkeypatch)
+
+    assert cli.main([
+        "--output",
+        str(tmp_path / "stress-standalone"),
+        "--tier",
+        "smoke",
+        "--scenario",
+        "query_fuzz_no_crash",
+        "--json",
+    ]) == 0
+    assert not hasattr(sys.modules["agent.context_engine"], "__file__")
 
 
 def test_stress_cli_refuses_non_empty_output_directory(tmp_path):

@@ -14,6 +14,7 @@ Depth semantics:
 import json
 import logging
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -155,6 +156,7 @@ class SummaryDAG:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
+        self._db_lock = threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -207,28 +209,29 @@ class SummaryDAG:
 
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
-        cur = self._conn.execute(
-            """INSERT INTO summary_nodes
-               (session_id, depth, summary, token_count, source_token_count,
-                source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                node.session_id,
-                node.depth,
-                node.summary,
-                node.token_count,
-                node.source_token_count,
-                json.dumps(node.source_ids),
-                node.source_type,
-                node.created_at or time.time(),
-                node.earliest_at,
-                node.latest_at,
-                node.expand_hint,
-            ),
-        )
-        self._conn.commit()
-        node.node_id = cur.lastrowid
-        return node.node_id
+        with self._db_lock:
+            cur = self._conn.execute(
+                """INSERT INTO summary_nodes
+                   (session_id, depth, summary, token_count, source_token_count,
+                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    node.session_id,
+                    node.depth,
+                    node.summary,
+                    node.token_count,
+                    node.source_token_count,
+                    json.dumps(node.source_ids),
+                    node.source_type,
+                    node.created_at or time.time(),
+                    node.earliest_at,
+                    node.latest_at,
+                    node.expand_hint,
+                ),
+            )
+            self._conn.commit()
+            node.node_id = cur.lastrowid
+            return node.node_id
 
     def delete_below_depth(self, session_id: str, min_depth: int) -> int:
         """Delete all nodes for a session with depth < min_depth.
@@ -281,29 +284,31 @@ class SummaryDAG:
                           depth: int | None = None,
                           limit: int = 1000) -> List[SummaryNode]:
         """Get nodes for a session, optionally filtered by depth."""
-        if depth is not None:
-            rows = self._conn.execute(
-                """SELECT * FROM summary_nodes
-                   WHERE session_id = ? AND depth = ?
-                   ORDER BY created_at LIMIT ?""",
-                (session_id, depth, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """SELECT * FROM summary_nodes
-                   WHERE session_id = ?
-                   ORDER BY depth, created_at LIMIT ?""",
-                (session_id, limit),
-            ).fetchall()
+        with self._db_lock:
+            if depth is not None:
+                rows = self._conn.execute(
+                    """SELECT * FROM summary_nodes
+                       WHERE session_id = ? AND depth = ?
+                       ORDER BY created_at LIMIT ?""",
+                    (session_id, depth, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """SELECT * FROM summary_nodes
+                       WHERE session_id = ?
+                       ORDER BY depth, created_at LIMIT ?""",
+                    (session_id, limit),
+                ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
     def count_at_depth(self, session_id: str, depth: int) -> int:
         """Count nodes at a specific depth for a session."""
-        row = self._conn.execute(
-            """SELECT COUNT(*) FROM summary_nodes
-               WHERE session_id = ? AND depth = ?""",
-            (session_id, depth),
-        ).fetchone()
+        with self._db_lock:
+            row = self._conn.execute(
+                """SELECT COUNT(*) FROM summary_nodes
+                   WHERE session_id = ? AND depth = ?""",
+                (session_id, depth),
+            ).fetchone()
         return row[0] if row else 0
 
     def get_session_node_count(self, session_id: str) -> int:
@@ -373,17 +378,18 @@ class SummaryDAG:
         A node is 'uncondensed' if it's not referenced as a source by
         any higher-depth node.
         """
-        rows = self._conn.execute(
-            """SELECT n.* FROM summary_nodes n
-               WHERE n.session_id = ? AND n.depth = ?
-               AND n.node_id NOT IN (
-                   SELECT json_each.value FROM summary_nodes p,
-                   json_each(p.source_ids)
-                   WHERE p.session_id = ? AND p.depth > ? AND p.source_type = 'nodes'
-               )
-               ORDER BY n.created_at LIMIT ?""",
-            (session_id, depth, session_id, depth, limit),
-        ).fetchall()
+        with self._db_lock:
+            rows = self._conn.execute(
+                """SELECT n.* FROM summary_nodes n
+                   WHERE n.session_id = ? AND n.depth = ?
+                   AND n.node_id NOT IN (
+                       SELECT json_each.value FROM summary_nodes p,
+                       json_each(p.source_ids)
+                       WHERE p.session_id = ? AND p.depth > ? AND p.source_type = 'nodes'
+                   )
+                   ORDER BY n.created_at LIMIT ?""",
+                (session_id, depth, session_id, depth, limit),
+            ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
     # -- Search -------------------------------------------------------------
@@ -418,22 +424,23 @@ class SummaryDAG:
         source_match_cache: dict[int, bool] = {}
         while True:
             try:
-                if session_id is not None:
-                    rows = self._conn.execute(
-                        f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
-                           JOIN summary_nodes n ON n.node_id = fts.rowid
-                           WHERE nodes_fts MATCH ? AND n.session_id = ?
-                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (safe_query, session_id, fetch_limit, offset),
-                    ).fetchall()
-                else:
-                    rows = self._conn.execute(
-                        f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
-                           JOIN summary_nodes n ON n.node_id = fts.rowid
-                           WHERE nodes_fts MATCH ?
-                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                        (safe_query, fetch_limit, offset),
-                    ).fetchall()
+                with self._db_lock:
+                    if session_id is not None:
+                        rows = self._conn.execute(
+                            f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
+                               JOIN summary_nodes n ON n.node_id = fts.rowid
+                               WHERE nodes_fts MATCH ? AND n.session_id = ?
+                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                            (safe_query, session_id, fetch_limit, offset),
+                        ).fetchall()
+                    else:
+                        rows = self._conn.execute(
+                            f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
+                               JOIN summary_nodes n ON n.node_id = fts.rowid
+                               WHERE nodes_fts MATCH ?
+                               ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                            (safe_query, fetch_limit, offset),
+                        ).fetchall()
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS node search failed, falling back to LIKE: %s", exc)
@@ -503,12 +510,13 @@ class SummaryDAG:
         nodes: list[SummaryNode] = []
         source_match_cache: dict[int, bool] = {}
         while True:
-            rows = self._conn.execute(
-                f"""SELECT * FROM summary_nodes
-                    WHERE {' AND '.join(where)}
-                    LIMIT ? OFFSET ?""",
-                [*base_args, fetch_limit, offset],
-            ).fetchall()
+            with self._db_lock:
+                rows = self._conn.execute(
+                    f"""SELECT * FROM summary_nodes
+                        WHERE {' AND '.join(where)}
+                        LIMIT ? OFFSET ?""",
+                    [*base_args, fetch_limit, offset],
+                ).fetchall()
             scanned_rows += len(rows)
             for row in rows:
                 node = self._row_to_node(row)
@@ -600,14 +608,15 @@ class SummaryDAG:
         if not node_ids:
             return None, None
         placeholders = ",".join("?" * len(node_ids))
-        row = self._conn.execute(
-            f"""SELECT
-                    MIN(COALESCE(earliest_at, created_at)),
-                    MAX(COALESCE(latest_at, created_at))
-                FROM summary_nodes
-                WHERE node_id IN ({placeholders})""",
-            node_ids,
-        ).fetchone()
+        with self._db_lock:
+            row = self._conn.execute(
+                f"""SELECT
+                        MIN(COALESCE(earliest_at, created_at)),
+                        MAX(COALESCE(latest_at, created_at))
+                    FROM summary_nodes
+                    WHERE node_id IN ({placeholders})""",
+                node_ids,
+            ).fetchone()
         if not row:
             return None, None
         return row[0], row[1]

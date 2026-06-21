@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 
+DOCTOR_ACTION_SAFE_IGNORE = "safe/ignore"
+DOCTOR_ACTION_INSPECT = "inspect"
+DOCTOR_ACTION_BACKUP_FIRST_CLEANUP = "backup-first cleanup"
+
+
 def state_db_path_for_engine(engine: Any) -> Path:
     """Return the Hermes state database path for an LCM engine.
 
@@ -53,6 +58,106 @@ def has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
         )
         or (bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error")))
     )
+
+
+def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
+    """Return operator triage guidance for one lcm_doctor check.
+
+    Guidance is deliberately conservative: most warning classes are inspect-only
+    evidence, and any mutation path is framed as preview/backup/apply rather than
+    implied automatic cleanup.
+    """
+    status = str(check.get("status") or "")
+    if status not in {"warn", "fail"}:
+        return None
+
+    name = str(check.get("check") or "unknown")
+    detail = check.get("detail")
+    action = DOCTOR_ACTION_INSPECT
+    command = "inspect the reported detail and confirm the active HERMES_HOME/LCM_DATABASE_PATH"
+    warning_only = False
+    rationale = "operator review required before changing persisted LCM state"
+
+    if name == "database_integrity":
+        command = "stop and inspect the SQLite database path; restore from backup if integrity_check is not ok"
+    elif name == "schema_core_tables":
+        command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before repair or restore"
+    elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:
+        action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
+        command = "run `/lcm doctor repair` first; if it still recommends repair, run `/lcm backup` before `/lcm doctor repair apply`"
+        rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
+    elif name == "sqlite_storage":
+        command = "inspect journal/quick_check output and database/WAL size; restore from backup if SQLite reports corruption"
+    elif name == "payload_storage":
+        missing_refs = 0
+        heartbeat_rows = 0
+        suspicious_rows = 0
+        if isinstance(detail, dict):
+            missing_refs = int(detail.get("externalized_payload_refs_missing", 0) or 0)
+            heartbeat_rows = len(detail.get("heartbeat_noise_rows") or [])
+            suspicious_rows = sum(
+                len(detail.get(key) or [])
+                for key in (
+                    "suspicious_data_uri_content_rows",
+                    "suspicious_data_uri_tool_calls_rows",
+                    "suspicious_base64_like_rows",
+                    "suspicious_repetitive_assistant_rows",
+                )
+            )
+        if heartbeat_rows and not missing_refs and not suspicious_rows:
+            action = DOCTOR_ACTION_SAFE_IGNORE
+            command = "safe to ignore unless heartbeat/progress noise is crowding useful recall; consider message/session filters for future rows"
+            rationale = "heartbeat rows are read-only noise diagnostics, not corruption"
+        else:
+            command = "inspect payload rows/refs; restore missing externalized payload files from backup before deleting or rewriting anything"
+            warning_only = True
+            rationale = "payload warnings may represent preserved user/tool data"
+    elif name == "sensitive_pattern_handling":
+        command = "inspect LCM_SENSITIVE_PATTERNS settings; remove unknown names or configure supported catalog entries"
+    elif name == "orphaned_dag_nodes":
+        command = "inspect affected DAG/source IDs; do not auto-delete summaries without confirming recall impact"
+        warning_only = True
+    elif name == "summary_quality":
+        command = "inspect worst_nodes and retrieval behavior; treat as summary quality evidence, not cleanup input"
+        warning_only = True
+    elif name == "config_validation":
+        command = "inspect LCM_* environment/config values and adjust only intentional operator overrides"
+    elif name == "source_lineage_hygiene":
+        action = DOCTOR_ACTION_SAFE_IGNORE
+        command = "safe to ignore legacy blank-source observations; use `/lcm doctor source` only when you intentionally want backup-first normalization"
+        rationale = "legacy blank sources are normalized to unknown for compatibility"
+    elif name == "lifecycle_fragmentation":
+        command = "inspect lifecycle categories; only use explicit backup-first lifecycle cleanup for empty lifecycle rows"
+        warning_only = True
+        rationale = "not every lifecycle/state mismatch is harmful or safe to mutate"
+    elif name == "context_pressure":
+        action = DOCTOR_ACTION_SAFE_IGNORE
+        command = "safe to ignore if compaction proceeds normally; inspect lcm_status only if pressure stays high or compaction loops"
+        warning_only = True
+        rationale = "context pressure is an operating state, not persisted-state corruption"
+    elif name == "cleanup_candidates":
+        action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
+        command = "run `/lcm doctor clean` first; if candidates are expected junk/noise, run `/lcm backup` before `/lcm doctor clean apply`"
+        rationale = "candidate cleanup deletes rows and must stay preview-and-backup gated"
+
+    return {
+        "check": name,
+        "status": status,
+        "action": action,
+        "operator_action": command,
+        "warning_only": warning_only,
+        "rationale": rationale,
+    }
+
+
+def doctor_guidance_for_checks(checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return actionable guidance for warning/failing lcm_doctor checks."""
+    guidance = []
+    for check in checks:
+        item = doctor_guidance_for_check(check)
+        if item is not None:
+            guidance.append(item)
+    return guidance
 
 
 # Backward-compatible private aliases for existing command/tool internals and tests.

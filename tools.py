@@ -15,7 +15,11 @@ from .externalize import (
     find_externalized_payload_for_message,
     load_externalized_payload,
 )
-from .diagnostics import _has_lifecycle_fragmentation, _state_db_path_for_engine
+from .diagnostics import (
+    _has_lifecycle_fragmentation,
+    _state_db_path_for_engine,
+    doctor_guidance_for_checks,
+)
 from .dag import build_nodes_fts_spec
 from .db_bootstrap import check_external_content_fts_integrity, inspect_lcm_schema_health
 from .extraction import sanitize_pre_compaction_content
@@ -2241,4 +2245,5 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "overall": overall,
         "runtime_identity": engine.get_runtime_identity(),
         "checks": checks,
+        "guidance": doctor_guidance_for_checks(checks),
     })

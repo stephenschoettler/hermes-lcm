@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .metrics import canary_present, count_active_canaries, normalize_message_content
+from .standalone import ensure_agent_context_engine_importable
 from .types import LCMPolicy, ReplayFixture, ReplayMetrics, SummaryFailureMode, _summary_failure_mode
 
 
@@ -21,6 +22,7 @@ _CANARY_LINE_RE = re.compile(r"\b(CANARY_[A-Z0-9_]+)\s*=\s*([A-Z0-9_:-]+)")
 
 def _ensure_hermes_lcm_package() -> None:
     """Make this source checkout importable as `hermes_lcm` without plugin registration."""
+    ensure_agent_context_engine_importable()
     if "hermes_lcm" in sys.modules:
         return
     spec = importlib.util.spec_from_file_location(

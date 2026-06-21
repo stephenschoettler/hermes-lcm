@@ -78,10 +78,12 @@ def register(ctx):
     ctx.register_context_engine(engine)
 
     # Register tools via the plugin registry only on hosts that preserve the
-    # active messages=... contract for registered context-engine tools. Current
-    # Hermes Agent handles lcm_* correctly through the native context-engine
-    # schema/dispatch path; registering duplicate names there would shadow that
-    # path and lose current-turn ingest.
+    # active messages=... contract for registered context-engine tools.
+    # Older/current Hermes hosts already expose lcm_* correctly through the
+    # native context-engine schema/dispatch path (Path B). Registering duplicate
+    # names through the plugin registry (Path A) on message-blind hosts would
+    # shadow Path B and lose current-turn ingest, so the Path B fallback is the
+    # expected healthy behavior there.
     _TOOLS = [
         ("lcm_grep", LCM_GREP, "🔍"),
         ("lcm_load_session", LCM_LOAD_SESSION, "📋"),
@@ -105,21 +107,23 @@ def register(ctx):
                 )
             except Exception as exc:
                 logger.warning(
-                    "LCM tool registration failed for %s; "
-                    "continuing with context-engine schemas: %s",
+                    "LCM plugin-registry tool registration for %s did not complete; "
+                    "LCM tools remain available through context-engine schemas: %s",
                     name,
                     exc,
                 )
     elif callable(register_tool):
         logger.info(
-            "LCM plugin tool registration skipped because this Hermes host "
-            "does not advertise messages forwarding for registered "
-            "context-engine tools; continuing with context-engine schemas"
+            "LCM tools are available through context-engine schemas "
+            "(expected Path B fallback on this Hermes host). Standalone "
+            "plugin-registry tool registration (Path A) requires message-aware "
+            "handlers and is not required here."
         )
     else:
         logger.info(
-            "LCM tool registration unavailable on this Hermes host; "
-            "continuing with context-engine schemas"
+            "LCM tools are available through context-engine schemas (Path B); "
+            "plugin-registry tool registration is unavailable on this Hermes "
+            "host and is not required."
         )
 
     register_command = getattr(ctx, "register_command", None)

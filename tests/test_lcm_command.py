@@ -446,6 +446,7 @@ def test_lcm_doctor_reports_health_checks(engine):
     assert "plugin_version: 0.18.0" in result
     assert f"plugin_path: {repo_root}" in result
     assert "plugin_git_commit:" in result
+    assert "triage_guidance:\n- none" in result
 
 
 def test_lcm_doctor_reports_heartbeat_noise_rows_without_mutating_or_leaking_content(engine):
@@ -622,6 +623,31 @@ def test_lcm_doctor_distinguishes_observations_from_recommended_actions(tmp_path
     assert "cleanup_candidates" in result
     assert "/lcm doctor clean" in result
     assert "/lcm backup" in result
+    assert "triage_guidance:" in result
+    assert "cleanup_candidates: backup-first cleanup" in result
+
+
+def test_lcm_doctor_tool_guidance_maps_warning_classes_to_operator_actions(engine):
+    engine._store.append("heartbeat-session", {"role": "assistant", "content": "Still working..."}, token_estimate=2)
+    engine._dag.add_node(
+        SummaryNode(
+            session_id="test-session",
+            depth=0,
+            summary="tiny",
+            token_count=1,
+            source_token_count=500,
+            source_ids=[],
+            source_type="messages",
+            created_at=0,
+        )
+    )
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert guidance["payload_storage"]["action"] == "safe/ignore"
+    assert guidance["summary_quality"]["action"] == "inspect"
+    assert guidance["summary_quality"]["warning_only"] is True
 
 
 def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):

@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .standalone import ensure_agent_context_engine_importable
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 STRESS_CHECK_VERSION = "1"
 DEFAULT_SCENARIOS = (
@@ -327,6 +329,7 @@ def _clear_hermes_lcm_submodules(pkg: str = "hermes_lcm") -> None:
 
 
 def _ensure_hermes_lcm_package(plugin_dir: Path, *, reload_submodules: bool = False) -> None:
+    ensure_agent_context_engine_importable()
     pkg = "hermes_lcm"
     if pkg in sys.modules:
         module = sys.modules[pkg]
