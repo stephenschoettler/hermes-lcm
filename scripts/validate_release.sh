@@ -123,8 +123,8 @@ DIFF_CHECK_RANGE="${LCM_RELEASE_DIFF_BASE:-}"
 if [[ -z "$DIFF_CHECK_RANGE" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   if git rev-parse --verify origin/main >/dev/null 2>&1 && ! git diff --quiet origin/main...HEAD -- .; then
     DIFF_CHECK_RANGE="origin/main...HEAD"
-  else
-    DIFF_CHECK_RANGE="HEAD"
+  elif git rev-parse --verify 'HEAD^' >/dev/null 2>&1; then
+    DIFF_CHECK_RANGE="HEAD^...HEAD"
   fi
 fi
 

@@ -9,7 +9,7 @@ Prerequisites:
 - Run from the repository checkout.
 - Use a Python environment with `pytest` installed. If `python` on `PATH` is not the intended interpreter, set `PYTHON=/path/to/python`.
 - The benchmark and stress gates are standalone-checkout safe: they provide the minimal Hermes Agent `ContextEngine` base class needed for deterministic local validation when Hermes Agent is not importable.
-- On a PR branch with `origin/main` available, the whitespace/conflict-marker gate checks `origin/main...HEAD` instead of only uncommitted working-tree changes, then also checks the local working tree and staged diff. Override with `LCM_RELEASE_DIFF_BASE=<rev-or-range>` when validating against another base.
+- On a PR branch with `origin/main` available, the whitespace/conflict-marker gate checks `origin/main...HEAD` instead of only uncommitted working-tree changes, then also checks the local working tree and staged diff. Override with `LCM_RELEASE_DIFF_BASE=<rev-or-range>` when validating against another base. If no changed `origin/main...HEAD` range is available but `HEAD` has a parent, the gate checks `HEAD^...HEAD` so a detached release checkout still validates the committed release diff.
 - Python validation runs with `PYTHONPYCACHEPREFIX` under the output directory and pytest cache disabled, then records git status before and after validation so release runs do not silently dirty the checkout.
 - The low-file-descriptor full gate lowers the limit to 1024 only when the current shell allows it; locked-down hosts keep their existing lower limit instead of failing before pytest starts.
 
@@ -19,7 +19,7 @@ scripts/validate_release.sh
 
 Default smoke mode runs the local gates that should be cheap enough for routine operator use:
 
-- adaptive `git diff --check` over `origin/main...HEAD` on PR branches, plus local working-tree and staged diff checks
+- adaptive `git diff --check` over `origin/main...HEAD` on PR branches or `HEAD^...HEAD` in detached/no-base release checkouts, plus local working-tree and staged diff checks
 - Python compile checks for the plugin and release scripts
 - shell syntax checks for maintained shell scripts
 - focused pytest coverage for core, command, packaging, benchmark, and stress surfaces
