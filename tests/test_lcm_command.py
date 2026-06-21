@@ -13,6 +13,7 @@ import hermes_lcm.command as command_mod
 from hermes_lcm.command import _fmt_size, handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
+from hermes_lcm.diagnostics import doctor_guidance_for_check
 from hermes_lcm.engine import LCMEngine
 
 
@@ -648,6 +649,47 @@ def test_lcm_doctor_tool_guidance_maps_warning_classes_to_operator_actions(engin
     assert guidance["payload_storage"]["action"] == "safe/ignore"
     assert guidance["summary_quality"]["action"] == "inspect"
     assert guidance["summary_quality"]["warning_only"] is True
+
+
+def test_lcm_doctor_source_lineage_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "source_lineage_hygiene",
+        "status": "fail",
+        "detail": "sqlite read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert "safe to ignore" not in guidance["operator_action"]
+    assert "source-lineage" in guidance["operator_action"]
+    assert guidance["warning_only"] is False
+
+
+def test_lcm_doctor_source_lineage_warning_preserves_legacy_blank_source_guidance():
+    guidance = doctor_guidance_for_check({
+        "check": "source_lineage_hygiene",
+        "status": "warn",
+        "detail": {"legacy_blank_source_messages": 2},
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "safe/ignore"
+    assert "legacy blank-source" in guidance["operator_action"]
+
+
+def test_lcm_doctor_tool_source_lineage_read_error_guidance_requires_inspection(engine, monkeypatch):
+    def fail_source_stats():
+        raise RuntimeError("sqlite read error")
+
+    monkeypatch.setattr(engine._store, "get_source_stats", fail_source_stats)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert doctor["overall"] == "unhealthy"
+    assert guidance["source_lineage_hygiene"]["action"] == "inspect"
+    assert "safe to ignore" not in guidance["source_lineage_hygiene"]["operator_action"]
+    assert "source-lineage" in guidance["source_lineage_hygiene"]["operator_action"]
 
 
 def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):
