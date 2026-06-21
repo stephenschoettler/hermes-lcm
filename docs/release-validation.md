@@ -9,6 +9,7 @@ Prerequisites:
 - Run from the repository checkout.
 - Use a Python environment with `pytest` installed. If `python` on `PATH` is not the intended interpreter, set `PYTHON=/path/to/python`.
 - The benchmark and stress gates are standalone-checkout safe: they provide the minimal Hermes Agent `ContextEngine` base class needed for deterministic local validation when Hermes Agent is not importable.
+- On a PR branch with `origin/main` available, the whitespace/conflict-marker gate checks `origin/main...HEAD` instead of only uncommitted working-tree changes, then also checks the local working tree and staged diff. Override with `LCM_RELEASE_DIFF_BASE=<rev-or-range>` when validating against another base.
 
 ```bash
 scripts/validate_release.sh
@@ -16,7 +17,7 @@ scripts/validate_release.sh
 
 Default smoke mode runs the local gates that should be cheap enough for routine operator use:
 
-- `git diff --check`
+- adaptive `git diff --check` over `origin/main...HEAD` on PR branches, plus local working-tree and staged diff checks
 - Python compile checks for the plugin and release scripts
 - shell syntax checks for maintained shell scripts
 - focused pytest coverage for core, command, packaging, benchmark, and stress surfaces

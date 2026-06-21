@@ -112,6 +112,14 @@ cd "$REPO_ROOT"
 branch="$(git branch --show-current 2>/dev/null || true)"
 commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
 dirty="$(git status --short 2>/dev/null || true)"
+DIFF_CHECK_RANGE="${LCM_RELEASE_DIFF_BASE:-}"
+if [[ -z "$DIFF_CHECK_RANGE" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if git rev-parse --verify origin/main >/dev/null 2>&1 && ! git diff --quiet origin/main...HEAD -- .; then
+    DIFF_CHECK_RANGE="origin/main...HEAD"
+  else
+    DIFF_CHECK_RANGE="HEAD"
+  fi
+fi
 
 cat > "$CHECKLIST" <<EOF
 # hermes-lcm release validation
@@ -119,6 +127,7 @@ cat > "$CHECKLIST" <<EOF
 - generated_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 - mode: $MODE
 - repo: ${branch:-detached}@${commit:-unknown}
+- diff_check_range: ${DIFF_CHECK_RANGE:-working-tree}
 - output_dir: $OUTPUT_DIR
 - provider_network_side_effects: none expected
 - live_profile_mutations: none expected
@@ -159,7 +168,15 @@ run_gate() {
   fi
 }
 
-run_gate "git diff check" git diff --check
+if [[ -n "$DIFF_CHECK_RANGE" ]]; then
+  run_gate "git diff check ($DIFF_CHECK_RANGE)" git diff --check "$DIFF_CHECK_RANGE"
+  if [[ "$DIFF_CHECK_RANGE" != "HEAD" ]]; then
+    run_gate "git working tree diff check" git diff --check
+    run_gate "git staged diff check" git diff --cached --check
+  fi
+else
+  run_gate "git diff check" git diff --check
+fi
 run_gate "python compileall" "$PYTHON_BIN" -m compileall -q .
 run_gate "script py_compile" "$PYTHON_BIN" -m py_compile scripts/import_lossless_claw.py scripts/lcm_benchmark.py scripts/lcm_stress_check.py
 run_gate "shell syntax" bash -n scripts/install.sh scripts/update.sh scripts/validate_release.sh
