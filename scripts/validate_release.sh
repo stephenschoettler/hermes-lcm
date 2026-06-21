@@ -107,11 +107,18 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 CHECKLIST="$OUTPUT_DIR/validation-checklist.md"
 FAILURES=()
 
+export PYTHONPYCACHEPREFIX="$OUTPUT_DIR/pycache"
+if [[ -n "${PYTEST_ADDOPTS:-}" ]]; then
+  export PYTEST_ADDOPTS="-p no:cacheprovider $PYTEST_ADDOPTS"
+else
+  export PYTEST_ADDOPTS="-p no:cacheprovider"
+fi
+
 cd "$REPO_ROOT"
 
 branch="$(git branch --show-current 2>/dev/null || true)"
 commit="$(git rev-parse --short HEAD 2>/dev/null || true)"
-dirty="$(git status --short 2>/dev/null || true)"
+dirty_start="$(git status --short 2>/dev/null || true)"
 DIFF_CHECK_RANGE="${LCM_RELEASE_DIFF_BASE:-}"
 if [[ -z "$DIFF_CHECK_RANGE" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   if git rev-parse --verify origin/main >/dev/null 2>&1 && ! git diff --quiet origin/main...HEAD -- .; then
@@ -168,6 +175,17 @@ run_gate() {
   fi
 }
 
+run_low_fd_pytest() {
+  local current_limit
+  current_limit="$(ulimit -n 2>/dev/null || true)"
+  if [[ "$current_limit" == "unlimited" ]]; then
+    ulimit -n 1024 2>/dev/null || echo "warning: could not lower file descriptor limit from unlimited to 1024" >&2
+  elif [[ "$current_limit" =~ ^[0-9]+$ ]] && (( current_limit > 1024 )); then
+    ulimit -n 1024 2>/dev/null || echo "warning: could not lower file descriptor limit from $current_limit to 1024" >&2
+  fi
+  "$PYTHON_BIN" -m pytest -q
+}
+
 if [[ -n "$DIFF_CHECK_RANGE" ]]; then
   run_gate "git diff check ($DIFF_CHECK_RANGE)" git diff --check "$DIFF_CHECK_RANGE"
   if [[ "$DIFF_CHECK_RANGE" != "HEAD" ]]; then
@@ -186,8 +204,13 @@ run_gate "stress smoke" "$PYTHON_BIN" scripts/lcm_stress_check.py --output "$OUT
 
 if [[ "$MODE" == "full" ]]; then
   run_gate "pytest full" "$PYTHON_BIN" -m pytest -q
-  run_gate "pytest low fd" bash -c 'ulimit -n 1024 && "$1" -m pytest -q' _ "$PYTHON_BIN"
+  run_gate "pytest low fd" run_low_fd_pytest
   run_gate "stress release" "$PYTHON_BIN" scripts/lcm_stress_check.py --output "$OUTPUT_DIR/stress-release" --tier release --json
+fi
+
+dirty_end="$(git status --short 2>/dev/null || true)"
+if [[ "${dirty_end:-}" != "${dirty_start:-}" ]]; then
+  FAILURES+=("validation changed git status; inspect start/end status in $CHECKLIST")
 fi
 
 cat >> "$CHECKLIST" <<'EOF'
@@ -203,7 +226,15 @@ cat >> "$CHECKLIST" <<'EOF'
 
 ```text
 EOF
-printf '%s\n' "${dirty:-clean}" >> "$CHECKLIST"
+printf '%s\n' "${dirty_start:-clean}" >> "$CHECKLIST"
+cat >> "$CHECKLIST" <<'EOF'
+```
+
+## Git status after validation
+
+```text
+EOF
+printf '%s\n' "${dirty_end:-clean}" >> "$CHECKLIST"
 cat >> "$CHECKLIST" <<'EOF'
 ```
 EOF

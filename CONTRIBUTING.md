@@ -75,11 +75,8 @@ PR bodies should use this template. It is mirrored in `.github/PULL_REQUEST_TEMP
 - [ ] Default validation:
   - [ ] `pytest tests/test_lcm_core.py tests/test_lcm_engine.py tests/test_packaging_install.py -q`
   - [ ] `pytest -q`
-  - [ ] `bash -lc 'ulimit -n 1024 && pytest -q'`
-  - [ ] `python -m compileall -q .`
-  - [ ] `python -m py_compile scripts/import_lossless_claw.py`
-  - [ ] `bash -n scripts/install.sh scripts/update.sh`
-  - [ ] `git diff --check`
+  - [ ] `scripts/validate_release.sh --full --keep-going --output /tmp/hermes-lcm-release-validation-<topic>`
+  - [ ] `git diff --check origin/main...HEAD && git diff --check && git diff --cached --check`
 - [ ] Workflow validation, if workflows changed: `actionlint`
 
 ## Notes
@@ -104,14 +101,12 @@ Do **not** claim behavior that is only partially implemented. If a filter, featu
 Default validation for code changes:
 
 ```bash
-scripts/validate_release.sh
+scripts/validate_release.sh --full --keep-going --output /tmp/hermes-lcm-release-validation-<topic>
 pytest tests/test_lcm_core.py tests/test_lcm_engine.py tests/test_packaging_install.py -q
 pytest -q
-bash -lc 'ulimit -n 1024 && pytest -q'
-python -m compileall -q .
-python -m py_compile scripts/import_lossless_claw.py
-bash -n scripts/install.sh scripts/update.sh
+git diff --check origin/main...HEAD
 git diff --check
+git diff --cached --check
 ```
 
 Workflow changes should also run:

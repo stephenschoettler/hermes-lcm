@@ -1,6 +1,6 @@
 # Release validation
 
-Use `scripts/validate_release.sh` as the local release-confidence lane before tagging or publishing hermes-lcm. The script is offline by default: it does not call model providers, does not mutate live Hermes config, and writes all validation artifacts under a fresh output directory.
+Use `scripts/validate_release.sh` as the local release-confidence lane before tagging or publishing hermes-lcm. The script is offline by default: it does not call model providers, does not mutate live Hermes config, routes Python bytecode/cache artifacts under the validation output directory, and writes validation artifacts under a fresh output directory.
 
 ## Command
 
@@ -10,6 +10,8 @@ Prerequisites:
 - Use a Python environment with `pytest` installed. If `python` on `PATH` is not the intended interpreter, set `PYTHON=/path/to/python`.
 - The benchmark and stress gates are standalone-checkout safe: they provide the minimal Hermes Agent `ContextEngine` base class needed for deterministic local validation when Hermes Agent is not importable.
 - On a PR branch with `origin/main` available, the whitespace/conflict-marker gate checks `origin/main...HEAD` instead of only uncommitted working-tree changes, then also checks the local working tree and staged diff. Override with `LCM_RELEASE_DIFF_BASE=<rev-or-range>` when validating against another base.
+- Python validation runs with `PYTHONPYCACHEPREFIX` under the output directory and pytest cache disabled, then records git status before and after validation so release runs do not silently dirty the checkout.
+- The low-file-descriptor full gate lowers the limit to 1024 only when the current shell allows it; locked-down hosts keep their existing lower limit instead of failing before pytest starts.
 
 ```bash
 scripts/validate_release.sh
@@ -42,8 +44,9 @@ Each run creates a fresh directory, by default:
 
 Important files:
 
-- `validation-checklist.md` — scrubbed operator checklist and command summary
+- `validation-checklist.md` — scrubbed operator checklist, command summary, and before/after git status
 - `logs/*.log` — stdout/stderr for each validation command
+- `pycache/` — validation-time Python bytecode cache redirected away from the source tree
 - `benchmark-smoke/summary.json` and `benchmark-smoke/metrics.jsonl` — deterministic benchmark artifacts
 - `stress-smoke/stress-summary.md` and `stress-smoke/results/stress-results.json` — deterministic stress artifacts
 
@@ -66,6 +69,7 @@ The checklist is safe to paste into a release note or PR validation section afte
 - [ ] focused or full pytest passed
 - [ ] deterministic benchmark smoke passed
 - [ ] deterministic stress smoke/release passed
+- [ ] git status before/after validation reviewed
 
 ### Doctor triage
 - [ ] `lcm_doctor` warnings were classified as `safe/ignore`, `inspect`, or `backup-first cleanup`

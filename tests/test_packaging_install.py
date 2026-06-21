@@ -66,6 +66,19 @@ def test_standalone_install_scripts_exist_and_are_shell_scripts():
     assert validate_script.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
 
 
+def test_validate_release_routes_cache_artifacts_outside_checkout():
+    repo_root = Path(__file__).resolve().parent.parent
+    validate_script = (repo_root / "scripts" / "validate_release.sh").read_text(encoding="utf-8")
+
+    assert "PYTHONPYCACHEPREFIX=\"$OUTPUT_DIR/pycache\"" in validate_script
+    assert "PYTEST_ADDOPTS=\"-p no:cacheprovider" in validate_script
+    assert "dirty_start=\"$(git status --short" in validate_script
+    assert "dirty_end=\"$(git status --short" in validate_script
+    assert "validation changed git status" in validate_script
+    assert "run_low_fd_pytest" in validate_script
+    assert "ulimit -n 1024 &&" not in validate_script
+
+
 def test_validate_release_checks_committed_pr_diff_against_origin_main(tmp_path):
     repo_root = Path(__file__).resolve().parent.parent
     source_script = repo_root / "scripts" / "validate_release.sh"
