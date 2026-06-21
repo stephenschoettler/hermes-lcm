@@ -157,7 +157,6 @@ _HISTORICAL_HEADING_MARKERS = (
     "## Historical In-Progress State",
     "## Historical Pending User Asks",
     "## Historical Remaining Work",
-    "## Completed Actions (historical)",
 )
 
 

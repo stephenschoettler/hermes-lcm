@@ -3603,6 +3603,11 @@ class TestEscalation:
         assert "must NOT resume" in prompt
         assert "## Historical Task Snapshot" in prompt
         assert "## Historical Remaining Work" in prompt
+        assert "## Completed Actions (historical)" not in prompt
+        assert (
+            "'## Historical Task Snapshot' / '## Historical In-Progress State' / "
+            "'## Historical Pending User Asks' / '## Historical Remaining Work'"
+        ) in prompt
         # Blocker / handoff exception
         assert "Exception: active blockers or handoff state should NOT be demoted" in prompt
         assert "Keep blockers and pending handoffs outside historical headings" in prompt
@@ -3619,6 +3624,11 @@ class TestEscalation:
         assert "Keep other active tasks only when they are current blockers or handoff state." in prompt
         # Demote + blocker exception
         assert "Demote old / completed topics:" in prompt
+        assert "## Completed Actions (historical)" not in prompt
+        assert (
+            "'## Historical Task Snapshot' / '## Historical In-Progress State' / "
+            "'## Historical Pending User Asks' / '## Historical Remaining Work'"
+        ) in prompt
         assert "Exception: active blockers and pending handoff state should NOT be demoted" in prompt
         assert "Keep them outside historical headings so the agent retains awareness" in prompt
 
