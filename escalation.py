@@ -148,8 +148,10 @@ def _normalized_focus_topic(focus_topic: str, max_chars: int = 160) -> str:
 # so headings influence LLM attention rather than being hard reference-only
 # markers.  The practical effect is that LLMs naturally down-weight content
 # under "Historical" headings, but no code path enforces the boundary.
-# (hermes-agent issue #9631 / PR #44687 — iterative compaction kept completed
-#  topics alive because no structural demote signal existed.)
+# (hermes-agent issue #9631: iterative compaction kept completed topics alive.
+#  PR #44687 adds auto-derive focus topic; PR #44454 salvaged #44345/#41650
+#  and introduced HISTORICAL_*_HEADING constants [8f8cad7ec / d5e2fbf24]
+#  for structural demote of stale/completed topics.)
 _HISTORICAL_HEADING_MARKERS = (
     "## Historical Task Snapshot",
     "## Historical In-Progress State",
@@ -162,9 +164,10 @@ _HISTORICAL_HEADING_MARKERS = (
 def _build_l1_focus_brief(focus_topic: str) -> str:
     """Build L1 focus guidance with explicit demote instructions for stale topics.
 
-    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44687)
-    which adds "demote old topics" to prevent iterative compaction from keeping
-    completed topics alive and overriding the current active topic (issue #9631).
+    Mirrors upstream hermes-agent PR #44687 (auto-derive focus topic) and
+    PR #44454 (historical heading constants + stale-task demotion) to prevent
+    iterative compaction from keeping completed topics alive and overriding
+    the current active topic (issue #9631).
     """
     topic = _normalized_focus_topic(focus_topic)
     if not topic:
@@ -189,7 +192,8 @@ def _build_l1_focus_brief(focus_topic: str) -> str:
 def _build_l2_focus_brief(focus_topic: str) -> str:
     """Build L2 focus guidance with explicit demote instructions for stale topics.
 
-    Mirrors upstream hermes-agent fix/compression-auto-focus-topic (#44687).
+    Mirrors upstream hermes-agent PR #44687 (auto-focus) and PR #44454
+    (historical heading constants + stale-task demotion).
     """
     topic = _normalized_focus_topic(focus_topic)
     if not topic:
