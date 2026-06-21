@@ -104,14 +104,17 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
                     "suspicious_repetitive_assistant_rows",
                 )
             )
-        if heartbeat_rows and not missing_refs and not suspicious_rows:
+        if status == "warn" and heartbeat_rows and not missing_refs and not suspicious_rows:
             action = DOCTOR_ACTION_SAFE_IGNORE
             command = "safe to ignore unless heartbeat/progress noise is crowding useful recall; consider message/session filters for future rows"
             rationale = "heartbeat rows are read-only noise diagnostics, not corruption"
         else:
             command = "inspect payload rows/refs; restore missing externalized payload files from backup before deleting or rewriting anything"
-            warning_only = True
-            rationale = "payload warnings may represent preserved user/tool data"
+            if status == "warn":
+                warning_only = True
+                rationale = "payload warnings may represent preserved user/tool data"
+            else:
+                rationale = "payload diagnostic failures mean doctor could not read storage risk state reliably"
     elif name == "sensitive_pattern_handling":
         command = "inspect LCM_SENSITIVE_PATTERNS settings; remove unknown names or configure supported catalog entries"
     elif name == "orphaned_dag_nodes":
@@ -131,8 +134,11 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         rationale = "source-lineage failures indicate the doctor could not read attribution state reliably"
     elif name == "lifecycle_fragmentation":
         command = "inspect lifecycle categories; only use explicit backup-first lifecycle cleanup for empty lifecycle rows"
-        warning_only = True
-        rationale = "not every lifecycle/state mismatch is harmful or safe to mutate"
+        if status == "warn":
+            warning_only = True
+            rationale = "not every lifecycle/state mismatch is harmful or safe to mutate"
+        else:
+            rationale = "lifecycle diagnostic failures mean doctor could not read session lifecycle state reliably"
     elif name == "context_pressure":
         action = DOCTOR_ACTION_SAFE_IGNORE
         command = "safe to ignore if compaction proceeds normally; inspect lcm_status only if pressure stays high or compaction loops"

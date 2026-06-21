@@ -651,6 +651,32 @@ def test_lcm_doctor_tool_guidance_maps_warning_classes_to_operator_actions(engin
     assert guidance["summary_quality"]["warning_only"] is True
 
 
+def test_lcm_doctor_payload_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "payload_storage",
+        "status": "fail",
+        "detail": "sqlite read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
+def test_lcm_doctor_lifecycle_failure_guidance_requires_inspection():
+    guidance = doctor_guidance_for_check({
+        "check": "lifecycle_fragmentation",
+        "status": "fail",
+        "detail": {"error": "lifecycle read error"},
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
 def test_lcm_doctor_source_lineage_failure_guidance_requires_inspection():
     guidance = doctor_guidance_for_check({
         "check": "source_lineage_hygiene",
@@ -690,6 +716,19 @@ def test_lcm_doctor_tool_source_lineage_read_error_guidance_requires_inspection(
     assert guidance["source_lineage_hygiene"]["action"] == "inspect"
     assert "safe to ignore" not in guidance["source_lineage_hygiene"]["operator_action"]
     assert "source-lineage" in guidance["source_lineage_hygiene"]["operator_action"]
+
+
+def test_lcm_doctor_command_lifecycle_read_error_guidance_is_failure(engine, monkeypatch):
+    def fail_lifecycle_stats(*_args, **_kwargs):
+        raise RuntimeError("lifecycle read error")
+
+    monkeypatch.setattr(engine._lifecycle, "get_fragmentation_stats", fail_lifecycle_stats)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in result
+    assert "lifecycle_fragmentation: inspect —" in result
+    assert "lifecycle_fragmentation: inspect warning-only" not in result
 
 
 def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):

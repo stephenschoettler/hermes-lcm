@@ -1176,7 +1176,8 @@ def _doctor_text(engine) -> str:
     if source_stats.get("error"):
         triage_checks.append({"check": "source_lineage_hygiene", "status": "fail", "detail": source_stats})
     if lifecycle_stats.get("error") or _has_lifecycle_fragmentation(lifecycle_stats):
-        triage_checks.append({"check": "lifecycle_fragmentation", "status": "warn", "detail": lifecycle_stats})
+        lifecycle_status = "fail" if lifecycle_stats.get("error") else "warn"
+        triage_checks.append({"check": "lifecycle_fragmentation", "status": lifecycle_status, "detail": lifecycle_stats})
     triage_guidance = doctor_guidance_for_checks(triage_checks)
 
     doctor_status = "issues-found" if integrity != "ok" or issues else (
