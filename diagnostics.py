@@ -119,10 +119,16 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
         command = "inspect LCM_SENSITIVE_PATTERNS settings; remove unknown names or configure supported catalog entries"
     elif name == "orphaned_dag_nodes":
         command = "inspect affected DAG/source IDs; do not auto-delete summaries without confirming recall impact"
-        warning_only = True
+        if status == "warn":
+            warning_only = True
+        else:
+            rationale = "DAG diagnostic failures mean doctor could not read summary/source state reliably"
     elif name == "summary_quality":
         command = "inspect worst_nodes and retrieval behavior; treat as summary quality evidence, not cleanup input"
-        warning_only = True
+        if status == "warn":
+            warning_only = True
+        else:
+            rationale = "summary-quality diagnostic failures mean doctor could not read DAG quality state reliably"
     elif name == "config_validation":
         command = "inspect LCM_* environment/config values and adjust only intentional operator overrides"
     elif name == "source_lineage_hygiene" and status == "warn":

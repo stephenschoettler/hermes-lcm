@@ -677,6 +677,20 @@ def test_lcm_doctor_lifecycle_failure_guidance_requires_inspection():
     assert "could not read" in guidance["rationale"]
 
 
+@pytest.mark.parametrize("check_name", ["orphaned_dag_nodes", "summary_quality"])
+def test_lcm_doctor_dag_failure_guidance_requires_inspection(check_name):
+    guidance = doctor_guidance_for_check({
+        "check": check_name,
+        "status": "fail",
+        "detail": "dag read error",
+    })
+
+    assert guidance is not None
+    assert guidance["action"] == "inspect"
+    assert guidance["warning_only"] is False
+    assert "could not read" in guidance["rationale"]
+
+
 def test_lcm_doctor_source_lineage_failure_guidance_requires_inspection():
     guidance = doctor_guidance_for_check({
         "check": "source_lineage_hygiene",
