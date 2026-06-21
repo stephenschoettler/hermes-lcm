@@ -745,6 +745,20 @@ def test_lcm_doctor_command_lifecycle_read_error_guidance_is_failure(engine, mon
     assert "lifecycle_fragmentation: inspect warning-only" not in result
 
 
+def test_lcm_doctor_command_payload_read_error_guidance_is_failure(engine, monkeypatch):
+    def fail_payload_scan(*_args, **_kwargs):
+        raise RuntimeError("payload read error")
+
+    monkeypatch.setattr(command_mod, "scan_sqlite_payload_risks", fail_payload_scan)
+
+    result = handle_lcm_command("doctor", engine)
+
+    assert "status: issues-found" in result
+    assert "payload_storage_error: payload read error" in result
+    assert "payload_storage: inspect —" in result
+    assert "payload_storage: inspect warning-only" not in result
+
+
 def test_lcm_doctor_reports_legacy_blank_source_as_observation_without_warning(engine):
     engine._store.append("sess-known", {"role": "user", "content": "cli message"}, source="cli")
     engine._store.append("sess-unknown", {"role": "user", "content": "unknown message"})

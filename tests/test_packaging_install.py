@@ -75,6 +75,10 @@ def test_validate_release_routes_cache_artifacts_outside_checkout():
     assert "dirty_start=\"$(git status --short" in validate_script
     assert "dirty_end=\"$(git status --short" in validate_script
     assert "validation changed git status" in validate_script
+    assert "run_pytest()" in validate_script
+    assert "ensure_agent_context_engine_importable()" in validate_script
+    assert "run_gate \"focused pytest\" run_pytest" in validate_script
+    assert "run_gate \"pytest full\" run_pytest" in validate_script
     assert "run_low_fd_pytest" in validate_script
     assert "ulimit -n 1024 &&" not in validate_script
 

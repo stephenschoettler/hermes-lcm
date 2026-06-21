@@ -175,6 +175,16 @@ run_gate() {
   fi
 }
 
+run_pytest() {
+  "$PYTHON_BIN" - "$@" <<'PY'
+import sys
+from benchmarking.standalone import ensure_agent_context_engine_importable
+ensure_agent_context_engine_importable()
+import pytest
+raise SystemExit(pytest.main(sys.argv[1:]))
+PY
+}
+
 run_low_fd_pytest() {
   local current_limit
   current_limit="$(ulimit -n 2>/dev/null || true)"
@@ -183,7 +193,7 @@ run_low_fd_pytest() {
   elif [[ "$current_limit" =~ ^[0-9]+$ ]] && (( current_limit > 1024 )); then
     ulimit -n 1024 2>/dev/null || echo "warning: could not lower file descriptor limit from $current_limit to 1024" >&2
   fi
-  "$PYTHON_BIN" -m pytest -q
+  run_pytest -q
 }
 
 if [[ -n "$DIFF_CHECK_RANGE" ]]; then
@@ -198,12 +208,12 @@ fi
 run_gate "python compileall" "$PYTHON_BIN" -m compileall -q .
 run_gate "script py_compile" "$PYTHON_BIN" -m py_compile scripts/import_lossless_claw.py scripts/lcm_benchmark.py scripts/lcm_stress_check.py
 run_gate "shell syntax" bash -n scripts/install.sh scripts/update.sh scripts/validate_release.sh
-run_gate "focused pytest" "$PYTHON_BIN" -m pytest tests/test_lcm_core.py tests/test_lcm_command.py tests/test_packaging_install.py tests/test_benchmarking_cli.py tests/test_stress_release_check.py -q
+run_gate "focused pytest" run_pytest tests/test_lcm_core.py tests/test_lcm_command.py tests/test_packaging_install.py tests/test_benchmarking_cli.py tests/test_stress_release_check.py -q
 run_gate "benchmark smoke" "$PYTHON_BIN" scripts/lcm_benchmark.py --synthetic-fixture release_validation_smoke:2:1:3 --policy benchmarks/policies/pressure_smoke.yaml --output "$OUTPUT_DIR/benchmark-smoke" --allow-external-output --json
 run_gate "stress smoke" "$PYTHON_BIN" scripts/lcm_stress_check.py --output "$OUTPUT_DIR/stress-smoke" --tier smoke --json
 
 if [[ "$MODE" == "full" ]]; then
-  run_gate "pytest full" "$PYTHON_BIN" -m pytest -q
+  run_gate "pytest full" run_pytest -q
   run_gate "pytest low fd" run_low_fd_pytest
   run_gate "stress release" "$PYTHON_BIN" scripts/lcm_stress_check.py --output "$OUTPUT_DIR/stress-release" --tier release --json
 fi

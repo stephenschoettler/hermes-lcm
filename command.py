@@ -952,6 +952,7 @@ def _doctor_text(engine) -> str:
     except Exception as exc:  # pragma: no cover - defensive
         quick_check = f"error: {exc}"
         issues.append("sqlite_quick_check")
+    payload_storage_error = ""
     try:
         payload_risks = scan_sqlite_payload_risks(store_conn)
         externalized_stats = externalized_payload_stats(engine._config, hermes_home=engine._hermes_home)
@@ -960,7 +961,8 @@ def _doctor_text(engine) -> str:
             engine._config,
             hermes_home=engine._hermes_home,
         )
-    except Exception:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - defensive
+        payload_storage_error = str(exc)
         payload_risks = {
             "largest_content_rows": [],
             "largest_tool_calls_rows": [],
@@ -1053,6 +1055,9 @@ def _doctor_text(engine) -> str:
         recommended_actions.append(
             "inspect missing externalized payload refs and restore from backups if needed"
         )
+    if payload_storage_error:
+        observations.append(f"payload_storage_error: {payload_storage_error}")
+        recommended_actions.append("inspect payload storage diagnostics before cleanup or deletion")
 
     try:
         source_stats = engine._store.get_source_stats()
@@ -1159,17 +1164,20 @@ def _doctor_text(engine) -> str:
         triage_checks.append({"check": "nodes_fts_integrity", "status": "fail", "detail": node_fts})
     if clean_scan["candidates"]:
         triage_checks.append({"check": "cleanup_candidates", "status": "warn", "detail": clean_scan})
-    if missing_externalized_refs or any(payload_risks.get(key) for key in (
+    if payload_storage_error or missing_externalized_refs or any(payload_risks.get(key) for key in (
         "suspicious_data_uri_content_rows",
         "suspicious_data_uri_tool_calls_rows",
         "suspicious_base64_like_rows",
         "suspicious_repetitive_assistant_rows",
         "heartbeat_noise_rows",
     )):
+        detail = {**payload_risks, **externalized_integrity}
+        if payload_storage_error:
+            detail["error"] = payload_storage_error
         triage_checks.append({
             "check": "payload_storage",
-            "status": "warn",
-            "detail": {**payload_risks, **externalized_integrity},
+            "status": "fail" if payload_storage_error else "warn",
+            "detail": detail,
         })
     if (protection["enabled"] and not protection["active_patterns"]) or protection["unknown_patterns"]:
         triage_checks.append({"check": "sensitive_pattern_handling", "status": "warn", "detail": protection})
