@@ -22,6 +22,7 @@ from agent.context_engine import ContextEngine
 
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
+from .diagnostics import _enforce_state_db_containment
 from .escalation import (
     SummaryCircuitBreaker,
     _strip_reasoning_blocks,
@@ -1500,19 +1501,15 @@ class LCMEngine(ContextEngine):
         kwargs = kwargs or {}
         hermes_home = str(kwargs.get("hermes_home") or self._hermes_home or "")
         if hermes_home:
-            # Prevent directory traversal by resolving the path
-            path = Path(hermes_home).expanduser().resolve()
-            # Check containment within allowed base only when restriction is active
-            allowed_base = self._get_allowed_hermes_base()
-            if allowed_base is not None:
-                try:
-                    path.relative_to(allowed_base)
-                except ValueError:
-                    raise ValueError(
-                        f"hermes_home {hermes_home} resolves to {path} which is not within allowed base {allowed_base}"
-                    )
-            return path / "state.db"
-        return Path(self._store.db_path).parent / "state.db"
+            return _enforce_state_db_containment(
+                Path(hermes_home) / "state.db",
+                description=f"hermes_home {hermes_home}",
+            )
+        db_path = Path(self._store.db_path)
+        return _enforce_state_db_containment(
+            db_path.parent / "state.db",
+            description=f"state database fallback from LCM database {db_path}",
+        )
 
     def _caller_is_auxiliary_agent_frame(self, caller_self: Any) -> bool:
         if caller_self is None:
@@ -2614,13 +2611,8 @@ class LCMEngine(ContextEngine):
         except Exception as exc:  # pragma: no cover - defensive
             status["source_lineage"] = {"error": str(exc)}
         try:
-            state_db_path = (
-                Path(self._hermes_home).expanduser() / "state.db"
-                if self._hermes_home
-                else Path(self._store.db_path).parent / "state.db"
-            )
             status["lifecycle_fragmentation"] = self._lifecycle.get_fragmentation_stats(
-                state_db_path=state_db_path
+                state_db_path=self._state_db_path()
             )
         except Exception as exc:  # pragma: no cover - defensive
             status["lifecycle_fragmentation"] = {"error": str(exc), "read_only": True}

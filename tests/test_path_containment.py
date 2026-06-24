@@ -62,3 +62,37 @@ def test_engine_state_db_path_outside_allowed_base(monkeypatch):
         # Should raise ValueError
         with pytest.raises(ValueError, match="not within allowed base"):
             engine._state_db_path()
+
+
+def test_state_db_path_fallback_outside_allowed_base_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("LCM_HERMES_BASE_DIR", str(tmp_path / "allowed"))
+
+    from hermes_lcm.command import _state_db_path_for_engine as command_state_db_path
+    from hermes_lcm.tools import _state_db_path_for_engine as tools_state_db_path
+
+    class MockStore:
+        db_path = str(tmp_path / "outside" / "lcm.db")
+
+    class MockEngine:
+        _hermes_home = ""
+        _store = MockStore()
+
+    for state_db_path_for_engine in (command_state_db_path, tools_state_db_path):
+        with pytest.raises(ValueError, match="not within allowed base"):
+            state_db_path_for_engine(MockEngine())
+
+
+def test_engine_state_db_path_fallback_outside_allowed_base_rejected(monkeypatch, tmp_path):
+    monkeypatch.setenv("LCM_HERMES_BASE_DIR", str(tmp_path / "allowed"))
+
+    from hermes_lcm.engine import LCMEngine
+
+    class MockStore:
+        db_path = str(tmp_path / "outside" / "lcm.db")
+
+    engine = LCMEngine.__new__(LCMEngine)
+    engine._hermes_home = ""
+    engine._store = MockStore()
+
+    with pytest.raises(ValueError, match="not within allowed base"):
+        engine._state_db_path()

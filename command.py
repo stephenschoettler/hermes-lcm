@@ -9,6 +9,7 @@ import sqlite3
 from typing import Any
 
 from .db_bootstrap import (
+    check_external_content_fts_integrity,
     external_content_fts_needs_repair,
     inspect_lcm_schema_health,
     repair_external_content_fts,
@@ -914,18 +915,26 @@ def _doctor_text(engine) -> str:
 
     try:
         store_fts_count = int(store_conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0])
-        store_fts = "ok"
+        store_fts_integrity = check_external_content_fts_integrity(store_conn, build_message_fts_spec())
+        store_fts = "ok" if store_fts_integrity["status"] == "pass" else store_fts_integrity["status"]
+        if store_fts != "ok":
+            issues.append("messages_fts")
     except Exception as exc:  # pragma: no cover - defensive
         store_fts_count = f"error: {exc}"
         store_fts = f"error: {exc}"
+        store_fts_integrity = {"status": "fail", "detail": str(exc)}
         issues.append("messages_fts")
 
     try:
         node_fts_count = int(dag_conn.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0])
-        node_fts = "ok"
+        node_fts_integrity = check_external_content_fts_integrity(dag_conn, build_nodes_fts_spec())
+        node_fts = "ok" if node_fts_integrity["status"] == "pass" else node_fts_integrity["status"]
+        if node_fts != "ok":
+            issues.append("nodes_fts")
     except Exception as exc:  # pragma: no cover - defensive
         node_fts_count = f"error: {exc}"
         node_fts = f"error: {exc}"
+        node_fts_integrity = {"status": "fail", "detail": str(exc)}
         issues.append("nodes_fts")
 
     total_messages = _safe_count(store_conn, "SELECT COUNT(*) FROM messages", "messages_total")

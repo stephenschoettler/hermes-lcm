@@ -505,7 +505,7 @@ def test_plugin_entrypoint_registration_is_repeatable_and_returns_lcm_engine():
     assert engine.name == "lcm"
 
 
-def test_register_gracefully_degrades_when_host_lacks_register_tool():
+def test_register_gracefully_degrades_when_legacy_host_lacks_register_tool():
     """Guard regression: register() must not raise when ctx lacks register_tool."""
     repo_root = Path(__file__).resolve().parent.parent
     module = _load_plugin_entrypoint_module("hermes_lcm_no_register_tool")
