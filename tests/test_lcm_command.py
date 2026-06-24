@@ -1076,6 +1076,29 @@ def test_lcm_doctor_text_reports_unchecked_message_fts_as_warning(engine, monkey
     assert "/lcm doctor repair" not in text_result
 
 
+def test_lcm_doctor_json_preserves_unchecked_fts_detail_for_guidance(engine, monkeypatch):
+    def fake_fts_integrity(_conn, spec):
+        if spec.table_name == "messages_fts":
+            return {"status": "unchecked", "detail": "attempt to write a readonly database"}
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(lcm_tools, "check_external_content_fts_integrity", fake_fts_integrity)
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    messages_check = next(check for check in doctor["checks"] if check["check"] == "messages_fts_integrity")
+    guidance = {item["check"]: item for item in doctor["guidance"]}
+
+    assert messages_check["status"] == "warn"
+    assert messages_check["detail"] == {
+        "status": "unchecked",
+        "detail": "attempt to write a readonly database",
+    }
+    assert guidance["messages_fts_integrity"]["action"] == "inspect"
+    assert guidance["messages_fts_integrity"]["warning_only"] is True
+    assert "read-write SQLite access" in guidance["messages_fts_integrity"]["operator_action"]
+    assert "/lcm doctor repair" not in guidance["messages_fts_integrity"]["operator_action"]
+
+
 def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "lcm_repair_drift.db"))
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
@@ -1111,6 +1134,29 @@ def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
         ).fetchall()
     }
     assert remaining_triggers == set()
+
+
+def test_lcm_doctor_repair_reports_same_count_deep_fts_drift(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_repair_deep_drift.db"))
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    engine._session_id = "live-session"
+    engine._session_platform = "telegram"
+    engine._conversation_id = "live-session"
+    engine._store.append("live-session", {"role": "user", "content": "original searchable content"}, token_estimate=4)
+    engine._store._conn.execute("DROP TRIGGER msg_fts_update")
+    engine._store._conn.execute(
+        "UPDATE messages SET content = ? WHERE session_id = ?",
+        ("changed searchable content", "live-session"),
+    )
+    engine._store._conn.commit()
+
+    result = handle_lcm_command("doctor repair", engine)
+
+    assert "LCM doctor repair" in result
+    assert "status: repair-needed" in result
+    assert "messages_fts: repair-needed" in result
+    assert "messages_fts_integrity_status: fail" in result
+    assert "note: use `/lcm doctor repair apply`" in result
 
 
 def test_lcm_doctor_repair_dry_run_works_with_read_only_database(tmp_path):

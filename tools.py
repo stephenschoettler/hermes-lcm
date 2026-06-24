@@ -2026,7 +2026,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             checks.append({
                 "check": check_name,
                 "status": "warn" if status == "unchecked" else status,
-                "detail": fts_integrity["detail"],
+                "detail": fts_integrity if status == "unchecked" else fts_integrity["detail"],
             })
         except Exception as e:
             checks.append({

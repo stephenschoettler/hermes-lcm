@@ -693,7 +693,10 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
     conn = engine._store._conn
     for label, spec in specs.items():
         try:
-            needs_repair = external_content_fts_needs_repair(conn, spec)
+            structural_needs_repair = external_content_fts_needs_repair(conn, spec)
+            integrity_check = check_external_content_fts_integrity(conn, spec)
+            integrity_status = str(integrity_check.get("status") or "fail")
+            needs_repair = structural_needs_repair or integrity_status == "fail"
             content_count = int(conn.execute(
                 f"SELECT COUNT(*) FROM {spec.content_table}"
             ).fetchone()[0])
@@ -706,6 +709,8 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
                 "needs_repair": needs_repair,
                 "content_rows": content_count,
                 "fts_rows": fts_count,
+                "integrity_status": integrity_status,
+                "integrity_detail": integrity_check.get("detail"),
                 "error": None,
             }
         except Exception as exc:  # pragma: no cover - defensive
@@ -714,6 +719,8 @@ def _scan_fts_repair(engine) -> dict[str, Any]:
                 "needs_repair": True,
                 "content_rows": None,
                 "fts_rows": None,
+                "integrity_status": "error",
+                "integrity_detail": str(exc),
                 "error": str(exc),
             }
     return {
@@ -736,6 +743,7 @@ def _doctor_repair_text(engine) -> str:
         else:
             lines.append(f"{label}_content_rows: {item['content_rows']}")
             lines.append(f"{label}_fts_rows: {item['fts_rows']}")
+            lines.append(f"{label}_integrity_status: {item['integrity_status']}")
     lines.append("note: read-only scan only — no FTS tables were repaired")
     if scan["needs_repair"]:
         lines.append("note: use `/lcm doctor repair apply` to create a backup and repair FTS indexes")
