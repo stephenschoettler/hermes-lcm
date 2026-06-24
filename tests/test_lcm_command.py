@@ -1057,6 +1057,25 @@ def test_lcm_doctor_text_reports_same_count_stale_message_fts(engine):
     assert "/lcm doctor repair" in text_result
 
 
+def test_lcm_doctor_text_reports_unchecked_message_fts_as_warning(engine, monkeypatch):
+    def fake_fts_integrity(_conn, spec):
+        if spec.table_name == "messages_fts":
+            return {"status": "unchecked", "detail": "attempt to write a readonly database"}
+        return {"status": "pass", "detail": "ok"}
+
+    monkeypatch.setattr(command_mod, "check_external_content_fts_integrity", fake_fts_integrity)
+
+    text_result = handle_lcm_command("doctor", engine)
+
+    assert "status: action-recommended" in text_result
+    assert "messages_fts: unchecked" in text_result
+    assert "nodes_fts: ok" in text_result
+    assert "issues: none" in text_result
+    assert "messages_fts_integrity: inspect warning-only" in text_result
+    assert "read-write SQLite access" in text_result
+    assert "/lcm doctor repair" not in text_result
+
+
 def test_lcm_doctor_repair_reports_fts_drift_without_mutating(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "lcm_repair_drift.db"))
     engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))

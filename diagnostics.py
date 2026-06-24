@@ -93,9 +93,15 @@ def doctor_guidance_for_check(check: dict[str, Any]) -> dict[str, Any] | None:
     elif name == "schema_core_tables":
         command = "verify HERMES_HOME/LCM_DATABASE_PATH points at the intended LCM database before repair or restore"
     elif name in {"messages_fts_integrity", "nodes_fts_integrity", "fts_index_sync"}:
-        action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
-        command = "run `/lcm doctor repair` first; if it still recommends repair, run `/lcm backup` before `/lcm doctor repair apply`"
-        rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
+        if status == "warn" and isinstance(detail, dict) and detail.get("status") == "unchecked":
+            action = DOCTOR_ACTION_INSPECT
+            command = "rerun `/lcm doctor` with read-write SQLite access if a deep FTS integrity result is needed"
+            warning_only = True
+            rationale = "the deep FTS check could not run, but this is not evidence that the index is corrupt"
+        else:
+            action = DOCTOR_ACTION_BACKUP_FIRST_CLEANUP
+            command = "run `/lcm doctor repair` first; if it still recommends repair, run `/lcm backup` before `/lcm doctor repair apply`"
+            rationale = "FTS repair is rebuildable, but it still mutates SQLite indexes"
     elif name == "sqlite_storage":
         command = "inspect journal/quick_check output and database/WAL size; restore from backup if SQLite reports corruption"
     elif name == "payload_storage":

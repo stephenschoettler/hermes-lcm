@@ -890,6 +890,7 @@ def _doctor_text(engine) -> str:
     dag_conn = engine._dag._conn
 
     issues: list[str] = []
+    recommended_actions: list[str] = []
     schema_health = inspect_lcm_schema_health(store_conn, database_path=str(db_path))
     schema_missing_raw = schema_health.get("missing_tables")
     schema_missing_tables = [str(name) for name in schema_missing_raw] if isinstance(schema_missing_raw, list) else []
@@ -913,12 +914,18 @@ def _doctor_text(engine) -> str:
         integrity = f"error: {exc}"
         issues.append("sqlite_integrity")
 
+    def _fts_text_status(result: dict[str, Any]) -> str:
+        status = str(result.get("status") or "fail")
+        return "ok" if status == "pass" else status
+
     try:
         store_fts_count = int(store_conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0])
         store_fts_integrity = check_external_content_fts_integrity(store_conn, build_message_fts_spec())
-        store_fts = "ok" if store_fts_integrity["status"] == "pass" else store_fts_integrity["status"]
-        if store_fts != "ok":
+        store_fts = _fts_text_status(store_fts_integrity)
+        if store_fts == "fail":
             issues.append("messages_fts")
+        elif store_fts == "unchecked":
+            recommended_actions.append("rerun `/lcm doctor` with read-write SQLite access if a deep messages FTS check is needed")
     except Exception as exc:  # pragma: no cover - defensive
         store_fts_count = f"error: {exc}"
         store_fts = f"error: {exc}"
@@ -928,9 +935,11 @@ def _doctor_text(engine) -> str:
     try:
         node_fts_count = int(dag_conn.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0])
         node_fts_integrity = check_external_content_fts_integrity(dag_conn, build_nodes_fts_spec())
-        node_fts = "ok" if node_fts_integrity["status"] == "pass" else node_fts_integrity["status"]
-        if node_fts != "ok":
+        node_fts = _fts_text_status(node_fts_integrity)
+        if node_fts == "fail":
             issues.append("nodes_fts")
+        elif node_fts == "unchecked":
+            recommended_actions.append("rerun `/lcm doctor` with read-write SQLite access if a deep nodes FTS check is needed")
     except Exception as exc:  # pragma: no cover - defensive
         node_fts_count = f"error: {exc}"
         node_fts = f"error: {exc}"
@@ -1023,7 +1032,6 @@ def _doctor_text(engine) -> str:
             debt_rows = [(f"error: {exc}", "error", 0)]
 
     observations: list[str] = []
-    recommended_actions: list[str] = []
     missing_externalized_refs = int(externalized_integrity.get("externalized_payload_refs_missing", 0) or 0)
     suspicious_payload_rows = sum(
         len(payload_risks.get(key) or [])
@@ -1189,9 +1197,17 @@ def _doctor_text(engine) -> str:
     if schema_health.get("error") or schema_missing_tables:
         triage_checks.append({"check": "schema_core_tables", "status": "fail", "detail": schema_health})
     if store_fts != "ok":
-        triage_checks.append({"check": "messages_fts_integrity", "status": "fail", "detail": store_fts})
+        triage_checks.append({
+            "check": "messages_fts_integrity",
+            "status": "warn" if store_fts == "unchecked" else "fail",
+            "detail": store_fts_integrity,
+        })
     if node_fts != "ok":
-        triage_checks.append({"check": "nodes_fts_integrity", "status": "fail", "detail": node_fts})
+        triage_checks.append({
+            "check": "nodes_fts_integrity",
+            "status": "warn" if node_fts == "unchecked" else "fail",
+            "detail": node_fts_integrity,
+        })
     if clean_scan["candidates"]:
         triage_checks.append({"check": "cleanup_candidates", "status": "warn", "detail": clean_scan})
     if payload_storage_error or missing_externalized_refs or any(payload_risks.get(key) for key in (
