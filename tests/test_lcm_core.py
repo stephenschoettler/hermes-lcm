@@ -1,5 +1,6 @@
 """Tests for LCM core components: store, DAG, tokens, config, escalation."""
 
+import copy
 import json
 import re
 import sqlite3
@@ -4745,3 +4746,24 @@ class TestLCMEngineCloning:
             lifecycle.close()
             for engine in (prototype, first_agent, second_agent):
                 engine.shutdown()
+
+    def test_deepcopy_uses_clone_for_agent_without_copying_sqlite_handles(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-deepcopy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            clone = copy.deepcopy(prototype)
+
+            assert clone is not prototype
+            assert isinstance(clone, LCMEngine)
+            assert clone._store is not prototype._store
+            assert clone._dag is not prototype._dag
+            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._config.database_path == prototype._config.database_path
+            assert clone._hermes_home == prototype._hermes_home
+        finally:
+            prototype.shutdown()
+            if clone is not None:
+                clone.shutdown()

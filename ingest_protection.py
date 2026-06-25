@@ -102,12 +102,15 @@ _HEARTBEAT_NOISE_RE = re.compile(
 _HEARTBEAT_NOISE_MAX_CHARS = 256
 _GENERIC_BASE64_MIN_CHARS = 4096
 _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*ref=([^;\]\s]+)\]")
+_EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
+    r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
+)
 _SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
 _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     "api_key": re.compile(
-        r"(?P<prefix>\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|client[_-]?secret)\b\s*[\"']?\s*[:=]\s*[\"']?)"
+        r"(?P<prefix>(?:\\?[\"']?)\b(?:api[_-]?key|api[_-]?token|access[_-]?token|secret[_-]?key|client[_-]?secret)\b\s*(?:\\?[\"']?)\s*[:=]\s*(?:\\?[\"']?))"
         r"(?P<secret>[A-Za-z0-9._~+/=-]{12,})"
-        r"(?P<suffix>[\"']?)",
+        r"(?P<suffix>\\?[\"']?)",
         re.IGNORECASE,
     ),
     "bearer_token": re.compile(
@@ -154,7 +157,7 @@ def extract_ingest_externalized_refs(text: str) -> list[str]:
 
 
 def _is_basename_ref(ref: str) -> bool:
-    return bool(ref) and "/" not in ref and "\\" not in ref and Path(ref).name == ref
+    return bool(ref) and ref.endswith(".json") and "/" not in ref and "\\" not in ref and Path(ref).name == ref
 
 
 def extract_all_externalized_payload_refs(text: str) -> list[str]:
@@ -618,12 +621,18 @@ def _maybe_parse_json_string(text: str) -> Any | None:
     stripped = text.strip()
     if not stripped or stripped[0] not in "[{":
         return None
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return None
-    if isinstance(parsed, (dict, list)):
-        return parsed
+    candidates = [text]
+    if '\\"' in stripped:
+        candidates.append(stripped.replace('\\"', '"'))
+    for candidate in candidates:
+        if _json_has_duplicate_object_keys(candidate):
+            return None
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, (dict, list)):
+            return parsed
     return None
 
 
@@ -982,6 +991,177 @@ def protect_messages_for_ingest(
     ]
 
 
+def _append_unique_refs(target: list[str], refs: list[str]) -> None:
+    for ref in refs:
+        if ref not in target:
+            target.append(ref)
+
+
+def _walk_string_values(value: Any):
+    if isinstance(value, str):
+        yield value
+        parsed = _maybe_parse_json_string(value)
+        if parsed is not None and not (isinstance(parsed, str) and parsed == value):
+            yield from _walk_string_values(parsed)
+    elif isinstance(value, dict):
+        for key, nested in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _walk_string_values(nested)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_string_values(item)
+
+
+def _walk_tool_call_argument_values(value: Any):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key == "arguments":
+                yield nested
+            yield from _walk_tool_call_argument_values(nested)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_tool_call_argument_values(item)
+
+
+def _is_inside_token_quote_span(text: str, start: int, token: str) -> bool:
+    in_span = False
+    i = 0
+    while i < start:
+        if text.startswith(token, i):
+            in_span = not in_span
+            i += len(token)
+        else:
+            i += 1
+    return in_span
+
+
+def _looks_like_example_quote_context(context: str) -> bool:
+    return re.search(r"(?:pytest\s+output|log|example|traceback|failure)\s*:\s*$", context.lower()) is not None
+
+
+def _has_local_escaped_quote_before(text: str, start: int) -> bool:
+    boundary = max(text.rfind(delimiter, 0, start) for delimiter in (",", "{", "["))
+    segment = text[boundary + 1:start]
+    matches = list(re.finditer(r"\\+[\"']", segment))
+    if not matches:
+        return False
+    quote = matches[-1]
+    context = segment[max(0, quote.start() - 80):quote.start()]
+    return _looks_like_example_quote_context(context)
+
+
+def _is_escaped_placeholder_example(text: str, start: int) -> bool:
+    prefix = text[max(0, start - 8):start]
+    return prefix.endswith("\\") or _has_local_escaped_quote_before(text, start)
+
+
+def _is_quoted_placeholder_example(text: str, start: int) -> bool:
+    for quote_token in ('"', "'"):
+        if not _is_inside_token_quote_span(text, start, quote_token):
+            continue
+        quote = text.rfind(quote_token, 0, start)
+        if quote < 0:
+            continue
+        context = text[max(0, quote - 80):quote]
+        if _looks_like_example_quote_context(context):
+            return True
+    return False
+
+
+def _looks_like_json_container_string(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("{") or stripped.startswith("[")
+
+
+def _looks_like_example_payload_ref(ref: str) -> bool:
+    name = Path(ref).name.lower()
+    return name.startswith(("example-", "example_", "fake-", "fake_", "dummy-", "dummy_", "placeholder-", "placeholder_"))
+
+
+def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
+    refs: list[str] = []
+    for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
+        for match in pattern.finditer(text):
+            ref = match.group(1).strip()
+            if not _is_basename_ref(ref):
+                continue
+            if _looks_like_example_payload_ref(ref) and _is_escaped_placeholder_example(text, match.start()):
+                continue
+            if (
+                ignore_quoted_spans
+                and _looks_like_example_payload_ref(ref)
+                and _is_quoted_placeholder_example(text, match.start())
+            ):
+                continue
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
+def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) -> list[str]:
+    """Return refs that plausibly came from LCM storage-boundary placeholders.
+
+    Tool outputs and tool-call arguments often contain escaped code snippets,
+    pytest failures, or docs that mention placeholder examples. Counting those
+    as live payload references turns doctor into a false-positive machine. Exact
+    placeholders are still counted everywhere; embedded unescaped placeholders
+    are counted for message content, raw JSON-container tool-call argument
+    strings, and raw free-form tool-call argument strings so ingestion-produced
+    refs do not disappear while quoted examples stay ignored.
+    """
+    if not isinstance(value, str) or not value:
+        return []
+    stripped = value.strip()
+    if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
+        return extract_all_externalized_payload_refs(stripped)
+    if field == "tool_calls":
+        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
+        parsed = _maybe_parse_json_string(value)
+        if parsed is None:
+            return refs
+        for argument in _walk_tool_call_argument_values(parsed):
+            if isinstance(argument, str):
+                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True))
+                parsed_argument = _maybe_parse_json_string(argument)
+                if parsed_argument is not None:
+                    for nested in _walk_string_values(parsed_argument):
+                        nested_stripped = nested.strip()
+                        if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                            _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+                        else:
+                            _append_unique_refs(
+                                refs,
+                                _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True),
+                            )
+            else:
+                for nested in _walk_string_values(argument):
+                    nested_stripped = nested.strip()
+                    if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                        _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+                    else:
+                        _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
+        for nested in _walk_string_values(parsed):
+            nested_stripped = nested.strip()
+            if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+            else:
+                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
+        return refs
+    if role == "tool":
+        refs = _extract_unescaped_externalized_payload_refs(value)
+        parsed = _maybe_parse_json_string(value)
+        if parsed is not None:
+            for nested in _walk_string_values(parsed):
+                nested_stripped = nested.strip()
+                if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
+                    _append_unique_refs(refs, extract_all_externalized_payload_refs(nested_stripped))
+                else:
+                    _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
+        return refs
+    return extract_all_externalized_payload_refs(value)
+
+
 def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
     """Compare externalized payload refs stored in messages with JSON files.
 
@@ -1009,7 +1189,7 @@ def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", 
         for field, value in (("content", content), ("tool_calls", tool_calls)):
             if not isinstance(value, str):
                 continue
-            for ref in extract_all_externalized_payload_refs(value):
+            for ref in _refs_for_externalized_integrity_scan(value, role=str(role or ""), field=field):
                 referenced_refs.add(ref)
                 first_location_by_ref.setdefault(
                     ref,

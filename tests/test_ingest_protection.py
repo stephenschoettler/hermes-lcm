@@ -336,10 +336,16 @@ def test_sensitive_patterns_cover_client_secret_duplicate_json_and_quoted_passwo
     client_secret = "oauthsupersecret1234567890"
     first_json_secret = "oldoauthclientsecret1234567890"
     second_json_secret = "newoauthclientsecret1234567890"
+    escaped_first_json_secret = "alphaescapedclientsecret1234567890"
+    escaped_second_json_secret = "betaescapedclientsecret1234567890"
     password_phrase = "correct horse battery staple"
     duplicate_key_json = (
         f'{{"client_secret":"{first_json_secret}",'
         f'"client_secret":"{second_json_secret}"}}'
+    )
+    escaped_duplicate_key_json = (
+        f'{{\\"client_secret\\":\\"{escaped_first_json_secret}\\",'
+        f'\\"client_secret\\":\\"{escaped_second_json_secret}\\"}}'
     )
 
     engine._ingest_messages([
@@ -355,7 +361,12 @@ def test_sensitive_patterns_cover_client_secret_duplicate_json_and_quoted_passwo
                     "id": "call_1",
                     "type": "function",
                     "function": {"name": "oauth", "arguments": duplicate_key_json},
-                }
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "oauth", "arguments": escaped_duplicate_key_json},
+                },
             ],
         },
     ])
@@ -364,7 +375,15 @@ def test_sensitive_patterns_cover_client_secret_duplicate_json_and_quoted_passwo
         "SELECT content, COALESCE(tool_calls, '') FROM messages ORDER BY store_id"
     ).fetchall()
     stored_text = "\n".join("\n".join(row) for row in rows)
-    for raw in (client_secret, first_json_secret, second_json_secret, password_phrase, "horse battery staple"):
+    for raw in (
+        client_secret,
+        first_json_secret,
+        second_json_secret,
+        escaped_first_json_secret,
+        escaped_second_json_secret,
+        password_phrase,
+        "horse battery staple",
+    ):
         assert raw not in stored_text
         assert engine._store.search(raw, session_id=engine.current_session_id) == []
     assert "client_secret=" in stored_text
@@ -1942,6 +1961,709 @@ def test_externalized_payload_integrity_scan_detects_embedded_content_placeholde
             "externalized_ref": "missing-embedded.json",
         }
     ]
+
+
+def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_examples_in_logs(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    escaped_output = (
+        'pytest output: \\\\"[Externalized LCM ingest payload: kind=ingest_payload; '
+        'field=content; chars=1; bytes=1; '
+        'ref=example-log-ref.json]\\\\"'
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "tool",
+            escaped_output,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+
+
+def test_externalized_payload_integrity_scan_detects_nested_tool_call_argument_json_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=missing-tool-call-media.json]"
+    )
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": json.dumps({"image": placeholder}),
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "telegram",
+            "role": "assistant",
+            "field": "tool_calls",
+            "externalized_ref": "missing-tool-call-media.json",
+        }
+    ]
+
+
+def test_externalized_payload_integrity_scan_detects_embedded_tool_call_metadata_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-tool-call-metadata-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-tool-call-metadata-media.json]"
+    )
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": "{}",
+                },
+                "metadata": f"prefix {placeholder} suffix",
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_counts_duplicate_provider_custom_field_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-provider-custom.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-provider-custom.json]"
+    )
+    tool_calls = (
+        '[{"metadata":"'
+        + placeholder
+        + '","metadata":"fallback","function":{"arguments":"{}"}}]'
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_reports_missing_ref_in_malformed_tool_calls(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=missing-malformed-tool-calls.json]"
+    )
+    tool_calls = '[{"function":{"arguments":"{}"},"metadata":"' + placeholder + '"'
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "telegram",
+            "role": "assistant",
+            "field": "tool_calls",
+            "externalized_ref": "missing-malformed-tool-calls.json",
+        }
+    ]
+
+
+def test_externalized_payload_integrity_scan_detects_embedded_tool_call_argument_placeholder_with_duplicate_keys(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-tool-call-media.json]"
+    )
+    duplicate_key_arguments = (
+        '{"note":"said \\\"hi\\\"","image":"'
+        + placeholder
+        + '","image":"plain text fallback"}'
+    )
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": duplicate_key_arguments,
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_detects_free_form_tool_call_argument_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-free-form-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-free-form-tool-call-media.json]"
+    )
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": f"prefix {placeholder} suffix",
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_detects_json_tool_call_argument_placeholder_after_caption_quotes(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-caption-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-caption-tool-call-media.json]"
+    )
+    arguments = json.dumps({"image": f'caption says "front" {placeholder}'})
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": arguments,
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_detects_json_tool_call_argument_placeholder_after_unmatched_caption_quote(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-unmatched-caption-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-unmatched-caption-tool-call-media.json]"
+    )
+    arguments = json.dumps({"image": f'caption says "front {placeholder}'})
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": arguments,
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_detects_parsed_object_tool_call_argument_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-object-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=present-object-tool-call-media.json]"
+    )
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "analyze_image",
+                    "arguments": {"image": f"user's screenshot {placeholder} suffix"},
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_examples_inside_tool_call_json(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=example-missing.json]"
+    )
+    arguments = json.dumps({"log": f'pytest output: "prefix before placeholder {placeholder}"'})
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "inspect_log",
+                    "arguments": arguments,
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+
+
+def test_externalized_payload_integrity_scan_ignores_single_quoted_placeholder_examples_inside_tool_call_json(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=example-single-quote.json]"
+    )
+    arguments = json.dumps({"log": f"pytest output: 'prefix before placeholder {placeholder}'"})
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "inspect_log",
+                    "arguments": arguments,
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+
+
+def test_externalized_payload_integrity_scan_counts_real_refs_inside_tool_call_log_quotes(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "20260625-real-tool-call-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=tool_calls; "
+        "chars=1; bytes=1; ref=20260625-real-tool-call-media.json]"
+    )
+    arguments = json.dumps({"log": f'pytest output: "prefix before placeholder {placeholder}"'})
+    tool_calls = json.dumps(
+        [
+            {
+                "function": {
+                    "name": "inspect_log",
+                    "arguments": arguments,
+                }
+            }
+        ]
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "assistant",
+            "calling tool",
+            None,
+            tool_calls,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_detects_embedded_tool_content_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    content = (
+        'log returned \\\"preview\\\" plus '
+        "[Externalized LCM ingest payload: kind=media_payload; field=content; "
+        "chars=1; bytes=1; ref=missing-tool-content-media.json]"
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "tool",
+            content,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "telegram",
+            "role": "tool",
+            "field": "content",
+            "externalized_ref": "missing-tool-content-media.json",
+        }
+    ]
+
+
+def test_externalized_payload_integrity_scan_detects_escaped_json_tool_content_placeholder(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    (storage_dir / "present-tool-content-media.json").write_text(json.dumps({"content": "payload"}))
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=content; "
+        "chars=1; bytes=1; ref=present-tool-content-media.json]"
+    )
+    content = '{\\"output\\":\\"' + placeholder + '\\",\\"output\\":\\"fallback\\"}'
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "tool",
+            content,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_existing"] == 1
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["externalized_payload_files_unreferenced"] == 0
+
+
+def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_examples_inside_tool_content_json(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized LCM ingest payload: kind=media_payload; field=content; "
+        "chars=1; bytes=1; ref=example-tool-content.json]"
+    )
+    content = '{\\"log\\":\\"pytest output: \\\\\\\"prefix before placeholder ' + placeholder + '\\\\\\\"\\"}'
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "telegram",
+            "tool",
+            content,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(engine._store._conn, engine._config, hermes_home=engine._hermes_home)
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
 
 
 def test_lcm_doctor_warns_on_missing_externalized_payload_refs_when_inline_payloads_are_clean(tmp_path):
