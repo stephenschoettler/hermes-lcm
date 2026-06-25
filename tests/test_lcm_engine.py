@@ -4137,6 +4137,43 @@ class TestEngineCompress:
         assert result[0]["content"][-1]["type"] == "text"
         assert "Lossless Context Management" in result[0]["content"][-1]["text"]
 
+    def test_assemble_context_summary_role_is_user_after_system_anchor(self, engine):
+        """The summary must not be the leading non-system message as ``assistant``.
+
+        After compaction the system prompt is the only leading anchor, so the
+        DAG summary becomes the first message reaching the provider. Anthropic
+        extracts the system prompt into a separate field and rejects a request
+        whose first ``messages`` entry is ``assistant`` with HTTP 400 (the
+        misleading ``tool_use ids ... without tool_result`` error). The summary
+        block must therefore be assigned ``role="user"``.
+        """
+        engine._dag.add_node(SummaryNode(
+            session_id=engine._session_id,
+            depth=0,
+            summary="prior work summary",
+            token_count=50,
+            source_token_count=5000,
+            source_ids=[],
+            source_type="messages",
+            created_at=1.0,
+        ))
+        system_msg = {"role": "system", "content": "You are an agent."}
+        tail = [
+            {"role": "user", "content": "do the thing"},
+            {"role": "assistant", "content": "working on it"},
+        ]
+
+        result = engine._assemble_context(system_msg, tail)
+
+        non_system = [m for m in result if m.get("role") != "system"]
+        assert non_system, "expected at least one non-system message"
+        assert non_system[0]["role"] == "user"
+        summary_block = next(
+            m for m in result
+            if isinstance(m.get("content"), str) and "prior work summary" in m["content"]
+        )
+        assert summary_block["role"] == "user"
+
     def test_compress_preserves_latest_user_request_outside_fresh_tail(self, tmp_path, monkeypatch):
         """The latest real user request anchors the task even after tool-heavy turns.
 
@@ -13897,7 +13934,11 @@ class TestEngineTools:
         compressed = engine.compress(messages)
 
         assert compressed[0]["role"] == "system"
-        assert compressed[1]["role"] == "assistant"
+        # The summary follows the system prompt, so it must be role "user" —
+        # an assistant summary as the first non-system message is rejected by
+        # Anthropic (it extracts the system prompt and requires messages[0]
+        # to be "user").
+        assert compressed[1]["role"] == "user"
         assert "Recent Summary" in compressed[1]["content"]
         stored_tool = next(row for row in engine._store.get_range("test-session") if row["role"] == "tool")
         assert stored_tool["content"].startswith("[GC'd externalized tool output:")

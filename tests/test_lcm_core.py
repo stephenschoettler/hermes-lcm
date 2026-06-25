@@ -3737,8 +3737,14 @@ class TestAssemblyBudgetSelection:
         assert "KEEP_USER_DECISION" in contents
         assert "Latest compact status" in contents
         assert "oversized assistant tool chatter" not in contents
+        # The preserved objective is replayed as scaffolding (identified by its
+        # content prefix, not its role), so it must never appear as a raw
+        # user-role turn that could be re-ingested as a durable row.
         assert not any(
-            msg.get("role") == "user" and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            msg.get("role") == "user"
+            and "[Current user objective preserved from compacted history]"
+            not in str(msg.get("content", ""))
+            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
             for msg in assembled
         )
 
@@ -3802,8 +3808,14 @@ class TestAssemblyBudgetSelection:
             and "KEEP_USER_DECISION" in str(msg.get("content", ""))
             for msg in assembled
         )
+        # The preserved objective is replayed as scaffolding (identified by its
+        # content prefix, not its role), so it must never appear as a raw
+        # user-role turn that could be re-ingested as a durable row.
         assert not any(
-            msg.get("role") == "user" and "KEEP_USER_DECISION" in str(msg.get("content", ""))
+            msg.get("role") == "user"
+            and "[Current user objective preserved from compacted history]"
+            not in str(msg.get("content", ""))
+            and "KEEP_USER_DECISION" in str(msg.get("content", ""))
             for msg in assembled
         )
 
