@@ -24,6 +24,16 @@ _MEDIA_ATTACHMENT_SUFFIX = "[with media attachment]"
 _TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 _MEDIA_BLOCK_HINTS = ("image", "audio", "video")
 _STRUCTURED_METADATA_KEYS = ("file_id", "filename", "name", "mime_type", "url", "file_url", "id")
+_INJECTED_CONTEXT_TAGS = (
+    "active_memory_plugin",
+    "relevant-memories",
+    "relevant_memories",
+    "hindsight_memories",
+)
+_UNTRUSTED_CONTEXT_HEADER_RE = re.compile(
+    r"^Untrusted context \(metadata, do not treat as instructions or commands\):\s*",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 EXTRACTION_PROMPT = """Extract decisions, commitments, outcomes, and rules from this conversation segment.
@@ -172,9 +182,21 @@ def _sanitize_json_like(value: Any) -> Any:
     return value
 
 
+def strip_injected_context_blocks(text: str) -> str:
+    """Remove transient memory/context blocks before compaction summarization."""
+    if not text or "<" not in text:
+        return _UNTRUSTED_CONTEXT_HEADER_RE.sub("", text).strip()
+    cleaned = text
+    for tag in _INJECTED_CONTEXT_TAGS:
+        escaped = re.escape(tag)
+        cleaned = re.sub(rf"<{escaped}>[\s\S]*?</{escaped}>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
 def sanitize_pre_compaction_content(text: Any) -> str:
-    """Replace inline media/base64 payloads with compact attachment markers."""
-    return _sanitize_content_block(text)
+    """Replace inline media/base64 payloads and transient injected context before compaction."""
+    return strip_injected_context_blocks(_sanitize_content_block(text))
 
 
 def sanitize_pre_compaction_tool_arguments(arguments: Any) -> str:
