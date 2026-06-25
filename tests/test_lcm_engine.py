@@ -4076,7 +4076,7 @@ class TestEngineCompress:
             "[Expand for details: backed prior]"
         )
         messages = [
-            {"role": "assistant", "content": active_summary_marker},
+            {"role": "user", "content": active_summary_marker},
             {"role": "user", "content": "fresh tail question"},
             {"role": "assistant", "content": "fresh tail answer"},
         ]
@@ -4164,6 +4164,41 @@ class TestEngineCompress:
         ]
 
         result = engine._assemble_context(system_msg, tail)
+
+        non_system = [m for m in result if m.get("role") != "system"]
+        assert non_system, "expected at least one non-system message"
+        assert non_system[0]["role"] == "user"
+        summary_block = next(
+            m for m in result
+            if isinstance(m.get("content"), str) and "prior work summary" in m["content"]
+        )
+        assert summary_block["role"] == "user"
+
+    def test_assemble_context_summary_role_is_user_without_system_anchor(self, engine):
+        """Gateway-style assembly (no system anchor) must not lead with ``assistant``.
+
+        ``_assemble_context`` can be called without a system message, e.g. a
+        gateway session that starts directly with user turns. With no leading
+        anchor the DAG summary becomes ``messages[0]`` itself, so it must be
+        ``role="user"`` for the same reason Anthropic rejects a leading
+        ``assistant`` entry with HTTP 400.
+        """
+        engine._dag.add_node(SummaryNode(
+            session_id=engine._session_id,
+            depth=0,
+            summary="prior work summary",
+            token_count=50,
+            source_token_count=5000,
+            source_ids=[],
+            source_type="messages",
+            created_at=1.0,
+        ))
+        tail = [
+            {"role": "user", "content": "do the thing"},
+            {"role": "assistant", "content": "working on it"},
+        ]
+
+        result = engine._assemble_context(None, tail)
 
         non_system = [m for m in result if m.get("role") != "system"]
         assert non_system, "expected at least one non-system message"

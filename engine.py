@@ -4285,12 +4285,13 @@ class LCMEngine(ContextEngine):
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
         last_role = result[-1].get("role", "system") if result else "system"
-        if result and result[-1].get("role") == "system":
-            # The system prompt is the only leading anchor, so the summary
-            # becomes the first message reaching the provider. Anthropic
-            # extracts the system prompt into a separate field and requires
-            # messages[0] to be role "user"; an assistant summary here is
-            # rejected with HTTP 400 after the second compaction.
+        if not result or result[-1].get("role") == "system":
+            # The summary becomes the first provider-visible message: either no
+            # leading anchor exists (gateway-style assembly) or the system
+            # prompt is the only anchor, which Anthropic extracts into a
+            # separate field. Either way messages[0] must be role "user"; an
+            # assistant summary here is rejected with HTTP 400 after the second
+            # compaction.
             summary_role = "user"
         else:
             summary_role = "assistant" if last_role != "assistant" else "user"
