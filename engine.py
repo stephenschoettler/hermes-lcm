@@ -485,6 +485,20 @@ class LCMEngine(ContextEngine):
             hermes_home=self._hermes_home,
         )
 
+    def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
+        """Copy the plugin runtime without pickling SQLite-backed helpers.
+
+        Hermes core may deepcopy plugin context engines while creating isolated
+        AIAgent instances. A default object deepcopy walks into MessageStore,
+        SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
+        cannot be pickled. LCM already exposes clone_for_agent() as the safe
+        boundary: share durable configuration/database path, but allocate fresh
+        per-agent runtime/storage helper objects.
+        """
+        clone = self.clone_for_agent()
+        memo[id(self)] = clone
+        return clone
+
     def _resolve_db_path(self, hermes_home: str = "") -> Path:
         """Resolve the SQLite path for the active Hermes profile/home."""
         if self._config.database_path:
