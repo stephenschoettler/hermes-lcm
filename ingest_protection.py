@@ -1057,13 +1057,16 @@ def _is_escaped_placeholder_example(text: str, start: int) -> bool:
 
 
 def _is_quoted_placeholder_example(text: str, start: int) -> bool:
-    if not _is_inside_token_quote_span(text, start, '"'):
-        return False
-    quote = text.rfind('"', 0, start)
-    if quote < 0:
-        return False
-    context = text[max(0, quote - 80):quote]
-    return _looks_like_example_quote_context(context)
+    for quote_token in ('"', "'"):
+        if not _is_inside_token_quote_span(text, start, quote_token):
+            continue
+        quote = text.rfind(quote_token, 0, start)
+        if quote < 0:
+            continue
+        context = text[max(0, quote - 80):quote]
+        if _looks_like_example_quote_context(context):
+            return True
+    return False
 
 
 def _looks_like_json_container_string(text: str) -> bool:
@@ -1113,13 +1116,13 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
         return extract_all_externalized_payload_refs(stripped)
     if field == "tool_calls":
-        refs: list[str] = []
+        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
         parsed = _maybe_parse_json_string(value)
         if parsed is None:
             return refs
         for argument in _walk_tool_call_argument_values(parsed):
             if isinstance(argument, str):
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument))
+                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True))
                 parsed_argument = _maybe_parse_json_string(argument)
                 if parsed_argument is not None:
                     for nested in _walk_string_values(parsed_argument):
