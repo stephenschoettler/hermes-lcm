@@ -5,6 +5,7 @@ with a DAG-based summarization system that preserves every message.
 """
 
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -1223,14 +1224,10 @@ class LCMEngine(ContextEngine):
             else count_messages_tokens(messages)
         )
 
-        # Auto-derive focus topic from recent user turns when not explicitly
-        # provided.  Uses already-redacted ``working_messages`` so that the
-        # same configured redaction path covers derived focus text — preventing
-        # sensitive-value leakage from structured content or bearer-style text.
-        if focus_topic is None:
-            focus_topic = self._derive_auto_focus_topic(working_messages)
+        explicit_focus_topic = focus_topic is not None
 
         noop_reason = "no eligible raw backlog outside fresh tail"
+        dependent_reply_message_ids: set[int] = set()
 
         while leaf_passes < max_leaf_passes:
             n = len(working_messages)
@@ -1255,11 +1252,73 @@ class LCMEngine(ContextEngine):
                 dropped_replayed_scaffold_messages = True
                 working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
                 pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
+                candidate_start = leading_anchor_count
                 n = len(working_messages)
                 fresh_tail_start = max(0, n - self._config.fresh_tail_count)
                 if fresh_tail_start <= leading_anchor_count:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
+
+            if candidate_start < fresh_tail_start:
+                compactable_pairs = list(
+                    zip(
+                        working_messages[candidate_start:fresh_tail_start],
+                        pressure_messages[candidate_start:fresh_tail_start],
+                    )
+                )
+                kept_working: list[Dict[str, Any]] = []
+                kept_pressure: list[Dict[str, Any]] = []
+                dropped_ignored_backlog = False
+                drop_dependent_reply = False
+                for working_msg, pressure_msg in compactable_pairs:
+                    role = str(working_msg.get("role") or "")
+                    content_text = text_content_for_pattern_matching(working_msg.get("content")) or ""
+                    volatile_digest = self._active_replay_placeholder_digest(content_text)
+                    generated_volatile_placeholder = (
+                        self._is_volatile_ignored_quarantine_placeholder(working_msg, content_text)
+                        and volatile_digest is not None
+                        and volatile_digest in self._load_generated_ignored_placeholder_hashes()
+                    )
+                    if (
+                        self._matches_ignore_message_patterns(working_msg)
+                        or self._matches_ignore_message_patterns(pressure_msg)
+                        or self._is_ignored_active_replay_placeholder(working_msg, content_text)
+                        or generated_volatile_placeholder
+                    ):
+                        dropped_ignored_backlog = True
+                        if role == "user" or role == "tool" or (role == "assistant" and working_msg.get("tool_calls")):
+                            drop_dependent_reply = True
+                        continue
+                    if drop_dependent_reply and role in {"assistant", "tool"}:
+                        dependent_reply_message_ids.add(id(working_msg))
+                    if role in {"user", "system"}:
+                        drop_dependent_reply = False
+                    kept_working.append(working_msg)
+                    kept_pressure.append(pressure_msg)
+                if dropped_ignored_backlog:
+                    dropped_replayed_scaffold_messages = True
+                    working_messages = (
+                        working_messages[:candidate_start]
+                        + kept_working
+                        + working_messages[fresh_tail_start:]
+                    )
+                    pressure_messages = (
+                        pressure_messages[:candidate_start]
+                        + kept_pressure
+                        + pressure_messages[fresh_tail_start:]
+                    )
+                    n = len(working_messages)
+                    fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+                    if fresh_tail_start <= leading_anchor_count:
+                        noop_reason = "selected leaf chunk lacks raw store lineage"
+                        break
+
+            # Auto-derive focus topic from the post-filter compaction view when
+            # not explicitly provided.  The derived focus is summarizer-visible,
+            # so it must follow the same ignored-message filtering as the leaf
+            # chunk itself.
+            if not explicit_focus_topic:
+                focus_topic = self._derive_auto_focus_topic(working_messages)
 
             candidate_raw = working_messages[leading_anchor_count:fresh_tail_start]
             if not candidate_raw:
@@ -1293,17 +1352,41 @@ class LCMEngine(ContextEngine):
                 noop_reason = "no eligible leaf chunk selected"
                 break
 
-            # Pre-compaction extraction: best-effort, never blocks compaction
-            if self._config.extraction_enabled:
-                self._run_pre_compaction_extraction(to_compact)
+            selected_raw_chunk = to_compact
+            summary_input_chunk = [
+                message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
+            ]
+            if not summary_input_chunk:
+                compacted_chunk = selected_raw_chunk
+                source_tokens = count_messages_tokens(selected_raw_chunk)
+                summary_text = (
+                    "Filtered replies derived from ignored messages.\n"
+                    "[Expand for details: ignored-dependent reply]"
+                )
+                _level = 0
+                _rescue_attempts = 0
+            else:
+                # Pre-compaction extraction: best-effort, never blocks compaction.
+                # Use the same dependency-filtered view as summarization so ignored
+                # turns cannot leak through derived assistant/tool replies.
+                if self._config.extraction_enabled:
+                    self._run_pre_compaction_extraction(summary_input_chunk)
 
-            compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
-                to_compact,
-                focus_topic=focus_topic,
-            )
-            remaining_messages = working_messages[leading_anchor_count + len(compacted_chunk):]
+                compacted_chunk, source_tokens, summary_text, _level, _rescue_attempts = self._summarize_leaf_chunk_with_rescue(
+                    summary_input_chunk,
+                    focus_topic=focus_topic,
+                )
+            compacted_summary_ids = {id(message) for message in compacted_chunk}
+            compacted_positions = [
+                idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
+            ]
+            last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
+            source_lookup_chunk = selected_raw_chunk[: last_compacted_raw_pos + 1]
+            selected_raw_len = len(source_lookup_chunk)
+            remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
 
-            source_store_ids = self._get_store_ids_for_messages(compacted_chunk)
+            source_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
+            source_store_ids = sorted(dict.fromkeys(source_store_ids))
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
 
@@ -1325,7 +1408,7 @@ class LCMEngine(ContextEngine):
             self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
             self._persist_frontier_marker()
 
-            pressure_remaining_messages = pressure_messages[leading_anchor_count + len(compacted_chunk):]
+            pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
             pressure_messages = pressure_messages[:leading_anchor_count] + pressure_remaining_messages
             leaf_compacted_this_turn = True
@@ -2049,6 +2132,7 @@ class LCMEngine(ContextEngine):
         """
         self._reset_session_counters()
         self._reset_compaction_progress()
+        self._generated_ignored_active_replay_placeholder_hashes = set()
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
@@ -2951,6 +3035,97 @@ class LCMEngine(ContextEngine):
             )
         )
 
+    @staticmethod
+    def _active_replay_placeholder_digest(text: str) -> Optional[str]:
+        match = re.search(r"sha256=([0-9a-f]{16})\]$", text.strip())
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _ignored_active_replay_placeholder(content: str) -> str:
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        return (
+            "[LCM active replay placeholder: message ignored; "
+            "kind=ignored_message; "
+            "scope=ignored_message_pattern; field=content; "
+            f"chars={len(content)}; bytes={len(content.encode('utf-8'))}; "
+            f"sha256={digest}]"
+        )
+
+    def _is_ignored_active_replay_placeholder(self, _msg: Dict[str, Any], text: str) -> bool:
+        match = re.fullmatch(
+                r"\[LCM active replay placeholder: message ignored; "
+                r"kind=ignored_message; "
+                r"scope=ignored_message_pattern; field=content; "
+                r"chars=\d+; bytes=\d+; "
+                r"sha256=([0-9a-f]{16})\]",
+                text.strip(),
+            )
+        if not match:
+            return False
+        digest = match.group(1)
+        hashes = getattr(self, "_generated_ignored_active_replay_placeholder_hashes", set())
+        if digest in hashes:
+            return True
+        if digest in self._load_generated_ignored_placeholder_hashes():
+            self._generated_ignored_active_replay_placeholder_hashes = set(hashes) | {digest}
+            return True
+        return False
+
+    def _ignored_placeholder_metadata_key(self) -> str:
+        return f"ignored_active_replay_placeholder_hashes:{self._session_id}"
+
+    def _load_generated_ignored_placeholder_hashes(self) -> set[str]:
+        return set(self._load_generated_ignored_placeholder_hash_list())
+
+    def _load_generated_ignored_placeholder_hash_list(self) -> list[str]:
+        if not self._session_id:
+            return []
+        try:
+            conn = self._store._conn
+            if conn is None:
+                return []
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (self._ignored_placeholder_metadata_key(),),
+            ).fetchone()
+            if not row or not row[0]:
+                return []
+            data = json.loads(str(row[0]))
+            if isinstance(data, list):
+                return [str(item) for item in data if re.fullmatch(r"[0-9a-f]{16}", str(item))]
+        except Exception:
+            logger.debug("LCM ignored-placeholder hash metadata load failed", exc_info=True)
+        return []
+
+    def _remember_generated_ignored_placeholder_hash(self, digest: str) -> None:
+        if not re.fullmatch(r"[0-9a-f]{16}", digest):
+            return
+        ordered_hashes = self._load_generated_ignored_placeholder_hash_list()
+        ordered_hashes = [item for item in ordered_hashes if item != digest]
+        ordered_hashes.append(digest)
+        ordered_hashes = ordered_hashes[-512:]
+        hashes = set(ordered_hashes)
+        self._generated_ignored_active_replay_placeholder_hashes = hashes
+        if not self._session_id:
+            return
+        try:
+            payload = json.dumps(ordered_hashes)
+            conn = self._store._conn
+            if conn is None:
+                return
+            with self._store._write_lock:
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (self._ignored_placeholder_metadata_key(), payload),
+                )
+                conn.commit()
+        except Exception:
+            logger.debug("LCM ignored-placeholder hash metadata write failed", exc_info=True)
+
     def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
         if not self._compiled_ignore_message_patterns:
             return False
@@ -2967,6 +3142,74 @@ class LCMEngine(ContextEngine):
             if externalized_text and externalized_text != text:
                 return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
         return False
+
+    def _apply_ignored_active_replay_placeholders(
+        self,
+        original_messages: List[Dict[str, Any]],
+        replay_messages: List[Dict[str, Any]],
+        *,
+        scan_start: int = 0,
+        ignored_messages: Optional[List[bool]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not self._compiled_ignore_message_patterns:
+            return replay_messages
+        active_replay_messages = replay_messages
+        for idx in range(max(0, scan_start), min(len(original_messages), len(replay_messages))):
+            original_msg = original_messages[idx]
+            replay_msg = replay_messages[idx]
+            ignored = (
+                ignored_messages[idx]
+                if ignored_messages is not None and idx < len(ignored_messages)
+                else self._matches_ignore_message_patterns(original_msg)
+            )
+            if not ignored:
+                continue
+            replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+            replay_preserves_ignore_decision = (
+                self._matches_ignore_message_patterns(replay_msg)
+                or self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
+                or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
+            )
+            if replay_preserves_ignore_decision:
+                continue
+            if active_replay_messages is replay_messages:
+                active_replay_messages = [dict(message) for message in replay_messages]
+            original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+            placeholder = self._ignored_active_replay_placeholder(original_text)
+            if str(original_msg.get("role") or "") == "tool":
+                active_message = {
+                    "role": "tool",
+                    "content": placeholder,
+                    "tool_call_id": original_msg.get("tool_call_id") or replay_msg.get("tool_call_id") or "ignored_tool_call",
+                }
+            else:
+                active_message = {"role": "user", "content": placeholder}
+            digest = hashlib.sha256(original_text.encode("utf-8")).hexdigest()[:16]
+            self._remember_generated_ignored_placeholder_hash(digest)
+            active_replay_messages[idx] = active_message
+        return active_replay_messages
+
+    def _remember_active_replay_messages(
+        self,
+        original_messages: List[Dict[str, Any]],
+        active_replay_messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        self._last_active_replay_source_identities = [
+            self._message_replay_identity(message) for message in original_messages
+        ]
+        self._last_active_replay_messages = [dict(message) for message in active_replay_messages]
+        return active_replay_messages
+
+    def _cached_active_replay_messages(
+        self,
+        original_messages: List[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        identities = [self._message_replay_identity(message) for message in original_messages]
+        if identities == getattr(self, "_last_active_replay_source_identities", None):
+            cached = getattr(self, "_last_active_replay_messages", None)
+            if cached is not None:
+                return [dict(message) for message in cached]
+        return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
         """Return true for active-context scaffolding that should not be re-ingested."""
@@ -3262,6 +3505,10 @@ class LCMEngine(ContextEngine):
                     msg,
                     text_content_for_pattern_matching(msg.get("content")) or "",
                 )
+                and not self._is_ignored_active_replay_placeholder(
+                    msg,
+                    text_content_for_pattern_matching(msg.get("content")) or "",
+                )
                 and not (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
@@ -3312,6 +3559,10 @@ class LCMEngine(ContextEngine):
             candidate_has_system = any(identity[0] == "system" for identity in candidate_prefix)
             candidate_dropped_quarantine_replay_placeholder = any(
                 self._is_volatile_ignored_quarantine_placeholder(
+                    msg,
+                    text_content_for_pattern_matching(msg.get("content")) or "",
+                )
+                or self._is_ignored_active_replay_placeholder(
                     msg,
                     text_content_for_pattern_matching(msg.get("content")) or "",
                 )
@@ -3614,6 +3865,12 @@ class LCMEngine(ContextEngine):
             prefer_existing_externalized=prefer_existing_externalized,
         )
         replay_messages = self._redact_active_replay_messages(replay_messages)
+        replay_messages = self._apply_ignored_active_replay_placeholders(
+            messages,
+            replay_messages,
+            scan_start=scan_start,
+            ignored_messages=ignored_original_messages,
+        )
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = replay_messages
             if self._compiled_ignore_message_patterns:
@@ -3633,23 +3890,54 @@ class LCMEngine(ContextEngine):
         original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
-            return replay_messages
+            cached_replay = self._cached_active_replay_messages(messages)
+            if cached_replay is not None:
+                return cached_replay
+            return self._remember_active_replay_messages(messages, replay_messages)
 
+        active_replay_messages = replay_messages
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
             (cursor + offset, replay_msg)
             for offset, replay_msg in enumerate(new_messages)
         ]
-        if self._compiled_ignore_message_patterns:
+        if messages_to_store_with_index:
             kept: list[tuple[int, Dict[str, Any]]] = []
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
                 absolute_idx = cursor + offset
-                if ignored_original_messages[absolute_idx] or self._is_volatile_ignored_quarantine_placeholder(
+                replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+                original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+                volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
                     replay_msg,
-                    text_content_for_pattern_matching(replay_msg.get("content")) or "",
+                    replay_text,
+                )
+                volatile_digest = self._active_replay_placeholder_digest(replay_text)
+                generated_volatile_placeholder = volatile_placeholder and (
+                    original_text != replay_text
+                    or (
+                        volatile_digest is not None
+                        and volatile_digest in self._load_generated_ignored_placeholder_hashes()
+                    )
+                )
+                if (
+                    ignored_original_messages[absolute_idx]
+                    or generated_volatile_placeholder
+                    or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
                 ):
                     self._ignored_message_count += 1
-                    text = text_content_for_pattern_matching(original_msg.get("content")) or ""
-                    excerpt = text[:80].replace("\n", " ")
+                    if generated_volatile_placeholder and volatile_digest is not None:
+                        self._remember_generated_ignored_placeholder_hash(volatile_digest)
+                    replay_preserves_ignore_decision = (
+                        self._matches_ignore_message_patterns(replay_msg)
+                        or self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
+                        or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
+                    )
+                    if ignored_original_messages[absolute_idx] and not replay_preserves_ignore_decision:
+                        if active_replay_messages is replay_messages:
+                            active_replay_messages = [dict(message) for message in replay_messages]
+                        active_message = dict(active_replay_messages[absolute_idx])
+                        active_message["content"] = self._ignored_active_replay_placeholder(original_text)
+                        active_replay_messages[absolute_idx] = active_message
+                    excerpt = original_text[:80].replace("\n", " ")
                     logger.debug(
                         "LCM ignore_message_patterns dropped %s message: %r",
                         original_msg.get("role", "unknown"),
@@ -3661,7 +3949,7 @@ class LCMEngine(ContextEngine):
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
-            return replay_messages
+            return self._remember_active_replay_messages(messages, active_replay_messages)
 
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
@@ -3669,7 +3957,6 @@ class LCMEngine(ContextEngine):
             config=self._config,
             hermes_home=self._hermes_home,
         )
-        active_replay_messages = replay_messages
         for (absolute_idx, _replay_msg), protected_msg in zip(
             messages_to_store_with_index,
             protected_messages,
@@ -3696,7 +3983,7 @@ class LCMEngine(ContextEngine):
         # active replay. Whole-message ``raw_payload`` externalization is the
         # exception: it intentionally returns a compact active stub so the host
         # does not replay huge opaque text while SQLite stores only the stub.
-        return active_replay_messages
+        return self._remember_active_replay_messages(messages, active_replay_messages)
 
     @staticmethod
     def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
@@ -4366,6 +4653,12 @@ class LCMEngine(ContextEngine):
         for message in reversed(messages):
             if not isinstance(message, dict):
                 continue
+            content_text = text_content_for_pattern_matching(message.get("content")) or ""
+            if self._matches_ignore_message_patterns(message) or self._is_volatile_ignored_quarantine_placeholder(
+                message,
+                content_text,
+            ) or self._is_ignored_active_replay_placeholder(message, content_text):
+                continue
             sanitized_preserved_objective = self._sanitized_preserved_objective_context_content(message)
             if sanitized_preserved_objective:
                 if any(
@@ -4512,6 +4805,9 @@ class LCMEngine(ContextEngine):
         # Drop assistant turns that carry only blank/internal structured content,
         # then ensure provider-valid tool-call/result sequencing.
         result = self._sanitize_active_context_messages(result)
+        if leading_msg is None:
+            while result and result[0].get("role") in {"assistant", "tool"}:
+                result = result[1:]
         if (
             assembly_cap is not None
             and anchor_part is not None
@@ -4751,6 +5047,11 @@ class LCMEngine(ContextEngine):
             if self._is_context_summary_content(content):
                 continue
             text = (text_content_for_pattern_matching(content) or "").strip()
+            if self._matches_ignore_message_patterns(msg) or self._is_volatile_ignored_quarantine_placeholder(
+                msg,
+                text,
+            ) or self._is_ignored_active_replay_placeholder(msg, text):
+                continue
             # Additional redaction safety net: run extracted text through the
             # configured redaction path.  _redact_active_replay_messages uses
             # parse_json_strings=False for content, so structured content

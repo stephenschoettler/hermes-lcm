@@ -3438,6 +3438,586 @@ class TestMessageFiltering:
         assert "can you check the database for me?" in stored_contents
         assert engine._ignored_message_count == 1
 
+    def test_ignored_messages_do_not_feed_compaction_summaries(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_compaction.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+
+        def echo_summary(**kwargs):
+            return kwargs["text"] + "\nExpand for details about: ignored leak", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", echo_summary)
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog must not summarize " + "x" * 200},
+            {"role": "user", "content": "fresh visible request"},
+        ]
+
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        nodes = engine._dag.get_session_nodes("user-123")
+        stored_contents = "\n".join(row["content"] for row in engine._store.get_session_messages("user-123"))
+
+        assert "SECRET" not in stored_contents
+        assert "SECRET" not in "\n".join(str(msg.get("content", "")) for msg in result)
+        assert nodes == []
+        assert engine._ignored_message_count == 1
+
+    def test_ignored_backlog_is_filtered_before_auto_focus_derivation(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_focus.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            captured["focus_topic"] = kwargs["focus_topic"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog must not become focus " + "x" * 200},
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "SECRET" not in captured["text"]
+        assert "visible backlog objective" in captured["focus_topic"]
+        assert "SECRET" not in captured["focus_topic"]
+
+    def test_ignored_rows_after_replayed_scaffolds_are_not_summarized(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_after_scaffold.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {
+                "role": "user",
+                "content": "[Recent Summary (d0, node 1)]\nold scaffold\n[Expand for details: old scaffold]",
+            },
+            {"role": "user", "content": "SECRET ignored row after scaffold " + "x" * 200},
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "SECRET" not in captured["text"]
+
+    def test_ignored_backlog_is_not_preserved_as_objective_anchor(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preserved_anchor.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=["SECRET"],
+        )
+        messages = [
+            {"role": "user", "content": "normal visible request"},
+            {"role": "user", "content": "SECRET ignored objective must not be preserved"},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+
+        assert "normal visible request" in result_text
+        assert "fresh tail response" in result_text
+        assert "SECRET" not in result_text
+        assert "Current user objective preserved" not in result_text
+
+    def test_preserved_objective_survives_ignored_backlog_filtering(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preserved_scaffold.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=["SECRET"],
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": "[Current user objective preserved from compacted history]\ncarry this objective forward",
+            },
+            {"role": "user", "content": "SECRET ignored objective must not be preserved"},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+
+        assert "carry this objective forward" in result_text
+        assert "fresh tail response" in result_text
+        assert "SECRET" not in result_text
+
+    def test_original_ignore_decision_survives_sensitive_active_redaction(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_sensitive_redaction.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "user", "content": "api_key=sk-ignore...cdef ignored before active replay redaction " + "x" * 200},
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "api_key" not in captured["text"]
+        assert "sk-ignore" not in captured["text"]
+        assert engine._ignored_message_count == 1
+
+    def test_original_ignore_decision_survives_redacted_replay_next_turn(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_sensitive_replay.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog objective " + "y" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        first_result_text = "\n".join(str(msg.get("content", "")) for msg in first_result)
+
+        assert "LCM active replay placeholder: message ignored" in first_result_text
+        assert "sk-ignore" not in first_result_text
+
+        engine.compress(
+            first_result + [{"role": "assistant", "content": "next fresh assistant turn"}],
+            current_tokens=10_000,
+        )
+
+        assert len(captured_texts) == 1
+        assert "visible backlog objective" in captured_texts[0]
+        assert all("sk-ignore" not in text for text in captured_texts)
+        assert all("LCM active replay placeholder: message ignored" not in text for text in captured_texts)
+
+    def test_generated_ignored_active_replay_placeholder_filtered_without_active_patterns(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_no_patterns.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "first visible backlog " + "y" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        assert "LCM active replay placeholder: message ignored" in "\n".join(
+            str(msg.get("content", "")) for msg in first_result
+        )
+
+        engine.shutdown()
+        second = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_no_patterns.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+        )
+        captured.clear()
+        second.compress(
+            first_result
+            + [
+                {"role": "user", "content": "second visible backlog " + "z" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert "second visible backlog" in captured["text"]
+        assert "LCM active replay placeholder: message ignored" not in captured["text"]
+        assert all(
+            "LCM active replay placeholder: message ignored" not in str(row["content"])
+            for row in second._store.get_session_messages("user-123")
+        )
+
+    def test_dependent_assistant_reply_to_ignored_backlog_is_not_summarized(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_reply.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "user", "content": "SECRET ignored user turn"},
+            {"role": "assistant", "content": "dependent assistant reply to ignored turn"},
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "dependent assistant reply" not in captured["text"]
+        assert "SECRET" not in captured["text"]
+        rows = engine._store.get_session_messages("user-123")
+        dependent_ids = [row["store_id"] for row in rows if "dependent assistant reply" in row["content"]]
+        nodes = engine._dag.get_session_nodes("user-123")
+        assert dependent_ids
+        assert any(dependent_ids[0] in node.source_ids for node in nodes)
+
+    def test_preflight_preserves_ignored_placeholder_for_later_compress(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preflight_placeholder.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        messages = [
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+        ]
+
+        assert engine.should_compress_preflight(messages) is True
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+
+        assert "LCM active replay placeholder: message ignored" in result_text
+        assert "sk-ignore" not in result_text
+
+    def test_ignored_assistant_tool_call_placeholder_clears_tool_calls(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_assistant_tool_placeholder.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": "api_key=sk-ignore...cdef ignored tool-call turn",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}],
+            },
+            {"role": "user", "content": "fresh request"},
+        ]
+
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert result[0]["role"] == "user"
+        assert "LCM active replay placeholder: message ignored" in str(result[0].get("content", ""))
+        assert "tool_calls" not in result[0]
+        assert "api_key" not in str(result[0].get("content", ""))
+
+    def test_ignored_tool_result_placeholder_preserves_tool_role_and_call_id(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_tool_result_placeholder.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        messages = [
+            {"role": "assistant", "content": "calling tool", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "api_key=sk-ignore...cdef ignored tool result"},
+            {"role": "user", "content": "fresh request"},
+        ]
+
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_1"
+        assert "LCM active replay placeholder: message ignored" in str(result[1].get("content", ""))
+        assert "api_key" not in str(result[1].get("content", ""))
+
+    def test_dependent_tool_result_to_ignored_assistant_tool_call_is_not_summarized(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_tool.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["IGNORE_TOOL_CALL"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {
+                "role": "assistant",
+                "content": "IGNORE_TOOL_CALL assistant turn",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "dependent tool result"},
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "dependent tool result" not in captured["text"]
+        assert "IGNORE_TOOL_CALL" not in captured["text"]
+
+    def test_dependent_assistant_reply_to_ignored_tool_result_is_not_summarized(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_tool_reply.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["PRIVATE_TOOL_RESULT"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "tool", "tool_call_id": "call_1", "content": "PRIVATE_TOOL_RESULT noisy/private output"},
+            {"role": "assistant", "content": "assistant answer derived from private tool result"},
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "assistant answer derived" not in captured["text"]
+        assert "PRIVATE_TOOL_RESULT" not in captured["text"]
+
+    def test_user_authored_ignored_placeholder_text_remains_lossless(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_literal.db",
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        placeholder = (
+            "[LCM active replay placeholder: message ignored; kind=ignored_message; "
+            "scope=ignored_message_pattern; field=content; chars=10; bytes=10; "
+            "sha256=0123456789abcdef]"
+        )
+
+        engine._ingest_messages([{"role": "user", "content": placeholder}])
+        stored = engine._store.get_session_messages("user-123")
+
+        assert [row["content"] for row in stored] == [placeholder]
+        assert engine._ignored_message_count == 0
+
+    def test_generated_placeholder_hashes_evict_by_recency_not_lexical_order(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_hash_recency.db",
+        )
+        for idx in range(512):
+            engine._remember_generated_ignored_placeholder_hash(f"{idx + 1:016x}")
+        recent_low_digest = "0000000000000000"
+
+        engine._remember_generated_ignored_placeholder_hash(recent_low_digest)
+        loaded = engine._load_generated_ignored_placeholder_hash_list()
+
+        assert recent_low_digest in loaded
+        assert loaded[-1] == recent_low_digest
+        assert "0000000000000001" not in loaded
+
+    def test_user_authored_quarantine_placeholder_text_remains_lossless_without_filters(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_quarantine_placeholder_literal.db",
+        )
+        placeholder = (
+            "[LCM active replay placeholder: assistant output quarantined; "
+            "kind=quarantined_assistant_output; reason=high_repetition; "
+            "scope=ignored_message_pattern; field=content; chars=10; bytes=10; "
+            "sha256=0123456789abcdef]"
+        )
+
+        engine._ingest_messages([{"role": "assistant", "content": placeholder}])
+        stored = engine._store.get_session_messages("user-123")
+
+        assert [row["content"] for row in stored] == [placeholder]
+        assert engine._ignored_message_count == 0
+
+    def test_user_authored_quarantine_placeholder_text_can_be_summarized_losslessly(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_quarantine_placeholder_literal_compaction.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+        )
+        captured: dict[str, str] = {}
+        placeholder = (
+            "[LCM active replay placeholder: assistant output quarantined; "
+            "kind=quarantined_assistant_output; reason=high_repetition; "
+            "scope=ignored_message_pattern; field=content; chars=10; bytes=10; "
+            "sha256=0123456789abcdef]"
+        )
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "literal quarantine placeholder summary\n[Expand for details: literal quarantine placeholder]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        engine.compress(
+            [
+                {"role": "assistant", "content": placeholder},
+                {"role": "user", "content": "visible backlog objective " + "y" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert "assistant output quarantined" in captured["text"]
+        assert "visible backlog objective" in captured["text"]
+
+    def test_user_authored_ignored_placeholder_text_can_be_summarized_losslessly(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_literal_compaction.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["^Cronjob Response:"],
+        )
+        captured: dict[str, str] = {}
+        placeholder = (
+            "[LCM active replay placeholder: message ignored; kind=ignored_message; "
+            "scope=ignored_message_pattern; field=content; chars=10; bytes=10; "
+            "sha256=0123456789abcdef]"
+        )
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "literal placeholder summary\n[Expand for details: literal placeholder]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        engine.compress(
+            [
+                {"role": "user", "content": placeholder},
+                {"role": "user", "content": "visible backlog objective " + "y" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert "LCM active replay placeholder: message ignored" in captured["text"]
+        assert "visible backlog objective" in captured["text"]
+
+    def test_ignored_only_backlog_does_not_leave_assistant_first_context(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_assistant_first.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=["SECRET"],
+        )
+        messages = [
+            {"role": "user", "content": "SECRET ignored cron/private turn"},
+            {"role": "assistant", "content": "assistant response to ignored turn"},
+        ]
+
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+
+        assert "SECRET" not in result_text
+        assert not result or result[0].get("role") != "assistant"
+
+    def test_ignored_fresh_tail_does_not_feed_auto_focus(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_fresh_tail_focus.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            captured["focus_topic"] = kwargs["focus_topic"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "user", "content": "SECRET ignored fresh tail must not become focus"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "SECRET" not in captured["text"]
+        assert "visible backlog objective" in captured["focus_topic"]
+        assert "SECRET" not in captured["focus_topic"]
+
     def test_triple_bracket_wrapper_variant_dropped(self, tmp_path):
         engine = self._make_engine(
             tmp_path, "lcm_msg_triple.db",
