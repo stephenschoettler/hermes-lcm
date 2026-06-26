@@ -648,6 +648,8 @@ exposes retrieval tools that can drill back into exact stored sources.
 - [Standard compression diagram](docs/standard_compression.png)
 - [LCM compression diagram](docs/lcm_compression.png)
 - [Contributing guide](CONTRIBUTING.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
 - [Releases](https://github.com/stephenschoettler/hermes-lcm/releases)
 
 ## Development
@@ -683,6 +685,8 @@ Issues and PRs welcome. Bug fixes and correctness improvements are highest
 priority. New features should be scoped, backwards-compatible, and tested.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch, validation, and PR guidance.
+See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for project conduct expectations
+and [SECURITY.md](SECURITY.md) for vulnerability reporting.
 See the [releases page](https://github.com/stephenschoettler/hermes-lcm/releases)
 for changelogs.
 
