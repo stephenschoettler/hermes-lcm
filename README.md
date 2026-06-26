@@ -688,7 +688,7 @@ for changelogs.
 
 ## License
 
-MIT
+[MIT](LICENSE)
 
 ## Star history
 
