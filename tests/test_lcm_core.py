@@ -4779,3 +4779,275 @@ class TestLCMEngineCloning:
             prototype.shutdown()
             if clone is not None:
                 clone.shutdown()
+
+    def test_deepcopy_matches_hermes_host_copy_contract_without_fallback(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        def host_selects_context_engine(candidate):
+            try:
+                return copy.deepcopy(candidate)
+            except Exception:
+                return "built-in-compressor-fallback"
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-host-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="gpt-5.5",
+                context_length=400_000,
+                provider="openai-codex",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="responses",
+            )
+            prototype.on_session_start(
+                "parent-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:1",
+            )
+
+            clone = host_selects_context_engine(prototype)
+
+            assert clone != "built-in-compressor-fallback"
+            assert isinstance(clone, LCMEngine)
+            assert clone.name == "lcm"
+            assert clone is not prototype
+            assert clone._store is not prototype._store
+            assert clone._dag is not prototype._dag
+            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._session_id == ""
+            assert clone._conversation_id == ""
+            assert clone.model == prototype.model
+            assert clone.provider == prototype.provider
+            assert clone.base_url == prototype.base_url
+            assert clone.api_key == prototype.api_key
+            assert clone.api_mode == prototype.api_mode
+            assert clone.raw_context_length == prototype.raw_context_length
+            assert clone.context_length == prototype.context_length
+            assert clone.effective_context_length_cap == prototype.effective_context_length_cap
+            assert clone.effective_context_length_reason == prototype.effective_context_length_reason
+            assert clone._context_length_source == prototype._context_length_source
+            assert clone._context_threshold_source == prototype._context_threshold_source
+            assert clone._context_threshold_autoraised == prototype._context_threshold_autoraised
+            assert clone.threshold_percent == prototype.threshold_percent
+            assert clone.threshold_tokens == prototype.threshold_tokens
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_before_session_start_copies_budget_without_pending_authority(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-pre-session-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="gpt-5.5",
+                context_length=400_000,
+                provider="openai-codex",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="responses",
+            )
+
+            clone = copy.deepcopy(prototype)
+
+            assert clone._session_id == ""
+            assert clone._conversation_id == ""
+            assert clone._update_model_pending_session_start is False
+            assert clone.model == "gpt-5.5"
+            assert clone.provider == "openai-codex"
+            assert clone.api_key == "test-secret"
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 272_000
+            assert clone.effective_context_length_cap == 272_000
+            assert clone.effective_context_length_reason == "codex_oauth_context_cap"
+            assert clone.context_threshold == 0.85
+            assert clone.threshold_tokens == int(272_000 * 0.85)
+
+            clone.on_session_start(
+                "child-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:2",
+                model="other-model",
+                provider="custom",
+                base_url="https://other.example.invalid/v1",
+                api_key="other-secret",
+                api_mode="chat",
+                context_length=128_000,
+            )
+
+            assert clone._session_id == "child-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:2"
+            assert clone._update_model_pending_session_start is False
+            assert clone.model == "other-model"
+            assert clone.provider == "custom"
+            assert clone.base_url == "https://other.example.invalid/v1"
+            assert clone.api_key == "other-secret"
+            assert clone.api_mode == "chat"
+            assert clone.raw_context_length == 128_000
+            assert clone.context_length == 128_000
+            assert clone.effective_context_length_cap is None
+            assert clone.effective_context_length_reason == ""
+            assert clone._context_length_source == "session_start"
+            assert clone.threshold_tokens == int(128_000 * clone.context_threshold)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_recomputes_copied_window_when_session_route_changes(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-route-recompute-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="large-custom-model",
+                context_length=1_000_000,
+                provider="custom",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="chat",
+            )
+
+            clone = copy.deepcopy(prototype)
+            assert clone._update_model_pending_session_start is False
+            assert clone.raw_context_length == 1_000_000
+            assert clone.context_length == 1_000_000
+            assert clone.effective_context_length_cap is None
+
+            clone.on_session_start(
+                "codex-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:4",
+                model="gpt-5.5",
+                provider="openai-codex",
+                base_url="https://codex.example.invalid/v1",
+                api_key="codex-secret",
+                api_mode="responses",
+            )
+
+            assert clone._session_id == "codex-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:4"
+            assert clone.model == "gpt-5.5"
+            assert clone.provider == "openai-codex"
+            assert clone.raw_context_length == 1_000_000
+            assert clone.context_length == 272_000
+            assert clone.effective_context_length_cap == 272_000
+            assert clone.effective_context_length_reason == "codex_oauth_context_cap"
+            assert clone.context_threshold == 0.85
+            assert clone.threshold_tokens == int(272_000 * 0.85)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_recomputes_copied_cap_away_when_session_route_changes(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-route-uncap-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="gpt-5.5",
+                context_length=400_000,
+                provider="openai-codex",
+                base_url="https://codex.example.invalid/v1",
+                api_key="codex-secret",
+                api_mode="responses",
+            )
+
+            clone = copy.deepcopy(prototype)
+            assert clone._update_model_pending_session_start is False
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 272_000
+            assert clone.effective_context_length_cap == 272_000
+            assert clone.context_threshold == 0.85
+
+            clone.on_session_start(
+                "custom-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:5",
+                model="large-custom-model",
+                provider="custom",
+                base_url="https://custom.example.invalid/v1",
+                api_key="custom-secret",
+                api_mode="chat",
+            )
+
+            assert clone._session_id == "custom-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:5"
+            assert clone.model == "large-custom-model"
+            assert clone.provider == "custom"
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 400_000
+            assert clone.effective_context_length_cap is None
+            assert clone.effective_context_length_reason == ""
+            assert clone.context_threshold == clone._config.context_threshold
+            assert clone.threshold_tokens == int(400_000 * clone._config.context_threshold)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+
+    def test_deepcopy_preserves_zero_context_metadata_without_pending_authority(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-zero-context-copy.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = None
+        try:
+            prototype.update_model(
+                model="unknown-model",
+                context_length=0,
+                provider="custom",
+                base_url="https://example.invalid/v1",
+                api_key="test-secret",
+                api_mode="chat",
+            )
+
+            clone = copy.deepcopy(prototype)
+
+            assert clone._update_model_pending_session_start is False
+            assert clone._context_length_source == "update_model"
+            assert clone.raw_context_length == 0
+            assert clone.context_length == 0
+            assert clone.threshold_tokens == 0
+
+            clone.on_session_start(
+                "zero-window-session",
+                platform="telegram",
+                conversation_id="agent:main:telegram:dm:3",
+                model="resolved-model",
+                provider="custom",
+                base_url="https://resolved.example.invalid/v1",
+                api_key="resolved-secret",
+                api_mode="chat",
+                context_length=400_000,
+            )
+
+            assert clone._session_id == "zero-window-session"
+            assert clone._conversation_id == "agent:main:telegram:dm:3"
+            assert clone._update_model_pending_session_start is False
+            assert clone.model == "resolved-model"
+            assert clone.base_url == "https://resolved.example.invalid/v1"
+            assert clone.api_key == "resolved-secret"
+            assert clone.raw_context_length == 400_000
+            assert clone.context_length == 400_000
+            assert clone._context_length_source == "session_start"
+            assert clone.threshold_tokens == int(400_000 * clone.context_threshold)
+        finally:
+            prototype.shutdown()
+            shutdown = getattr(clone, "shutdown", None)
+            if callable(shutdown):
+                shutdown()

@@ -478,13 +478,39 @@ class LCMEngine(ContextEngine):
         rebind another conversation's raw-message ingest and lifecycle state.
 
         The clone shares the same durable SQLite database path/configuration,
-        but gets independent session/cursor/lifecycle runtime state. Hermes core
-        calls update_model() on the returned engine before on_session_start().
+        but gets independent session/cursor/lifecycle runtime state. Runtime
+        model and context-window metadata is copied so the clone is immediately
+        budget-aware even before a compatible Hermes host calls update_model().
         """
-        return type(self)(
+        clone = type(self)(
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
         )
+        clone.model = self.model
+        clone.base_url = self.base_url
+        clone.api_key = self.api_key
+        clone.provider = self.provider
+        clone.api_mode = self.api_mode
+        if self._context_length_source:
+            clone._set_context_length(
+                self.raw_context_length,
+                source=self._context_length_source,
+                model=self.model,
+                provider=self.provider,
+            )
+        elif self.raw_context_length or self.context_length:
+            clone._set_context_length(
+                self.raw_context_length or self.context_length,
+                source="clone_for_agent",
+                model=self.model,
+                provider=self.provider,
+            )
+        # ``update_model()`` authority is a per-runtime lifecycle edge, not
+        # durable metadata.  Compatible hosts call update_model() on the clone
+        # before binding it; hosts that bind only through on_session_start()
+        # must still be able to replace the copied prototype route.
+        clone._update_model_pending_session_start = False
+        return clone
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
         """Copy the plugin runtime without pickling SQLite-backed helpers.
@@ -2028,9 +2054,21 @@ class LCMEngine(ContextEngine):
             return
         if "model" in kwargs:
             self.model = str(kwargs.get("model") or "")
+        route_affects_context = "model" in kwargs or "provider" in kwargs
         for key in ("base_url", "api_key", "provider", "api_mode"):
             if key in kwargs:
                 setattr(self, key, str(kwargs.get(key) or ""))
+        if (
+            "context_length" not in kwargs
+            and route_affects_context
+            and (self.raw_context_length or self.context_length)
+        ):
+            self._set_context_length(
+                self.raw_context_length or self.context_length,
+                source=self._context_length_source or "session_start",
+                model=self.model,
+                provider=self.provider,
+            )
         self._update_model_pending_session_start = False
 
     def _continue_compression_boundary(
