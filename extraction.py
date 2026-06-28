@@ -25,6 +25,7 @@ _TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 _MEDIA_BLOCK_HINTS = ("image", "audio", "video")
 _STRUCTURED_METADATA_KEYS = ("file_id", "filename", "name", "mime_type", "url", "file_url", "id")
 _INJECTED_CONTEXT_TAGS = (
+    "active_memory",
     "active_memory_plugin",
     "relevant-memories",
     "relevant_memories",
