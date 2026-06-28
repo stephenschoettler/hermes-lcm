@@ -182,15 +182,6 @@ def _sanitize_content_block(content: Any) -> str:
     return str(content)
 
 
-def _looks_like_inter_block_user_text(text: str) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return False
-    lowered = stripped.lower()
-    injected_terms = ("delimiter", "ephemeral", "fake", "injected", "leak", "memory", "recall", "spoof", "tail")
-    return not any(term in lowered for term in injected_terms)
-
-
 def _select_injected_context_closer(
     text: str,
     opener: re.Match[str],
@@ -203,8 +194,11 @@ def _select_injected_context_closer(
 
     # Prompt-injected context normally uses a block shape:
     #   <tag>\n...\n</tag>
-    # In that shape, any matching delimiter inside the body is untrusted text;
-    # prefer a close delimiter that is also on its own line.
+    # In that shape, a line-delimited close/open pair inside recalled text is
+    # indistinguishable from two adjacent injected blocks with user text between
+    # them. Choose safety over preservation: block-shaped repeated same-tag
+    # sections are stripped as one untrusted region up to the last line-isolated
+    # close, even if that drops a real inter-block gap.
     if _at_line_end(text, opener.end()):
         line_closers = [
             closer
@@ -213,16 +207,6 @@ def _select_injected_context_closer(
         ]
         if not line_closers:
             return None
-        for index, closer in enumerate(line_closers[:-1]):
-            next_line_closer = line_closers[index + 1]
-            next_opener = open_re.search(text, closer.end())
-            if (
-                next_opener is not None
-                and next_opener.start() < next_line_closer.start()
-                and _at_line_start(text, next_opener.start())
-                and _looks_like_inter_block_user_text(text[closer.end() : next_opener.start()])
-            ):
-                return closer
         return line_closers[-1]
 
     # Inline JSON/tool strings can contain multiple adjacent injected blocks
