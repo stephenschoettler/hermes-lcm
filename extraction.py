@@ -207,6 +207,11 @@ def strip_injected_context_blocks(text: str) -> str:
             for index, candidate in enumerate(closers):
                 next_opener = open_re.search(cleaned, candidate.end())
                 next_closer = closers[index + 1] if index + 1 < len(closers) else None
+                if next_opener is None:
+                    if index + 1 < len(closers) and not _at_line_end(cleaned, candidate.end()):
+                        continue
+                    closer = candidate
+                    break
                 # Injected blocks are emitted as their own lines. If untrusted
                 # block text mentions a matching opener inline before the next
                 # close, keep stripping through it instead of treating that

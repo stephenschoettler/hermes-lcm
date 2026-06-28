@@ -3959,15 +3959,26 @@ class TestEngineCompress:
                     "must also be stripped</relevant-memories>\n"
                     "keep this real request"
                 ),
-            }
+            },
+            {
+                "role": "user",
+                "content": (
+                    "<hindsight-memories>ephemeral memory contains </hindsight-memories> "
+                    "close-only injected tail must also be stripped</hindsight-memories>\n"
+                    "keep this second real request"
+                ),
+            },
         ]
 
         serialized = engine._serialize_messages(messages)
 
         assert "keep this real request" in serialized
+        assert "keep this second real request" in serialized
         assert "ephemeral memory contains" not in serialized
         assert "trailing injected text" not in serialized
+        assert "close-only injected tail" not in serialized
         assert "relevant-memories" not in serialized
+        assert "hindsight-memories" not in serialized
 
     def test_compression_serialization_strips_injected_context_from_tool_arguments(self, engine):
         messages = [
