@@ -182,6 +182,15 @@ def _sanitize_content_block(content: Any) -> str:
     return str(content)
 
 
+def _looks_like_inter_block_user_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    injected_terms = ("delimiter", "ephemeral", "fake", "injected", "leak", "memory", "recall", "spoof", "tail")
+    return not any(term in lowered for term in injected_terms)
+
+
 def _select_injected_context_closer(
     text: str,
     opener: re.Match[str],
@@ -219,7 +228,11 @@ def _select_injected_context_closer(
         if next_closer is None:
             return closer
         next_opener = open_re.search(text, closer.end())
-        if next_opener is not None and next_opener.start() < next_closer.start():
+        if (
+            next_opener is not None
+            and next_opener.start() < next_closer.start()
+            and _looks_like_inter_block_user_text(text[closer.end() : next_opener.start()])
+        ):
             return closer
     return closers[-1]
 

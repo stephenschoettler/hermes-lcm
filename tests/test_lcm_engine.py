@@ -3920,7 +3920,7 @@ class TestEngineCompress:
                 "role": "user",
                 "content": (
                     "<relevant-memories>first ephemeral recall block</relevant-memories>\n"
-                    "preserve user text between same-tag injected blocks\n"
+                    "preserve user text between same-tag blocks\n"
                     "<relevant-memories>second ephemeral recall block</relevant-memories>\n"
                     "also keep this real user content"
                 ),
@@ -3966,7 +3966,7 @@ class TestEngineCompress:
         serialized = engine._serialize_messages(messages)
 
         assert "keep this real user request" in serialized
-        assert "preserve user text between same-tag injected blocks" in serialized
+        assert "preserve user text between same-tag blocks" in serialized
         assert "also keep this real user content" in serialized
         assert "please summarize my plan" in serialized
         assert "keep after inline spoof" in serialized
