@@ -28,6 +28,7 @@ _INJECTED_CONTEXT_TAGS = (
     "active_memory_plugin",
     "relevant-memories",
     "relevant_memories",
+    "hindsight-memories",
     "hindsight_memories",
 )
 _UNTRUSTED_CONTEXT_HEADER_RE = re.compile(
@@ -169,29 +170,51 @@ def _sanitize_content_block(content: Any) -> str:
     return str(content)
 
 
+def strip_injected_context_blocks(text: str) -> str:
+    """Remove transient memory/context blocks before compaction summarization."""
+    if not text or "<" not in text:
+        return _UNTRUSTED_CONTEXT_HEADER_RE.sub("", text).strip()
+
+    cleaned = text
+    for tag in _INJECTED_CONTEXT_TAGS:
+        escaped = re.escape(tag)
+        open_re = re.compile(rf"<{escaped}>", re.IGNORECASE)
+        close_re = re.compile(rf"</{escaped}>", re.IGNORECASE)
+
+        while True:
+            opener = open_re.search(cleaned)
+            if not opener:
+                break
+
+            next_opener = open_re.search(cleaned, opener.end())
+            search_end = next_opener.start() if next_opener else len(cleaned)
+            closers = list(close_re.finditer(cleaned, opener.end(), search_end))
+            if not closers:
+                cleaned = cleaned[: opener.start()] + cleaned[search_end:]
+                continue
+
+            closer = closers[-1]
+            cleaned = cleaned[: opener.start()] + cleaned[closer.end() :]
+
+    cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
 def _sanitize_json_like(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            _sanitize_string_media(key) if isinstance(key, str) else key: _sanitize_json_like(val)
+            (
+                strip_injected_context_blocks(_sanitize_string_media(key))
+                if isinstance(key, str)
+                else key
+            ): _sanitize_json_like(val)
             for key, val in value.items()
         }
     if isinstance(value, list):
         return [_sanitize_json_like(item) for item in value]
     if isinstance(value, str):
-        return _sanitize_string_media(value)
+        return strip_injected_context_blocks(_sanitize_string_media(value))
     return value
-
-
-def strip_injected_context_blocks(text: str) -> str:
-    """Remove transient memory/context blocks before compaction summarization."""
-    if not text or "<" not in text:
-        return _UNTRUSTED_CONTEXT_HEADER_RE.sub("", text).strip()
-    cleaned = text
-    for tag in _INJECTED_CONTEXT_TAGS:
-        escaped = re.escape(tag)
-        cleaned = re.sub(rf"<{escaped}>[\s\S]*?</{escaped}>", "", cleaned, flags=re.IGNORECASE)
-    cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", cleaned)
-    return cleaned.strip()
 
 
 def sanitize_pre_compaction_content(text: Any) -> str:

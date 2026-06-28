@@ -3923,16 +3923,83 @@ class TestEngineCompress:
                     "also keep this real user content"
                 ),
             },
+            {
+                "role": "user",
+                "content": (
+                    "<hindsight-memories>hyphenated Hindsight recall block</hindsight-memories>\n"
+                    "keep hyphenated-tag user content"
+                ),
+            },
         ]
 
         serialized = engine._serialize_messages(messages)
 
         assert "keep this real user request" in serialized
         assert "also keep this real user content" in serialized
+        assert "keep hyphenated-tag user content" in serialized
         assert "temporary retrieved memory" not in serialized
         assert "ephemeral recall block" not in serialized
+        assert "hyphenated Hindsight recall block" not in serialized
         assert "Untrusted context" not in serialized
         assert "hindsight_memories" not in serialized
+        assert "hindsight-memories" not in serialized
+        assert "relevant-memories" not in serialized
+
+    def test_compression_serialization_strips_injected_context_with_embedded_closing_tag(self, engine):
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "<relevant-memories>ephemeral memory contains </relevant-memories> delimiter text "
+                    "and this trailing injected text must also be stripped</relevant-memories>\n"
+                    "keep this real request"
+                ),
+            }
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "keep this real request" in serialized
+        assert "ephemeral memory contains" not in serialized
+        assert "trailing injected text" not in serialized
+        assert "relevant-memories" not in serialized
+
+    def test_compression_serialization_strips_injected_context_from_tool_arguments(self, engine):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I will call the tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_with_context",
+                        "type": "function",
+                        "function": {
+                            "name": "write_note",
+                            "arguments": json.dumps(
+                                {
+                                    "body": (
+                                        "<hindsight-memories>temporary tool-arg recall</hindsight-memories>\n"
+                                        "keep this tool argument"
+                                    ),
+                                    "nested": [
+                                        "<relevant-memories>nested recall</relevant-memories>nested keep"
+                                    ],
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_with_context", "content": "done"},
+        ]
+
+        serialized = engine._serialize_messages(messages)
+
+        assert "keep this tool argument" in serialized
+        assert "nested keep" in serialized
+        assert "temporary tool-arg recall" not in serialized
+        assert "nested recall" not in serialized
+        assert "hindsight-memories" not in serialized
         assert "relevant-memories" not in serialized
 
     def test_compression_serialization_keeps_assistant_text_but_drops_orphaned_tool_calls(self, engine):
