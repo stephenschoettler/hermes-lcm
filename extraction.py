@@ -182,7 +182,12 @@ def _sanitize_content_block(content: Any) -> str:
     return str(content)
 
 
-def _select_injected_context_closer(text: str, opener: re.Match[str], close_re: re.Pattern[str]) -> re.Match[str] | None:
+def _select_injected_context_closer(
+    text: str,
+    opener: re.Match[str],
+    open_re: re.Pattern[str],
+    close_re: re.Pattern[str],
+) -> re.Match[str] | None:
     closers = list(close_re.finditer(text, opener.end()))
     if not closers:
         return None
@@ -192,10 +197,25 @@ def _select_injected_context_closer(text: str, opener: re.Match[str], close_re: 
     # In that shape, any matching delimiter inside the body is untrusted text;
     # prefer a close delimiter that is also on its own line.
     if _at_line_end(text, opener.end()):
-        for closer in closers:
-            if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end()):
+        line_closers = [
+            closer
+            for closer in closers
+            if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
+        ]
+        if not line_closers:
+            return closers[-1]
+        for index, closer in enumerate(line_closers):
+            next_line_closer = line_closers[index + 1] if index + 1 < len(line_closers) else None
+            if next_line_closer is None:
                 return closer
-        return closers[-1]
+            next_opener = open_re.search(text, closer.end())
+            if (
+                next_opener is not None
+                and next_opener.start() < next_line_closer.start()
+                and _at_line_start(text, next_opener.start())
+            ):
+                return closer
+        return line_closers[-1]
 
     # Inline JSON/tool strings can contain multiple adjacent injected blocks
     # with real user text between them. Strip inline blocks one by one instead
@@ -219,7 +239,7 @@ def strip_injected_context_blocks(text: str) -> str:
             if not opener:
                 break
 
-            closer = _select_injected_context_closer(cleaned, opener, close_re)
+            closer = _select_injected_context_closer(cleaned, opener, open_re, close_re)
             if closer is None:
                 cleaned = cleaned[: opener.start()]
                 continue
