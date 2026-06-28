@@ -208,7 +208,7 @@ def strip_injected_context_blocks(text: str) -> str:
                 next_opener = open_re.search(cleaned, candidate.end())
                 next_closer = closers[index + 1] if index + 1 < len(closers) else None
                 if next_opener is None:
-                    if index + 1 < len(closers) and not _at_line_end(cleaned, candidate.end()):
+                    if index + 1 < len(closers):
                         continue
                     closer = candidate
                     break

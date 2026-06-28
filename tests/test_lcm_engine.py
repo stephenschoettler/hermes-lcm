@@ -3973,7 +3973,7 @@ class TestEngineCompress:
             {
                 "role": "user",
                 "content": (
-                    "<hindsight-memories>ephemeral memory contains </hindsight-memories> "
+                    "<hindsight-memories>ephemeral memory contains </hindsight-memories>\n"
                     "close-only injected tail must also be stripped</hindsight-memories>\n"
                     "keep this second real request"
                 ),
