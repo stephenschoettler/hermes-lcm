@@ -3919,7 +3919,9 @@ class TestEngineCompress:
             {
                 "role": "user",
                 "content": (
-                    "<relevant-memories>ephemeral recall block</relevant-memories>\n"
+                    "<relevant-memories>first ephemeral recall block</relevant-memories>\n"
+                    "preserve user text between same-tag injected blocks\n"
+                    "<relevant-memories>second ephemeral recall block</relevant-memories>\n"
                     "also keep this real user content"
                 ),
             },
@@ -3935,10 +3937,12 @@ class TestEngineCompress:
         serialized = engine._serialize_messages(messages)
 
         assert "keep this real user request" in serialized
+        assert "preserve user text between same-tag injected blocks" in serialized
         assert "also keep this real user content" in serialized
         assert "keep hyphenated-tag user content" in serialized
         assert "temporary retrieved memory" not in serialized
-        assert "ephemeral recall block" not in serialized
+        assert "first ephemeral recall block" not in serialized
+        assert "second ephemeral recall block" not in serialized
         assert "hyphenated Hindsight recall block" not in serialized
         assert "Untrusted context" not in serialized
         assert "hindsight_memories" not in serialized

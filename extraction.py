@@ -37,6 +37,18 @@ _UNTRUSTED_CONTEXT_HEADER_RE = re.compile(
 )
 
 
+def _at_line_start(text: str, index: int) -> bool:
+    line_start = text.rfind("\n", 0, index) + 1
+    return not text[line_start:index].strip()
+
+
+def _at_line_end(text: str, index: int) -> bool:
+    line_end = text.find("\n", index)
+    if line_end == -1:
+        line_end = len(text)
+    return not text[index:line_end].strip()
+
+
 EXTRACTION_PROMPT = """Extract decisions, commitments, outcomes, and rules from this conversation segment.
 
 Format as a flat list of bullet points. Each bullet should be self-contained and understandable
@@ -191,10 +203,23 @@ def strip_injected_context_blocks(text: str) -> str:
                 cleaned = cleaned[: opener.start()]
                 continue
 
-            # Treat the block body as untrusted text: if it mentions matching
-            # open/close delimiters, keep stripping until the last close rather
-            # than allowing fake delimiters to split the injected block open.
             closer = closers[-1]
+            for index, candidate in enumerate(closers):
+                next_opener = open_re.search(cleaned, candidate.end())
+                next_closer = closers[index + 1] if index + 1 < len(closers) else None
+                # Injected blocks are emitted as their own lines. If untrusted
+                # block text mentions a matching opener inline before the next
+                # close, keep stripping through it instead of treating that
+                # inline opener as a separate top-level block.
+                has_inline_opener_before_next_close = (
+                    next_opener is not None
+                    and (next_closer is None or next_opener.start() < next_closer.start())
+                    and not _at_line_start(cleaned, next_opener.start())
+                )
+                if has_inline_opener_before_next_close and not _at_line_end(cleaned, candidate.end()):
+                    continue
+                closer = candidate
+                break
             cleaned = cleaned[: opener.start()] + cleaned[closer.end() :]
 
     cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", cleaned)
