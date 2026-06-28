@@ -215,8 +215,8 @@ def _select_injected_context_closer(
             if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
         ]
         if not line_closers:
-            for closer in closers:
-                if not _at_line_start(text, closer.start()):
+            for index, closer in enumerate(closers):
+                if index + 1 < len(closers) or not _at_line_start(text, closer.start()):
                     continue
                 line_end = text.find("\n", closer.end())
                 if line_end == -1:
