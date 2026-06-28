@@ -1142,6 +1142,7 @@ def _doctor_text(engine) -> str:
         observations.append(
             "lifecycle_fragmentation: "
             f"lifecycle_rows={lifecycle_stats['lifecycle_rows']} "
+            f"empty_lifecycle_rows={lifecycle_stats.get('empty_lifecycle_rows', 0)} "
             f"message_sessions={lifecycle_stats['distinct_message_sessions']} "
             f"node_sessions={lifecycle_stats['distinct_node_sessions']} "
             f"current_missing_in_lcm_any={lifecycle_stats['lifecycle_current_missing_in_lcm_any']} "

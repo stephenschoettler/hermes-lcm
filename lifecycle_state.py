@@ -342,6 +342,7 @@ class LifecycleStateStore:
         Hermes host state. Repair/cleanup flows must stay explicit and separate.
         """
         conn = self._conn
+        assert conn is not None
 
         def _count(query: str, params: tuple[Any, ...] = ()) -> int:
             row = conn.execute(query, params).fetchone()
@@ -367,9 +368,25 @@ class LifecycleStateStore:
         )
         lifecycle_referenced_sessions = lifecycle_current_sessions | lifecycle_last_finalized_sessions
 
+        empty_lifecycle_rows = 0
+        for row in conn.execute(
+            """
+            SELECT current_session_id, last_finalized_session_id
+            FROM lcm_lifecycle_state
+            """
+        ).fetchall():
+            refs = {
+                str(value)
+                for value in (row["current_session_id"], row["last_finalized_session_id"])
+                if value
+            }
+            if not refs or refs.isdisjoint(lcm_any_sessions):
+                empty_lifecycle_rows += 1
+
         stats: dict[str, Any] = {
             "read_only": True,
             "lifecycle_rows": _count("SELECT COUNT(*) FROM lcm_lifecycle_state"),
+            "empty_lifecycle_rows": empty_lifecycle_rows,
             "messages_total": _count("SELECT COUNT(*) FROM messages"),
             "summary_nodes_total": _count("SELECT COUNT(*) FROM summary_nodes"),
             "distinct_message_sessions": len(message_sessions),

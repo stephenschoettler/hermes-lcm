@@ -46,27 +46,17 @@ def state_db_path_for_engine(engine: Any) -> Path:
 
 
 def has_lifecycle_fragmentation(stats: dict[str, Any]) -> bool:
-    """Return whether lifecycle diagnostics should be treated as warning evidence."""
-    direct_mismatch_keys = (
-        "lifecycle_current_missing_in_lcm_any",
-        "lifecycle_last_finalized_missing_in_lcm_any",
-        "lifecycle_current_missing_in_state",
-        "lifecycle_last_finalized_missing_in_state",
-        "lcm_message_sessions_missing_in_state",
-        "lcm_node_sessions_missing_in_state",
-    )
-    lifecycle_rows = int(stats.get("lifecycle_rows", 0) or 0)
-    missing_lifecycle_reference_keys = (
-        "message_sessions_without_lifecycle_reference",
-        "node_sessions_without_lifecycle_reference",
-    )
-    return (
-        any(int(stats.get(key, 0) or 0) > 0 for key in direct_mismatch_keys)
-        or (
-            lifecycle_rows > 0
-            and any(int(stats.get(key, 0) or 0) > 0 for key in missing_lifecycle_reference_keys)
-        )
-        or (bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error")))
+    """Return whether lifecycle diagnostics should be treated as warning evidence.
+
+    Retained-history drift is intentionally read-only diagnostic context. Keep the
+    doctor warning for concrete operator action (empty lifecycle rows that the
+    explicit backup-first cleanup path can prune) or diagnostic unreadability, but
+    do not make overall health unhealthy solely because historical LCM/state
+    indexes no longer agree.
+    """
+    empty_lifecycle_rows = int(stats.get("empty_lifecycle_rows", 0) or 0)
+    return empty_lifecycle_rows > 0 or (
+        bool(stats.get("state_db_checked")) and bool(stats.get("state_db_error"))
     )
 
 

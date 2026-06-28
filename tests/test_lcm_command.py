@@ -947,6 +947,7 @@ def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(eng
     assert "status: action-recommended" in result
     assert "lifecycle_fragmentation:" in result
     assert "lifecycle_rows=2" in result
+    assert "empty_lifecycle_rows=1" in result
     assert "current_missing_in_lcm_any=1" in result
     assert "current_missing_in_state=1" in result
     assert "node_sessions_missing_in_state=1" in result
@@ -961,7 +962,7 @@ def test_lcm_doctor_reports_lifecycle_fragmentation_as_read_only_observation(eng
     assert engine._lifecycle.row_count() == 2
 
 
-def test_lcm_doctor_warns_on_lcm_sessions_without_lifecycle_references(engine):
+def test_lcm_doctor_reports_lcm_sessions_without_lifecycle_references_as_observations(engine):
     engine.on_session_start("current-session", platform="cli", context_length=200000)
     engine._store.append("current-session", {"role": "user", "content": "covered"}, source="cli")
     engine._store.append("message-only-session", {"role": "user", "content": "missing lifecycle"}, source="cli")
@@ -978,11 +979,14 @@ def test_lcm_doctor_warns_on_lcm_sessions_without_lifecycle_references(engine):
 
     result = handle_lcm_command("doctor", engine)
 
-    assert "status: action-recommended" in result
+    assert "status: ok" in result
+    assert "lifecycle_fragmentation: lifecycle_rows=1" in result
+    assert "empty_lifecycle_rows=0" in result
     assert "message_sessions_without_lifecycle_current=1" in result
     assert "message_sessions_without_lifecycle_reference=1" in result
     assert "node_sessions_without_lifecycle_reference=1" in result
-    assert "inspect lifecycle fragmentation before any cleanup/repair behavior mutates state" in result
+    assert "lifecycle_fragmentation_classification: notice; 2 categories need review" in result
+    assert "triage_guidance:\n- none" in result
 
 
 def test_lcm_doctor_does_not_warn_on_last_finalized_message_session(engine):
