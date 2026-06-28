@@ -182,6 +182,18 @@ def _sanitize_content_block(content: Any) -> str:
     return str(content)
 
 
+def _looks_like_inter_block_user_text(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or any(char in stripped for char in "<>"):
+        return False
+    lowered = stripped.lower()
+    injected_terms = ("delimiter", "ephemeral", "fake", "injected", "leak", "memory", "recall", "spoof", "tail")
+    if any(term in lowered for term in injected_terms):
+        return False
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    return len(lines) <= 2 and len(stripped) <= 300
+
+
 def _select_injected_context_closer(
     text: str,
     opener: re.Match[str],
@@ -202,9 +214,19 @@ def _select_injected_context_closer(
             for closer in closers
             if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
         ]
-        if line_closers:
-            return line_closers[-1]
-        return closers[-1]
+        if not line_closers:
+            return closers[-1]
+        for index, closer in enumerate(line_closers[:-1]):
+            next_line_closer = line_closers[index + 1]
+            next_opener = open_re.search(text, closer.end())
+            if (
+                next_opener is not None
+                and next_opener.start() < next_line_closer.start()
+                and _at_line_start(text, next_opener.start())
+                and _looks_like_inter_block_user_text(text[closer.end() : next_opener.start()])
+            ):
+                return closer
+        return line_closers[-1]
 
     # Inline JSON/tool strings can contain multiple adjacent injected blocks
     # with real user text between them. Strip inline blocks one by one when a

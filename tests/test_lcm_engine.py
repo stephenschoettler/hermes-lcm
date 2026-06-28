@@ -3944,6 +3944,18 @@ class TestEngineCompress:
             {
                 "role": "user",
                 "content": (
+                    "<relevant-memories>\n"
+                    "block first recall\n"
+                    "</relevant-memories>\n"
+                    "please do X\n"
+                    "<relevant-memories>\n"
+                    "block second recall\n"
+                    "</relevant-memories>"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
                     "<hindsight-memories>hyphenated Hindsight recall block</hindsight-memories>\n"
                     "keep hyphenated-tag user content"
                 ),
@@ -3957,6 +3969,7 @@ class TestEngineCompress:
         assert "also keep this real user content" in serialized
         assert "please summarize my plan" in serialized
         assert "keep after inline spoof" in serialized
+        assert "please do X" in serialized
         assert "keep hyphenated-tag user content" in serialized
         assert "temporary retrieved memory" not in serialized
         assert "first ephemeral recall block" not in serialized
@@ -3965,6 +3978,8 @@ class TestEngineCompress:
         assert "inline second recall" not in serialized
         assert "inline recall with spoofed close" not in serialized
         assert "leaked inline tail" not in serialized
+        assert "block first recall" not in serialized
+        assert "block second recall" not in serialized
         assert "hyphenated Hindsight recall block" not in serialized
         assert "Untrusted context" not in serialized
         assert "hindsight_memories" not in serialized
