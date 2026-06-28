@@ -227,22 +227,9 @@ def _select_injected_context_closer(
             return None
         return line_closers[-1]
 
-    # Inline JSON/tool strings can contain multiple adjacent injected blocks
-    # with real user text between them. Strip inline blocks one by one when a
-    # following opener appears before the next close; otherwise keep consuming
-    # through later closes because close-only delimiters inside the payload are
-    # untrusted too.
-    for index, closer in enumerate(closers):
-        next_closer = closers[index + 1] if index + 1 < len(closers) else None
-        if next_closer is None:
-            return closer
-        next_opener = open_re.search(text, closer.end())
-        if (
-            next_opener is not None
-            and next_opener.start() < next_closer.start()
-            and _looks_like_inter_block_user_text(text[closer.end() : next_opener.start()])
-        ):
-            return closer
+    # Inline close/open pairs are ambiguous too: a recalled memory can contain a
+    # spoofed close, normal-looking text, and a fake opener before the real
+    # close. Choose safety over preserving inter-block inline gaps.
     return closers[-1]
 
 

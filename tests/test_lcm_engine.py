@@ -3976,14 +3976,14 @@ class TestEngineCompress:
         serialized = engine._serialize_messages(messages)
 
         assert "keep this real user request" in serialized
-        assert "preserve user text between same-tag blocks" in serialized
         assert "also keep this real user content" in serialized
-        assert "recall our plan from memory" in serialized
-        assert "tail -f logs" in serialized
         assert "keep after inline spoof" in serialized
         assert "keep this request after close" in serialized
         assert "keep hyphenated-tag user content" in serialized
         assert "temporary retrieved memory" not in serialized
+        assert "preserve user text between same-tag blocks" not in serialized
+        assert "recall our plan from memory" not in serialized
+        assert "tail -f logs" not in serialized
         assert "first ephemeral recall block" not in serialized
         assert "second ephemeral recall block" not in serialized
         assert "inline first recall" not in serialized
@@ -4063,7 +4063,7 @@ class TestEngineCompress:
                                     ),
                                     "inline_blocks": (
                                         "<relevant-memories>tool first recall</relevant-memories> "
-                                        "keep this longer tool argument between blocks "
+                                        "ambiguous tool argument between inline blocks "
                                         "<relevant-memories>tool second recall</relevant-memories>"
                                     ),
                                     "nested": [
@@ -4081,9 +4081,9 @@ class TestEngineCompress:
         serialized = engine._serialize_messages(messages)
 
         assert "keep this tool argument" in serialized
-        assert "keep this longer tool argument between blocks" in serialized
         assert "nested keep" in serialized
         assert "temporary tool-arg recall" not in serialized
+        assert "ambiguous tool argument between inline blocks" not in serialized
         assert "tool first recall" not in serialized
         assert "tool second recall" not in serialized
         assert "nested recall" not in serialized
