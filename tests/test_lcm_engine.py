@@ -3947,8 +3947,9 @@ class TestEngineCompress:
                     "<relevant-memories>\n"
                     "block first recall\n"
                     "</relevant-memories>\n"
-                    "please do X\n"
-                    "<relevant-memories>\n"
+                    + ("please do X " * 40)
+                    + "\n"
+                    + "<relevant-memories>\n"
                     "block second recall\n"
                     "</relevant-memories>"
                 ),

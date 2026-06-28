@@ -184,14 +184,11 @@ def _sanitize_content_block(content: Any) -> str:
 
 def _looks_like_inter_block_user_text(text: str) -> bool:
     stripped = text.strip()
-    if not stripped or any(char in stripped for char in "<>"):
+    if not stripped:
         return False
     lowered = stripped.lower()
     injected_terms = ("delimiter", "ephemeral", "fake", "injected", "leak", "memory", "recall", "spoof", "tail")
-    if any(term in lowered for term in injected_terms):
-        return False
-    lines = [line for line in stripped.splitlines() if line.strip()]
-    return len(lines) <= 2 and len(stripped) <= 300
+    return not any(term in lowered for term in injected_terms)
 
 
 def _select_injected_context_closer(
@@ -215,7 +212,7 @@ def _select_injected_context_closer(
             if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
         ]
         if not line_closers:
-            return closers[-1]
+            return None
         for index, closer in enumerate(line_closers[:-1]):
             next_line_closer = line_closers[index + 1]
             next_opener = open_re.search(text, closer.end())
