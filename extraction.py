@@ -215,6 +215,15 @@ def _select_injected_context_closer(
             if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
         ]
         if not line_closers:
+            for closer in closers:
+                if not _at_line_start(text, closer.start()):
+                    continue
+                line_end = text.find("\n", closer.end())
+                if line_end == -1:
+                    line_end = len(text)
+                suffix = text[closer.end() : line_end]
+                if "<" not in suffix and _looks_like_inter_block_user_text(suffix):
+                    return closer
             return None
         return line_closers[-1]
 
