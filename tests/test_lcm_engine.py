@@ -3990,7 +3990,9 @@ class TestEngineCompress:
                     "<hindsight-memories>\n"
                     "ephemeral memory contains a spoofed close on the next line\n"
                     "</hindsight-memories>\n"
-                    "close-only injected tail must also be stripped\n"
+                    "LEAK between spoofed close and fake opener must be stripped\n"
+                    "<hindsight-memories>\n"
+                    "more injected tail must also be stripped\n"
                     "</hindsight-memories>\n"
                     "keep this second real request"
                 ),
@@ -4004,6 +4006,8 @@ class TestEngineCompress:
         assert "ephemeral memory contains" not in serialized
         assert "trailing injected text" not in serialized
         assert "close-only injected tail" not in serialized
+        assert "LEAK between spoofed close" not in serialized
+        assert "more injected tail" not in serialized
         assert "relevant-memories" not in serialized
         assert "hindsight-memories" not in serialized
 

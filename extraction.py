@@ -202,20 +202,9 @@ def _select_injected_context_closer(
             for closer in closers
             if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
         ]
-        if not line_closers:
-            return closers[-1]
-        for index, closer in enumerate(line_closers):
-            next_line_closer = line_closers[index + 1] if index + 1 < len(line_closers) else None
-            if next_line_closer is None:
-                return closer
-            next_opener = open_re.search(text, closer.end())
-            if (
-                next_opener is not None
-                and next_opener.start() < next_line_closer.start()
-                and _at_line_start(text, next_opener.start())
-            ):
-                return closer
-        return line_closers[-1]
+        if line_closers:
+            return line_closers[-1]
+        return closers[-1]
 
     # Inline JSON/tool strings can contain multiple adjacent injected blocks
     # with real user text between them. Strip inline blocks one by one when a
