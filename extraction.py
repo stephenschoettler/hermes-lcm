@@ -218,9 +218,18 @@ def _select_injected_context_closer(
         return line_closers[-1]
 
     # Inline JSON/tool strings can contain multiple adjacent injected blocks
-    # with real user text between them. Strip inline blocks one by one instead
-    # of greedily deleting the interstitial text.
-    return closers[0]
+    # with real user text between them. Strip inline blocks one by one when a
+    # following opener appears before the next close; otherwise keep consuming
+    # through later closes because close-only delimiters inside the payload are
+    # untrusted too.
+    for index, closer in enumerate(closers):
+        next_closer = closers[index + 1] if index + 1 < len(closers) else None
+        if next_closer is None:
+            return closer
+        next_opener = open_re.search(text, closer.end())
+        if next_opener is not None and next_opener.start() < next_closer.start():
+            return closer
+    return closers[-1]
 
 
 def strip_injected_context_blocks(text: str) -> str:
