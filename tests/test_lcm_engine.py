@@ -3928,7 +3928,8 @@ class TestEngineCompress:
             {
                 "role": "user",
                 "content": (
-                    "<relevant-memories>inline first recall</relevant-memories> keep "
+                    "<relevant-memories>inline first recall</relevant-memories> "
+                    "please summarize my plan "
                     "<relevant-memories>inline second recall</relevant-memories>"
                 ),
             },
@@ -3946,7 +3947,7 @@ class TestEngineCompress:
         assert "keep this real user request" in serialized
         assert "preserve user text between same-tag injected blocks" in serialized
         assert "also keep this real user content" in serialized
-        assert " keep" in serialized
+        assert "please summarize my plan" in serialized
         assert "keep hyphenated-tag user content" in serialized
         assert "temporary retrieved memory" not in serialized
         assert "first ephemeral recall block" not in serialized
@@ -3964,17 +3965,21 @@ class TestEngineCompress:
             {
                 "role": "user",
                 "content": (
-                    "<relevant-memories>ephemeral memory contains </relevant-memories> delimiter text "
-                    "and a fake <relevant-memories> opener plus trailing injected text "
-                    "must also be stripped</relevant-memories>\n"
+                    "<relevant-memories>\n"
+                    "ephemeral memory contains </relevant-memories> delimiter text "
+                    "and a fake <relevant-memories> opener plus trailing injected text\n"
+                    "must also be stripped\n"
+                    "</relevant-memories>\n"
                     "keep this real request"
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "<hindsight-memories>ephemeral memory contains </hindsight-memories>\n"
-                    "close-only injected tail must also be stripped</hindsight-memories>\n"
+                    "<hindsight-memories>\n"
+                    "ephemeral memory contains </hindsight-memories>\n"
+                    "close-only injected tail must also be stripped\n"
+                    "</hindsight-memories>\n"
                     "keep this second real request"
                 ),
             },

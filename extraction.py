@@ -182,6 +182,27 @@ def _sanitize_content_block(content: Any) -> str:
     return str(content)
 
 
+def _select_injected_context_closer(text: str, opener: re.Match[str], close_re: re.Pattern[str]) -> re.Match[str] | None:
+    closers = list(close_re.finditer(text, opener.end()))
+    if not closers:
+        return None
+
+    # Prompt-injected context normally uses a block shape:
+    #   <tag>\n...\n</tag>
+    # In that shape, any matching delimiter inside the body is untrusted text;
+    # prefer a close delimiter that is also on its own line.
+    if _at_line_end(text, opener.end()):
+        for closer in closers:
+            if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end()):
+                return closer
+        return closers[-1]
+
+    # Inline JSON/tool strings can contain multiple adjacent injected blocks
+    # with real user text between them. Strip inline blocks one by one instead
+    # of greedily deleting the interstitial text.
+    return closers[0]
+
+
 def strip_injected_context_blocks(text: str) -> str:
     """Remove transient memory/context blocks before compaction summarization."""
     if not text or "<" not in text:
@@ -198,37 +219,10 @@ def strip_injected_context_blocks(text: str) -> str:
             if not opener:
                 break
 
-            closers = list(close_re.finditer(cleaned, opener.end()))
-            if not closers:
+            closer = _select_injected_context_closer(cleaned, opener, close_re)
+            if closer is None:
                 cleaned = cleaned[: opener.start()]
                 continue
-
-            closer = closers[-1]
-            for index, candidate in enumerate(closers):
-                next_opener = open_re.search(cleaned, candidate.end())
-                next_closer = closers[index + 1] if index + 1 < len(closers) else None
-                if next_opener is None:
-                    if index + 1 < len(closers):
-                        continue
-                    closer = candidate
-                    break
-                # Injected blocks are emitted as their own lines. If untrusted
-                # block text mentions a matching opener inline before the next
-                # close, keep stripping through it. Preserve only short inline
-                # separators so compact JSON/tool strings can keep real text
-                # between two adjacent same-tag blocks.
-                inline_gap = cleaned[candidate.end() : next_opener.start()]
-                preserve_short_inline_separator = "\n" not in inline_gap and len(inline_gap.strip()) <= 16
-                has_inline_opener_before_next_close = (
-                    next_opener is not None
-                    and (next_closer is None or next_opener.start() < next_closer.start())
-                    and not _at_line_start(cleaned, next_opener.start())
-                    and not preserve_short_inline_separator
-                )
-                if has_inline_opener_before_next_close and not _at_line_end(cleaned, candidate.end()):
-                    continue
-                closer = candidate
-                break
             cleaned = cleaned[: opener.start()] + cleaned[closer.end() :]
 
     cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", cleaned)
