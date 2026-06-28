@@ -186,13 +186,14 @@ def strip_injected_context_blocks(text: str) -> str:
             if not opener:
                 break
 
-            next_opener = open_re.search(cleaned, opener.end())
-            search_end = next_opener.start() if next_opener else len(cleaned)
-            closers = list(close_re.finditer(cleaned, opener.end(), search_end))
+            closers = list(close_re.finditer(cleaned, opener.end()))
             if not closers:
-                cleaned = cleaned[: opener.start()] + cleaned[search_end:]
+                cleaned = cleaned[: opener.start()]
                 continue
 
+            # Treat the block body as untrusted text: if it mentions matching
+            # open/close delimiters, keep stripping until the last close rather
+            # than allowing fake delimiters to split the injected block open.
             closer = closers[-1]
             cleaned = cleaned[: opener.start()] + cleaned[closer.end() :]
 
