@@ -214,12 +214,16 @@ def strip_injected_context_blocks(text: str) -> str:
                     break
                 # Injected blocks are emitted as their own lines. If untrusted
                 # block text mentions a matching opener inline before the next
-                # close, keep stripping through it instead of treating that
-                # inline opener as a separate top-level block.
+                # close, keep stripping through it. Preserve only short inline
+                # separators so compact JSON/tool strings can keep real text
+                # between two adjacent same-tag blocks.
+                inline_gap = cleaned[candidate.end() : next_opener.start()]
+                preserve_short_inline_separator = "\n" not in inline_gap and len(inline_gap.strip()) <= 16
                 has_inline_opener_before_next_close = (
                     next_opener is not None
                     and (next_closer is None or next_opener.start() < next_closer.start())
                     and not _at_line_start(cleaned, next_opener.start())
+                    and not preserve_short_inline_separator
                 )
                 if has_inline_opener_before_next_close and not _at_line_end(cleaned, candidate.end()):
                     continue
