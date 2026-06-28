@@ -3929,7 +3929,7 @@ class TestEngineCompress:
                 "role": "user",
                 "content": (
                     "<relevant-memories>inline first recall</relevant-memories> "
-                    "please summarize my plan "
+                    "recall our plan from memory "
                     "<relevant-memories>inline second recall</relevant-memories>"
                 ),
             },
@@ -3968,7 +3968,7 @@ class TestEngineCompress:
         assert "keep this real user request" in serialized
         assert "preserve user text between same-tag blocks" in serialized
         assert "also keep this real user content" in serialized
-        assert "please summarize my plan" in serialized
+        assert "recall our plan from memory" in serialized
         assert "keep after inline spoof" in serialized
         assert "keep hyphenated-tag user content" in serialized
         assert "temporary retrieved memory" not in serialized
