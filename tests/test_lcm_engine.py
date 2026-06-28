@@ -3930,7 +3930,9 @@ class TestEngineCompress:
                 "content": (
                     "<relevant-memories>inline first recall</relevant-memories> "
                     "recall our plan from memory "
-                    "<relevant-memories>inline second recall</relevant-memories>"
+                    "<relevant-memories>inline second recall</relevant-memories> "
+                    "tail -f logs "
+                    "<relevant-memories>inline third recall</relevant-memories>"
                 ),
             },
             {
@@ -3977,6 +3979,7 @@ class TestEngineCompress:
         assert "preserve user text between same-tag blocks" in serialized
         assert "also keep this real user content" in serialized
         assert "recall our plan from memory" in serialized
+        assert "tail -f logs" in serialized
         assert "keep after inline spoof" in serialized
         assert "keep this request after close" in serialized
         assert "keep hyphenated-tag user content" in serialized
@@ -3985,6 +3988,7 @@ class TestEngineCompress:
         assert "second ephemeral recall block" not in serialized
         assert "inline first recall" not in serialized
         assert "inline second recall" not in serialized
+        assert "inline third recall" not in serialized
         assert "inline recall with spoofed close" not in serialized
         assert "leaked inline tail" not in serialized
         assert "block first recall" not in serialized

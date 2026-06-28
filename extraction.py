@@ -187,7 +187,7 @@ def _looks_like_inter_block_user_text(text: str) -> bool:
     if not stripped:
         return False
     lowered = stripped.lower()
-    injected_terms = ("delimiter", "ephemeral", "fake", "injected", "leak", "spoof", "tail")
+    injected_terms = ("delimiter", "ephemeral", "injected", "leak", "spoof")
     return not any(term in lowered for term in injected_terms)
 
 
