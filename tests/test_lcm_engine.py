@@ -45,6 +45,36 @@ def test_shutdown_closes_lifecycle_store(tmp_path):
     assert engine._lifecycle._conn is None
 
 
+def test_discord_short_turn_ingest_preserves_conversation_id(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "discord-lanes.db"))
+    engine = LCMEngine(config=config)
+    try:
+        conversation_id = "agent:main:discord:thread:1520890589762031776:1520890589762031776"
+        engine.on_session_start(
+            "discord-session-1",
+            platform="discord",
+            conversation_id=conversation_id,
+            context_length=200_000,
+        )
+
+        engine.ingest([
+            {"role": "user", "content": "needle from discord topic"},
+            {"role": "assistant", "content": "topic answer"},
+        ])
+
+        rows = engine._store.search(
+            "needle",
+            source="discord",
+            conversation_id=conversation_id,
+        )
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "discord-session-1"
+        assert rows[0]["source"] == "discord"
+        assert rows[0]["conversation_id"] == conversation_id
+    finally:
+        engine.shutdown()
+
+
 def test_engine_deallocation_releases_sqlite_fds_without_gc(tmp_path):
     fd_dir = Path("/proc/self/fd")
     if not fd_dir.exists():
@@ -1299,6 +1329,8 @@ class TestEngineABC:
         assert "source" in grep_props
         assert "descendant source lineage" in grep_props["source"]["description"]
         assert "unknown" in grep_props["source"]["description"]
+        assert "conversation_id" in grep_props
+        assert "Discord" in grep_props["conversation_id"]["description"]
         # The default scope still steers callers to the active session.
         description_lower = grep_schema["description"].lower()
         assert (
@@ -2866,6 +2898,46 @@ class TestEngineABC:
 
         assert result["total_results"] >= 1
         assert any("needle phrase" in item["snippet"] for item in result["results"])
+
+    def test_lcm_grep_filters_live_discord_history_by_conversation_id(self, engine):
+        target_conversation = "agent:main:discord:thread:topic-a:topic-a"
+        other_conversation = "agent:main:discord:thread:topic-b:topic-b"
+        engine.on_session_start(
+            "discord-topic-a",
+            platform="discord",
+            conversation_id=target_conversation,
+            context_length=200000,
+        )
+        engine.ingest([
+            {"role": "user", "content": "multichannel canary from topic a"},
+        ])
+        engine.on_session_start(
+            "discord-topic-b",
+            platform="discord",
+            conversation_id=other_conversation,
+            context_length=200000,
+        )
+        engine.ingest([
+            {"role": "user", "content": "multichannel canary from topic b"},
+        ])
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "multichannel canary",
+                    "session_scope": "all",
+                    "source": "discord",
+                    "conversation_id": target_conversation,
+                    "limit": 5,
+                },
+            )
+        )
+
+        assert result["conversation_id"] == target_conversation
+        assert result["summary_results_omitted"] is True
+        assert [item["conversation_id"] for item in result["results"]] == [target_conversation]
+        assert "topic a" in result["results"][0]["snippet"]
 
     def test_compress_accepts_focus_topic(self, engine, monkeypatch):
         import importlib

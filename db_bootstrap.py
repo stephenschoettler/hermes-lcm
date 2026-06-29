@@ -17,7 +17,7 @@ from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
@@ -173,6 +173,22 @@ def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_rollover_at REAL")
     if "last_reset_at" not in columns:
         conn.execute("ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL")
+
+
+def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
+    table_row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+    ).fetchone()
+    if not table_row:
+        return
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "conversation_id" not in columns:
+        conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+    )
 
 
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
@@ -597,5 +613,10 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     if current_version < 4:
         mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
         current_version = 4
+
+    ensure_message_origin_columns(conn)
+    if current_version < 5:
+        mark_migration_step_complete(conn, "v5_message_conversation_id")
+        current_version = 5
 
     set_schema_version(conn, current_version)

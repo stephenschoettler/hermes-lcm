@@ -1128,6 +1128,59 @@ class TestMessageStore:
         assert discord_results[0]["source"] == "discord"
         assert discord_results[0]["session_id"] == "sess2"
 
+    def test_conversation_id_stored_and_filterable_for_discord_lanes(self, store):
+        main_id = store.append(
+            "sess-main",
+            {"role": "user", "content": "docker in discord main lane"},
+            source="discord",
+            conversation_id="agent:main:discord:group:main:user",
+        )
+        thread_id = store.append(
+            "sess-thread",
+            {"role": "user", "content": "docker in discord forum topic"},
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        main_results = store.search(
+            "docker",
+            source="discord",
+            conversation_id="agent:main:discord:group:main:user",
+        )
+        thread_results = store.search(
+            "docker",
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        assert [result["store_id"] for result in main_results] == [main_id]
+        assert main_results[0]["conversation_id"] == "agent:main:discord:group:main:user"
+        assert [result["store_id"] for result in thread_results] == [thread_id]
+        assert thread_results[0]["conversation_id"] == "agent:main:discord:thread:topic:topic"
+        assert store.get(main_id)["conversation_id"] == "agent:main:discord:group:main:user"
+
+    def test_like_fallback_filters_by_conversation_id(self, store):
+        store.append(
+            "sess-main",
+            {"role": "user", "content": "foo bar lane main"},
+            source="discord",
+            conversation_id="agent:main:discord:group:main:user",
+        )
+        thread_id = store.append(
+            "sess-thread",
+            {"role": "user", "content": "foo bar lane topic"},
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        results = store.search(
+            'foo"bar',
+            source="discord",
+            conversation_id="agent:main:discord:thread:topic:topic",
+        )
+
+        assert [result["store_id"] for result in results] == [thread_id]
+
     def test_missing_source_is_normalized_to_unknown_and_filterable(self, store):
         store_id = store.append("sess-unknown", {"role": "user", "content": "docker with unknown source"})
 
@@ -1337,7 +1390,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == ("5",)
 
         results = store.search("docker", session_id="sess1")
         assert len(results) == 1
@@ -1386,7 +1439,7 @@ class TestMessageStore:
         version = store._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == ("5",)
 
         migration_state = store._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"
@@ -2295,7 +2348,7 @@ class TestLifecycleStateStore:
         version = state._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()[0]
-        assert version == "4"
+        assert version == "5"
 
         tables = {
             row[0]
@@ -2875,7 +2928,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == ("5",)
 
         results = dag.search("docker", session_id="s1")
         assert len(results) == 1
@@ -2927,7 +2980,7 @@ class TestSummaryDAG:
         version = dag._conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("4",)
+        assert version == ("5",)
 
         migration_state = dag._conn.execute(
             "SELECT step_name FROM lcm_migration_state ORDER BY step_name"

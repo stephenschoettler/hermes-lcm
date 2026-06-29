@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import types
 
 
 EXPECTED_LCM_TOOLS = {
@@ -600,3 +601,130 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
         assert "messages" in kwargs, f"{name}: messages kwarg not forwarded"
         # Depending on whether engine passes it through, at minimum verify it arrived
         assert kwargs["messages"] == test_messages, f"{name}: messages content mismatch"
+
+
+def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_active_clone")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+
+    class _ActiveClone:
+        name = "lcm"
+
+        def __init__(self):
+            self.current_session_id = ""
+            self.current_conversation_id = ""
+            self.starts = []
+            self.ingested = []
+
+        def on_session_start(self, session_id, **kwargs):
+            self.current_session_id = session_id
+            self.current_conversation_id = kwargs.get("conversation_id") or session_id
+            self.starts.append((session_id, kwargs))
+
+        def ingest(self, history):
+            self.ingested.append(list(history))
+
+    active = _ActiveClone()
+    hook = manager._hooks["post_llm_call"][-1]
+    history = [{"role": "user", "content": "discord lane canary"}]
+
+    hook(
+        context_compressor=active,
+        session_id="discord-session",
+        conversation_id="agent:main:discord:thread:t:t",
+        platform="discord",
+        conversation_history=history,
+    )
+
+    assert active.starts == [
+        (
+            "discord-session",
+            {
+                "platform": "discord",
+                "conversation_id": "agent:main:discord:thread:t:t",
+            },
+        )
+    ]
+    assert active.ingested == [history]
+    assert ctx.engine.current_session_id == ""
+    ctx.engine.shutdown()
+
+
+def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_singleton_rebind")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+    hook = manager._hooks["post_llm_call"][-1]
+
+    ingests = []
+
+    def spy_ingest(history):
+        ingests.append(
+            (
+                ctx.engine.current_session_id,
+                ctx.engine.current_conversation_id,
+                ctx.engine.current_session_platform,
+                list(history),
+            )
+        )
+
+    monkeypatch.setattr(ctx.engine, "ingest", spy_ingest)
+    hook(
+        session_id="discord-topic-a",
+        conversation_id="agent:main:discord:thread:a:a",
+        platform="discord",
+        conversation_history=[{"role": "user", "content": "topic a"}],
+    )
+    hook(
+        session_id="telegram-dm",
+        conversation_id="agent:main:telegram:private:1782862480",
+        platform="telegram",
+        conversation_history=[{"role": "user", "content": "telegram dm"}],
+    )
+
+    assert ingests == [
+        (
+            "discord-topic-a",
+            "agent:main:discord:thread:a:a",
+            "discord",
+            [{"role": "user", "content": "topic a"}],
+        ),
+        (
+            "telegram-dm",
+            "agent:main:telegram:private:1782862480",
+            "telegram",
+            [{"role": "user", "content": "telegram dm"}],
+        ),
+    ]
+    ctx.engine.shutdown()

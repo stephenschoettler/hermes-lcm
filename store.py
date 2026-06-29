@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
-    "tool_calls, tool_name, timestamp, token_estimate, pinned"
+    "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id"
 )
 _UNKNOWN_SOURCE = "unknown"
 
@@ -71,12 +71,23 @@ def _normalize_source_value(source: str | None) -> str:
     return normalized or _UNKNOWN_SOURCE
 
 
+def _normalize_conversation_id_value(conversation_id: str | None) -> str:
+    return (conversation_id or "").strip()
+
+
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
     normalized = _normalize_source_value(source) if source is not None else ""
     if not normalized:
         return None, []
     if normalized == _UNKNOWN_SOURCE:
         return f"({column} = ? OR {_legacy_blank_source_clause(column)})", [_UNKNOWN_SOURCE]
+    return f"{column} = ?", [normalized]
+
+
+def _conversation_filter_clause(column: str, conversation_id: str | None) -> tuple[str | None, list[str]]:
+    normalized = _normalize_conversation_id_value(conversation_id)
+    if not normalized:
+        return None, []
     return f"{column} = ?", [normalized]
 
 
@@ -240,6 +251,7 @@ class MessageStore:
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
                 source TEXT DEFAULT '',
+                conversation_id TEXT DEFAULT '',
                 role TEXT NOT NULL,
                 content TEXT,
                 tool_call_id TEXT,
@@ -265,6 +277,7 @@ class MessageStore:
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_column()
+        self._ensure_conversation_id_column()
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -277,10 +290,21 @@ class MessageStore:
             "CREATE INDEX IF NOT EXISTS idx_msg_source_session ON messages(source, session_id, store_id)"
         )
 
+    def _ensure_conversation_id_column(self) -> None:
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "conversation_id" not in columns:
+            self._conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
+        )
+
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
-               token_estimate: int = 0, source: str = "") -> int:
+               token_estimate: int = 0, source: str = "",
+               conversation_id: str = "") -> int:
         """Persist a message and return its store_id."""
         msg = protect_message_for_ingest(
             msg,
@@ -294,12 +318,13 @@ class MessageStore:
         with self._write_lock:
             cur = self._conn.execute(
                 """INSERT INTO messages
-                   (session_id, source, role, content, tool_call_id, tool_calls,
+                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
+                    _normalize_conversation_id_value(conversation_id),
                     msg.get("role", "unknown"),
                     _normalize_content_value(msg.get("content")),
                     msg.get("tool_call_id"),
@@ -316,7 +341,8 @@ class MessageStore:
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
                      token_estimates: List[int] | None = None,
-                     source: str = "") -> List[int]:
+                     source: str = "",
+                     conversation_id: str = "") -> List[int]:
         """Persist multiple messages in one transaction. Returns store_ids."""
         protected_messages = protect_messages_for_ingest(
             messages,
@@ -329,12 +355,14 @@ class MessageStore:
             protected_messages,
             token_estimates,
             source=source,
+            conversation_id=conversation_id,
         )
 
     def _append_protected_batch(self, session_id: str,
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
-                                source: str = "") -> List[int]:
+                                source: str = "",
+                                conversation_id: str = "") -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -353,12 +381,13 @@ class MessageStore:
                 ts = time.time()
                 cur = self._conn.execute(
                     """INSERT INTO messages
-                       (session_id, source, role, content, tool_call_id, tool_calls,
+                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
+                        _normalize_conversation_id_value(conversation_id),
                         msg.get("role", "unknown"),
                         _normalize_content_value(msg.get("content")),
                         msg.get("tool_call_id"),
@@ -700,6 +729,7 @@ class MessageStore:
     def search(self, query: str, session_id: str | None = None,
                limit: int = 20, sort: str | None = None,
                source: str | None = None,
+               conversation_id: str | None = None,
                role: str | None = None,
                time_from: float | None = None,
                time_to: float | None = None) -> List[Dict[str, Any]]:
@@ -712,6 +742,7 @@ class MessageStore:
         - ``source`` limits which raw rows inside those sessions are eligible
         - ``source='unknown'`` means the explicit unknown-source bucket, with
           legacy blank-source rows treated as equivalent for back-compat
+        - ``conversation_id`` limits rows to one gateway conversation/session key
         """
         safe_query = sanitize_fts5_query(query)
         terms = extract_search_terms(safe_query)
@@ -723,6 +754,7 @@ class MessageStore:
                 limit=limit,
                 sort=sort,
                 source=source,
+                conversation_id=conversation_id,
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
@@ -738,6 +770,7 @@ class MessageStore:
         apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
         max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
         source_clause, source_args = _source_filter_clause("m.source", source)
+        conversation_clause, conversation_args = _conversation_filter_clause("m.conversation_id", conversation_id)
         offset = 0
         scanned_rows = 0
         results: list[Dict[str, Any]] = []
@@ -751,6 +784,9 @@ class MessageStore:
                 if source_clause:
                     where.append(source_clause)
                     args.extend(source_args)
+                if conversation_clause:
+                    where.append(conversation_clause)
+                    args.extend(conversation_args)
                 if role is not None:
                     where.append("m.role = ?")
                     args.append(role)
@@ -763,7 +799,7 @@ class MessageStore:
                 args.extend([fetch_limit, offset])
                 rows = self._conn.execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned,
+                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
                               rank as search_rank,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
@@ -781,6 +817,7 @@ class MessageStore:
                     limit=limit,
                     sort=sort,
                     source=source,
+                    conversation_id=conversation_id,
                     role=role,
                     time_from=time_from,
                     time_to=time_to,
@@ -789,7 +826,7 @@ class MessageStore:
             raw_primary_values: list[float] = []
             for r in rows:
                 d = self._row_to_dict(r)
-                base_columns = 11
+                base_columns = 12
                 d["search_rank"] = r[base_columns] if len(r) > base_columns else None
                 d["snippet"] = r[base_columns + 1] if len(r) > (base_columns + 1) else ""
                 d["_directness_score"] = _message_directness_score(d.get("role"), d.get("content"), terms, phrases)
@@ -821,6 +858,7 @@ class MessageStore:
     def _search_like(self, query: str, session_id: str | None = None,
                      limit: int = 20, sort: str | None = None,
                      source: str | None = None,
+                     conversation_id: str | None = None,
                      role: str | None = None,
                      time_from: float | None = None,
                      time_to: float | None = None) -> List[Dict[str, Any]]:
@@ -840,6 +878,10 @@ class MessageStore:
         if source_clause:
             where.append(source_clause)
             args.extend(source_args)
+        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        if conversation_clause:
+            where.append(conversation_clause)
+            args.extend(conversation_args)
         if role is not None:
             where.append("role = ?")
             args.append(role)
@@ -1017,10 +1059,11 @@ class MessageStore:
             return {}
         cols = [
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
-            "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned",
+            "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))
+        d["conversation_id"] = _normalize_conversation_id_value(d.get("conversation_id"))
         # Deserialize tool_calls JSON
         if d.get("tool_calls"):
             try:

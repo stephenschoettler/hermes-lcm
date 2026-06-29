@@ -3585,6 +3585,7 @@ class LCMEngine(ContextEngine):
             protected_messages,
             estimates,
             source=self._session_platform,
+            conversation_id=self._conversation_id,
         )
         self._ingest_cursor = n
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))

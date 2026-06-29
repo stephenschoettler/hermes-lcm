@@ -67,6 +67,13 @@ LCM_GREP = {
                     "Use 'unknown' for explicit unknown-source content."
                 ),
             },
+            "conversation_id": {
+                "type": "string",
+                "description": (
+                    "Optional gateway conversation/session key filter for lane-scoped retrieval. "
+                    "Use this to restrict Discord searches to one channel/thread/forum topic lane when rows carry metadata."
+                ),
+            },
             "role": {
                 "type": "string",
                 "enum": ["system", "user", "assistant", "tool", "unknown"],

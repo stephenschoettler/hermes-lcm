@@ -1067,6 +1067,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
     )
     source = str(args.get("source") or "").strip() or None
+    conversation_id = str(args.get("conversation_id") or "").strip() or None
     role, role_error = _parse_grep_role(args.get("role"))
     if role_error:
         return json.dumps({"error": role_error})
@@ -1078,7 +1079,12 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": time_to_error})
     if time_from is not None and time_to is not None and time_to < time_from:
         return json.dumps({"error": "time_to must be greater than or equal to time_from"})
-    raw_message_filter_active = role is not None or time_from is not None or time_to is not None
+    raw_message_filter_active = (
+        role is not None
+        or time_from is not None
+        or time_to is not None
+        or conversation_id is not None
+    )
 
     if requested_session_scope == "current":
         if explicit_session_id:
@@ -1130,6 +1136,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
             limit=source_limit,
             sort=sort,
             source=source,
+            conversation_id=conversation_id,
             role=role,
             time_from=time_from,
             time_to=time_to,
@@ -1143,6 +1150,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
                     "store_id": hit["store_id"],
                     "session_id": hit["session_id"],
                     "source": hit.get("source") or "",
+                    "conversation_id": hit.get("conversation_id") or "",
                     "role": hit["role"],
                     "timestamp": timestamp_value,
                     "snippet": hit.get("snippet", hit.get("content", "")[:200]),
@@ -1211,6 +1219,7 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
         "sort": sort,
         "session_scope": session_scope,
         "source": source,
+        "conversation_id": conversation_id,
         "limit": limit,
         "total_results": len(results),
         "results": results[:limit],
@@ -1392,6 +1401,7 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "source_type": "raw_message",
             "session_id": stored_session_id,
             "source": stored.get("source") or "",
+            "conversation_id": stored.get("conversation_id") or "",
             "role": stored.get("role"),
             "timestamp": stored.get("timestamp", 0),
             "tool_call_id": stored.get("tool_call_id") or "",

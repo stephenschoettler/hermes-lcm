@@ -156,11 +156,40 @@ def register(ctx):
 
         def _on_post_llm_call(**kwargs):
             history = kwargs.get("conversation_history")
-            if history:
-                try:
-                    engine.ingest(history)
-                except Exception as exc:
-                    logger.debug("LCM post_llm_call ingest error: %s", exc)
+            if not history:
+                return
+            active_engine = kwargs.get("context_compressor")
+            if not (
+                active_engine is not None
+                and getattr(active_engine, "name", None) == "lcm"
+                and hasattr(active_engine, "ingest")
+            ):
+                active_engine = engine
+
+            session_id = str(kwargs.get("session_id") or "")
+            conversation_id = str(
+                kwargs.get("conversation_id")
+                or kwargs.get("gateway_session_key")
+                or ""
+            )
+            platform = str(kwargs.get("platform") or "")
+
+            try:
+                if session_id and (
+                    str(getattr(active_engine, "current_session_id", "") or "") != session_id
+                    or (
+                        conversation_id
+                        and str(getattr(active_engine, "current_conversation_id", "") or "") != conversation_id
+                    )
+                ):
+                    active_engine.on_session_start(
+                        session_id,
+                        platform=platform,
+                        conversation_id=conversation_id or None,
+                    )
+                active_engine.ingest(history)
+            except Exception as exc:
+                logger.debug("LCM post_llm_call ingest error: %s", exc)
 
         _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
