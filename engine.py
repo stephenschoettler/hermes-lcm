@@ -540,10 +540,17 @@ class LCMEngine(ContextEngine):
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
         self._pending_context_anchor_messages: Optional[List[Dict[str, Any]]] = None
+        self._current_compress_store_ids_by_message_id: dict[int, int] = {}
+        self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
+        self._last_active_replay_messages: list[Dict[str, Any]] = []
+        self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
         self._pending_reset_frontier_store_id: int = 0
+        self._compression_boundary_ingest_pending = False
+        self._compression_boundary_active_placeholder_digest_budget: dict[str, int] = {}
+        self._compression_boundary_active_placeholder_digest_ordinals: dict[str, set[int]] = {}
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
@@ -650,6 +657,9 @@ class LCMEngine(ContextEngine):
         self._session_ignored = False
         self._session_stateless = False
         self._clear_pending_reset_boundary()
+        self._compression_boundary_ingest_pending = False
+        self._compression_boundary_active_placeholder_digest_budget = {}
+        self._compression_boundary_active_placeholder_digest_ordinals = {}
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
@@ -958,6 +968,25 @@ class LCMEngine(ContextEngine):
         """Pre-flight check — also ingests messages into the store."""
         if self._session_ignored or self._session_stateless or self._thread_context_stateless():
             return False
+        from .tokens import count_messages_tokens
+        rough = count_messages_tokens(messages)
+        pre_ingest_placeholder_ambiguous_noop = False
+        pre_ingest_noop_reason = ""
+        if (
+            self.threshold_tokens > 0
+            and rough >= self.threshold_tokens
+            and not self._compiled_ignore_message_patterns
+            and any(
+                self._is_ignored_active_replay_placeholder(
+                    msg,
+                    text_content_for_pattern_matching(msg.get("content")) or "",
+                )
+                for msg in messages
+            )
+        ):
+            eligible, reason = self._leaf_compaction_candidate_status(messages)
+            pre_ingest_placeholder_ambiguous_noop = not eligible
+            pre_ingest_noop_reason = reason
         replay_messages = None
         if self._session_id and messages:
             try:
@@ -967,16 +996,44 @@ class LCMEngine(ContextEngine):
         if replay_messages is not None and replay_messages != messages:
             if self._compression_boundary_cooldown_active():
                 return False
-            return True
+            replay_rough = count_messages_tokens(replay_messages)
+            if self._should_force_overflow_recovery(observed_tokens=replay_rough):
+                return True
+            if self._replay_diff_requests_ingest_cleanup(messages, replay_messages):
+                return True
+            if pre_ingest_placeholder_ambiguous_noop:
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = pre_ingest_noop_reason
+                logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
+                return False
+            eligible, reason = self._leaf_compaction_candidate_status(replay_messages)
+            if eligible:
+                return True
+            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
+                return True
+            if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+                if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
+                    return True
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = reason
+                logger.info("LCM preflight compression no-op: %s", reason)
+                return False
+            self._refresh_raw_backlog_debt(replay_messages, observed_tokens=replay_rough)
+            return self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough)
         if self._compression_boundary_cooldown_active():
             return False
-        from .tokens import count_messages_tokens
-        rough = count_messages_tokens(messages)
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return True
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+            if pre_ingest_placeholder_ambiguous_noop:
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = pre_ingest_noop_reason
+                logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
+                return False
             eligible, reason = self._leaf_compaction_candidate_status(messages)
             if eligible:
+                return True
+            if self._has_ignored_backlog_outside_fresh_tail(messages):
                 return True
             if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
                 return True
@@ -986,6 +1043,41 @@ class LCMEngine(ContextEngine):
             return False
         self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
         return self._should_run_deferred_maintenance(messages, observed_tokens=rough)
+
+    def _replay_diff_requests_ingest_cleanup(
+        self,
+        original_messages: List[Dict[str, Any]],
+        replay_messages: List[Dict[str, Any]],
+    ) -> bool:
+        if len(original_messages) != len(replay_messages):
+            return True
+        for original_msg, replay_msg in zip(original_messages, replay_messages):
+            original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+            replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+            if original_text == replay_text:
+                continue
+            if replay_text.startswith("[Externalized LCM ingest payload:"):
+                return True
+            if replay_text.startswith("[Externalized payload: kind=raw_payload;"):
+                return True
+            if replay_text.startswith("[LCM active replay placeholder: assistant output quarantined;"):
+                return True
+            if replay_text.startswith("[LCM active replay placeholder: message ignored;"):
+                return True
+        return False
+
+    def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
+        if not self._compiled_ignore_message_patterns or not messages:
+            return False
+        n = len(messages)
+        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        leading_anchor_count = self._leading_anchor_count(messages)
+        if fresh_tail_start <= leading_anchor_count:
+            return False
+        return any(
+            self._matches_ignore_message_patterns(msg)
+            for msg in messages[leading_anchor_count:fresh_tail_start]
+        )
 
     def _leaf_compaction_candidate_status(
         self,
@@ -1013,6 +1105,32 @@ class LCMEngine(ContextEngine):
         candidate_raw = messages[leading_anchor_count:fresh_tail_start]
         if not candidate_raw:
             return False, "no eligible raw backlog outside fresh tail"
+        generated_placeholder_hashes = self._load_generated_ignored_placeholder_hashes()
+        if self._compiled_ignore_message_patterns or generated_placeholder_hashes:
+            previous_store_id_map = self._current_compress_store_ids_by_message_id
+            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(candidate_raw)
+            try:
+                filtered_candidate_raw: list[Dict[str, Any]] = []
+                for msg in candidate_raw:
+                    content_text = text_content_for_pattern_matching(msg.get("content")) or ""
+                    volatile_digest = self._active_replay_placeholder_digest(content_text)
+                    generated_volatile_placeholder = (
+                        self._is_volatile_ignored_quarantine_placeholder(msg, content_text)
+                        and volatile_digest is not None
+                        and volatile_digest in generated_placeholder_hashes
+                    )
+                    if (
+                        self._matches_ignore_message_patterns(msg)
+                        or self._is_ignored_active_replay_placeholder(msg, content_text)
+                        or generated_volatile_placeholder
+                    ):
+                        continue
+                    filtered_candidate_raw.append(msg)
+            finally:
+                self._current_compress_store_ids_by_message_id = previous_store_id_map
+            candidate_raw = filtered_candidate_raw
+            if not candidate_raw:
+                return False, "no eligible raw backlog outside fresh tail"
 
         if force_overflow:
             return True, "forced overflow recovery"
@@ -1196,6 +1314,7 @@ class LCMEngine(ContextEngine):
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
+        ingest_cleanup_changed_active_context = working_messages != messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
@@ -1260,6 +1379,9 @@ class LCMEngine(ContextEngine):
                     break
 
             if candidate_start < fresh_tail_start:
+                self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(
+                    working_messages[leading_anchor_count:]
+                )
                 compactable_pairs = list(
                     zip(
                         working_messages[candidate_start:fresh_tail_start],
@@ -1273,6 +1395,10 @@ class LCMEngine(ContextEngine):
                 for working_msg, pressure_msg in compactable_pairs:
                     role = str(working_msg.get("role") or "")
                     content_text = text_content_for_pattern_matching(working_msg.get("content")) or ""
+                    generated_dependent_reply = self._is_generated_ignored_dependent_reply(
+                        working_msg,
+                        content_text,
+                    )
                     volatile_digest = self._active_replay_placeholder_digest(content_text)
                     generated_volatile_placeholder = (
                         self._is_volatile_ignored_quarantine_placeholder(working_msg, content_text)
@@ -1286,15 +1412,21 @@ class LCMEngine(ContextEngine):
                         or generated_volatile_placeholder
                     ):
                         dropped_ignored_backlog = True
-                        if role == "user" or role == "tool" or (role == "assistant" and working_msg.get("tool_calls")):
+                        if role in {"user", "tool", "assistant"}:
                             drop_dependent_reply = True
                         continue
+                    if generated_dependent_reply:
+                        dependent_reply_message_ids.add(id(working_msg))
+                        if role in {"assistant", "tool"}:
+                            drop_dependent_reply = True
                     if drop_dependent_reply and role in {"assistant", "tool"}:
                         dependent_reply_message_ids.add(id(working_msg))
+                        self._remember_generated_ignored_dependent_reply(working_msg, content_text)
                     if role in {"user", "system"}:
                         drop_dependent_reply = False
                     kept_working.append(working_msg)
                     kept_pressure.append(pressure_msg)
+                drop_dependent_reply_into_tail = drop_dependent_reply
                 if dropped_ignored_backlog:
                     dropped_replayed_scaffold_messages = True
                     working_messages = (
@@ -1309,9 +1441,21 @@ class LCMEngine(ContextEngine):
                     )
                     n = len(working_messages)
                     fresh_tail_start = max(0, n - self._config.fresh_tail_count)
-                    if fresh_tail_start <= leading_anchor_count:
-                        noop_reason = "selected leaf chunk lacks raw store lineage"
-                        break
+                if drop_dependent_reply_into_tail:
+                    tail_scan_start = max(fresh_tail_start, leading_anchor_count)
+                    for tail_msg in working_messages[tail_scan_start:]:
+                        if not isinstance(tail_msg, dict):
+                            continue
+                        tail_role = str(tail_msg.get("role") or "")
+                        if tail_role in {"user", "system"}:
+                            break
+                        if tail_role in {"assistant", "tool"}:
+                            tail_text = text_content_for_pattern_matching(tail_msg.get("content")) or ""
+                            dependent_reply_message_ids.add(id(tail_msg))
+                            self._remember_generated_ignored_dependent_reply(tail_msg, tail_text)
+                if dropped_ignored_backlog and fresh_tail_start <= leading_anchor_count:
+                    noop_reason = "selected leaf chunk lacks raw store lineage"
+                    break
 
             # Auto-derive focus topic from the post-filter compaction view when
             # not explicitly provided.  The derived focus is summarizer-visible,
@@ -1381,9 +1525,16 @@ class LCMEngine(ContextEngine):
                 idx for idx, message in enumerate(selected_raw_chunk) if id(message) in compacted_summary_ids
             ]
             last_compacted_raw_pos = max(compacted_positions) if compacted_positions else len(compacted_chunk) - 1
-            source_lookup_chunk = selected_raw_chunk[: last_compacted_raw_pos + 1]
+            last_consumed_raw_pos = last_compacted_raw_pos
+            while (
+                last_consumed_raw_pos + 1 < len(selected_raw_chunk)
+                and id(selected_raw_chunk[last_consumed_raw_pos + 1]) in dependent_reply_message_ids
+            ):
+                last_consumed_raw_pos += 1
+            source_lookup_chunk = selected_raw_chunk[: last_consumed_raw_pos + 1]
             selected_raw_len = len(source_lookup_chunk)
             remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
+            source_tokens = count_messages_tokens(source_lookup_chunk)
 
             source_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
@@ -1470,7 +1621,7 @@ class LCMEngine(ContextEngine):
                     working_messages,
                     insert_missing_tool_stubs=False,
                 )
-            if sanitized_messages != working_messages:
+            if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized
                 # or reassembled context, keeping the old cursor could make the
@@ -1488,6 +1639,12 @@ class LCMEngine(ContextEngine):
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)
+            self._write_generated_ignored_placeholder_hash_counts(
+                self._generated_placeholder_digest_budget_for_active_replay(sanitized_messages)
+            )
+            self._write_generated_ignored_placeholder_hash_ordinals(
+                self._generated_placeholder_digest_ordinals_for_active_replay(sanitized_messages)
+            )
             return sanitized_messages
 
         # Step 6: Check if condensation is needed
@@ -1549,6 +1706,12 @@ class LCMEngine(ContextEngine):
         # compress() output is consumed directly by the main loop in some
         # edge cases (e.g. forced overflow recovery bypassing _assemble_context).
         compressed = self._sanitize_active_context_messages(compressed)
+        self._write_generated_ignored_placeholder_hash_counts(
+            self._generated_placeholder_digest_budget_for_active_replay(compressed)
+        )
+        self._write_generated_ignored_placeholder_hash_ordinals(
+            self._generated_placeholder_digest_ordinals_for_active_replay(compressed)
+        )
 
         return compressed
 
@@ -2133,6 +2296,9 @@ class LCMEngine(ContextEngine):
         self._reset_session_counters()
         self._reset_compaction_progress()
         self._generated_ignored_active_replay_placeholder_hashes = set()
+        self._generated_ignored_active_replay_placeholder_message_ids = set()
+        self._compression_boundary_active_placeholder_digest_budget = {}
+        self._compression_boundary_active_placeholder_digest_ordinals = {}
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
@@ -2435,12 +2601,66 @@ class LCMEngine(ContextEngine):
             and session_id
             and source_session_id != session_id
         )
+        boundary_placeholder_budget = {}
+        boundary_placeholder_ordinals: dict[str, set[int]] = {}
+        if can_reassign:
+            if previous_session_id == source_session_id:
+                boundary_placeholder_budget = self._active_replay_generated_placeholder_digest_budget()
+                boundary_placeholder_ordinals = self._generated_placeholder_digest_ordinals_for_active_replay(
+                    self._last_active_replay_messages
+                )
+            if not boundary_placeholder_budget:
+                boundary_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts(
+                    self._session_scoped_hash_metadata_keys(
+                        "ignored_active_replay_placeholder_hash_counts",
+                        source_session_id,
+                    )
+                )
+            if not boundary_placeholder_ordinals:
+                boundary_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals(
+                    self._session_scoped_hash_metadata_keys(
+                        "ignored_active_replay_placeholder_hash_ordinals",
+                        source_session_id,
+                    )
+                )
+            boundary_placeholder_budget = self._subtract_placeholder_digest_counts(
+                boundary_placeholder_budget,
+                self._stored_active_replay_placeholder_digest_counts(
+                    source_session_id,
+                    after_store_id=frontier,
+                ),
+            )
+            for digest, ordinals in boundary_placeholder_ordinals.items():
+                boundary_placeholder_budget[digest] = max(
+                    boundary_placeholder_budget.get(digest, 0),
+                    len(ordinals),
+                )
 
         if can_reassign:
             self._lifecycle.finalize_session(
                 conversation_id,
                 source_session_id,
                 frontier_store_id=frontier,
+            )
+            self._copy_generated_ignore_hashes_to_session(
+                source_session_id,
+                session_id,
+                copy_dependent_content=True,
+                source_frontier_store_id=frontier,
+            )
+            self._write_generated_ignored_placeholder_hash_counts(
+                boundary_placeholder_budget,
+                self._session_scoped_hash_metadata_keys(
+                    "ignored_active_replay_placeholder_hash_counts",
+                    session_id,
+                ),
+            )
+            self._write_generated_ignored_placeholder_hash_ordinals(
+                boundary_placeholder_ordinals,
+                self._session_scoped_hash_metadata_keys(
+                    "ignored_active_replay_placeholder_hash_ordinals",
+                    session_id,
+                ),
             )
             # Compression rollover carries derived context forward, but raw
             # messages remain owned by the session that produced them. Moving
@@ -2484,6 +2704,9 @@ class LCMEngine(ContextEngine):
             if state is not None:
                 self._last_compacted_store_id = state.current_frontier_store_id
         self._clear_pending_reset_boundary()
+        self._compression_boundary_ingest_pending = can_reassign
+        self._compression_boundary_active_placeholder_digest_budget = boundary_placeholder_budget
+        self._compression_boundary_active_placeholder_digest_ordinals = boundary_placeholder_ordinals
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
@@ -3051,7 +3274,7 @@ class LCMEngine(ContextEngine):
             f"sha256={digest}]"
         )
 
-    def _is_ignored_active_replay_placeholder(self, _msg: Dict[str, Any], text: str) -> bool:
+    def _is_ignored_active_replay_placeholder(self, msg: Dict[str, Any], text: str) -> bool:
         match = re.fullmatch(
                 r"\[LCM active replay placeholder: message ignored; "
                 r"kind=ignored_message; "
@@ -3062,6 +3285,8 @@ class LCMEngine(ContextEngine):
             )
         if not match:
             return False
+        if self._current_compress_store_ids_by_message_id.get(id(msg)) is not None:
+            return False
         digest = match.group(1)
         hashes = getattr(self, "_generated_ignored_active_replay_placeholder_hashes", set())
         if digest in hashes:
@@ -3071,60 +3296,562 @@ class LCMEngine(ContextEngine):
             return True
         return False
 
+    def _is_cached_active_replay_message_at_index(self, idx: int, msg: Dict[str, Any]) -> bool:
+        if idx < 0 or idx >= len(self._last_active_replay_messages):
+            return False
+        return self._message_replay_identity(msg) == self._message_replay_identity(
+            self._last_active_replay_messages[idx]
+        )
+
     def _ignored_placeholder_metadata_key(self) -> str:
         return f"ignored_active_replay_placeholder_hashes:{self._session_id}"
 
-    def _load_generated_ignored_placeholder_hashes(self) -> set[str]:
-        return set(self._load_generated_ignored_placeholder_hash_list())
+    def _ignored_placeholder_metadata_keys(self) -> list[str]:
+        return self._session_scoped_hash_metadata_keys("ignored_active_replay_placeholder_hashes")
 
-    def _load_generated_ignored_placeholder_hash_list(self) -> list[str]:
-        if not self._session_id:
+    def _ignored_placeholder_count_metadata_keys(self) -> list[str]:
+        return self._session_scoped_hash_metadata_keys("ignored_active_replay_placeholder_hash_counts")
+
+    def _ignored_placeholder_ordinal_metadata_keys(self) -> list[str]:
+        return self._session_scoped_hash_metadata_keys("ignored_active_replay_placeholder_hash_ordinals")
+
+    def _ignored_dependent_reply_metadata_keys(self) -> list[str]:
+        return self._session_scoped_hash_metadata_keys("ignored_dependent_reply_hashes")
+
+    def _session_scoped_hash_metadata_keys(self, prefix: str, session_id: str | None = None) -> list[str]:
+        scoped_session_id = self._session_id if session_id is None else session_id
+        keys: list[str] = []
+        if scoped_session_id:
+            keys.append(f"{prefix}:{scoped_session_id}")
+        return list(dict.fromkeys(keys))
+
+    def _copy_generated_ignore_hashes_to_session(
+        self,
+        source_session_id: str,
+        target_session_id: str,
+        *,
+        copy_dependent_content: bool = False,
+        source_frontier_store_id: int = 0,
+    ) -> None:
+        if not source_session_id or not target_session_id or source_session_id == target_session_id:
+            return
+        source_keys = self._session_scoped_hash_metadata_keys(
+            "ignored_active_replay_placeholder_hashes",
+            source_session_id,
+        )
+        target_keys = self._session_scoped_hash_metadata_keys(
+            "ignored_active_replay_placeholder_hashes",
+            target_session_id,
+        )
+        for digest in self._load_hash_list_for_metadata_keys(source_keys):
+            self._remember_hash_for_metadata_keys(digest, target_keys)
+
+        if not copy_dependent_content:
+            return
+
+        dependent_target_keys = self._session_scoped_hash_metadata_keys(
+            "ignored_dependent_reply_hashes",
+            target_session_id,
+        )
+        dependent_records = self._load_generated_ignored_dependent_reply_records(
+            self._session_scoped_hash_metadata_keys(
+                "ignored_dependent_reply_hashes",
+                source_session_id,
+            )
+        )
+        active_dependent_store_digests: set[str] = set()
+        try:
+            active_rows = self._store.get_session_messages_after(
+                source_session_id,
+                after_store_id=max(0, int(source_frontier_store_id or 0)),
+            )
+            for row in active_rows:
+                role = str(row.get("role") or "")
+                if role not in {"assistant", "tool"}:
+                    continue
+                store_id = row.get("store_id")
+                if store_id is None:
+                    continue
+                identity = f"{source_session_id}\0{int(store_id)}"
+                active_dependent_store_digests.add(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16])
+        except Exception:
+            logger.debug("LCM active dependent marker scan failed", exc_info=True)
+
+        pending_records = [
+            {"content": record["content"]}
+            for record in dependent_records
+            if record.get("content")
+            and (not record.get("store") or record.get("store") in active_dependent_store_digests)
+        ]
+        if pending_records:
+            target_records = self._load_generated_ignored_dependent_reply_records(dependent_target_keys)
+            self._write_generated_ignored_dependent_reply_records(
+                target_records + pending_records,
+                dependent_target_keys,
+            )
+
+    def _load_hash_list_for_metadata_keys(self, keys: list[str]) -> list[str]:
+        if not keys:
             return []
         try:
             conn = self._store._conn
             if conn is None:
                 return []
-            row = conn.execute(
-                "SELECT value FROM metadata WHERE key = ?",
-                (self._ignored_placeholder_metadata_key(),),
-            ).fetchone()
-            if not row or not row[0]:
-                return []
-            data = json.loads(str(row[0]))
-            if isinstance(data, list):
-                return [str(item) for item in data if re.fullmatch(r"[0-9a-f]{16}", str(item))]
+            ordered: list[str] = []
+            seen: set[str] = set()
+            for key in keys:
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                if not row or not row[0]:
+                    continue
+                data = json.loads(str(row[0]))
+                if isinstance(data, list):
+                    for item in data:
+                        digest = str(item)
+                        if re.fullmatch(r"[0-9a-f]{16}", digest) and digest not in seen:
+                            ordered.append(digest)
+                            seen.add(digest)
+            return ordered
         except Exception:
-            logger.debug("LCM ignored-placeholder hash metadata load failed", exc_info=True)
+            logger.debug("LCM scoped hash metadata load failed", exc_info=True)
         return []
 
-    def _remember_generated_ignored_placeholder_hash(self, digest: str) -> None:
+    def _remember_hash_for_metadata_keys(self, digest: str, keys: list[str]) -> list[str]:
         if not re.fullmatch(r"[0-9a-f]{16}", digest):
-            return
-        ordered_hashes = self._load_generated_ignored_placeholder_hash_list()
+            return []
+        ordered_hashes = self._load_hash_list_for_metadata_keys(keys)
         ordered_hashes = [item for item in ordered_hashes if item != digest]
         ordered_hashes.append(digest)
         ordered_hashes = ordered_hashes[-512:]
-        hashes = set(ordered_hashes)
-        self._generated_ignored_active_replay_placeholder_hashes = hashes
-        if not self._session_id:
-            return
+        if not keys:
+            return ordered_hashes
         try:
             payload = json.dumps(ordered_hashes)
             conn = self._store._conn
             if conn is None:
-                return
+                return ordered_hashes
             with self._store._write_lock:
-                conn.execute(
-                    """
-                    INSERT INTO metadata(key, value)
-                    VALUES(?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (self._ignored_placeholder_metadata_key(), payload),
-                )
+                for key in keys:
+                    conn.execute(
+                        """
+                        INSERT INTO metadata(key, value)
+                        VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (key, payload),
+                    )
                 conn.commit()
         except Exception:
-            logger.debug("LCM ignored-placeholder hash metadata write failed", exc_info=True)
+            logger.debug("LCM scoped hash metadata write failed", exc_info=True)
+        return ordered_hashes
+
+    def _load_generated_ignored_placeholder_hashes(self) -> set[str]:
+        return set(self._load_generated_ignored_placeholder_hash_list())
+
+    def _load_generated_ignored_placeholder_hash_list(self) -> list[str]:
+        return self._load_hash_list_for_metadata_keys(self._ignored_placeholder_metadata_keys())
+
+    def _load_generated_ignored_placeholder_hash_counts(
+        self,
+        keys: Optional[list[str]] = None,
+    ) -> dict[str, int]:
+        count_keys = self._ignored_placeholder_count_metadata_keys() if keys is None else keys
+        counts: dict[str, int] = {}
+        if not count_keys:
+            return counts
+        try:
+            conn = self._store._conn
+            if conn is None:
+                return counts
+            for key in count_keys:
+                row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+                if not row or not row[0]:
+                    continue
+                data = json.loads(str(row[0]))
+                if not isinstance(data, dict):
+                    continue
+                for digest, count in data.items():
+                    digest = str(digest)
+                    if not re.fullmatch(r"[0-9a-f]{16}", digest):
+                        continue
+                    try:
+                        parsed_count = max(0, int(count))
+                    except (TypeError, ValueError):
+                        continue
+                    counts[digest] = max(counts.get(digest, 0), parsed_count)
+        except Exception:
+            logger.debug("LCM ignored placeholder count metadata load failed", exc_info=True)
+        return counts
+
+    def _write_generated_ignored_placeholder_hash_counts(
+        self,
+        counts: dict[str, int],
+        keys: Optional[list[str]] = None,
+    ) -> None:
+        count_keys = self._ignored_placeholder_count_metadata_keys() if keys is None else keys
+        if not count_keys:
+            return
+        payload: dict[str, int] = {}
+        for digest, count in counts.items():
+            digest = str(digest)
+            if not re.fullmatch(r"[0-9a-f]{16}", digest):
+                continue
+            try:
+                parsed_count = int(count)
+            except (TypeError, ValueError):
+                continue
+            if parsed_count > 0:
+                payload[digest] = parsed_count
+        try:
+            conn = self._store._conn
+            if conn is None:
+                return
+            serialized = json.dumps(payload, sort_keys=True)
+            with self._store._write_lock:
+                for key in count_keys:
+                    conn.execute(
+                        """
+                        INSERT INTO metadata(key, value)
+                        VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (key, serialized),
+                    )
+                conn.commit()
+        except Exception:
+            logger.debug("LCM ignored placeholder count metadata write failed", exc_info=True)
+
+    def _load_generated_ignored_placeholder_hash_ordinals(
+        self,
+        keys: Optional[list[str]] = None,
+    ) -> dict[str, set[int]]:
+        ordinal_keys = self._ignored_placeholder_ordinal_metadata_keys() if keys is None else keys
+        ordinals: dict[str, set[int]] = {}
+        if not ordinal_keys:
+            return ordinals
+        try:
+            conn = self._store._conn
+            if conn is None:
+                return ordinals
+            for key in ordinal_keys:
+                row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+                if not row or not row[0]:
+                    continue
+                data = json.loads(str(row[0]))
+                if not isinstance(data, dict):
+                    continue
+                for digest, values in data.items():
+                    digest = str(digest)
+                    if not re.fullmatch(r"[0-9a-f]{16}", digest) or not isinstance(values, list):
+                        continue
+                    bucket = ordinals.setdefault(digest, set())
+                    for value in values:
+                        try:
+                            parsed = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if parsed > 0:
+                            bucket.add(parsed)
+        except Exception:
+            logger.debug("LCM ignored placeholder ordinal metadata load failed", exc_info=True)
+        return ordinals
+
+    def _write_generated_ignored_placeholder_hash_ordinals(
+        self,
+        ordinals: dict[str, Any],
+        keys: Optional[list[str]] = None,
+    ) -> None:
+        ordinal_keys = self._ignored_placeholder_ordinal_metadata_keys() if keys is None else keys
+        if not ordinal_keys:
+            return
+        payload: dict[str, list[int]] = {}
+        for digest, values in ordinals.items():
+            digest = str(digest)
+            if not re.fullmatch(r"[0-9a-f]{16}", digest):
+                continue
+            clean_values: set[int] = set()
+            for value in values:
+                try:
+                    parsed = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    clean_values.add(parsed)
+            clean = sorted(clean_values)
+            if clean:
+                payload[digest] = clean
+        try:
+            conn = self._store._conn
+            if conn is None:
+                return
+            serialized = json.dumps(payload, sort_keys=True)
+            with self._store._write_lock:
+                for key in ordinal_keys:
+                    conn.execute(
+                        """
+                        INSERT INTO metadata(key, value)
+                        VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (key, serialized),
+                    )
+                conn.commit()
+        except Exception:
+            logger.debug("LCM ignored placeholder ordinal metadata write failed", exc_info=True)
+
+    def _active_replay_generated_placeholder_digest_budget(self) -> dict[str, int]:
+        return self._generated_placeholder_digest_budget_for_active_replay(
+            self._last_active_replay_messages
+        )
+
+    def _generated_placeholder_digest_ordinals_for_active_replay(
+        self,
+        active_replay_messages: List[Dict[str, Any]],
+    ) -> dict[str, set[int]]:
+        generated_hashes = self._load_generated_ignored_placeholder_hashes()
+        if not generated_hashes or not active_replay_messages:
+            return {}
+        stored_message_ids = set(self._get_store_id_map_for_messages(active_replay_messages))
+        occurrence_by_digest: dict[str, int] = {}
+        ordinals: dict[str, set[int]] = {}
+        for msg in active_replay_messages:
+            text = text_content_for_pattern_matching(msg.get("content")) or ""
+            digest = self._active_replay_placeholder_digest(text)
+            if not digest or digest not in generated_hashes:
+                continue
+            occurrence_by_digest[digest] = occurrence_by_digest.get(digest, 0) + 1
+            if id(msg) in stored_message_ids:
+                continue
+            ordinals.setdefault(digest, set()).add(occurrence_by_digest[digest])
+        return ordinals
+
+    def _generated_placeholder_digest_budget_for_active_replay(
+        self,
+        active_replay_messages: List[Dict[str, Any]],
+    ) -> dict[str, int]:
+        generated_hashes = self._load_generated_ignored_placeholder_hashes()
+        if not generated_hashes or not active_replay_messages:
+            return {}
+        stored_message_ids = set(self._get_store_id_map_for_messages(active_replay_messages))
+        budget: dict[str, int] = {}
+        for msg in active_replay_messages:
+            if id(msg) in stored_message_ids:
+                continue
+            text = text_content_for_pattern_matching(msg.get("content")) or ""
+            digest = self._active_replay_placeholder_digest(text)
+            if digest and digest in generated_hashes:
+                budget[digest] = budget.get(digest, 0) + 1
+        return budget
+
+    def _stored_active_replay_placeholder_digest_counts(
+        self,
+        session_id: str,
+        *,
+        after_store_id: int = 0,
+    ) -> dict[str, int]:
+        if not session_id:
+            return {}
+        counts: dict[str, int] = {}
+        next_candidate_after = max(0, int(after_store_id or 0))
+        while True:
+            rows = self._store.get_session_messages_after(
+                session_id,
+                after_store_id=next_candidate_after,
+            )
+            if not rows:
+                break
+            for row in rows:
+                text = text_content_for_pattern_matching(row.get("content")) or ""
+                digest = self._active_replay_placeholder_digest(text)
+                if digest:
+                    counts[digest] = counts.get(digest, 0) + 1
+            next_candidate_after = rows[-1]["store_id"]
+        return counts
+
+    @staticmethod
+    def _subtract_placeholder_digest_counts(
+        budget: dict[str, int],
+        stored_counts: dict[str, int],
+    ) -> dict[str, int]:
+        adjusted: dict[str, int] = {}
+        for digest, count in budget.items():
+            parsed_count = max(0, int(count or 0))
+            stored_count = max(0, int(stored_counts.get(digest, 0) or 0))
+            remaining = parsed_count - stored_count if parsed_count > stored_count else parsed_count
+            if remaining > 0:
+                adjusted[digest] = remaining
+        return adjusted
+
+    def _remember_generated_ignored_placeholder_hash(self, digest: str) -> None:
+        ordered_hashes = self._remember_hash_for_metadata_keys(
+            digest,
+            self._ignored_placeholder_metadata_keys(),
+        )
+        hashes = set(ordered_hashes)
+        self._generated_ignored_active_replay_placeholder_hashes = hashes
+
+    def _ignored_dependent_reply_store_fingerprint(self, msg: Dict[str, Any]) -> Optional[str]:
+        role = str(msg.get("role") or "")
+        if role not in {"assistant", "tool"}:
+            return None
+        mapped_store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
+        if mapped_store_id is not None:
+            store_id = mapped_store_id
+        else:
+            store_ids = self._get_store_ids_for_messages([msg])
+            if not store_ids:
+                return None
+            store_id = store_ids[0]
+        identity = f"{self._session_id}\0{store_id}"
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+    def _ignored_dependent_reply_content_fingerprint(self, msg: Dict[str, Any], text: str) -> Optional[str]:
+        role = str(msg.get("role") or "")
+        if role not in {"assistant", "tool"}:
+            return None
+        identity = "\0".join(
+            (
+                role,
+                str(msg.get("tool_call_id") or ""),
+                self._stable_tool_calls_identity(msg.get("tool_calls")),
+                text,
+            )
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+    def _load_generated_ignored_dependent_reply_records(
+        self,
+        keys: Optional[list[str]] = None,
+    ) -> list[dict[str, str]]:
+        keys = self._ignored_dependent_reply_metadata_keys() if keys is None else keys
+        if not keys:
+            return []
+        try:
+            conn = self._store._conn
+            if conn is None:
+                return []
+            records: list[dict[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for key in keys:
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                if not row or not row[0]:
+                    continue
+                data = json.loads(str(row[0]))
+                if not isinstance(data, list):
+                    continue
+                for item in data:
+                    record: dict[str, str] = {}
+                    if isinstance(item, dict):
+                        store = str(item.get("store") or "")
+                        content = str(item.get("content") or "")
+                        if re.fullmatch(r"[0-9a-f]{16}", store):
+                            record["store"] = store
+                        if re.fullmatch(r"[0-9a-f]{16}", content):
+                            record["content"] = content
+                    elif re.fullmatch(r"[0-9a-f]{16}", str(item)):
+                        record["store"] = str(item)
+                    if not record:
+                        continue
+                    marker = (record.get("store", ""), record.get("content", ""))
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    records.append(record)
+            return records[-512:]
+        except Exception:
+            logger.debug("LCM ignored-dependent reply metadata load failed", exc_info=True)
+        return []
+
+    def _write_generated_ignored_dependent_reply_records(
+        self,
+        records: list[dict[str, str]],
+        keys: Optional[list[str]] = None,
+    ) -> None:
+        keys = self._ignored_dependent_reply_metadata_keys() if keys is None else keys
+        if not keys:
+            return
+        normalized: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for record in records:
+            clean: dict[str, str] = {}
+            store = str(record.get("store") or "")
+            content = str(record.get("content") or "")
+            if re.fullmatch(r"[0-9a-f]{16}", store):
+                clean["store"] = store
+            if re.fullmatch(r"[0-9a-f]{16}", content):
+                clean["content"] = content
+            if not clean:
+                continue
+            marker = (clean.get("store", ""), clean.get("content", ""))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            normalized.append(clean)
+        normalized = normalized[-512:]
+        try:
+            conn = self._store._conn
+            if conn is None:
+                return
+            payload = json.dumps(normalized)
+            with self._store._write_lock:
+                for key in keys:
+                    conn.execute(
+                        """
+                        INSERT INTO metadata(key, value)
+                        VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (key, payload),
+                    )
+                conn.commit()
+        except Exception:
+            logger.debug("LCM ignored-dependent reply metadata write failed", exc_info=True)
+
+    def _load_generated_ignored_dependent_reply_hashes(self) -> set[str]:
+        return {
+            value
+            for record in self._load_generated_ignored_dependent_reply_records()
+            for value in (record.get("store"), record.get("content"))
+            if value
+        }
+
+    def _is_generated_ignored_dependent_reply(self, msg: Dict[str, Any], text: str) -> bool:
+        store_digest = self._ignored_dependent_reply_store_fingerprint(msg)
+        content_digest = self._ignored_dependent_reply_content_fingerprint(msg, text)
+        records = self._load_generated_ignored_dependent_reply_records()
+        if store_digest and any(record.get("store") == store_digest for record in records):
+            return True
+        if not content_digest:
+            return False
+        pending_index = next(
+            (
+                idx
+                for idx, record in enumerate(records)
+                if record.get("content") == content_digest and not record.get("store")
+            ),
+            None,
+        )
+        if pending_index is None:
+            return False
+        records.pop(pending_index)
+        if store_digest:
+            records.append({"store": store_digest, "content": content_digest})
+        self._write_generated_ignored_dependent_reply_records(records)
+        return True
+
+    def _remember_generated_ignored_dependent_reply(self, msg: Dict[str, Any], text: str) -> None:
+        store_digest = self._ignored_dependent_reply_store_fingerprint(msg)
+        content_digest = self._ignored_dependent_reply_content_fingerprint(msg, text)
+        if not store_digest:
+            return
+        records = self._load_generated_ignored_dependent_reply_records()
+        records.append({"store": store_digest, "content": content_digest or ""})
+        self._write_generated_ignored_dependent_reply_records(records)
 
     def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
         if not self._compiled_ignore_message_patterns:
@@ -3166,28 +3893,58 @@ class LCMEngine(ContextEngine):
                 continue
             replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
             replay_preserves_ignore_decision = (
-                self._matches_ignore_message_patterns(replay_msg)
-                or self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
+                self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
                 or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
             )
             if replay_preserves_ignore_decision:
                 continue
             if active_replay_messages is replay_messages:
-                active_replay_messages = [dict(message) for message in replay_messages]
+                active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+                    replay_messages
+                )
             original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
             placeholder = self._ignored_active_replay_placeholder(original_text)
-            if str(original_msg.get("role") or "") == "tool":
+            original_role = str(original_msg.get("role") or "")
+            if original_role == "tool":
                 active_message = {
                     "role": "tool",
                     "content": placeholder,
                     "tool_call_id": original_msg.get("tool_call_id") or replay_msg.get("tool_call_id") or "ignored_tool_call",
                 }
+            elif original_role == "assistant":
+                active_message = {
+                    "role": "assistant",
+                    "content": placeholder,
+                }
+                tool_calls = replay_msg.get("tool_calls") or original_msg.get("tool_calls")
+                if tool_calls:
+                    active_message["tool_calls"] = tool_calls
+            elif original_role == "system":
+                active_message = {"role": "system", "content": placeholder}
             else:
                 active_message = {"role": "user", "content": placeholder}
             digest = hashlib.sha256(original_text.encode("utf-8")).hexdigest()[:16]
             self._remember_generated_ignored_placeholder_hash(digest)
+            self._generated_ignored_active_replay_placeholder_message_ids.add(id(active_message))
             active_replay_messages[idx] = active_message
         return active_replay_messages
+
+    def _copy_active_replay_messages_preserving_generated_ids(
+        self,
+        active_replay_messages: List[Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        copied_replay_messages: list[Dict[str, Any]] = []
+        generated_message_ids = getattr(
+            self,
+            "_generated_ignored_active_replay_placeholder_message_ids",
+            set(),
+        )
+        for message in active_replay_messages:
+            copied_message = dict(message)
+            if id(message) in generated_message_ids:
+                self._generated_ignored_active_replay_placeholder_message_ids.add(id(copied_message))
+            copied_replay_messages.append(copied_message)
+        return copied_replay_messages
 
     def _remember_active_replay_messages(
         self,
@@ -3197,7 +3954,15 @@ class LCMEngine(ContextEngine):
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
-        self._last_active_replay_messages = [dict(message) for message in active_replay_messages]
+        self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+            active_replay_messages
+        )
+        self._write_generated_ignored_placeholder_hash_counts(
+            self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
+        )
+        self._write_generated_ignored_placeholder_hash_ordinals(
+            self._generated_placeholder_digest_ordinals_for_active_replay(active_replay_messages)
+        )
         return active_replay_messages
 
     def _cached_active_replay_messages(
@@ -3208,7 +3973,7 @@ class LCMEngine(ContextEngine):
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return [dict(message) for message in cached]
+                return self._copy_active_replay_messages_preserving_generated_ids(cached)
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -3518,18 +4283,33 @@ class LCMEngine(ContextEngine):
                 )
             ]
             filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
+            candidate_has_scaffold_evidence = any(
+                self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
+            )
+            candidate_has_quarantined_replay_evidence = any(
+                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
+                for msg in candidate_messages
+            )
             candidate_identity_messages = (
                 candidate_non_placeholder_messages
                 if candidate_non_placeholder_messages or filtered_candidate_placeholders
                 else candidate_visible_messages
             )
+            candidate_visible_prefix = [
+                self._message_replay_identity(msg)
+                for msg in candidate_visible_messages
+            ]
             candidate_prefix = [
                 self._message_replay_identity(msg)
                 for msg in candidate_identity_messages
             ]
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
-                if allow_empty_prefix:
+                if allow_empty_prefix and (
+                    not filtered_candidate_placeholders
+                    or candidate_has_scaffold_evidence
+                    or candidate_has_quarantined_replay_evidence
+                ):
                     return cursor
                 continue
 
@@ -3538,6 +4318,19 @@ class LCMEngine(ContextEngine):
                 and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix)
             )
             matches_raw_tail = self._matches_store_tail_suffix(stored_tail, candidate_prefix)
+            matches_visible_sanitized_tail = (
+                filtered_candidate_placeholders
+                and bool(candidate_visible_prefix)
+                and len(candidate_visible_prefix) <= len(sanitized_replay_tail)
+                and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_visible_prefix)
+            )
+            matches_visible_raw_tail = (
+                filtered_candidate_placeholders
+                and bool(candidate_visible_prefix)
+                and self._matches_store_tail_suffix(stored_tail, candidate_visible_prefix)
+            )
+            if matches_visible_sanitized_tail or matches_visible_raw_tail:
+                return cursor
             raw_tail_suffix = stored_tail[-len(candidate_prefix) :] if matches_raw_tail else []
             raw_suffix_needs_cleanup_equivalence = any(
                 self._active_cleanup_replay_identity(identity) != identity
@@ -3711,6 +4504,33 @@ class LCMEngine(ContextEngine):
             logger.debug("LCM ingest cursor reconciliation count failed: %s", exc)
             return 0
         if session_count <= 0:
+            placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
+            placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
+            if placeholder_budget and placeholder_ordinals:
+                consumed: dict[str, int] = {}
+                cursor = 0
+                for msg in messages:
+                    text = text_content_for_pattern_matching(msg.get("content")) or ""
+                    digest = self._active_replay_placeholder_digest(text)
+                    if not digest:
+                        break
+                    consumed[digest] = consumed.get(digest, 0) + 1
+                    ordinal = consumed[digest]
+                    remaining = int(placeholder_budget.get(digest, 0) or 0)
+                    if remaining <= 0 or ordinal not in placeholder_ordinals.get(digest, set()):
+                        break
+                    cursor += 1
+                if cursor > 0:
+                    self._record_ingest_reconciliation(
+                        action="advanced cursor",
+                        reason="replayed generated placeholders in empty session",
+                        cursor=cursor,
+                        incoming=len(messages),
+                        session_count=session_count,
+                        stored_tail_count=0,
+                        effective_incoming=cursor,
+                    )
+                    return cursor
             return 0
 
         tail_limit = min(max(len(messages) * 4, 64), session_count)
@@ -3801,6 +4621,11 @@ class LCMEngine(ContextEngine):
 
     def _redact_active_replay_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         redacted_replay_messages: list[Dict[str, Any]] = []
+        generated_message_ids = getattr(
+            self,
+            "_generated_ignored_active_replay_placeholder_message_ids",
+            set(),
+        )
         for message in messages:
             redacted_message = dict(message)
             if "content" in redacted_message:
@@ -3815,6 +4640,8 @@ class LCMEngine(ContextEngine):
                     self._config,
                     parse_json_strings=True,
                 )
+            if id(message) in generated_message_ids:
+                self._generated_ignored_active_replay_placeholder_message_ids.add(id(redacted_message))
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
@@ -3881,6 +4708,25 @@ class LCMEngine(ContextEngine):
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
+        if cursor > 0:
+            cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
+            cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
+            if (
+                cached_source_identities is not None
+                and cached_active_replay_messages is not None
+                and len(cached_source_identities) >= cursor
+                and len(cached_active_replay_messages) >= cursor
+            ):
+                current_prefix_identities = [
+                    self._message_replay_identity(message) for message in messages[:cursor]
+                ]
+                if current_prefix_identities == cached_source_identities[:cursor]:
+                    replay_messages = (
+                        self._copy_active_replay_messages_preserving_generated_ids(
+                            cached_active_replay_messages[:cursor]
+                        )
+                        + replay_messages[cursor:]
+                    )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,
@@ -3891,17 +4737,62 @@ class LCMEngine(ContextEngine):
 
         if not new_messages:
             cached_replay = self._cached_active_replay_messages(messages)
+            self._compression_boundary_ingest_pending = False
+            self._compression_boundary_active_placeholder_digest_budget = {}
+            self._compression_boundary_active_placeholder_digest_ordinals = {}
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
 
         active_replay_messages = replay_messages
+        compression_boundary_ingest_pending = self._compression_boundary_ingest_pending
+        empty_session_placeholder_budget: dict[str, int] = {}
+        empty_session_placeholder_ordinals: dict[str, set[int]] = {}
+        if not compression_boundary_ingest_pending and self._session_id:
+            try:
+                if self._store.get_session_count(self._session_id) == 0:
+                    empty_session_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
+                    empty_session_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
+            except Exception:
+                empty_session_placeholder_budget = {}
+                empty_session_placeholder_ordinals = {}
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
             (cursor + offset, replay_msg)
             for offset, replay_msg in enumerate(new_messages)
         ]
         if messages_to_store_with_index:
             kept: list[tuple[int, Dict[str, Any]]] = []
+            boundary_placeholder_seen: dict[str, int] = {}
+            boundary_seen_synthetic_summary_before = False
+            empty_session_placeholder_seen: dict[str, int] = {}
+            if empty_session_placeholder_ordinals and cursor > 0:
+                for replay_msg in replay_messages[:cursor]:
+                    replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+                    digest = self._active_replay_placeholder_digest(replay_text)
+                    if digest:
+                        empty_session_placeholder_seen[digest] = empty_session_placeholder_seen.get(digest, 0) + 1
+            boundary_all_placeholder_replay_batch = (
+                compression_boundary_ingest_pending
+                and len(new_messages) > 1
+                and all(
+                    self._is_ignored_active_replay_placeholder(
+                        msg,
+                        text_content_for_pattern_matching(msg.get("content")) or "",
+                    )
+                    for msg in new_messages
+                )
+            )
+            empty_session_all_placeholder_replay_batch = (
+                bool(empty_session_placeholder_ordinals)
+                and bool(new_messages)
+                and all(
+                    self._is_ignored_active_replay_placeholder(
+                        msg,
+                        text_content_for_pattern_matching(msg.get("content")) or "",
+                    )
+                    for msg in new_messages
+                )
+            )
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
                 absolute_idx = cursor + offset
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
@@ -3918,22 +4809,106 @@ class LCMEngine(ContextEngine):
                         and volatile_digest in self._load_generated_ignored_placeholder_hashes()
                     )
                 )
+                active_replay_placeholder = self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
+                active_replay_placeholder_digest = self._active_replay_placeholder_digest(replay_text)
+                if not active_replay_placeholder:
+                    replay_text_stripped = replay_text.strip()
+                    if (
+                        self._is_context_summary_content(replay_text)
+                        or replay_text_stripped.startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
+                        or replay_text_stripped.startswith(_PRESERVED_TODO_CONTEXT_PREFIX)
+                    ):
+                        boundary_seen_synthetic_summary_before = True
+                compression_carried_active_placeholder = False
+                metadata_replayed_active_placeholder = False
+                if (
+                    empty_session_placeholder_budget
+                    and empty_session_placeholder_ordinals
+                    and active_replay_placeholder
+                    and active_replay_placeholder_digest is not None
+                ):
+                    empty_session_placeholder_seen[active_replay_placeholder_digest] = (
+                        empty_session_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
+                    )
+                    ordinal = empty_session_placeholder_seen[active_replay_placeholder_digest]
+                    remaining = empty_session_placeholder_budget.get(active_replay_placeholder_digest, 0)
+                    if (
+                        remaining > 0
+                        and ordinal in empty_session_placeholder_ordinals.get(
+                            active_replay_placeholder_digest,
+                            set(),
+                        )
+                        and (ordinal > 1 or empty_session_all_placeholder_replay_batch)
+                    ):
+                        metadata_replayed_active_placeholder = True
+                        if remaining == 1:
+                            empty_session_placeholder_budget.pop(active_replay_placeholder_digest, None)
+                        else:
+                            empty_session_placeholder_budget[active_replay_placeholder_digest] = remaining - 1
+                if (
+                    compression_boundary_ingest_pending
+                    and active_replay_placeholder
+                    and active_replay_placeholder_digest is not None
+                ):
+                    boundary_placeholder_seen[active_replay_placeholder_digest] = (
+                        boundary_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
+                    )
+                    current_placeholder_ordinal = boundary_placeholder_seen[active_replay_placeholder_digest]
+                    boundary_budget = self._compression_boundary_active_placeholder_digest_budget
+                    boundary_ordinals = self._compression_boundary_active_placeholder_digest_ordinals
+                    generated_message_ids = getattr(
+                        self,
+                        "_generated_ignored_active_replay_placeholder_message_ids",
+                        set(),
+                    )
+                    has_generated_provenance = (
+                        id(replay_msg) in generated_message_ids
+                        or id(original_msg) in generated_message_ids
+                    )
+                    ordinal_matches_generated = (
+                        current_placeholder_ordinal in boundary_ordinals.get(
+                            active_replay_placeholder_digest,
+                            set(),
+                        )
+                        and (
+                            current_placeholder_ordinal > 1
+                            or boundary_seen_synthetic_summary_before
+                            or boundary_all_placeholder_replay_batch
+                        )
+                    )
+                    if boundary_budget and (
+                        has_generated_provenance
+                        or (not has_generated_provenance and ordinal_matches_generated)
+                    ):
+                        remaining = boundary_budget.get(active_replay_placeholder_digest, 0)
+                        if remaining > 0:
+                            compression_carried_active_placeholder = True
+                            if remaining == 1:
+                                boundary_budget.pop(active_replay_placeholder_digest, None)
+                            else:
+                                boundary_budget[active_replay_placeholder_digest] = remaining - 1
+                replayed_active_placeholder = active_replay_placeholder and (
+                    self._is_cached_active_replay_message_at_index(absolute_idx, replay_msg)
+                    or compression_carried_active_placeholder
+                    or metadata_replayed_active_placeholder
+                )
                 if (
                     ignored_original_messages[absolute_idx]
                     or generated_volatile_placeholder
-                    or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
+                    or replayed_active_placeholder
                 ):
                     self._ignored_message_count += 1
                     if generated_volatile_placeholder and volatile_digest is not None:
                         self._remember_generated_ignored_placeholder_hash(volatile_digest)
                     replay_preserves_ignore_decision = (
-                        self._matches_ignore_message_patterns(replay_msg)
-                        or self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
+                        self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
                         or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
                     )
                     if ignored_original_messages[absolute_idx] and not replay_preserves_ignore_decision:
                         if active_replay_messages is replay_messages:
-                            active_replay_messages = [dict(message) for message in replay_messages]
+                            active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+                                replay_messages
+                            )
                         active_message = dict(active_replay_messages[absolute_idx])
                         active_message["content"] = self._ignored_active_replay_placeholder(original_text)
                         active_replay_messages[absolute_idx] = active_message
@@ -3949,6 +4924,9 @@ class LCMEngine(ContextEngine):
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
+            self._compression_boundary_ingest_pending = False
+            self._compression_boundary_active_placeholder_digest_budget = {}
+            self._compression_boundary_active_placeholder_digest_ordinals = {}
             return self._remember_active_replay_messages(messages, active_replay_messages)
 
         protected_messages = protect_messages_for_ingest(
@@ -3963,7 +4941,9 @@ class LCMEngine(ContextEngine):
         ):
             if self._protected_message_uses_raw_payload_active_stub(protected_msg):
                 if active_replay_messages is replay_messages:
-                    active_replay_messages = [dict(message) for message in replay_messages]
+                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+                        replay_messages
+                    )
                 active_message = dict(active_replay_messages[absolute_idx])
                 active_message["content"] = protected_msg["content"]
                 active_replay_messages[absolute_idx] = active_message
@@ -3977,6 +4957,9 @@ class LCMEngine(ContextEngine):
             conversation_id=self._conversation_id,
         )
         self._ingest_cursor = n
+        self._compression_boundary_ingest_pending = False
+        self._compression_boundary_active_placeholder_digest_budget = {}
+        self._compression_boundary_active_placeholder_digest_ordinals = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         # Most ``protected_messages`` changes are storage-only: inline media,
         # tool results, and data/base64 substrings must stay provider-usable in
@@ -3992,54 +4975,103 @@ class LCMEngine(ContextEngine):
             "[Externalized payload: kind=raw_payload;"
         )
 
-    def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
-        """Map current raw messages back to store_ids in stable store order.
+    def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+        """Map current raw message objects back to store_ids in stable order.
 
         Matching starts strictly after ``_last_compacted_store_id`` so repeated
         content from older already-compacted history cannot hijack the mapping.
-        Synthetic summary messages simply fail to match and are skipped.
+        Synthetic summary messages simply fail to match and are skipped.  When
+        active context has more occurrences of an identical replay identity than
+        the store has, the surplus earliest active occurrences are treated as
+        synthetic/carry-over and left unmapped so they cannot steal later stored
+        literal copies with the same content.
         """
         candidates: list[Dict[str, Any]] = []
         next_candidate_after = self._last_compacted_store_id
-        candidates_exhausted = False
-
-        def ensure_candidate_loaded(index: int) -> bool:
-            nonlocal next_candidate_after, candidates_exhausted
-            while index >= len(candidates) and not candidates_exhausted:
-                page = self._store.get_session_messages_after(
-                    self._session_id,
-                    after_store_id=next_candidate_after,
+        while True:
+            page = self._store.get_session_messages_after(
+                self._session_id,
+                after_store_id=next_candidate_after,
+            )
+            if not page:
+                break
+            candidates.extend(page)
+            next_candidate_after = page[-1]["store_id"]
+        active_identity_counts: dict[tuple[Any, ...], int] = {}
+        for msg in messages:
+            identity = self._message_replay_identity(msg)
+            active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
+        stored_identity_counts: dict[tuple[Any, ...], int] = {}
+        stored_cleanup_identity_counts: dict[tuple[Any, ...], int] = {}
+        for stored in candidates:
+            identity = self._message_replay_identity(stored, stored_row=True)
+            stored_identity_counts[identity] = stored_identity_counts.get(identity, 0) + 1
+            cleanup_identity = self._active_cleanup_replay_identity(identity)
+            if cleanup_identity is not None:
+                stored_cleanup_identity_counts[cleanup_identity] = (
+                    stored_cleanup_identity_counts.get(cleanup_identity, 0) + 1
                 )
-                if not page:
-                    candidates_exhausted = True
-                    break
-                candidates.extend(page)
-                next_candidate_after = page[-1]["store_id"]
-            return index < len(candidates)
+        active_surplus_skips: dict[tuple[Any, ...], int] = {}
+        generated_surplus_skip_message_ids: set[int] = set()
+        generated_placeholder_message_ids = getattr(
+            self,
+            "_generated_ignored_active_replay_placeholder_message_ids",
+            set(),
+        )
+        for identity, active_count in active_identity_counts.items():
+            wanted_cleanup_identity = self._active_cleanup_replay_identity(identity)
+            stored_exact = stored_identity_counts.get(identity, 0)
+            stored_cleanup = 0
+            if wanted_cleanup_identity is not None:
+                stored_cleanup = stored_cleanup_identity_counts.get(wanted_cleanup_identity, 0)
+            stored_available = max(stored_exact, stored_cleanup)
+            if active_count > stored_available:
+                surplus_count = active_count - stored_available
+                for msg in messages:
+                    if surplus_count <= 0:
+                        break
+                    if id(msg) not in generated_placeholder_message_ids:
+                        continue
+                    if self._message_replay_identity(msg) != identity:
+                        continue
+                    generated_surplus_skip_message_ids.add(id(msg))
+                    surplus_count -= 1
+                if surplus_count > 0:
+                    active_surplus_skips[identity] = surplus_count
 
-        ids: list[int] = []
+        ids_by_message_id: dict[int, int] = {}
         store_idx = 0
         for msg in messages:
             message_identity = self._message_replay_identity(msg)
+            if id(msg) in generated_surplus_skip_message_ids:
+                continue
+            surplus = active_surplus_skips.get(message_identity, 0)
+            if surplus > 0:
+                active_surplus_skips[message_identity] = surplus - 1
+                continue
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = store_idx
-            while ensure_candidate_loaded(probe_idx):
+            while probe_idx < len(candidates):
                 stored = candidates[probe_idx]
                 stored_identity = self._message_replay_identity(stored, stored_row=True)
                 if stored_identity == message_identity:
-                    ids.append(stored["store_id"])
+                    ids_by_message_id[id(msg)] = stored["store_id"]
                     store_idx = probe_idx + 1
                     break
                 if (
                     wanted_cleanup_identity is not None
                     and self._active_cleanup_replay_identity(stored_identity) == wanted_cleanup_identity
                 ):
-                    ids.append(stored["store_id"])
+                    ids_by_message_id[id(msg)] = stored["store_id"]
                     store_idx = probe_idx + 1
                     break
                 probe_idx += 1
 
-        return ids
+        return ids_by_message_id
+
+    def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
+        ids_by_message_id = self._get_store_id_map_for_messages(messages)
+        return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
 
     # -- Internal: summarization -------------------------------------------
 

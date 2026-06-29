@@ -4174,6 +4174,19 @@ class TestIngestExternalization:
         assert len(rows) == 2
         assert rows[-1]["content"] == "followup"
 
+    def test_preflight_requests_cleanup_for_oversized_raw_payload_stub(self, tmp_path):
+        engine, _output_dir = self._engine(tmp_path)
+        content = "PREFLIGHT_RAW_NEEDLE:" + ("r" * 5000)
+        messages = [{"role": "user", "content": content}]
+
+        assert engine.should_compress_preflight(messages) is True
+
+        active_context = engine.compress(messages)
+        assert active_context[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
+        assert "PREFLIGHT_RAW_NEEDLE" not in active_context[0]["content"]
+        assert engine._last_compression_status == "sanitized"
+        assert engine._last_compression_noop_reason == ""
+
     def test_non_tool_externalized_placeholder_sanitizes_role_metadata_for_ref_parsing(self, tmp_path):
         import hermes_lcm.tools as lcm_tools
 

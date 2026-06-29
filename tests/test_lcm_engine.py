@@ -3429,7 +3429,10 @@ class TestMessageFiltering:
             {"role": "user", "content": "can you check the database for me?"},
             {"role": "assistant", "content": "Sure, looking now."},
         ]
-        engine._ingest_messages(messages)
+        active_replay = engine._ingest_messages(messages)
+
+        assert "LCM active replay placeholder: message ignored" in str(active_replay[0].get("content", ""))
+        assert "Cronjob Response:" not in str(active_replay[0].get("content", ""))
 
         stored = engine._store.get_session_messages("user-123")
         stored_contents = [row["content"] for row in stored]
@@ -3639,6 +3642,30 @@ class TestMessageFiltering:
         assert all("sk-ignore" not in text for text in captured_texts)
         assert all("LCM active replay placeholder: message ignored" not in text for text in captured_texts)
 
+    def test_already_ingested_ignored_prefix_keeps_placeholder_when_new_turn_appends(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_cached_prefix_appended_turn.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        ignored = {"role": "user", "content": "api_key=sk-ignore...cdef ignored active turn"}
+
+        first_replay = engine._ingest_messages([ignored])
+        assert "LCM active replay placeholder: message ignored" in str(first_replay[0].get("content", ""))
+        assert "sk-ignore" not in str(first_replay[0].get("content", ""))
+
+        appended_replay = engine._ingest_messages(
+            [ignored, {"role": "user", "content": "visible appended turn"}]
+        )
+
+        assert "LCM active replay placeholder: message ignored" in str(appended_replay[0].get("content", ""))
+        assert "sk-ignore" not in str(appended_replay[0].get("content", ""))
+        assert appended_replay[1]["content"] == "visible appended turn"
+
     def test_generated_ignored_active_replay_placeholder_filtered_without_active_patterns(self, tmp_path, monkeypatch):
         engine = self._make_engine(
             tmp_path,
@@ -3691,6 +3718,1329 @@ class TestMessageFiltering:
             for row in second._store.get_session_messages("user-123")
         )
 
+    def test_known_ignored_placeholder_replay_is_not_stored_after_restart(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_restart_replay.db"
+        first = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_restart_replay.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        first.shutdown()
+        assert "LCM active replay placeholder: message ignored" in "\n".join(
+            str(msg.get("content", "")) for msg in first_result
+        )
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start("user-123", platform="telegram", context_length=1000)
+            second._ingest_messages(first_result)
+
+            assert all(
+                "LCM active replay placeholder: message ignored" not in str(row["content"])
+                for row in second._store.get_session_messages("user-123")
+            )
+        finally:
+            second.shutdown()
+
+    def test_restart_reconciliation_preserves_literal_placeholder_with_known_digest(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_restart_literal_known_digest.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._store.append("session", {"role": "user", "content": "old row"})
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            second._ingest_messages([{"role": "user", "content": placeholder}])
+
+            rows = second._store.get_session_messages("session")
+            assert [row["content"] for row in rows] == ["old row", placeholder]
+        finally:
+            second.shutdown()
+
+    def test_compacted_restart_preserves_first_delta_literal_placeholder_with_known_digest(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_compacted_restart_literal_first_delta.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        old_store_id = first._store.append("session", {"role": "user", "content": "old compacted row"})
+        first._last_compacted_store_id = old_store_id
+        first._persist_frontier_marker()
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            assert second._last_compacted_store_id == old_store_id
+            second._ingest_messages([{"role": "user", "content": placeholder}])
+
+            rows = second._store.get_session_messages("session")
+            assert [row["content"] for row in rows] == ["old compacted row", placeholder]
+            assert second._last_ingest_reconciliation["reason"] == "persisted ambiguous delta"
+        finally:
+            second.shutdown()
+
+    def test_restart_reconciliation_keeps_stored_literal_placeholder_in_tail_match(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_restart_literal_tail_match.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._store.append("session", {"role": "user", "content": "old row"})
+        first._store.append("session", {"role": "user", "content": placeholder})
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            second._ingest_messages(
+                [
+                    {"role": "user", "content": "old row"},
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = second._store.get_session_messages("session")
+            assert [row["content"] for row in rows] == ["old row", placeholder]
+            assert second._ingest_cursor == 2
+        finally:
+            second.shutdown()
+
+    def test_user_quoted_generated_placeholder_is_stored_losslessly(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_user_quoted_placeholder.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog objective " + "y" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        placeholder = next(
+            str(msg.get("content", ""))
+            for msg in first_result
+            if "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+        )
+
+        engine._ingest_messages(first_result + [{"role": "user", "content": placeholder}])
+
+        rows = engine._store.get_session_messages("user-123")
+        assert any(row["content"] == placeholder for row in rows)
+
+    def test_stored_placeholder_quote_does_not_declassify_generated_placeholder(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_quote_does_not_declassify.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+        )
+        placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef ignored active turn")
+        digest = engine._active_replay_placeholder_digest(placeholder)
+        assert digest
+        engine._remember_generated_ignored_placeholder_hash(digest)
+
+        quoted_placeholder = {"role": "user", "content": placeholder}
+        engine._ingest_messages([quoted_placeholder])
+        rows = engine._store.get_session_messages("user-123")
+        assert any(row["content"] == placeholder for row in rows)
+
+        generated_placeholder = {"role": "user", "content": placeholder}
+        assert engine._is_ignored_active_replay_placeholder(generated_placeholder, placeholder) is True
+
+        store_map = engine._get_store_id_map_for_messages([generated_placeholder, quoted_placeholder])
+        assert id(generated_placeholder) not in store_map
+        assert id(quoted_placeholder) in store_map
+
+        generated_placeholder_after_quote = {"role": "user", "content": placeholder}
+        engine._generated_ignored_active_replay_placeholder_message_ids.add(
+            id(generated_placeholder_after_quote)
+        )
+        store_map = engine._get_store_id_map_for_messages(
+            [quoted_placeholder, generated_placeholder_after_quote]
+        )
+        assert id(quoted_placeholder) in store_map
+        assert id(generated_placeholder_after_quote) not in store_map
+
+        engine._current_compress_store_ids_by_message_id = {id(quoted_placeholder): 1}
+        assert engine._is_ignored_active_replay_placeholder(quoted_placeholder, placeholder) is False
+
+    def test_preflight_keeps_stored_placeholder_literal_candidate(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_placeholder_preflight_literal.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            ignore_message_patterns=[r"NEVER_MATCH_THIS_PATTERN"],
+        )
+        placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef ignored active turn")
+        digest = engine._active_replay_placeholder_digest(placeholder)
+        assert digest
+        engine._remember_generated_ignored_placeholder_hash(digest)
+        quoted_placeholder = {"role": "user", "content": placeholder}
+        engine._store.append("user-123", quoted_placeholder)
+
+        eligible, reason = engine._leaf_compaction_candidate_status(
+            [quoted_placeholder, {"role": "assistant", "content": "fresh tail"}]
+        )
+
+        assert eligible is True
+        assert reason == "eligible raw backlog outside fresh tail"
+
+    def test_new_session_carry_over_does_not_poison_quoted_placeholder_backlog(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_new_session_no_hash_poison.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-normal-carry",
+        )
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog before placeholder " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        placeholder = next(
+            str(msg.get("content", ""))
+            for msg in first_result
+            if "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+        )
+        first.carry_over_new_session_context("old-session", "new-session")
+        first.shutdown()
+
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible summary\n[Expand for details: visible summary]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-normal-carry",
+            )
+            second.compress(
+                [
+                    {"role": "user", "content": placeholder},
+                    {"role": "user", "content": "visible new backlog " + "z" * 200},
+                    {"role": "assistant", "content": "fresh tail response"},
+                ],
+                current_tokens=10_000,
+            )
+
+            assert "LCM active replay placeholder: message ignored" in captured["text"]
+            assert any(row["content"] == placeholder for row in second._store.get_session_messages("new-session"))
+        finally:
+            second.shutdown()
+
+    def test_rollover_session_normal_new_does_not_poison_literal_placeholder_backlog(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_session_normal_new.db"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        engine.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-rollover-normal-new",
+        )
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before normal new " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        placeholder = next(
+            str(msg.get("content", ""))
+            for msg in first_result
+            if "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+        )
+        moved = engine.rollover_session(
+            "old-session",
+            "new-session",
+            previous_messages=first_result,
+            platform="telegram",
+            context_length=1000,
+        )
+        assert moved >= 0
+        assert engine._session_id == "new-session"
+
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "literal placeholder summary\n[Expand for details: literal placeholder]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        engine._config.ignore_message_patterns = []
+        engine._compiled_ignore_message_patterns = []
+        engine.compress(
+            [
+                {"role": "user", "content": placeholder},
+                {"role": "user", "content": "visible normal new backlog " + "z" * 200},
+                {"role": "assistant", "content": "fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert "LCM active replay placeholder: message ignored" in captured["text"]
+        assert any(row["content"] == placeholder for row in engine._store.get_session_messages("new-session"))
+        engine.shutdown()
+
+    def test_ignored_placeholder_hash_survives_compression_rollover_restart(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-rollover",
+        )
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        first.shutdown()
+
+        assert "LCM active replay placeholder: message ignored" in "\n".join(
+            str(msg.get("content", "")) for msg in first_result
+        )
+
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible new summary\n[Expand for details: visible new]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-rollover",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second.compress(
+                first_result
+                + [
+                    {"role": "user", "content": "visible new backlog " + "z" * 200},
+                    {"role": "assistant", "content": "fresh tail response"},
+                ],
+                current_tokens=10_000,
+            )
+
+            assert "visible new backlog" in captured["text"]
+            assert "LCM active replay placeholder: message ignored" not in captured["text"]
+            assert all(
+                "LCM active replay placeholder: message ignored" not in str(row["content"])
+                for row in second._store.get_session_messages("new-session")
+            )
+        finally:
+            second.shutdown()
+
+    def test_carried_ignored_placeholder_in_fresh_tail_is_not_stored_after_rollover(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_fresh_tail.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-rollover-fresh-tail",
+        )
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        first.shutdown()
+
+        assert len(first_result) <= 10
+        assert "LCM active replay placeholder: message ignored" in "\n".join(
+            str(msg.get("content", "")) for msg in first_result
+        )
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-rollover-fresh-tail",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second._ingest_messages(first_result)
+
+            assert all(
+                "LCM active replay placeholder: message ignored" not in str(row["content"])
+                for row in second._store.get_session_messages("new-session")
+            )
+        finally:
+            second.shutdown()
+
+    def test_new_placeholder_literal_after_rollover_is_stored_losslessly(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_new_literal.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-rollover-new-literal",
+        )
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        first.shutdown()
+        placeholder = next(
+            str(msg.get("content", ""))
+            for msg in first_result
+            if "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+        )
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-rollover-new-literal",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second._ingest_messages(first_result + [{"role": "user", "content": placeholder}])
+
+            rows = second._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows].count(placeholder) == 1
+        finally:
+            second.shutdown()
+
+    def test_source_stored_placeholder_literal_after_frontier_is_preserved_after_rollover_restart(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_source_literal_after_frontier.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-source-literal-after-frontier",
+        )
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+        placeholder = next(
+            str(msg.get("content", ""))
+            for msg in first_result
+            if "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+        )
+        first._store.append("old-session", {"role": "user", "content": placeholder})
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-source-literal-after-frontier",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second._ingest_messages(first_result + [{"role": "user", "content": placeholder}])
+
+            rows = second._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows].count(placeholder) == 1
+        finally:
+            second.shutdown()
+
+    def test_cached_generated_placeholder_copy_does_not_steal_stored_literal_mapping(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_cached_generated_copy.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start(
+                "session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-cached-generated-copy",
+            )
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            literal = {"role": "user", "content": placeholder}
+            generated = {"role": "user", "content": placeholder}
+            literal_store_id = engine._store.append("session", literal)
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._generated_ignored_active_replay_placeholder_message_ids.add(id(generated))
+
+            engine._remember_active_replay_messages(
+                [literal, generated],
+                [literal, generated],
+            )
+            cached_literal, cached_generated = engine._last_active_replay_messages
+            ids_by_message_id = engine._get_store_id_map_for_messages(
+                engine._last_active_replay_messages
+            )
+
+            assert ids_by_message_id.get(id(cached_literal)) == literal_store_id
+            assert id(cached_generated) not in ids_by_message_id
+            assert engine._active_replay_generated_placeholder_digest_budget() == {digest: 1}
+
+            engine._ingest_cursor = 2
+            active = [literal, generated, {"role": "user", "content": "new turn"}]
+            engine._ingest_messages(active)
+            assert engine._active_replay_generated_placeholder_digest_budget() == {digest: 1}
+        finally:
+            engine.shutdown()
+
+    def test_copying_replay_to_insert_new_ignored_placeholder_preserves_existing_generated_ids(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_copy_existing_generated_id.db",
+            ignore_message_patterns=["SECRET"],
+        )
+        placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+        digest = engine._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        literal = {"role": "user", "content": placeholder}
+        generated = {"role": "user", "content": placeholder}
+        raw_ignored = {"role": "user", "content": "SECRET later ignored"}
+        engine._store.append("user-123", literal)
+        engine._remember_generated_ignored_placeholder_hash(digest)
+        engine._generated_ignored_active_replay_placeholder_message_ids.add(id(generated))
+
+        active_replay = engine._apply_ignored_active_replay_placeholders(
+            [literal, generated, raw_ignored],
+            [literal, generated, raw_ignored],
+        )
+        copied_literal, copied_generated, copied_new_placeholder = active_replay
+        ids_by_message_id = engine._get_store_id_map_for_messages(active_replay)
+
+        assert copied_new_placeholder["content"].startswith("[LCM active replay placeholder: message ignored;")
+        assert id(copied_generated) in engine._generated_ignored_active_replay_placeholder_message_ids
+        assert ids_by_message_id.get(id(copied_literal)) is not None
+        assert id(copied_generated) not in ids_by_message_id
+
+    def test_zero_row_restart_replays_generated_placeholder_from_count_metadata(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_zero_row_restart_placeholder.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first._write_generated_ignored_placeholder_hash_counts({digest: 1})
+        first._write_generated_ignored_placeholder_hash_ordinals({digest: {1}})
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            second._ingest_messages([{"role": "user", "content": placeholder}])
+
+            assert second._store.get_session_messages("session") == []
+            assert second._ingest_cursor == 1
+        finally:
+            second.shutdown()
+
+    def test_zero_row_suffix_literal_uses_full_replay_ordinals(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_zero_row_suffix_literal.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start("session", platform="telegram", context_length=1000)
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._write_generated_ignored_placeholder_hash_counts({digest: 1})
+            engine._write_generated_ignored_placeholder_hash_ordinals({digest: {1}})
+            engine._ingest_cursor = 1
+
+            engine._ingest_messages(
+                [
+                    {"role": "user", "content": placeholder},
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = engine._store.get_session_messages("session")
+            assert [row["content"] for row in rows] == [placeholder]
+        finally:
+            engine.shutdown()
+
+    def test_boundary_budget_uses_generated_provenance_when_literal_precedes_generated(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_boundary_literal_before_generated.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start("new-session", platform="telegram", context_length=1000)
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            literal = {"role": "user", "content": placeholder}
+            generated = {"role": "user", "content": placeholder}
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._generated_ignored_active_replay_placeholder_message_ids.add(id(generated))
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
+
+            engine._ingest_messages(
+                [
+                    literal,
+                    {"role": "user", "content": "visible separator"},
+                    generated,
+                ]
+            )
+
+            rows = engine._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows] == [placeholder, "visible separator"]
+        finally:
+            engine.shutdown()
+
+    def test_boundary_budget_uses_ordinals_after_restart_when_literal_precedes_generated(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_boundary_ordinals_literal_before_generated.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start("new-session", platform="telegram", context_length=1000)
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
+            engine._compression_boundary_active_placeholder_digest_ordinals = {digest: {2}}
+
+            engine._ingest_messages(
+                [
+                    {"role": "user", "content": placeholder},
+                    {"role": "user", "content": "visible separator"},
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = engine._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows] == [placeholder, "visible separator"]
+        finally:
+            engine.shutdown()
+
+    def test_boundary_count_only_budget_preserves_ambiguous_placeholder_literals(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_boundary_count_only_ambiguous.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start("new-session", platform="telegram", context_length=1000)
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
+            engine._compression_boundary_active_placeholder_digest_ordinals = {}
+
+            engine._ingest_messages(
+                [
+                    {"role": "user", "content": placeholder},
+                    {"role": "user", "content": "visible separator"},
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = engine._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows] == [
+                placeholder,
+                "visible separator",
+                placeholder,
+            ]
+        finally:
+            engine.shutdown()
+
+    def test_empty_boundary_placeholder_budget_preserves_literal_placeholder(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_empty_boundary_budget_literal.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-empty-boundary-budget-literal",
+            )
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {}
+
+            engine._ingest_messages(
+                [
+                    {"role": "user", "content": placeholder},
+                    {"role": "user", "content": "visible separator"},
+                ]
+            )
+
+            rows = engine._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows] == [placeholder, "visible separator"]
+        finally:
+            engine.shutdown()
+
+    def test_boundary_literal_placeholder_after_normal_turn_is_not_consumed_by_ordinal_metadata(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_boundary_literal_after_normal.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start("new-session", platform="telegram", context_length=1000)
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
+            engine._compression_boundary_active_placeholder_digest_ordinals = {digest: {1}}
+
+            engine._ingest_messages(
+                [
+                    {"role": "user", "content": "actual next user turn"},
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = engine._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows] == ["actual next user turn", placeholder]
+        finally:
+            engine.shutdown()
+
+    def test_empty_session_literal_placeholder_after_normal_turn_is_not_consumed_by_ordinal_metadata(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_empty_session_literal_after_normal.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first._write_generated_ignored_placeholder_hash_counts({digest: 1})
+        first._write_generated_ignored_placeholder_hash_ordinals({digest: {1}})
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            second._ingest_messages(
+                [
+                    {"role": "user", "content": "actual next user turn"},
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = second._store.get_session_messages("session")
+            assert [row["content"] for row in rows] == ["actual next user turn", placeholder]
+        finally:
+            second.shutdown()
+
+    def test_boundary_singleton_literal_placeholder_is_not_consumed_by_ordinal_metadata(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_boundary_singleton_literal.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-boundary-singleton-literal",
+            )
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
+            engine._compression_boundary_active_placeholder_digest_ordinals = {digest: {1}}
+
+            engine._ingest_messages([{"role": "user", "content": placeholder}])
+
+            rows = engine._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows] == [placeholder]
+        finally:
+            engine.shutdown()
+
+    def test_cleared_boundary_frontier_does_not_drop_literal_placeholder(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_cleared_boundary_literal.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-cleared-boundary-literal",
+            )
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._last_compacted_store_id = 1
+            engine._compression_boundary_ingest_pending = False
+            engine._compression_boundary_active_placeholder_digest_budget = {}
+
+            engine._ingest_messages([{"role": "user", "content": placeholder}])
+
+            rows = engine._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows] == [placeholder]
+        finally:
+            engine.shutdown()
+
+    def test_compaction_clears_generated_placeholder_count_when_placeholder_not_returned(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_compaction_clears_placeholder_count.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        ignored_text = "SECRET ignored compactable turn"
+        placeholder = engine._ignored_active_replay_placeholder(ignored_text)
+
+        def summary(**kwargs):
+            return "visible summary\n[Expand for details: visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+        result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before ignored " + "v" * 200},
+                {"role": "user", "content": ignored_text},
+                {"role": "user", "content": "fresh tail"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert all("LCM active replay placeholder: message ignored" not in str(msg.get("content", "")) for msg in result)
+        assert engine._load_generated_ignored_placeholder_hash_counts() == {}
+
+        engine.on_session_start(
+            "new-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-cleared-count-literal",
+            boundary_reason="compression",
+            old_session_id="user-123",
+        )
+        engine._ingest_messages(result + [{"role": "user", "content": placeholder}])
+        rows = engine._store.get_session_messages("new-session")
+        assert any(row["content"] == placeholder for row in rows)
+
+    def test_empty_ingest_clears_pending_boundary_placeholder_budget(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_empty_ingest_clears_budget.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-empty-ingest-clears-budget",
+            )
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._write_generated_ignored_placeholder_hash_counts({digest: 1})
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
+
+            engine._ingest_messages([])
+
+            assert engine._compression_boundary_ingest_pending is False
+            assert engine._compression_boundary_active_placeholder_digest_budget == {}
+        finally:
+            engine.shutdown()
+
+    def test_duplicate_carried_ignored_placeholders_after_rollover_are_not_stored(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_placeholder_rollover_duplicate.db"),
+                fresh_tail_count=2,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        try:
+            engine.on_session_start(
+                "old-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-rollover-duplicate",
+            )
+            first_result = engine.compress(
+                [
+                    {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
+                    {"role": "user", "content": "api_key=sk-ignore...cdef duplicate ignored"},
+                    {"role": "user", "content": "api_key=sk-ignore...cdef duplicate ignored"},
+                ],
+                current_tokens=10_000,
+            )
+            assert sum(
+                "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+                for msg in first_result
+            ) == 2
+
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-rollover-duplicate",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            engine._ingest_messages(first_result)
+
+            assert all(
+                "LCM active replay placeholder: message ignored" not in str(row["content"])
+                for row in engine._store.get_session_messages("new-session")
+            )
+        finally:
+            engine.shutdown()
+
+    def test_duplicate_carried_ignored_placeholders_after_rollover_restart_are_not_stored(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_rollover_duplicate_restart.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=2,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-rollover-duplicate-restart",
+        )
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
+                {"role": "user", "content": "api_key=sk-ignore...cdef duplicate ignored"},
+                {"role": "user", "content": "api_key=sk-ignore...cdef duplicate ignored"},
+            ],
+            current_tokens=10_000,
+        )
+        first.shutdown()
+        assert sum(
+            "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+            for msg in first_result
+        ) == 2
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=2,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-rollover-duplicate-restart",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second._ingest_messages(first_result)
+
+            assert all(
+                "LCM active replay placeholder: message ignored" not in str(row["content"])
+                for row in second._store.get_session_messages("new-session")
+            )
+        finally:
+            second.shutdown()
+
+    def test_duplicate_generated_placeholder_count_survives_separate_ingests_before_rollover_restart(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_separate_ingest_count.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=[r"api_key=sk-ignore\.\.\.cdef"],
+                sensitive_patterns_enabled=True,
+                sensitive_patterns=["api_key"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-separate-ingest-count",
+        )
+        first_result = first._ingest_messages(
+            [{"role": "user", "content": "api_key=sk-ignore...cdef duplicate ignored"}]
+        )
+        first_result = first._ingest_messages(
+            first_result
+            + [{"role": "user", "content": "api_key=sk-ignore...cdef duplicate ignored"}]
+        )
+        assert sum(
+            "LCM active replay placeholder: message ignored" in str(msg.get("content", ""))
+            for msg in first_result
+        ) == 2
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-separate-ingest-count",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second._ingest_messages(first_result)
+
+            assert all(
+                "LCM active replay placeholder: message ignored" not in str(row["content"])
+                for row in second._store.get_session_messages("new-session")
+            )
+        finally:
+            second.shutdown()
+
+    def test_extraction_uses_same_ignored_dependency_filtered_view_as_summary(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_extraction_filtered_view.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+            extraction_enabled=True,
+        )
+        captured: dict[str, str] = {}
+
+        def capture_extraction(**kwargs):
+            captured["serialized"] = kwargs["serialized_messages"]
+
+        def capture_summary(**kwargs):
+            captured["summary_text"] = kwargs["text"]
+            return "visible summary\n[Expand for details: visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "extract_before_compaction", capture_extraction)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog must not extract " + "x" * 200},
+            {"role": "assistant", "content": "dependent assistant reply must not extract"},
+            {"role": "user", "content": "visible backlog should extract " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog should extract" in captured["serialized"]
+        assert "visible backlog should extract" in captured["summary_text"]
+        assert "SECRET" not in captured["serialized"]
+        assert "dependent assistant reply" not in captured["serialized"]
+        assert "SECRET" not in captured["summary_text"]
+        assert "dependent assistant reply" not in captured["summary_text"]
+
+    def test_source_ids_exclude_historical_rows_ignored_by_current_filter(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_source_ids_exclude_historical.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        ignored_store_id = first._store.append(
+            "session",
+            {"role": "user", "content": "SECRET historical row must not be a source"},
+        )
+        visible_store_id = first._store.append(
+            "session",
+            {"role": "user", "content": "visible historical backlog " + "v" * 200},
+        )
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["SECRET"],
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+
+            def summary(**kwargs):
+                assert "SECRET" not in kwargs["text"]
+                assert "visible historical backlog" in kwargs["text"]
+                return "visible summary\n[Expand for details: visible]", 1
+
+            monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+            messages = [
+                {"role": "user", "content": "SECRET historical row must not be a source"},
+                {"role": "user", "content": "visible historical backlog " + "v" * 200},
+                {"role": "assistant", "content": "fresh tail"},
+            ]
+            second.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            nodes = second._dag.get_session_nodes("session")
+            assert nodes
+            assert ignored_store_id not in nodes[0].source_ids
+            assert visible_store_id in nodes[0].source_ids
+        finally:
+            second.shutdown()
+
     def test_dependent_assistant_reply_to_ignored_backlog_is_not_summarized(self, tmp_path, monkeypatch):
         engine = self._make_engine(
             tmp_path,
@@ -3706,9 +5056,10 @@ class TestMessageFiltering:
             return "visible backlog summary\n[Expand for details: visible backlog]", 1
 
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        dependent_message = {"role": "assistant", "content": "dependent assistant reply to ignored turn " + "d" * 500}
         messages = [
             {"role": "user", "content": "SECRET ignored user turn"},
-            {"role": "assistant", "content": "dependent assistant reply to ignored turn"},
+            dependent_message,
             {"role": "user", "content": "visible backlog objective " + "y" * 200},
             {"role": "assistant", "content": "fresh tail response"},
         ]
@@ -3722,7 +5073,710 @@ class TestMessageFiltering:
         dependent_ids = [row["store_id"] for row in rows if "dependent assistant reply" in row["content"]]
         nodes = engine._dag.get_session_nodes("user-123")
         assert dependent_ids
+        node_with_dependent = next(node for node in nodes if dependent_ids[0] in node.source_ids)
+        assert node_with_dependent.source_token_count >= count_messages_tokens([dependent_message])
+
+    def test_trailing_dependent_reply_is_consumed_with_selected_visible_chunk(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_trailing_dependent_reply.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        dependent_message = {"role": "assistant", "content": "trailing dependent assistant reply " + "d" * 500}
+        messages = [
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "user", "content": "SECRET ignored user turn"},
+            dependent_message,
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+
+        assert "visible backlog objective" in captured["text"]
+        assert "trailing dependent assistant reply" not in captured["text"]
+        assert "SECRET" not in captured["text"]
+        assert "trailing dependent assistant reply" not in result_text
+        rows = engine._store.get_session_messages("user-123")
+        dependent_ids = [row["store_id"] for row in rows if "trailing dependent assistant reply" in row["content"]]
+        nodes = engine._dag.get_session_nodes("user-123")
+        assert dependent_ids
         assert any(dependent_ids[0] in node.source_ids for node in nodes)
+
+    def test_dependent_reply_marker_does_not_match_later_identical_reply(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_identical_later_reply.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        repeated_reply = "same assistant reply text"
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "SECRET ignored user turn"},
+                {"role": "assistant", "content": repeated_reply},
+                {"role": "user", "content": "fresh tail request"},
+            ],
+            current_tokens=10_000,
+        )
+        assert engine._load_generated_ignored_dependent_reply_hashes()
+
+        later_same_reply = {"role": "assistant", "content": repeated_reply}
+        engine._ingest_messages(
+            first_result
+            + [
+                {"role": "user", "content": "legitimate visible prompt"},
+                later_same_reply,
+            ]
+        )
+
+        assert not engine._is_generated_ignored_dependent_reply(later_same_reply, repeated_reply)
+
+    def test_dependent_reply_marker_does_not_filter_later_identical_reply_during_compress(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_identical_later_compress.db",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        repeated_reply = "same assistant reply text"
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible summary\n[Expand for details: visible summary]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored user turn"},
+                {"role": "assistant", "content": repeated_reply},
+                {"role": "user", "content": "fresh tail request"},
+            ],
+            current_tokens=10_000,
+        )
+        assert engine._load_generated_ignored_dependent_reply_hashes()
+        first_summary_texts = list(captured_texts)
+        assert all(repeated_reply not in text for text in first_summary_texts)
+
+        engine.compress(
+            first_result
+            + [
+                {"role": "user", "content": "legitimate visible prompt"},
+                {"role": "assistant", "content": repeated_reply},
+                {"role": "user", "content": "new fresh request"},
+                {"role": "assistant", "content": "new fresh response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        later_summary_texts = captured_texts[len(first_summary_texts):]
+        assert any(
+            "legitimate visible prompt" in text and repeated_reply in text
+            for text in later_summary_texts
+        )
+
+    def test_content_only_dependent_marker_survives_same_engine_compression_rollover(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_same_engine_rollover.db",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        dependent_reply = "dependent reply carried in same engine rollover"
+
+        def first_summary(**kwargs):
+            return "visible summary\n[Expand for details: visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", first_summary)
+        engine.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-dependent-same-engine-rollover",
+        )
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored turn before carried reply"},
+                {"role": "assistant", "content": dependent_reply},
+                {"role": "user", "content": "fresh tail request"},
+            ],
+            current_tokens=10_000,
+        )
+        assert dependent_reply in "\n".join(str(msg.get("content", "")) for msg in first_result)
+        assert engine._load_generated_ignored_dependent_reply_hashes()
+
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "new visible summary\n[Expand for details: new visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        engine.on_session_start(
+            "new-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-dependent-same-engine-rollover",
+            boundary_reason="compression",
+            old_session_id="old-session",
+        )
+        engine.compress(
+            first_result
+            + [
+                {"role": "user", "content": "new visible backlog " + "z" * 200},
+                {"role": "assistant", "content": "new fresh tail response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert captured_texts
+        assert all(dependent_reply not in text for text in captured_texts)
+        assert all("SECRET" not in text for text in captured_texts)
+
+    def test_dependent_reply_marker_survives_compression_rollover_reingest(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_dependent_rollover.db"
+        dependent_reply = "dependent reply carried across compression rollover"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=2,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["SECRET"],
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-dependent-rollover",
+        )
+
+        def summary(**kwargs):
+            return "visible summary\n[Expand for details: visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+        first_result = first.compress(
+            [
+                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored turn before carried reply"},
+                {"role": "assistant", "content": dependent_reply},
+                {"role": "user", "content": "fresh tail request"},
+            ],
+            current_tokens=10_000,
+        )
+        assert dependent_reply in "\n".join(str(msg.get("content", "")) for msg in first_result)
+        assert first._load_generated_ignored_dependent_reply_hashes()
+        first.shutdown()
+
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "new visible summary\n[Expand for details: new visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-dependent-rollover",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second.compress(
+                first_result + [{"role": "assistant", "content": "new fresh tail response"}],
+                current_tokens=10_000,
+            )
+
+            assert captured_texts
+            assert all(dependent_reply not in text for text in captured_texts)
+        finally:
+            second.shutdown()
+
+    def test_ignored_plain_assistant_filters_following_assistant_continuation(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_plain_assistant_continuation.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible summary\n[Expand for details: visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        engine.compress(
+            [
+                {"role": "assistant", "content": "SECRET ignored assistant output"},
+                {"role": "assistant", "content": "assistant continuation derived from SECRET"},
+                {"role": "user", "content": "visible backlog " + "v" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert captured_texts
+        assert all("SECRET" not in text for text in captured_texts)
+        assert all("assistant continuation derived" not in text for text in captured_texts)
+        assert any("visible backlog" in text for text in captured_texts)
+
+    def test_generated_dependent_reply_filters_following_assistant_continuation(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_generated_continuation.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        dependent_reply = "dependent assistant reply after ignored turn"
+        continuation = "assistant continuation derived from ignored turn"
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible summary\n[Expand for details: visible summary]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored user turn"},
+                {"role": "assistant", "content": dependent_reply},
+            ],
+            current_tokens=10_000,
+        )
+        assert dependent_reply in "\n".join(str(msg.get("content", "")) for msg in first_result)
+        assert engine._load_generated_ignored_dependent_reply_hashes()
+
+        engine.compress(
+            first_result
+            + [
+                {"role": "assistant", "content": continuation},
+                {"role": "user", "content": "new visible user boundary"},
+                {"role": "assistant", "content": "new fresh response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert captured_texts
+        assert all(dependent_reply not in text for text in captured_texts)
+        assert all(continuation not in text for text in captured_texts)
+
+    def test_generated_dependent_reply_marks_following_fresh_tail_continuation(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_generated_tail_continuation.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        dependent_reply = "dependent assistant reply carried in active tail"
+        continuation = "fresh tail continuation derived from ignored turn"
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible summary\n[Expand for details: visible summary]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored user turn"},
+                {"role": "assistant", "content": dependent_reply},
+            ],
+            current_tokens=10_000,
+        )
+        second_result = engine.compress(
+            first_result + [{"role": "assistant", "content": continuation}],
+            current_tokens=10_000,
+        )
+        engine.compress(
+            second_result
+            + [
+                {"role": "user", "content": "new visible boundary"},
+                {"role": "assistant", "content": "new fresh response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert captured_texts
+        assert all(dependent_reply not in text for text in captured_texts)
+        assert all(continuation not in text for text in captured_texts)
+
+    def test_new_session_carry_over_does_not_poison_same_text_future_reply(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_dependent_new_session_no_content_poison.db"
+        repeated_reply = "OK"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["SECRET"],
+            )
+        )
+        engine.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-normal-carry-over",
+        )
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible summary\n[Expand for details: visible summary]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        try:
+            engine.compress(
+                [
+                    {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                    {"role": "user", "content": "SECRET ignored user turn"},
+                    {"role": "assistant", "content": repeated_reply},
+                ],
+                current_tokens=10_000,
+            )
+            assert engine._load_generated_ignored_dependent_reply_hashes()
+            first_summary_texts = list(captured_texts)
+            assert all(repeated_reply not in text for text in first_summary_texts)
+
+            engine.carry_over_new_session_context("old-session", "new-session")
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-normal-carry-over",
+            )
+            engine.compress(
+                [
+                    {"role": "user", "content": "legitimate visible prompt " + "z" * 200},
+                    {"role": "assistant", "content": repeated_reply},
+                    {"role": "user", "content": "fresh request"},
+                ],
+                current_tokens=10_000,
+            )
+
+            later_summary_texts = captured_texts[len(first_summary_texts):]
+            assert any(
+                "legitimate visible prompt" in text and repeated_reply in text
+                for text in later_summary_texts
+            )
+        finally:
+            engine.shutdown()
+
+    def test_dependent_reply_to_ignored_turn_stays_filtered_after_fresh_tail_ages(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_fresh_tail_marker.db",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible summary\n[Expand for details: visible summary]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before secret " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored turn before fresh tail"},
+                {"role": "assistant", "content": "dependent assistant reply that must not summarize later"},
+                {"role": "user", "content": "fresh tail request"},
+            ],
+            current_tokens=10_000,
+        )
+
+        engine.compress(
+            first_result + [{"role": "assistant", "content": "new fresh assistant response"}],
+            current_tokens=10_000,
+        )
+
+        assert captured_texts
+        assert all("SECRET" not in text for text in captured_texts)
+        assert all("dependent assistant reply" not in text for text in captured_texts)
+        rows = engine._store.get_session_messages("user-123")
+        dependent_ids = [
+            row["store_id"]
+            for row in rows
+            if "dependent assistant reply that must not summarize later" in row["content"]
+        ]
+        nodes = engine._dag.get_session_nodes("user-123")
+        assert dependent_ids
+        assert any(dependent_ids[0] in node.source_ids for node in nodes)
+
+    def test_dependent_reply_in_tail_is_marked_before_anchor_break(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_tail_anchor_break.db",
+            fresh_tail_count=3,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured_texts: list[str] = []
+
+        def capture_summary(**kwargs):
+            captured_texts.append(kwargs["text"])
+            return "visible summary\n[Expand for details: visible summary]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_result = engine.compress(
+            [
+                {"role": "system", "content": "stable system anchor"},
+                {"role": "user", "content": "SECRET ignored compactable turn"},
+                {"role": "assistant", "content": "dependent tail reply after ignored turn"},
+                {"role": "user", "content": "fresh tail request"},
+                {"role": "assistant", "content": "fresh tail response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        # The first pass drops the ignored compactable turn, then fresh_tail_start
+        # collapses back to the system anchor. The dependent assistant reply must
+        # still be remembered before that no-op break, otherwise a later pass can
+        # summarize it once it ages out of the fresh tail.
+        engine.compress(
+            first_result
+            + [
+                {"role": "user", "content": "later visible backlog " + "z" * 200},
+                {"role": "assistant", "content": "later visible response"},
+            ],
+            current_tokens=10_000,
+        )
+
+        assert captured_texts
+        assert all("SECRET" not in text for text in captured_texts)
+        assert all("dependent tail reply" not in text for text in captured_texts)
+
+    def test_preflight_skips_when_only_ignored_backlog_is_eligible(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preflight_only_ignored_backlog.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog " + "x" * 4000},
+            {"role": "user", "content": "fresh request"},
+        ]
+
+        assert count_messages_tokens(messages) >= engine.threshold_tokens
+        assert engine.should_compress_preflight(messages) is True
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        assert all("SECRET" not in str(msg.get("content", "")) for msg in result)
+        assert all(
+            "LCM active replay placeholder: message ignored" not in str(msg.get("content", ""))
+            for msg in result
+        )
+
+    def test_preflight_uses_replay_view_when_ignored_backlog_masks_tiny_visible_chunk(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preflight_ignored_masks_tiny_visible.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=500,
+            ignore_message_patterns=["SECRET"],
+        )
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog " + "x" * 4000},
+            {"role": "user", "content": "visible tiny"},
+            {"role": "user", "content": "fresh request"},
+        ]
+
+        assert count_messages_tokens(messages) >= engine.threshold_tokens
+        assert engine.should_compress_preflight(messages) is True
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        assert all("SECRET" not in str(msg.get("content", "")) for msg in result)
+        assert any("visible tiny" in str(msg.get("content", "")) for msg in result)
+
+    def test_preflight_filters_generated_placeholder_backlog_without_active_patterns_after_rollover(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_preflight_placeholder_without_patterns.db"),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-preflight-placeholder-without-patterns",
+            )
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            messages = [
+                {"role": "user", "content": placeholder},
+                {"role": "assistant", "content": "fresh tail"},
+            ]
+
+            eligible, reason = engine._leaf_compaction_candidate_status(messages)
+
+            assert eligible is False
+            assert "no eligible raw backlog" in reason
+            assert engine.should_compress_preflight(messages) is False
+        finally:
+            engine.shutdown()
+
+    def test_preflight_does_not_persist_generated_placeholder_after_same_session_restart_without_patterns(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_preflight_placeholder_same_session_restart.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                context_threshold=0.35,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        first._store.append(
+            "session",
+            {"role": "user", "content": "visible backlog before restart " + "v" * 120},
+        )
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef ignored same-session restart")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                context_threshold=0.35,
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            messages = [
+                {"role": "user", "content": placeholder},
+                {"role": "assistant", "content": "large fresh tail " + "x" * 700},
+            ]
+            assert second._leaf_compaction_candidate_status(messages)[0] is False
+
+            assert second.should_compress_preflight(messages) is False
+
+            rows = second._store.get_session_messages("session")
+            assert any(row["content"] == placeholder for row in rows)
+        finally:
+            second.shutdown()
+
+    def test_preflight_ambiguous_generated_placeholder_still_requests_externalization_cleanup(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_preflight_placeholder_externalize_cleanup.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                context_threshold=0.35,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        first._store.append("session", {"role": "user", "content": "old row"})
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef externalize cleanup")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                context_threshold=0.35,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=40,
+                large_output_externalization_path=str(tmp_path / "externalized"),
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            messages = [
+                {"role": "user", "content": placeholder},
+                {"role": "user", "content": "oversized raw payload " + "x" * 200},
+            ]
+
+            assert second.should_compress_preflight(messages) is True
+        finally:
+            second.shutdown()
+
+    def test_preflight_preserves_user_literal_placeholder_plus_followup_after_same_session_restart(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_preflight_literal_placeholder_followup.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                context_threshold=0.35,
+            )
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        first._store.append("session", {"role": "user", "content": "old row"})
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef user literal")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                context_threshold=0.35,
+            )
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            followup = "actual next user turn"
+            messages = [
+                {"role": "user", "content": placeholder},
+                {"role": "user", "content": followup},
+            ]
+
+            second.should_compress_preflight(messages)
+
+            rows = second._store.get_session_messages("session")
+            row_texts = [row["content"] for row in rows]
+            assert placeholder in row_texts
+            assert followup in row_texts
+        finally:
+            second.shutdown()
 
     def test_preflight_preserves_ignored_placeholder_for_later_compress(self, tmp_path):
         engine = self._make_engine(
@@ -3746,7 +5800,7 @@ class TestMessageFiltering:
         assert "LCM active replay placeholder: message ignored" in result_text
         assert "sk-ignore" not in result_text
 
-    def test_ignored_assistant_tool_call_placeholder_clears_tool_calls(self, tmp_path):
+    def test_ignored_assistant_tool_call_placeholder_uses_redacted_tool_calls(self, tmp_path):
         engine = self._make_engine(
             tmp_path,
             "lcm_msg_ignore_assistant_tool_placeholder.db",
@@ -3760,17 +5814,130 @@ class TestMessageFiltering:
             {
                 "role": "assistant",
                 "content": "api_key=sk-ignore...cdef ignored tool-call turn",
-                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}],
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"api_key":"sk-ignore...cdef"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "user", "content": "fresh request"},
+        ]
+        replay_messages = [
+            {
+                "role": "assistant",
+                "content": "redacted ignored tool-call turn",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"api_key":"***"}',
+                        },
+                    }
+                ],
             },
             {"role": "user", "content": "fresh request"},
         ]
 
-        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result = engine._apply_ignored_active_replay_placeholders(
+            messages,
+            replay_messages,
+            ignored_messages=[True, False],
+        )
 
-        assert result[0]["role"] == "user"
+        assert result[0]["role"] == "assistant"
         assert "LCM active replay placeholder: message ignored" in str(result[0].get("content", ""))
-        assert "tool_calls" not in result[0]
+        assert result[0].get("tool_calls") == replay_messages[0]["tool_calls"]
+        assert result[0].get("tool_calls") != messages[0]["tool_calls"]
+        assert "sk-ignore" not in str(result[0].get("tool_calls", ""))
         assert "api_key" not in str(result[0].get("content", ""))
+
+    def test_empty_ingest_clears_compression_boundary_replay_flag(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_empty_boundary_ingest.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+        )
+        messages = [{"role": "user", "content": "carried context"}]
+        engine._ingest_cursor = len(messages)
+        engine._compression_boundary_ingest_pending = True
+
+        engine._ingest_messages(messages)
+
+        assert engine._compression_boundary_ingest_pending is False
+
+    def test_content_only_dependent_marker_is_consumed_after_match(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_dependent_content_marker_consumed.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+        )
+        message = {"role": "assistant", "content": "OK"}
+        digest = engine._ignored_dependent_reply_content_fingerprint(message, "OK")
+        assert digest
+        engine._write_generated_ignored_dependent_reply_records([{"content": digest}])
+
+        assert engine._is_generated_ignored_dependent_reply(message, "OK") is True
+        assert engine._is_generated_ignored_dependent_reply(message, "OK") is False
+
+    def test_ignored_plain_assistant_placeholder_preserves_assistant_role(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_plain_assistant_placeholder.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=[r"SECRET"],
+        )
+        messages = [
+            {"role": "assistant", "content": "SECRET ignored assistant response"},
+            {"role": "user", "content": "fresh request"},
+        ]
+        result = engine._apply_ignored_active_replay_placeholders(
+            messages,
+            [
+                {"role": "assistant", "content": "redacted assistant response"},
+                {"role": "user", "content": "fresh request"},
+            ],
+            ignored_messages=[True, False],
+        )
+
+        assert result[0]["role"] == "assistant"
+        assert "LCM active replay placeholder: message ignored" in str(result[0].get("content", ""))
+        assert "SECRET" not in str(result[0].get("content", ""))
+
+    def test_ignored_system_placeholder_preserves_system_role(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_system_placeholder.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=[r"SYSTEM_SECRET"],
+        )
+        messages = [
+            {"role": "system", "content": "SYSTEM_SECRET ignored system prompt"},
+            {"role": "user", "content": "fresh request"},
+        ]
+
+        result = engine._apply_ignored_active_replay_placeholders(
+            messages,
+            [
+                {"role": "system", "content": "redacted system prompt"},
+                {"role": "user", "content": "fresh request"},
+            ],
+            scan_start=0,
+        )
+
+        assert result[0]["role"] == "system"
+        assert "LCM active replay placeholder: message ignored" in str(result[0].get("content", ""))
+        assert "SYSTEM_SECRET" not in str(result[0].get("content", ""))
 
     def test_ignored_tool_result_placeholder_preserves_tool_role_and_call_id(self, tmp_path):
         engine = self._make_engine(
@@ -5600,6 +7767,27 @@ class TestEngineCompress:
             mapped_ids = instance._get_store_ids_for_messages(uncompacted_messages)
 
             assert mapped_ids == inserted_ids[10_000:]
+        finally:
+            instance.shutdown()
+
+    def test_source_mapping_pages_uncompacted_window_past_default_store_limit(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_long_uncompacted_source_lineage.db"))
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("long-uncompacted-session", platform="cli", context_length=200000)
+            messages = [
+                {"role": "user", "content": f"uncompacted message {idx}"}
+                for idx in range(10_005)
+            ]
+            inserted_ids = instance._store.append_batch(
+                "long-uncompacted-session",
+                messages,
+                [1] * len(messages),
+            )
+
+            mapped_ids = instance._get_store_ids_for_messages([messages[-1]])
+
+            assert mapped_ids == [inserted_ids[-1]]
         finally:
             instance.shutdown()
 
