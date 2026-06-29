@@ -206,6 +206,8 @@ def _select_injected_context_closer(
             if _at_line_start(text, closer.start()) and _at_line_end(text, closer.end())
         ]
         if not line_closers:
+            if len(closers) == 1 and _at_line_end(text, closers[0].end()):
+                return closers[0]
             for index, closer in enumerate(closers):
                 if index + 1 < len(closers) or not _at_line_start(text, closer.start()):
                     continue
