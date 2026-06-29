@@ -231,16 +231,24 @@ def _select_injected_context_closer(
 
 def strip_injected_context_blocks(text: str) -> str:
     """Remove transient memory/context blocks before compaction summarization."""
-    if not text or "<" not in text:
-        return _UNTRUSTED_CONTEXT_HEADER_RE.sub("", text).strip()
+    if not text:
+        return ""
 
     cleaned = text
+    changed = False
+    if "<" not in text:
+        cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", text)
+        changed = cleaned != text
+        return cleaned.strip() if changed else cleaned
+
     for tag in _INJECTED_CONTEXT_TAGS:
         escaped = re.escape(tag)
         self_close_re = re.compile(rf"<{escaped}(?:\s[^>]*)?\s*/\s*>", re.IGNORECASE)
         open_re = re.compile(rf"<{escaped}(?:\s[^>]*)?>", re.IGNORECASE)
         close_re = re.compile(rf"</{escaped}\s*>", re.IGNORECASE)
+        before_self_close = cleaned
         cleaned = self_close_re.sub("", cleaned)
+        changed = changed or cleaned != before_self_close
 
         while True:
             opener = open_re.search(cleaned)
@@ -250,11 +258,15 @@ def strip_injected_context_blocks(text: str) -> str:
             closer = _select_injected_context_closer(cleaned, opener, close_re)
             if closer is None:
                 cleaned = cleaned[: opener.start()]
+                changed = True
                 continue
             cleaned = cleaned[: opener.start()] + cleaned[closer.end() :]
+            changed = True
 
+    before_header = cleaned
     cleaned = _UNTRUSTED_CONTEXT_HEADER_RE.sub("", cleaned)
-    return cleaned.strip()
+    changed = changed or cleaned != before_header
+    return cleaned.strip() if changed else cleaned
 
 
 def _sanitize_json_like(value: Any) -> Any:

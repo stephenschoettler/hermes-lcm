@@ -3978,6 +3978,45 @@ class TestEngineCompress:
         assert "[ASSISTANT]: ACK" not in serialized
         assert "[ASSISTANT]: [heartbeat]" not in serialized
 
+    def test_compression_serialization_preserves_plain_content_whitespace(self, engine):
+        serialized = engine._serialize_messages([
+            {"role": "user", "content": "  indented patch line\n"},
+            {
+                "role": "assistant",
+                "content": "tool call incoming",
+                "tool_calls": [{
+                    "id": "call_ws",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "  raw args with trailing newline\n"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_ws", "content": "done"},
+        ])
+
+        assert "[USER]:   indented patch line\n" in serialized
+        assert "write_file(  raw args with trailing newline\n)" in serialized
+
+    def test_compression_serialization_externalizes_plain_tool_output_without_stripping_whitespace(self, tmp_path):
+        payload = "  leading spaces before patch\n+ added line\n"
+        config = LCMConfig(
+            database_path=str(tmp_path / "externalized-whitespace.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=10,
+        )
+        instance = LCMEngine(config=config, hermes_home=str(tmp_path))
+        instance.on_session_start("externalized-whitespace", platform="cli", context_length=200000)
+        try:
+            serialized = instance._serialize_messages([
+                {"role": "tool", "tool_call_id": "call_ws", "content": payload},
+            ])
+
+            match = re.search(r";\s*ref=([^;\]\s]+)", serialized)
+            assert match, serialized
+            expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": match.group(1), "max_tokens": 100_000}, engine=instance))
+            assert expanded["content"] == payload
+        finally:
+            instance.shutdown()
+
     def test_compression_serialization_strips_injected_memory_context_blocks(self, engine):
         messages = [
             {
