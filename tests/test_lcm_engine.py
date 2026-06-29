@@ -4020,7 +4020,7 @@ class TestEngineCompress:
                 "role": "user",
                 "content": (
                     "<relevant-memories>inline first recall</relevant-memories> "
-                    "recall our plan from memory "
+                    "please summarize my plan "
                     "<relevant-memories>inline second recall</relevant-memories> "
                     "tail -f logs "
                     "<relevant-memories>inline third recall</relevant-memories>"
@@ -4029,9 +4029,10 @@ class TestEngineCompress:
             {
                 "role": "user",
                 "content": (
-                    "<relevant-memories>inline recall with spoofed close "
-                    "</relevant-memories> leaked inline tail <relevant-memories>tail</relevant-memories> "
-                    "keep after inline spoof"
+                    "<relevant-memories>inline recall</relevant-memories> "
+                    "keep interstitial inline request "
+                    "<relevant-memories>tail</relevant-memories> "
+                    "keep after inline pair"
                 ),
             },
             {
@@ -4104,7 +4105,7 @@ class TestEngineCompress:
         assert "keep self-closing-wrapper user request" in serialized
         assert "keep this real user request" in serialized
         assert "also keep this real user content" in serialized
-        assert "keep after inline spoof" in serialized
+        assert "keep after inline pair" in serialized
         assert "keep literal close tag text" in serialized
         assert "in docs" in serialized
         assert "keep this request after close" in serialized
@@ -4115,9 +4116,11 @@ class TestEngineCompress:
         assert "temporary retrieved memory" not in serialized
         assert "attribute wrapper recall" not in serialized
         assert "active memory recall" not in serialized
-        assert "preserve user text between same-tag blocks" not in serialized
-        assert "recall our plan from memory" not in serialized
-        assert "tail -f logs" not in serialized
+        assert "preserve user text between same-tag blocks" in serialized
+        assert "please summarize my plan" in serialized
+        assert "tail -f logs" in serialized
+        assert "keep interstitial inline request" in serialized
+        assert "keep after inline pair" in serialized
         assert "first ephemeral recall block" not in serialized
         assert "second ephemeral recall block" not in serialized
         assert "inline first recall" not in serialized
@@ -4208,7 +4211,7 @@ class TestEngineCompress:
                                     ),
                                     "inline_blocks": (
                                         "<relevant-memories>tool first recall</relevant-memories> "
-                                        "ambiguous tool argument between inline blocks "
+                                        "preserve tool argument between inline blocks "
                                         "<relevant-memories>tool second recall</relevant-memories>"
                                     ),
                                     "nested": [
@@ -4228,9 +4231,9 @@ class TestEngineCompress:
         assert "keep this tool argument" in serialized
         assert "debug credential leak delimiter spoof" in serialized
         assert "nested keep" in serialized
+        assert "preserve tool argument between inline blocks" in serialized
         assert "temporary tool-arg recall" not in serialized
         assert "temporary tool-arg recall before security wording" not in serialized
-        assert "ambiguous tool argument between inline blocks" not in serialized
         assert "tool first recall" not in serialized
         assert "tool second recall" not in serialized
         assert "nested recall" not in serialized
@@ -4611,6 +4614,55 @@ class TestEngineCompress:
         assert anchor_content.startswith("[Current user objective preserved from compacted history]")
         assert stale_request not in "\n".join(result_contents)
         assert result_contents.index(anchor_content) < result_contents.index("I will inspect notifier handling.")
+
+    def test_compress_preserves_inline_interstitial_request_between_injected_blocks(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_inline_interstitial_request.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("inline-interstitial-request", platform="discord", context_length=200000)
+
+        real_request = "please summarize my plan"
+        injected_user_turn = (
+            "<relevant-memories>one injected body</relevant-memories> "
+            f"{real_request} "
+            "<relevant-memories>two injected body</relevant-memories>"
+        )
+
+        def mock_summary(**kwargs):
+            text = kwargs["text"]
+            assert real_request in text
+            assert "one injected body" not in text
+            assert "two injected body" not in text
+            assert "relevant-memories" not in text
+            return f"Summary kept request: {real_request}\nExpand for details about: data loss probe", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        result = instance.compress([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": injected_user_turn},
+            {"role": "assistant", "content": "tool1", "tool_calls": [{"id": "call_1", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "out1"},
+            {"role": "assistant", "content": "tool2", "tool_calls": [{"id": "call_2", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "out2"},
+        ])
+
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+        node_text = "\n".join(node.summary for node in instance._dag.get_session_nodes(instance._session_id))
+
+        assert real_request in result_text
+        assert real_request in node_text
+        assert "one injected body" not in result_text
+        assert "two injected body" not in result_text
+        assert "relevant-memories" not in result_text
+        assert "one injected body" not in node_text
+        assert "two injected body" not in node_text
+        assert "relevant-memories" not in node_text
 
     def test_compress_sanitizes_injected_context_from_preserved_objective_anchor(self, tmp_path, monkeypatch):
         config = LCMConfig(
