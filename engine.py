@@ -3742,8 +3742,6 @@ class LCMEngine(ContextEngine):
                 self._config,
                 parse_json_strings=False,
             )
-            content = sanitize_pre_compaction_content(content)
-
             if role == "tool":
                 tool_id = str(msg.get("tool_call_id") or "").strip()
                 externalized = maybe_externalize_tool_output(
@@ -3755,10 +3753,14 @@ class LCMEngine(ContextEngine):
                 )
                 if externalized:
                     content = externalized["placeholder"]
-                elif len(content) > 3000:
-                    content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                else:
+                    content = sanitize_pre_compaction_content(content)
+                    if len(content) > 3000:
+                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
+
+            content = sanitize_pre_compaction_content(content)
 
             if role == "assistant":
                 tool_calls = msg.get("tool_calls", [])

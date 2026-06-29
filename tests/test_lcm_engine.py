@@ -3997,7 +3997,11 @@ class TestEngineCompress:
         assert "write_file(  raw args with trailing newline\n)" in serialized
 
     def test_compression_serialization_externalizes_plain_tool_output_without_stripping_whitespace(self, tmp_path):
-        payload = "  leading spaces before patch\n+ added line\n"
+        payload = (
+            "  leading spaces before patch\n"
+            "<relevant-memories>literal XML docs, not injected summary context</relevant-memories>\n"
+            "+ added line\n"
+        )
         config = LCMConfig(
             database_path=str(tmp_path / "externalized-whitespace.db"),
             large_output_externalization_enabled=True,
@@ -4012,10 +4016,24 @@ class TestEngineCompress:
 
             match = re.search(r";\s*ref=([^;\]\s]+)", serialized)
             assert match, serialized
+            assert "literal XML docs" not in serialized
             expanded = json.loads(lcm_tools.lcm_expand({"externalized_ref": match.group(1), "max_tokens": 100_000}, engine=instance))
             assert expanded["content"] == payload
         finally:
             instance.shutdown()
+
+    def test_compression_serialization_strips_injected_context_from_non_externalized_tool_result(self, engine):
+        serialized = engine._serialize_messages([
+            {
+                "role": "tool",
+                "tool_call_id": "call_small",
+                "content": "<relevant-memories>temporary tool output context</relevant-memories> keep small tool result",
+            },
+        ])
+
+        assert "keep small tool result" in serialized
+        assert "temporary tool output context" not in serialized
+        assert "relevant-memories" not in serialized
 
     def test_compression_serialization_strips_injected_memory_context_blocks(self, engine):
         messages = [
