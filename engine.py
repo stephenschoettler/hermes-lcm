@@ -3949,6 +3949,7 @@ class LCMEngine(ContextEngine):
         dropped_assistant_messages = 0
         stripped_assistant_messages = 0
         for msg in messages:
+            msg = self._sanitize_active_preserved_objective_message(msg)
             if msg.get("role") == "assistant":
                 cleaned_msg = self._clean_active_assistant_message(msg)
                 if cleaned_msg is None:
@@ -4203,6 +4204,23 @@ class LCMEngine(ContextEngine):
         content = text_content_for_pattern_matching(message.get("content")) or ""
         return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
 
+    def _sanitized_preserved_objective_context_content(self, message: Dict[str, Any]) -> str:
+        preserved_objective = self._preserved_objective_context_content(message)
+        if not preserved_objective:
+            return ""
+        return self._sanitize_preserved_objective_content(
+            preserved_objective,
+            role=str(message.get("role") or "user"),
+        )
+
+    def _sanitize_active_preserved_objective_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized_content = self._sanitized_preserved_objective_context_content(message)
+        if not sanitized_content or sanitized_content == message.get("content"):
+            return message
+        sanitized = dict(message)
+        sanitized["content"] = sanitized_content
+        return sanitized
+
     def _sanitize_preserved_objective_content(self, content: str, role: str = "user") -> str:
         content = strip_injected_context_blocks(content)
         content = protect_inline_payloads_in_text(
@@ -4245,14 +4263,10 @@ class LCMEngine(ContextEngine):
         for message in reversed(messages):
             if not isinstance(message, dict):
                 continue
-            preserved_objective = self._preserved_objective_context_content(message)
-            if preserved_objective:
-                sanitized_preserved_objective = self._sanitize_preserved_objective_content(
-                    preserved_objective,
-                    role=str(message.get("role") or "user"),
-                )
+            sanitized_preserved_objective = self._sanitized_preserved_objective_context_content(message)
+            if sanitized_preserved_objective:
                 if any(
-                    self._preserved_objective_context_content(selected) == sanitized_preserved_objective
+                    self._sanitized_preserved_objective_context_content(selected) == sanitized_preserved_objective
                     for selected in selected_tail_messages
                 ):
                     return None
