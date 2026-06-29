@@ -186,7 +186,6 @@ def _sanitize_content_block(content: Any) -> str:
 def _select_injected_context_closer(
     text: str,
     opener: re.Match[str],
-    open_re: re.Pattern[str],
     close_re: re.Pattern[str],
 ) -> re.Match[str] | None:
     closers = list(close_re.finditer(text, opener.end()))
@@ -241,7 +240,7 @@ def strip_injected_context_blocks(text: str) -> str:
             if not opener:
                 break
 
-            closer = _select_injected_context_closer(cleaned, opener, open_re, close_re)
+            closer = _select_injected_context_closer(cleaned, opener, close_re)
             if closer is None:
                 cleaned = cleaned[: opener.start()]
                 continue
