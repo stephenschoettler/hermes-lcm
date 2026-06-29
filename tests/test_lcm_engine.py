@@ -5735,6 +5735,125 @@ class TestMessageFiltering:
         finally:
             second.shutdown()
 
+    def test_preflight_requests_cleanup_for_sensitive_tool_call_redaction(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_preflight_sensitive_tool_call_cleanup.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "calling lookup",
+                "tool_calls": [
+                    {
+                        "id": "call_lookup",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"api_key":"sk-sensitive...cdef"}',
+                        },
+                    }
+                ],
+            },
+        ]
+
+        assert engine._leaf_compaction_candidate_status(messages)[0] is False
+        assert engine.should_compress_preflight(messages) is True
+
+    def test_preflight_requests_cleanup_for_sensitive_content_redaction(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_preflight_sensitive_content_cleanup.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        sensitive_text = "api_key=" + "sk-sensitive...cdef"
+        messages = [
+            {"role": "user", "content": sensitive_text + " should be redacted"},
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        assert engine._leaf_compaction_candidate_status(messages)[0] is False
+        assert engine.should_compress_preflight(messages) is True
+
+    def test_preflight_requests_cleanup_for_sensitive_structured_content_redaction(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_preflight_sensitive_structured_content_cleanup.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        sensitive_url_param = "api_key=" + "sk-sen...cdef"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "https://example.test/image.png?" + sensitive_url_param
+                        },
+                    },
+                ],
+            },
+            {"role": "assistant", "content": "ack"},
+        ]
+
+        assert engine._leaf_compaction_candidate_status(messages)[0] is False
+        assert engine.should_compress_preflight(messages) is True
+
+    def test_preflight_requests_cleanup_for_sensitive_structured_key_redaction(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_preflight_sensitive_structured_key_cleanup.db",
+            fresh_tail_count=10,
+            leaf_chunk_tokens=10_000,
+            context_threshold=0.95,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        sensitive_content_key = "api_key=" + "sk-key...cdef"
+        sensitive_tool_key = "api_key=" + "sk-toolkey...cdef"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "visible"},
+                    {sensitive_content_key: 1},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "calling lookup",
+                "tool_calls": [
+                    {
+                        "id": "call_lookup",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": {sensitive_tool_key: 1},
+                        },
+                    }
+                ],
+            },
+        ]
+
+        assert engine._leaf_compaction_candidate_status(messages)[0] is False
+        assert engine.should_compress_preflight(messages) is True
+
     def test_preflight_preserves_user_literal_placeholder_plus_followup_after_same_session_restart(self, tmp_path):
         db_path = tmp_path / "lcm_msg_ignore_preflight_literal_placeholder_followup.db"
         first = LCMEngine(

@@ -1054,16 +1054,39 @@ class LCMEngine(ContextEngine):
         for original_msg, replay_msg in zip(original_messages, replay_messages):
             original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
             replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
-            if original_text == replay_text:
-                continue
-            if replay_text.startswith("[Externalized LCM ingest payload:"):
+            if original_text != replay_text:
+                if replay_text.startswith("[Externalized LCM ingest payload:"):
+                    return True
+                if replay_text.startswith("[Externalized payload: kind=raw_payload;"):
+                    return True
+                if replay_text.startswith("[LCM active replay placeholder: assistant output quarantined;"):
+                    return True
+                if replay_text.startswith("[LCM active replay placeholder: message ignored;"):
+                    return True
+                if "[LCM sensitive redaction:" in replay_text:
+                    return True
+            if original_msg.get("content") != replay_msg.get("content") and self._contains_sensitive_redaction(
+                replay_msg.get("content")
+            ):
                 return True
-            if replay_text.startswith("[Externalized payload: kind=raw_payload;"):
+            if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and self._contains_sensitive_redaction(
+                replay_msg.get("tool_calls")
+            ):
                 return True
-            if replay_text.startswith("[LCM active replay placeholder: assistant output quarantined;"):
-                return True
-            if replay_text.startswith("[LCM active replay placeholder: message ignored;"):
-                return True
+        return False
+
+    @staticmethod
+    def _contains_sensitive_redaction(value: Any) -> bool:
+        if isinstance(value, str):
+            return "[LCM sensitive redaction:" in value
+        if isinstance(value, dict):
+            return any(
+                LCMEngine._contains_sensitive_redaction(item)
+                for pair in value.items()
+                for item in pair
+            )
+        if isinstance(value, list):
+            return any(LCMEngine._contains_sensitive_redaction(item) for item in value)
         return False
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
