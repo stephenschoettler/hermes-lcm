@@ -234,8 +234,8 @@ def strip_injected_context_blocks(text: str) -> str:
     cleaned = text
     for tag in _INJECTED_CONTEXT_TAGS:
         escaped = re.escape(tag)
-        open_re = re.compile(rf"<{escaped}>", re.IGNORECASE)
-        close_re = re.compile(rf"</{escaped}>", re.IGNORECASE)
+        open_re = re.compile(rf"<{escaped}(?:\s[^>]*)?>", re.IGNORECASE)
+        close_re = re.compile(rf"</{escaped}\s*>", re.IGNORECASE)
 
         while True:
             opener = open_re.search(cleaned)
