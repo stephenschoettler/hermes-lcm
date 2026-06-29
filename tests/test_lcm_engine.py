@@ -4083,6 +4083,18 @@ class TestEngineCompress:
             },
             {
                 "role": "user",
+                "content": "please document <relevant-memories> tag syntax",
+            },
+            {
+                "role": "user",
+                "content": "<active_memory_plugin> keep singleton-marker user request",
+            },
+            {
+                "role": "user",
+                "content": "<active_memory_plugin>\nblock-shaped unmatched context should truncate this tail",
+            },
+            {
+                "role": "user",
                 "content": (
                     "<relevant-memories>\n"
                     "block first recall\n"
@@ -4160,6 +4172,11 @@ class TestEngineCompress:
         assert "tail -f logs" in serialized
         assert "keep interstitial inline request" in serialized
         assert "keep after inline pair" in serialized
+        assert "please document" in serialized
+        assert "tag syntax" in serialized
+        assert "keep singleton-marker user request" in serialized
+        assert "block-shaped unmatched context should truncate this tail" not in serialized
+        assert "<active_memory_plugin>" not in serialized
         assert "first ephemeral recall block" not in serialized
         assert "second ephemeral recall block" not in serialized
         assert "inline first recall" not in serialized
@@ -4253,6 +4270,8 @@ class TestEngineCompress:
                                         "preserve tool argument between inline blocks "
                                         "<relevant-memories>tool second recall</relevant-memories>"
                                     ),
+                                    "unmatched_inline": "please document <relevant-memories> tool tag syntax",
+                                    "singleton_marker": "<active_memory_plugin> keep singleton-marker tool argument",
                                     "nested": [
                                         "<relevant-memories>nested recall</relevant-memories>nested keep"
                                     ],
@@ -4271,11 +4290,14 @@ class TestEngineCompress:
         assert "debug credential leak delimiter spoof" in serialized
         assert "nested keep" in serialized
         assert "preserve tool argument between inline blocks" in serialized
+        assert "tool tag syntax" in serialized
+        assert "keep singleton-marker tool argument" in serialized
         assert "temporary tool-arg recall" not in serialized
         assert "temporary tool-arg recall before security wording" not in serialized
         assert "tool first recall" not in serialized
         assert "tool second recall" not in serialized
         assert "nested recall" not in serialized
+        assert "active_memory_plugin" not in serialized
         assert "hindsight-memories" not in serialized
         assert "relevant-memories" not in serialized
 
@@ -4702,6 +4724,45 @@ class TestEngineCompress:
         assert "one injected body" not in node_text
         assert "two injected body" not in node_text
         assert "relevant-memories" not in node_text
+
+    def test_compress_preserves_request_after_unmatched_inline_context_marker(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=4,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_unmatched_inline_marker.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("unmatched-inline-marker", platform="discord", context_length=200000)
+
+        real_request = "keep request after singleton marker"
+        user_turn = f"<active_memory_plugin> {real_request}"
+
+        def mock_summary(**kwargs):
+            text = kwargs["text"]
+            assert real_request in text
+            assert "active_memory_plugin" not in text
+            return f"Summary kept request: {real_request}\nExpand for details about: unmatched marker", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        result = instance.compress([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            {"role": "user", "content": user_turn},
+            {"role": "assistant", "content": "tool1", "tool_calls": [{"id": "call_1", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "out1"},
+            {"role": "assistant", "content": "tool2", "tool_calls": [{"id": "call_2", "type": "function"}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "out2"},
+        ])
+
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+        node_text = "\n".join(node.summary for node in instance._dag.get_session_nodes(instance._session_id))
+
+        assert real_request in result_text
+        assert real_request in node_text
+        assert "active_memory_plugin" not in result_text
+        assert "active_memory_plugin" not in node_text
 
     def test_compress_sanitizes_injected_context_from_preserved_objective_anchor(self, tmp_path, monkeypatch):
         config = LCMConfig(

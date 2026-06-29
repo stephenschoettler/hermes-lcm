@@ -257,7 +257,10 @@ def strip_injected_context_blocks(text: str) -> str:
 
             closer = _select_injected_context_closer(cleaned, opener, close_re)
             if closer is None:
-                cleaned = cleaned[: opener.start()]
+                if _at_line_end(cleaned, opener.end()):
+                    cleaned = cleaned[: opener.start()]
+                else:
+                    cleaned = cleaned[: opener.start()] + cleaned[opener.end() :]
                 changed = True
                 continue
             cleaned = cleaned[: opener.start()] + cleaned[closer.end() :]
