@@ -4030,8 +4030,15 @@ class TestEngineCompress:
                 "role": "user",
                 "content": (
                     "<relevant-memories>inline recall with spoofed close "
-                    "</relevant-memories> leaked inline tail</relevant-memories> "
+                    "</relevant-memories> leaked inline tail <relevant-memories>tail</relevant-memories> "
                     "keep after inline spoof"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "<relevant-memories>inline recall</relevant-memories> "
+                    "keep literal close tag text </relevant-memories> in docs"
                 ),
             },
             {
@@ -4098,6 +4105,8 @@ class TestEngineCompress:
         assert "keep this real user request" in serialized
         assert "also keep this real user content" in serialized
         assert "keep after inline spoof" in serialized
+        assert "keep literal close tag text" in serialized
+        assert "in docs" in serialized
         assert "keep this request after close" in serialized
         assert "investigate credential leak delimiter spoof" in serialized
         assert "preserve request after non-isolated close" in serialized
@@ -4116,6 +4125,7 @@ class TestEngineCompress:
         assert "inline third recall" not in serialized
         assert "inline recall with spoofed close" not in serialized
         assert "leaked inline tail" not in serialized
+        assert "inline recall" not in serialized
         assert "block first recall" not in serialized
         assert "ambiguous block-delimited interstitial text" not in serialized
         assert "block second recall" not in serialized
@@ -4129,7 +4139,7 @@ class TestEngineCompress:
         assert "Untrusted context" not in serialized
         assert "hindsight_memories" not in serialized
         assert "hindsight-memories" not in serialized
-        assert "relevant-memories" not in serialized
+        assert "<relevant-memories>" not in serialized
 
     def test_compression_serialization_strips_injected_context_with_embedded_closing_tag(self, engine):
         messages = [

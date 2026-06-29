@@ -186,6 +186,7 @@ def _sanitize_content_block(content: Any) -> str:
 def _select_injected_context_closer(
     text: str,
     opener: re.Match[str],
+    open_re: re.Pattern[str],
     close_re: re.Pattern[str],
 ) -> re.Match[str] | None:
     closers = list(close_re.finditer(text, opener.end()))
@@ -222,8 +223,13 @@ def _select_injected_context_closer(
 
     # Inline close/open pairs are ambiguous too: a recalled memory can contain a
     # spoofed close, normal-looking text, and a fake opener before the real
-    # close. Choose safety over preserving inter-block inline gaps.
-    return closers[-1]
+    # close. Choose safety only when a later same-tag opener is present; plain
+    # literal close-tag text after an already closed inline block is user text.
+    first_closer = closers[0]
+    next_opener = open_re.search(text, first_closer.end())
+    if next_opener and any(closer.start() > next_opener.end() for closer in closers[1:]):
+        return closers[-1]
+    return first_closer
 
 
 def strip_injected_context_blocks(text: str) -> str:
@@ -244,7 +250,7 @@ def strip_injected_context_blocks(text: str) -> str:
             if not opener:
                 break
 
-            closer = _select_injected_context_closer(cleaned, opener, close_re)
+            closer = _select_injected_context_closer(cleaned, opener, open_re, close_re)
             if closer is None:
                 cleaned = cleaned[: opener.start()]
                 continue
