@@ -551,6 +551,7 @@ class LCMEngine(ContextEngine):
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget: dict[str, int] = {}
         self._compression_boundary_active_placeholder_digest_ordinals: dict[str, set[int]] = {}
+        self._compression_boundary_stored_placeholder_digest_counts: dict[str, int] = {}
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
@@ -660,6 +661,7 @@ class LCMEngine(ContextEngine):
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
+        self._compression_boundary_stored_placeholder_digest_counts = {}
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
@@ -2322,6 +2324,7 @@ class LCMEngine(ContextEngine):
         self._generated_ignored_active_replay_placeholder_message_ids = set()
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
+        self._compression_boundary_stored_placeholder_digest_counts = {}
 
     def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
         self._session_id = session_id
@@ -2646,18 +2649,17 @@ class LCMEngine(ContextEngine):
                         source_session_id,
                     )
                 )
-            boundary_placeholder_budget = self._subtract_placeholder_digest_counts(
-                boundary_placeholder_budget,
-                self._stored_active_replay_placeholder_digest_counts(
-                    source_session_id,
-                    after_store_id=frontier,
-                ),
-            )
             for digest, ordinals in boundary_placeholder_ordinals.items():
                 boundary_placeholder_budget[digest] = max(
                     boundary_placeholder_budget.get(digest, 0),
                     len(ordinals),
                 )
+            self._compression_boundary_stored_placeholder_digest_counts = (
+                self._stored_active_replay_placeholder_digest_counts(
+                    source_session_id,
+                    after_store_id=frontier,
+                )
+            )
 
         if can_reassign:
             self._lifecycle.finalize_session(
@@ -3702,7 +3704,7 @@ class LCMEngine(ContextEngine):
         for digest, count in budget.items():
             parsed_count = max(0, int(count or 0))
             stored_count = max(0, int(stored_counts.get(digest, 0) or 0))
-            remaining = parsed_count - stored_count if parsed_count > stored_count else parsed_count
+            remaining = max(0, parsed_count - stored_count)
             if remaining > 0:
                 adjusted[digest] = remaining
         return adjusted
@@ -4763,6 +4765,7 @@ class LCMEngine(ContextEngine):
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
+            self._compression_boundary_stored_placeholder_digest_counts = {}
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
@@ -4805,6 +4808,26 @@ class LCMEngine(ContextEngine):
                     for msg in new_messages
                 )
             )
+            if compression_boundary_ingest_pending:
+                boundary_budget = self._compression_boundary_active_placeholder_digest_budget
+                stored_counts = self._compression_boundary_stored_placeholder_digest_counts
+                if boundary_budget and stored_counts:
+                    incoming_counts: dict[str, int] = {}
+                    relevant_digests = set(boundary_budget) | set(stored_counts)
+                    for msg in new_messages:
+                        text = text_content_for_pattern_matching(msg.get("content")) or ""
+                        digest = self._active_replay_placeholder_digest(text)
+                        if digest in relevant_digests:
+                            incoming_counts[digest] = incoming_counts.get(digest, 0) + 1
+                    adjusted_budget: dict[str, int] = {}
+                    for digest, count in boundary_budget.items():
+                        parsed_count = max(0, int(count or 0))
+                        incoming_count = max(0, int(incoming_counts.get(digest, 0) or 0))
+                        stored_count = max(0, int(stored_counts.get(digest, 0) or 0))
+                        remaining = min(parsed_count, max(0, incoming_count - stored_count))
+                        if remaining > 0:
+                            adjusted_budget[digest] = remaining
+                    self._compression_boundary_active_placeholder_digest_budget = adjusted_budget
             empty_session_all_placeholder_replay_batch = (
                 bool(empty_session_placeholder_ordinals)
                 and bool(new_messages)
@@ -4950,6 +4973,7 @@ class LCMEngine(ContextEngine):
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
+            self._compression_boundary_stored_placeholder_digest_counts = {}
             return self._remember_active_replay_messages(messages, active_replay_messages)
 
         protected_messages = protect_messages_for_ingest(
@@ -4983,6 +5007,7 @@ class LCMEngine(ContextEngine):
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
+        self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         # Most ``protected_messages`` changes are storage-only: inline media,
         # tool results, and data/base64 substrings must stay provider-usable in

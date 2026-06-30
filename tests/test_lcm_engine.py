@@ -4326,6 +4326,61 @@ class TestMessageFiltering:
         finally:
             second.shutdown()
 
+    def test_stored_placeholder_after_frontier_keeps_rollover_literal(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_placeholder_budget_stored_after_frontier.db"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        first.on_session_start(
+            "old-session",
+            platform="telegram",
+            context_length=1000,
+            conversation_id="conv-placeholder-budget-stored-after-frontier",
+        )
+        placeholder = first._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+        digest = first._active_replay_placeholder_digest(placeholder)
+        assert digest is not None
+        first._remember_generated_ignored_placeholder_hash(digest)
+        first._write_generated_ignored_placeholder_hash_counts({digest: 1})
+        first._write_generated_ignored_placeholder_hash_ordinals({digest: {1}})
+        first._store.append("old-session", {"role": "user", "content": placeholder})
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            second.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-placeholder-budget-stored-after-frontier",
+                boundary_reason="compression",
+                old_session_id="old-session",
+            )
+            second._ingest_messages(
+                [
+                    {
+                        "role": "user",
+                        "content": "[Current user objective preserved from compacted history]\ncarry objective",
+                    },
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = second._store.get_session_messages("new-session")
+            assert [row["content"] for row in rows].count(placeholder) == 1
+        finally:
+            second.shutdown()
+
     def test_cached_generated_placeholder_copy_does_not_steal_stored_literal_mapping(self, tmp_path):
         engine = LCMEngine(
             config=LCMConfig(
