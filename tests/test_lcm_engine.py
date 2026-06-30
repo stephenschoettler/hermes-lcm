@@ -9446,6 +9446,32 @@ class TestStoreIdMapping:
         finally:
             esc._call_llm_for_summary = original_fn
 
+    def test_singleton_externalized_placeholder_does_not_skip_later_visible_row(self, engine):
+        placeholder = (
+            "[Externalized payload: kind=raw_payload; role=user; "
+            "chars=10; bytes=10; ref=raw-a.json]"
+        )
+        visible = "visible B must keep source lineage"
+        first_placeholder_id, visible_id, _second_placeholder_id = engine._store._append_protected_batch(
+            "test-session",
+            [
+                {"role": "user", "content": placeholder},
+                {"role": "user", "content": visible},
+                {"role": "user", "content": placeholder},
+            ],
+            [1, 1, 1],
+        )
+
+        active_placeholder = {"role": "user", "content": placeholder}
+        active_visible = {"role": "user", "content": visible}
+
+        ids_by_message_id = engine._get_store_id_map_for_messages(
+            [active_placeholder, active_visible]
+        )
+
+        assert ids_by_message_id[id(active_placeholder)] == first_placeholder_id
+        assert ids_by_message_id[id(active_visible)] == visible_id
+
 
 class TestSessionRetainDepth:
     """Tests for issue #2a — new_session_retain_depth wiring."""

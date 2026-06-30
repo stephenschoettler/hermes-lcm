@@ -5256,26 +5256,111 @@ class LCMEngine(ContextEngine):
                 placeholder_identity_counts[raw_identity] = placeholder_identity_counts.get(raw_identity, 0) + 1
         self._current_compress_placeholder_identity_counts = placeholder_identity_counts
 
+        def find_raw_placeholder_match_index(
+            raw_identity: tuple[str, str, str, str],
+            start_idx: int,
+        ) -> int | None:
+            probe_idx = start_idx
+            while probe_idx < len(candidates):
+                stored = candidates[probe_idx]
+                if self._raw_externalized_placeholder_replay_identity(stored) == raw_identity:
+                    return probe_idx
+                probe_idx += 1
+            return None
+
+        def find_message_match_index(msg: Dict[str, Any], start_idx: int) -> int | None:
+            msg_content = normalize_content_value(msg.get("content")) or ""
+            if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
+                raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
+                raw_match_idx = find_raw_placeholder_match_index(raw_identity, start_idx)
+                if raw_match_idx is not None:
+                    return raw_match_idx
+
+            message_identity = self._message_replay_identity(msg)
+            wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
+            probe_idx = start_idx
+            while probe_idx < len(candidates):
+                stored = candidates[probe_idx]
+                stored_identity = self._message_replay_identity(stored, stored_row=True)
+                if stored_identity == message_identity:
+                    return probe_idx
+                if (
+                    wanted_cleanup_identity is not None
+                    and self._active_cleanup_replay_identity(stored_identity) == wanted_cleanup_identity
+                ):
+                    return probe_idx
+                probe_idx += 1
+            return None
+
+        def matched_remaining_message_ids(
+            message_start_idx: int,
+            start_store_idx: int,
+            surplus_skips: dict[tuple[Any, ...], int],
+        ) -> set[int]:
+            matched_message_ids: set[int] = set()
+            local_surplus_skips = dict(surplus_skips)
+            probe_idx = start_store_idx
+            for remaining_msg in messages[message_start_idx:]:
+                msg_content = normalize_content_value(remaining_msg.get("content")) or ""
+                if (
+                    remaining_msg.get("store_id") is None
+                    and self._content_has_externalized_placeholder_ref(msg_content)
+                ):
+                    raw_identity = self._raw_externalized_placeholder_replay_identity(remaining_msg)
+                    raw_match_idx = find_raw_placeholder_match_index(raw_identity, probe_idx)
+                    if raw_match_idx is not None:
+                        matched_message_ids.add(id(remaining_msg))
+                        probe_idx = raw_match_idx + 1
+                        continue
+                message_identity = self._message_replay_identity(remaining_msg)
+                if id(remaining_msg) in generated_surplus_skip_message_ids:
+                    continue
+                surplus = local_surplus_skips.get(message_identity, 0)
+                if surplus > 0:
+                    local_surplus_skips[message_identity] = surplus - 1
+                    continue
+                match_idx = find_message_match_index(remaining_msg, probe_idx)
+                if match_idx is None:
+                    continue
+                matched_message_ids.add(id(remaining_msg))
+                probe_idx = match_idx + 1
+            return matched_message_ids
+
         ids_by_message_id: dict[int, int] = {}
         store_idx = 0
-        for msg in messages:
+        for msg_idx, msg in enumerate(messages):
             msg_content = normalize_content_value(msg.get("content")) or ""
             if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
                 raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
                 if placeholder_identity_counts.get(raw_identity, 0) > 1:
-                    probe_idx = store_idx
-                    while probe_idx < len(candidates):
-                        stored = candidates[probe_idx]
-                        if self._raw_externalized_placeholder_replay_identity(stored) == raw_identity:
-                            ids_by_message_id[id(msg)] = stored["store_id"]
-                            store_idx = probe_idx + 1
-                            break
-                        probe_idx += 1
+                    match_idx = find_raw_placeholder_match_index(raw_identity, store_idx)
+                    if match_idx is not None:
+                        ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
+                        store_idx = match_idx + 1
                 else:
+                    # Prefer a later duplicate only when it does not orphan
+                    # later active messages that still need monotonic mapping.
+                    first_match_idx = find_raw_placeholder_match_index(raw_identity, store_idx)
+                    if first_match_idx is not None:
+                        baseline_suffix_ids = matched_remaining_message_ids(
+                            msg_idx + 1,
+                            first_match_idx + 1,
+                            active_surplus_skips,
+                        )
+                    else:
+                        baseline_suffix_ids = set()
                     probe_idx = len(candidates) - 1
-                    while probe_idx >= store_idx:
+                    while first_match_idx is not None and probe_idx >= first_match_idx:
                         stored = candidates[probe_idx]
                         if self._raw_externalized_placeholder_replay_identity(stored) == raw_identity:
+                            candidate_suffix_ids = matched_remaining_message_ids(
+                                msg_idx + 1,
+                                probe_idx + 1,
+                                active_surplus_skips,
+                            )
+                            if not baseline_suffix_ids.issubset(candidate_suffix_ids):
+                                probe_idx -= 1
+                                continue
                             ids_by_message_id[id(msg)] = stored["store_id"]
                             store_idx = probe_idx + 1
                             break
@@ -5289,23 +5374,10 @@ class LCMEngine(ContextEngine):
             if surplus > 0:
                 active_surplus_skips[message_identity] = surplus - 1
                 continue
-            wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
-            probe_idx = store_idx
-            while probe_idx < len(candidates):
-                stored = candidates[probe_idx]
-                stored_identity = self._message_replay_identity(stored, stored_row=True)
-                if stored_identity == message_identity:
-                    ids_by_message_id[id(msg)] = stored["store_id"]
-                    store_idx = probe_idx + 1
-                    break
-                if (
-                    wanted_cleanup_identity is not None
-                    and self._active_cleanup_replay_identity(stored_identity) == wanted_cleanup_identity
-                ):
-                    ids_by_message_id[id(msg)] = stored["store_id"]
-                    store_idx = probe_idx + 1
-                    break
-                probe_idx += 1
+            match_idx = find_message_match_index(msg, store_idx)
+            if match_idx is not None:
+                ids_by_message_id[id(msg)] = candidates[match_idx]["store_id"]
+                store_idx = match_idx + 1
 
         return ids_by_message_id
 
