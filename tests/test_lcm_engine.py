@@ -5096,6 +5096,66 @@ class TestMessageFiltering:
         finally:
             second.shutdown()
 
+    def test_source_ids_exclude_stored_externalized_rows_ignored_by_current_filter(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_externalized_source_ids_exclude.db"
+        hermes_home = tmp_path / "hermes-externalized-ignore"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        ignored_store_id = first._store.append(
+            "session",
+            {"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200},
+        )
+        stored_externalized_row = first._store.get(ignored_store_id)
+        assert stored_externalized_row is not None
+        assert "Externalized payload:" in stored_externalized_row["content"]
+        assert "SECRET_PAYLOAD_MARKER" not in stored_externalized_row["content"]
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            captured: dict[str, str] = {}
+
+            def summary(**kwargs):
+                captured["text"] = kwargs["text"]
+                return "visible summary\n[Expand for details: visible]", 1
+
+            monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+            messages = [
+                stored_externalized_row,
+                {"role": "user", "content": "visible historical backlog " + "v" * 200},
+                {"role": "assistant", "content": "fresh tail"},
+            ]
+            second.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            assert "visible historical backlog" in captured["text"]
+            assert "SECRET_PAYLOAD_MARKER" not in captured["text"]
+            assert "Externalized LCM ingest payload" not in captured["text"]
+            nodes = second._dag.get_session_nodes("session")
+            assert nodes
+            assert ignored_store_id not in nodes[0].source_ids
+        finally:
+            second.shutdown()
+
     def test_dependent_assistant_reply_to_ignored_backlog_is_not_summarized(self, tmp_path, monkeypatch):
         engine = self._make_engine(
             tmp_path,

@@ -1433,6 +1433,7 @@ class LCMEngine(ContextEngine):
                     if (
                         self._matches_ignore_message_patterns(working_msg)
                         or self._matches_ignore_message_patterns(pressure_msg)
+                        or self._mapped_stored_row_matches_ignore_message_patterns(working_msg)
                         or self._is_ignored_active_replay_placeholder(working_msg, content_text)
                         or generated_volatile_placeholder
                     ):
@@ -3894,6 +3895,19 @@ class LCMEngine(ContextEngine):
             if externalized_text and externalized_text != text:
                 return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
         return False
+
+    def _mapped_stored_row_matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
+        store_id = msg.get("store_id")
+        if store_id is None:
+            store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
+        if store_id is None:
+            return False
+        try:
+            stored = self._store.get(int(store_id))
+        except Exception:
+            logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
+            return False
+        return bool(stored and self._matches_ignore_message_patterns(stored, stored_row=True))
 
     def _apply_ignored_active_replay_placeholders(
         self,
