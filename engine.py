@@ -1580,8 +1580,13 @@ class LCMEngine(ContextEngine):
             remaining_messages = working_messages[leading_anchor_count + selected_raw_len:]
             source_tokens = count_messages_tokens(source_lookup_chunk)
 
-            source_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
+            source_lineage_chunk = [
+                message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
+            ]
+            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
+            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
+            consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
 
@@ -1600,7 +1605,7 @@ class LCMEngine(ContextEngine):
             )
             self._dag.add_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(source_store_ids) if source_store_ids else 0
+            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
             self._persist_frontier_marker()
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]

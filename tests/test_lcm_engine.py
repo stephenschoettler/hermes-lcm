@@ -5926,8 +5926,8 @@ class TestMessageFiltering:
         dependent_ids = [row["store_id"] for row in rows if "dependent assistant reply" in row["content"]]
         nodes = engine._dag.get_session_nodes("user-123")
         assert dependent_ids
-        node_with_dependent = next(node for node in nodes if dependent_ids[0] in node.source_ids)
-        assert node_with_dependent.source_token_count >= count_messages_tokens([dependent_message])
+        assert all(dependent_ids[0] not in node.source_ids for node in nodes)
+        assert engine._last_compacted_store_id >= dependent_ids[0]
 
     def test_dependent_assistant_reply_to_ignored_system_backlog_is_not_summarized(self, tmp_path, monkeypatch):
         engine = self._make_engine(
@@ -5992,7 +5992,8 @@ class TestMessageFiltering:
         dependent_ids = [row["store_id"] for row in rows if "trailing dependent assistant reply" in row["content"]]
         nodes = engine._dag.get_session_nodes("user-123")
         assert dependent_ids
-        assert any(dependent_ids[0] in node.source_ids for node in nodes)
+        assert all(dependent_ids[0] not in node.source_ids for node in nodes)
+        assert engine._last_compacted_store_id >= dependent_ids[0]
 
     def test_dependent_reply_marker_does_not_match_later_identical_reply(self, tmp_path):
         engine = self._make_engine(
@@ -6517,7 +6518,8 @@ class TestMessageFiltering:
         ]
         nodes = engine._dag.get_session_nodes("user-123")
         assert dependent_ids
-        assert any(dependent_ids[0] in node.source_ids for node in nodes)
+        assert all(dependent_ids[0] not in node.source_ids for node in nodes)
+        assert engine._last_compacted_store_id >= dependent_ids[0]
 
     def test_dependent_reply_in_tail_is_marked_before_anchor_break(self, tmp_path, monkeypatch):
         engine = self._make_engine(
