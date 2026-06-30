@@ -4016,13 +4016,22 @@ class LCMEngine(ContextEngine):
         if not self._session_id:
             return False
         raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-        for row in self._store.get_session_messages(self._session_id):
-            row_store_id = int(row.get("store_id") or 0)
-            if row_store_id >= store_id:
-                break
-            if self._raw_externalized_placeholder_replay_identity(row) == raw_identity:
-                return True
-        return False
+        after_store_id = 0
+        while True:
+            rows = self._store.get_session_messages_after(
+                self._session_id,
+                after_store_id=after_store_id,
+                limit=1000,
+            )
+            if not rows:
+                return False
+            for row in rows:
+                row_store_id = int(row.get("store_id") or 0)
+                if row_store_id >= store_id:
+                    return False
+                if self._raw_externalized_placeholder_replay_identity(row) == raw_identity:
+                    return True
+                after_store_id = max(after_store_id, row_store_id)
 
     def _mapped_stored_row_matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
         store_id = msg.get("store_id")

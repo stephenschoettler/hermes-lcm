@@ -5329,6 +5329,42 @@ class TestMessageFiltering:
         finally:
             second.shutdown()
 
+    def test_prior_externalized_placeholder_scan_pages_past_default_limit(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_externalized_prior_scan_pages.db"
+        hermes_home = tmp_path / "hermes-externalized-prior-scan-pages"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            engine.on_session_start("session", platform="telegram", context_length=1000)
+            for idx in range(10_000):
+                engine._store.append(
+                    "session",
+                    {"role": "assistant", "content": f"filler row {idx}"},
+                )
+            prior_store_id = engine._store.append(
+                "session",
+                {"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200},
+            )
+            prior_row = engine._store.get(prior_store_id)
+            assert prior_row is not None
+            assert "Externalized payload:" in prior_row["content"]
+            literal_copy = {"role": "user", "content": prior_row["content"]}
+
+            assert engine._has_prior_raw_externalized_placeholder_row(
+                prior_store_id + 1,
+                literal_copy,
+            ) is True
+        finally:
+            engine.shutdown()
+
     def test_duplicate_stored_externalized_rows_ignored_by_current_filter_are_all_filtered(
         self, tmp_path, monkeypatch
     ):
