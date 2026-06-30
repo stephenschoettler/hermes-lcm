@@ -3818,9 +3818,10 @@ class LCMEngine(ContextEngine):
                     if not record:
                         continue
                     marker = (record.get("store", ""), record.get("content", ""))
-                    if marker in seen:
-                        continue
-                    seen.add(marker)
+                    if record.get("store"):
+                        if marker in seen:
+                            continue
+                        seen.add(marker)
                     records.append(record)
             return records[-512:]
         except Exception:
@@ -3848,9 +3849,10 @@ class LCMEngine(ContextEngine):
             if not clean:
                 continue
             marker = (clean.get("store", ""), clean.get("content", ""))
-            if marker in seen:
-                continue
-            seen.add(marker)
+            if clean.get("store"):
+                if marker in seen:
+                    continue
+                seen.add(marker)
             normalized.append(clean)
         normalized = normalized[-512:]
         try:

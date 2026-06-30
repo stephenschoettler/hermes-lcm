@@ -1,5 +1,6 @@
 """Integration tests for the LCM engine."""
 
+import hashlib
 import json
 import logging
 import re
@@ -6099,6 +6100,101 @@ class TestMessageFiltering:
         assert captured_texts
         assert all(dependent_reply not in text for text in captured_texts)
         assert all("SECRET" not in text for text in captured_texts)
+
+    def test_duplicate_dependent_content_markers_survive_rollover_copy(self, tmp_path):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_duplicate_dependent_rollover_copy.db",
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        try:
+            engine.on_session_start(
+                "old-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="conv-duplicate-dependent-rollover",
+            )
+            dependent_reply = "duplicate dependent reply carried over rollover"
+            content_digest = engine._ignored_dependent_reply_content_fingerprint(
+                {"role": "assistant", "content": dependent_reply},
+                dependent_reply,
+            )
+            assert content_digest is not None
+            first_store_id = engine._store.append(
+                "old-session",
+                {"role": "assistant", "content": dependent_reply},
+                token_estimate=1,
+                source="telegram",
+                conversation_id="conv-duplicate-dependent-rollover",
+            )
+            second_store_id = engine._store.append(
+                "old-session",
+                {"role": "assistant", "content": dependent_reply},
+                token_estimate=1,
+                source="telegram",
+                conversation_id="conv-duplicate-dependent-rollover",
+            )
+            source_keys = engine._session_scoped_hash_metadata_keys(
+                "ignored_dependent_reply_hashes",
+                "old-session",
+            )
+            engine._write_generated_ignored_dependent_reply_records(
+                [
+                    {
+                        "store": hashlib.sha256(
+                            f"old-session\0{first_store_id}".encode("utf-8")
+                        ).hexdigest()[:16],
+                        "content": content_digest,
+                    },
+                    {
+                        "store": hashlib.sha256(
+                            f"old-session\0{second_store_id}".encode("utf-8")
+                        ).hexdigest()[:16],
+                        "content": content_digest,
+                    },
+                ],
+                source_keys,
+            )
+
+            engine._copy_generated_ignore_hashes_to_session(
+                "old-session",
+                "new-session",
+                copy_dependent_content=True,
+                source_frontier_store_id=0,
+            )
+
+            target_keys = engine._session_scoped_hash_metadata_keys(
+                "ignored_dependent_reply_hashes",
+                "new-session",
+            )
+            copied_records = engine._load_generated_ignored_dependent_reply_records(target_keys)
+            assert copied_records == [
+                {"content": content_digest},
+                {"content": content_digest},
+            ]
+
+            engine._session_id = "new-session"
+            live_records = engine._load_generated_ignored_dependent_reply_records()
+            msg = {"role": "assistant", "content": dependent_reply}
+            assert engine._matches_preexisting_generated_ignored_dependent_reply(
+                msg,
+                dependent_reply,
+                live_records,
+            )
+            assert engine._matches_preexisting_generated_ignored_dependent_reply(
+                msg,
+                dependent_reply,
+                live_records,
+            )
+            assert not engine._matches_preexisting_generated_ignored_dependent_reply(
+                msg,
+                dependent_reply,
+                live_records,
+            )
+        finally:
+            engine.shutdown()
 
     def test_dependent_reply_marker_survives_compression_rollover_reingest(self, tmp_path, monkeypatch):
         db_path = tmp_path / "lcm_msg_ignore_dependent_rollover.db"
