@@ -4518,6 +4518,56 @@ class TestMessageFiltering:
         finally:
             engine.shutdown()
 
+    def test_session_rebind_clears_abandoned_boundary_placeholder_budget(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(tmp_path / "lcm_msg_ignore_abandoned_boundary_budget.db"),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10,
+            )
+        )
+        try:
+            engine.on_session_start(
+                "old-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="old-conv",
+            )
+            placeholder = engine._ignored_active_replay_placeholder("api_key=sk-ignore...cdef")
+            digest = engine._active_replay_placeholder_digest(placeholder)
+            assert digest is not None
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._compression_boundary_ingest_pending = True
+            engine._compression_boundary_active_placeholder_digest_budget = {digest: 1}
+            engine._compression_boundary_active_placeholder_digest_ordinals = {digest: {1}}
+            engine._compression_boundary_stored_placeholder_digest_counts = {digest: 1}
+
+            engine.on_session_start(
+                "new-session",
+                platform="telegram",
+                context_length=1000,
+                conversation_id="new-conv",
+            )
+            assert engine._compression_boundary_ingest_pending is False
+            assert engine._compression_boundary_active_placeholder_digest_budget == {}
+            assert engine._compression_boundary_active_placeholder_digest_ordinals == {}
+            assert engine._compression_boundary_stored_placeholder_digest_counts == {}
+
+            engine._remember_generated_ignored_placeholder_hash(digest)
+            engine._write_generated_ignored_placeholder_hash_counts({digest: 2})
+            engine._write_generated_ignored_placeholder_hash_ordinals({digest: {1, 2}})
+            engine._ingest_messages(
+                [
+                    {"role": "user", "content": placeholder},
+                    {"role": "user", "content": placeholder},
+                ]
+            )
+
+            rows = engine._store.get_session_messages("new-session")
+            assert rows == []
+        finally:
+            engine.shutdown()
+
     def test_boundary_budget_uses_generated_provenance_when_literal_precedes_generated(self, tmp_path):
         engine = LCMEngine(
             config=LCMConfig(
