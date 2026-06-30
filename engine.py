@@ -3755,14 +3755,14 @@ class LCMEngine(ContextEngine):
         role = str(msg.get("role") or "")
         if role not in {"assistant", "tool"}:
             return None
-        mapped_store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
-        if mapped_store_id is not None:
-            store_id = mapped_store_id
-        else:
-            store_ids = self._get_store_ids_for_messages([msg])
-            if not store_ids:
-                return None
-            store_id = store_ids[0]
+        # Store-scoped dependent markers must be tied to provenance the caller
+        # already has; a singleton content lookup can bind repeated replies to
+        # an older ignored-dependent row.
+        store_id = msg.get("store_id")
+        if store_id is None:
+            store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
+        if store_id is None:
+            return None
         identity = f"{self._session_id}\0{store_id}"
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 

@@ -5933,6 +5933,14 @@ class TestMessageFiltering:
                 later_same_reply,
             ]
         )
+        dependent_store_id = next(
+            row["store_id"]
+            for row in engine._store.get_session_messages("user-123")
+            if row["role"] == "assistant" and row["content"] == repeated_reply
+        )
+        engine._last_compacted_store_id = 0
+        engine._current_compress_store_ids_by_message_id = {}
+        assert engine._get_store_ids_for_messages([later_same_reply]) == [dependent_store_id]
 
         assert not engine._is_generated_ignored_dependent_reply(later_same_reply, repeated_reply)
 
