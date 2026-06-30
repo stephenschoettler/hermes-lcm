@@ -3648,6 +3648,18 @@ class TestEscalation:
         assert "Exception: active blockers and pending handoff state should NOT be demoted" in prompt
         assert "Keep them outside historical headings so the agent retains awareness" in prompt
 
+    def test_focus_topic_with_braces_does_not_break_prompts(self):
+        from hermes_lcm.escalation import _build_l1_prompt, _build_l2_prompt
+
+        focus_topic = 'payload {"a": 1} and trailing {brace'
+        l1 = _build_l1_prompt("test content", 500, depth=0, focus_topic=focus_topic)
+        l2 = _build_l2_prompt("test content", 500, focus_topic=focus_topic)
+
+        assert f"Primary focus: {focus_topic}" in l1
+        assert f"Primary focus: {focus_topic}" in l2
+        assert "Demote old / completed topics:" in l1
+        assert "Demote old / completed topics:" in l2
+
     def test_focus_topic_is_normalized_and_bounded_in_prompts(self):
         from hermes_lcm.escalation import _build_l1_prompt
         noisy_focus = "  migration\n\n" + ("very-long-topic " * 40)
