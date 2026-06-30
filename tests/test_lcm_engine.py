@@ -77,6 +77,41 @@ def test_discord_short_turn_ingest_preserves_conversation_id(tmp_path):
         engine.shutdown()
 
 
+def test_webui_like_local_short_turn_ingest_preserves_lane_metadata(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "webui-local.db"))
+    engine = LCMEngine(config=config)
+    try:
+        conversation_id = "agent:main:local:webui:session-42"
+        engine.on_session_start(
+            "webui-session-42",
+            platform="local",
+            conversation_id=conversation_id,
+            model="local-test-model",
+            provider="local",
+            context_length=128_000,
+        )
+
+        engine.ingest([
+            {"role": "user", "content": "needle from local webui lane"},
+            {"role": "assistant", "content": "local lane answer"},
+        ])
+        status = json.loads(engine.handle_tool_call("lcm_status", {}))
+        rows = engine._store.search(
+            "needle",
+            source="local",
+            conversation_id=conversation_id,
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "webui-session-42"
+        assert rows[0]["source"] == "local"
+        assert rows[0]["conversation_id"] == conversation_id
+        assert engine.current_session_platform == "local"
+        assert status["runtime_identity"]["conversation_id"] == conversation_id
+    finally:
+        engine.shutdown()
+
+
 def test_engine_deallocation_releases_sqlite_fds_without_gc(tmp_path):
     fd_dir = Path("/proc/self/fd")
     if not fd_dir.exists():

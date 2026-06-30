@@ -17,6 +17,8 @@ python scripts/lcm_benchmark.py \
   --fixture benchmarks/fixtures/repeated_compaction_chatter.json \
   --fixture benchmarks/fixtures/summary_timeout_probe.json \
   --fixture benchmarks/fixtures/summary_refusal_probe.json \
+  --fixture benchmarks/fixtures/scrubbed_operator_coding_tool_heavy.json \
+  --fixture benchmarks/fixtures/scrubbed_operator_chatter_repeated_compaction.json \
   --output benchmarks/runs/local-smoke \
   --json
 ```
@@ -74,6 +76,13 @@ python scripts/lcm_benchmark.py \
 Synthetic fixture specs use `name:pairs:canaries:filler_words` and are deterministic. They are bounded to 250 message pairs and 2,000 filler words so typos do not create huge benchmark outputs. Benchmark output directories should be fresh or cleaned between runs because the harness refuses to reuse non-empty per-run directories.
 
 The committed `summary_timeout_probe` and `summary_refusal_probe` fixtures are small pilot fixtures for summary-provider failure-mode accounting. Their `benchmark_profile` records `summary_level` and `summary_failure_mode` metadata so reports can group timeout/refusal fallback scenarios without embedding provider calls or secrets in fixture content.
+
+The committed scrubbed operator-shape fixtures extend the suite beyond pure synthetic pressure probes without leaking local transcripts:
+
+- `scrubbed_operator_coding_tool_heavy.json` models a long coding lane with repeated tool output, patch/test loops, and old canaries.
+- `scrubbed_operator_chatter_repeated_compaction.json` models a repeated-chatter lane with a compaction-prone recent tail.
+
+These fixtures use bounded `benchmark_repeat` markers to expand scrubbed shape messages at load time. The marker is removed before replay/storage, keeping the committed JSON small while preserving the pressure profile needed to compare baseline and candidate policies.
 
 `codex_gpt_long_context` and `codex_spark_context` are benchmark candidates and now have inspectable dry-run preset surfaces. `pressure_smoke` is not a runtime preset recommendation. It is a control policy for validating benchmark signals.
 
@@ -187,15 +196,16 @@ The shipped preset catalog is inspectable from the `/lcm` command surface when s
 /lcm preset apply codex_gpt_long_context --dry-run
 ```
 
-Current `codex_gpt_long_context` provenance:
+Current `codex_gpt_long_context` / `codex_spark_context` provenance from the fresh-main validation suite:
 
 - policy file: `benchmarks/policies/codex_gpt_long_context.yaml`
 - policy version: `1`
 - benchmark version: `2`
-- fixture suite: `codex_pressure_probe:42:4:1000`
-- pressure score: `92.5` vs `72.5` for `baseline_272k`
+- fixture suite: committed baseline/chatter/failure fixtures, two scrubbed operator-shape fixtures, plus `codex_pressure_probe:42:4:1000` and `spark_pressure_probe:42:4:1000`
+- aggregate candidate score: `92.941` vs `82.941` for `baseline_272k`
 - retrieval canary recall: `1.0`
-- repeated-compaction risk: candidate `0`, baseline `1`
+- repeated-compaction risk: candidate `0`, baseline `4`
+- Spark minimum post-compaction headroom: `26,432` tokens in the validation suite
 
 The dry-run apply surface previews env-var changes only:
 

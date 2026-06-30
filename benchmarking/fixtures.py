@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from .types import ReplayFixture, SummaryFailureMode, _summary_failure_mode
 
@@ -13,6 +13,7 @@ from .types import ReplayFixture, SummaryFailureMode, _summary_failure_mode
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MAX_SYNTHETIC_MESSAGE_PAIRS = 250
 _MAX_SYNTHETIC_FILLER_WORDS = 2_000
+_MAX_BENCHMARK_MESSAGE_REPEAT = 120
 
 
 def _resolve_path(path: str | Path) -> Path:
@@ -28,7 +29,51 @@ def fixture_from_dict(data: Mapping[str, object]) -> ReplayFixture:
         raise ValueError(f"fixture missing required key(s): {', '.join(missing)}")
     if not isinstance(data["messages"], list):
         raise ValueError("fixture messages must be a list")
-    return ReplayFixture.from_dict(data)
+    fixture = ReplayFixture.from_dict(data)
+    return ReplayFixture(
+        name=fixture.name,
+        messages=_expand_benchmark_repeated_messages(fixture.messages),
+        canaries=fixture.canaries,
+        tags=fixture.tags,
+        benchmark_profile=fixture.benchmark_profile,
+    )
+
+
+def _expand_benchmark_repeated_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expand scrubbed fixture shape markers into deterministic replay messages.
+
+    Committed real/operator-shape fixtures should stay small and scrubbed.  A
+    message may include ``benchmark_repeat`` to represent repeated local/tool
+    turns without committing a huge raw transcript.  The marker is benchmark
+    metadata only: expanded messages remove it before replay/storage.
+    """
+
+    expanded: list[dict[str, Any]] = []
+    for message in messages:
+        raw_repeat = message.get("benchmark_repeat", 1)
+        try:
+            repeat = int(raw_repeat)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("benchmark_repeat must be an integer") from exc
+        if repeat < 1:
+            raise ValueError("benchmark_repeat must be positive")
+        if repeat > _MAX_BENCHMARK_MESSAGE_REPEAT:
+            raise ValueError(
+                f"benchmark_repeat exceeds maximum {_MAX_BENCHMARK_MESSAGE_REPEAT}"
+            )
+
+        base = dict(message)
+        base.pop("benchmark_repeat", None)
+        content = str(base.get("content") or "")
+        for idx in range(repeat):
+            item = dict(base)
+            if repeat > 1 and content:
+                item["content"] = (
+                    f"{content}\n"
+                    f"[scrubbed benchmark repeat {idx + 1:03d}/{repeat:03d}]"
+                )
+            expanded.append(item)
+    return expanded
 
 
 def load_fixture(path: str | Path) -> ReplayFixture:

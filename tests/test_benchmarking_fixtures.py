@@ -69,6 +69,30 @@ def test_fixture_preserves_benchmark_profile_metadata():
     assert fixture.to_dict()["benchmark_profile"] == fixture.benchmark_profile
 
 
+def test_fixture_expands_scrubbed_benchmark_repeat_markers():
+    fixture = fixture_from_dict({
+        "name": "repeat_shape",
+        "messages": [
+            {"role": "user", "content": "repeat me", "benchmark_repeat": 3},
+        ],
+    })
+
+    assert len(fixture.messages) == 3
+    assert all("benchmark_repeat" not in message for message in fixture.messages)
+    assert fixture.messages[0]["content"].endswith("[scrubbed benchmark repeat 001/003]")
+    assert fixture.messages[2]["content"].endswith("[scrubbed benchmark repeat 003/003]")
+
+
+def test_fixture_rejects_unbounded_benchmark_repeat_marker():
+    with pytest.raises(ValueError, match="benchmark_repeat exceeds maximum"):
+        fixture_from_dict({
+            "name": "too_big",
+            "messages": [
+                {"role": "user", "content": "repeat me", "benchmark_repeat": 121},
+            ],
+        })
+
+
 def test_make_summary_failure_fixture_marks_profile_and_tags():
     fixture = make_summary_failure_fixture(
         name="timeout_probe",
@@ -173,6 +197,21 @@ def test_committed_long_history_fixture_loads():
     assert fixture.name == "long_history_canaries"
     assert fixture.canaries
     assert fixture.messages[0]["role"] == "system"
+
+
+def test_committed_scrubbed_operator_shape_fixtures_load_without_raw_repeat_markers():
+    coding = load_fixture("benchmarks/fixtures/scrubbed_operator_coding_tool_heavy.json")
+    chatter = load_fixture("benchmarks/fixtures/scrubbed_operator_chatter_repeated_compaction.json")
+
+    assert {"real_shape", "scrubbed_operator", "pressure_replay"}.issubset(coding.tags)
+    assert {"real_shape", "scrubbed_operator", "pressure_replay"}.issubset(chatter.tags)
+    assert coding.benchmark_profile["raw_transcript_included"] is False
+    assert chatter.benchmark_profile["raw_transcript_included"] is False
+    assert len(coding.messages) > 100
+    assert len(chatter.messages) > 100
+    assert all("benchmark_repeat" not in message for message in [*coding.messages, *chatter.messages])
+    assert coding.canaries[0].expected_query == "CANARY_OPERATOR_BUILD"
+    assert chatter.canaries[0].expected_query == "CANARY_OPERATOR_CHATTER"
 
 
 def test_committed_chatter_fixture_with_pressure_policy_compacts(tmp_path):

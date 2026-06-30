@@ -192,7 +192,7 @@ def run_replay(
     policy: LCMPolicy,
     *,
     output_dir: str | Path,
-    max_summary_canaries: int = 1,
+    max_summary_canaries: int = 2,
 ) -> ReplayMetrics:
     """Replay one fixture against one LCM policy with deterministic summarization."""
     _ensure_hermes_lcm_package()

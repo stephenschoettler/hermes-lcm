@@ -237,10 +237,11 @@ mutations. With `LCM_ENABLE_SLASH_COMMAND=true`, use:
 
 `/lcm preset show` reports the shipped preset metadata, benchmark provenance,
 policy file, policy version, and metric summary. `/lcm preset suggest` chooses a
-safe shipped suggestion for the current context window when one exists, and
-labels the current selector as `context-only` when the provider/model family is
-not available to the plugin. `/lcm preset apply ... --dry-run` previews env-var
-settings only; it does not
+safe shipped suggestion for the current context window when one exists and emits
+confidence reasons. The confidence is `benchmark-backed-route` only when host
+metadata identifies an OpenAI Codex/GPT route; otherwise it stays `context-only`
+and tells the operator to confirm provider/model family before applying any env
+changes. `/lcm preset apply ... --dry-run` previews env-var settings only; it does not
 write files, change process state, or override explicit parseable
 preset-managed `LCM_*` environment variables. Invalid preset-managed env values
 are reported as invalid instead of being treated as active runtime overrides.
@@ -264,7 +265,7 @@ setting, because the engine does not expose that live knob yet.
 
 For dashboards and agents, `lcm_status` also exposes the same information under
 `preset_suggestion` as read-only JSON: suggested preset name/family, selection
-reason, match confidence, provenance, explicit override diagnostics, invalid
+reason, match confidence, confidence reasons, provenance, explicit override diagnostics, invalid
 override diagnostics, unsupported benchmark-only fields, and the dry-run delta.
 This surface is safe to consume without scraping slash-command text; it does not
 write files, mutate process state, expose local benchmark run paths, or apply

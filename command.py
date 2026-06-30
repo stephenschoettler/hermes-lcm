@@ -30,7 +30,9 @@ from .presets import (
     explicit_operator_overrides,
     get_preset,
     invalid_operator_overrides,
+    preset_confidence_reasons,
     preset_env_diff,
+    preset_match_confidence,
     shipped_presets,
     suggest_preset_for_engine,
     unsupported_runtime_fields_text,
@@ -1746,11 +1748,16 @@ def _preset_suggest_text(engine) -> str:
     lines.extend([
         f"suggested_preset: {preset.name}",
         f"reason: {reason}",
-        "match_confidence: context-only",
+        f"match_confidence: {preset_match_confidence(engine, preset)}",
         f"policy_version: {preset.policy_version}",
         f"benchmark_version: {preset.provenance.get('benchmark_version', '(unknown)')}",
         "explicit_overrides: " + (", ".join(sorted(explicit.values())) if explicit else "(none)"),
         f"invalid_overrides: {invalid_text}",
+        "confidence_reasons:",
+    ])
+    for item in preset_confidence_reasons(engine, preset, reason):
+        lines.append(f"- {item}")
+    lines.extend([
         "preview:",
     ])
     for item in preset_env_diff(
