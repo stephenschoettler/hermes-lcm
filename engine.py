@@ -1435,7 +1435,7 @@ class LCMEngine(ContextEngine):
                         or generated_volatile_placeholder
                     ):
                         dropped_ignored_backlog = True
-                        if role in {"user", "tool", "assistant"}:
+                        if role in {"user", "system", "tool", "assistant"}:
                             drop_dependent_reply = True
                         continue
                     if generated_dependent_reply:

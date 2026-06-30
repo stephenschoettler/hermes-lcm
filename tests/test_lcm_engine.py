@@ -5076,6 +5076,35 @@ class TestMessageFiltering:
         node_with_dependent = next(node for node in nodes if dependent_ids[0] in node.source_ids)
         assert node_with_dependent.source_token_count >= count_messages_tokens([dependent_message])
 
+    def test_dependent_assistant_reply_to_ignored_system_backlog_is_not_summarized(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_system_dependent_reply.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs["text"]
+            return "visible backlog summary\n[Expand for details: visible backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "system", "content": "public system prompt"},
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "system", "content": "SECRET ignored system instruction"},
+            {"role": "assistant", "content": "assistant reply derived from ignored system secret " + "d" * 500},
+            {"role": "user", "content": "fresh tail request"},
+        ]
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert "visible backlog objective" in captured["text"]
+        assert "assistant reply derived from ignored system" not in captured["text"]
+        assert "SECRET" not in captured["text"]
+
     def test_trailing_dependent_reply_is_consumed_with_selected_visible_chunk(self, tmp_path, monkeypatch):
         engine = self._make_engine(
             tmp_path,
