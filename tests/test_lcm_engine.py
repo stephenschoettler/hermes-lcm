@@ -5185,6 +5185,7 @@ class TestMessageFiltering:
         )
         try:
             second.on_session_start("session", platform="telegram", context_length=1000)
+            assert second._latest_user_context_anchor([stored_externalized_row], []) is None
             captured: dict[str, str] = {}
 
             def summary(**kwargs):

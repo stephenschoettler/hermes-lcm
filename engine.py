@@ -6001,10 +6001,15 @@ class LCMEngine(ContextEngine):
             if not isinstance(message, dict):
                 continue
             content_text = text_content_for_pattern_matching(message.get("content")) or ""
-            if self._matches_ignore_message_patterns(message) or self._is_volatile_ignored_quarantine_placeholder(
-                message,
-                content_text,
-            ) or self._is_ignored_active_replay_placeholder(message, content_text):
+            if (
+                self._matches_ignore_message_patterns(message)
+                or self._mapped_stored_row_matches_ignore_message_patterns(message)
+                or self._is_volatile_ignored_quarantine_placeholder(
+                    message,
+                    content_text,
+                )
+                or self._is_ignored_active_replay_placeholder(message, content_text)
+            ):
                 continue
             sanitized_preserved_objective = self._sanitized_preserved_objective_context_content(message)
             if sanitized_preserved_objective:
