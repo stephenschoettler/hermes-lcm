@@ -46,6 +46,7 @@ from .extraction import (
 from .ingest_protection import (
     _json_has_duplicate_object_keys,
     assistant_output_quarantine_reason,
+    extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
@@ -541,6 +542,7 @@ class LCMEngine(ContextEngine):
         # keep anchoring opt-in rather than changing its public behavior.
         self._pending_context_anchor_messages: Optional[List[Dict[str, Any]]] = None
         self._current_compress_store_ids_by_message_id: dict[int, int] = {}
+        self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
@@ -1099,10 +1101,18 @@ class LCMEngine(ContextEngine):
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
             return False
-        return any(
-            self._matches_ignore_message_patterns(msg)
-            for msg in messages[leading_anchor_count:fresh_tail_start]
+        previous_store_id_map = self._current_compress_store_ids_by_message_id
+        self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(
+            messages[leading_anchor_count:fresh_tail_start]
         )
+        try:
+            return any(
+                self._matches_ignore_message_patterns(msg)
+                or self._mapped_stored_row_matches_ignore_message_patterns(msg)
+                for msg in messages[leading_anchor_count:fresh_tail_start]
+            )
+        finally:
+            self._current_compress_store_ids_by_message_id = previous_store_id_map
 
     def _leaf_compaction_candidate_status(
         self,
@@ -1146,6 +1156,7 @@ class LCMEngine(ContextEngine):
                     )
                     if (
                         self._matches_ignore_message_patterns(msg)
+                        or self._mapped_stored_row_matches_ignore_message_patterns(msg)
                         or self._is_ignored_active_replay_placeholder(msg, content_text)
                         or generated_volatile_placeholder
                     ):
@@ -1372,6 +1383,7 @@ class LCMEngine(ContextEngine):
 
         noop_reason = "no eligible raw backlog outside fresh tail"
         dependent_reply_message_ids: set[int] = set()
+        preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
             n = len(working_messages)
@@ -1469,16 +1481,22 @@ class LCMEngine(ContextEngine):
                     fresh_tail_start = max(0, n - self._config.fresh_tail_count)
                 if drop_dependent_reply_into_tail:
                     tail_scan_start = max(fresh_tail_start, leading_anchor_count)
+                    pending_tail_dependents: list[tuple[Dict[str, Any], str]] = []
+                    saw_tail_boundary = False
                     for tail_msg in working_messages[tail_scan_start:]:
                         if not isinstance(tail_msg, dict):
                             continue
                         tail_role = str(tail_msg.get("role") or "")
                         if tail_role in {"user", "system"}:
+                            saw_tail_boundary = True
                             break
                         if tail_role in {"assistant", "tool"}:
                             tail_text = text_content_for_pattern_matching(tail_msg.get("content")) or ""
-                            dependent_reply_message_ids.add(id(tail_msg))
                             self._remember_generated_ignored_dependent_reply(tail_msg, tail_text)
+                            pending_tail_dependents.append((tail_msg, tail_text))
+                    if saw_tail_boundary or leading_anchor_count > 0 or kept_working:
+                        for tail_msg, _tail_text in pending_tail_dependents:
+                            dependent_reply_message_ids.add(id(tail_msg))
                 if dropped_ignored_backlog and fresh_tail_start <= leading_anchor_count:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
@@ -1630,21 +1648,25 @@ class LCMEngine(ContextEngine):
                     compressed,
                     assembly_cap_override=recovery_assembly_cap,
                 )
+            active_context_messages = self._drop_preexisting_generated_ignored_dependent_eof_replies(
+                working_messages,
+                preexisting_dependent_reply_records,
+            )
             if dropped_replayed_scaffold_messages:
-                leading_anchor_count = self._leading_anchor_count(working_messages)
+                leading_anchor_count = self._leading_anchor_count(active_context_messages)
                 anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
                 self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
                 try:
                     sanitized_messages = self._assemble_context(
-                        working_messages[0] if leading_anchor_count else None,
-                        working_messages[leading_anchor_count:],
+                        active_context_messages[0] if leading_anchor_count else None,
+                        active_context_messages[leading_anchor_count:],
                         assembly_cap_override=recovery_assembly_cap,
                     )
                 finally:
                     self._pending_context_anchor_messages = None
             else:
                 sanitized_messages = self._sanitize_active_context_messages(
-                    working_messages,
+                    active_context_messages,
                     insert_missing_tool_stubs=False,
                 )
             if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
@@ -3242,14 +3264,22 @@ class LCMEngine(ContextEngine):
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
-    def _stored_row_externalized_text_for_pattern_matching(self, msg: Dict[str, Any]) -> str:
+    def _stored_row_externalized_text_parts_for_pattern_matching(self, msg: Dict[str, Any]) -> list[str]:
+        ref_sources: list[str] = []
         content = msg.get("content")
-        if not isinstance(content, str):
-            return ""
-        refs = extract_ingest_externalized_refs(content)
-        legacy_ref = extract_externalized_ref(content)
-        if legacy_ref and legacy_ref not in refs:
-            refs.append(legacy_ref)
+        if isinstance(content, str):
+            ref_sources.append(content)
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            try:
+                ref_sources.append(json.dumps(tool_calls, ensure_ascii=False))
+            except (TypeError, ValueError):
+                ref_sources.append(str(tool_calls))
+        refs: list[str] = []
+        for source in ref_sources:
+            for ref in extract_all_externalized_payload_refs(source):
+                if ref not in refs:
+                    refs.append(ref)
         parts: list[str] = []
         session_id = str(msg.get("session_id") or self._session_id or "")
         for ref in refs:
@@ -3266,7 +3296,10 @@ class LCMEngine(ContextEngine):
             payload_content = payload.get("content")
             if isinstance(payload_content, str):
                 parts.append(payload_content)
-        return "\n".join(parts)
+        return parts
+
+    def _stored_row_externalized_text_for_pattern_matching(self, msg: Dict[str, Any]) -> str:
+        return "\n".join(self._stored_row_externalized_text_parts_for_pattern_matching(msg))
 
     @staticmethod
     def _is_volatile_ignored_quarantine_placeholder(msg: Dict[str, Any], text: str) -> bool:
@@ -3870,6 +3903,79 @@ class LCMEngine(ContextEngine):
         self._write_generated_ignored_dependent_reply_records(records)
         return True
 
+    def _matches_preexisting_generated_ignored_dependent_reply(
+        self,
+        msg: Dict[str, Any],
+        text: str,
+        records: list[dict[str, str]],
+    ) -> bool:
+        store_digest = self._ignored_dependent_reply_store_fingerprint(msg)
+        content_digest = self._ignored_dependent_reply_content_fingerprint(msg, text)
+        if store_digest and any(record.get("store") == store_digest for record in records):
+            return True
+        if not content_digest:
+            return False
+        pending_index = next(
+            (
+                idx
+                for idx, record in enumerate(records)
+                if record.get("content") == content_digest and not record.get("store")
+            ),
+            None,
+        )
+        if pending_index is None:
+            return False
+        records.pop(pending_index)
+        if store_digest:
+            records.append({"store": store_digest, "content": content_digest})
+        live_records = self._load_generated_ignored_dependent_reply_records()
+        live_pending_index = next(
+            (
+                idx
+                for idx, record in enumerate(live_records)
+                if record.get("content") == content_digest and not record.get("store")
+            ),
+            None,
+        )
+        if live_pending_index is not None:
+            live_records.pop(live_pending_index)
+            if store_digest:
+                live_records.append({"store": store_digest, "content": content_digest})
+            self._write_generated_ignored_dependent_reply_records(live_records)
+        return True
+
+    def _drop_preexisting_generated_ignored_dependent_eof_replies(
+        self,
+        messages: List[Dict[str, Any]],
+        records: list[dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        if not records or not messages:
+            return messages
+        previous_store_id_map = self._current_compress_store_ids_by_message_id
+        self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
+        try:
+            drop_from = len(messages)
+            idx = len(messages) - 1
+            while idx >= 0:
+                msg = messages[idx]
+                role = str(msg.get("role") or "")
+                if role not in {"assistant", "tool"}:
+                    break
+                text = text_content_for_pattern_matching(msg.get("content")) or ""
+                if not self._matches_preexisting_generated_ignored_dependent_reply(
+                    msg,
+                    text,
+                    records,
+                ):
+                    break
+                drop_from = idx
+                idx -= 1
+            if drop_from == len(messages):
+                return messages
+            return messages[:drop_from]
+        finally:
+            self._current_compress_store_ids_by_message_id = previous_store_id_map
+
     def _remember_generated_ignored_dependent_reply(self, msg: Dict[str, Any], text: str) -> None:
         store_digest = self._ignored_dependent_reply_store_fingerprint(msg)
         content_digest = self._ignored_dependent_reply_content_fingerprint(msg, text)
@@ -3891,17 +3997,44 @@ class LCMEngine(ContextEngine):
         if matches_message_pattern(text, self._compiled_ignore_message_patterns):
             return True
         if stored_row:
-            externalized_text = self._stored_row_externalized_text_for_pattern_matching(msg)
+            externalized_parts = self._stored_row_externalized_text_parts_for_pattern_matching(msg)
+            for externalized_text in externalized_parts:
+                if externalized_text and matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns):
+                    return True
+            externalized_text = "\n".join(externalized_parts)
             if externalized_text and externalized_text != text:
                 return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
         return False
 
+    def _content_has_externalized_placeholder_ref(self, content: str) -> bool:
+        return bool(extract_externalized_ref(content) or extract_ingest_externalized_refs(content))
+
+    def _has_prior_raw_externalized_placeholder_row(self, store_id: int, msg: Dict[str, Any]) -> bool:
+        if not self._session_id:
+            return False
+        raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
+        for row in self._store.get_session_messages(self._session_id):
+            row_store_id = int(row.get("store_id") or 0)
+            if row_store_id >= store_id:
+                break
+            if self._raw_externalized_placeholder_replay_identity(row) == raw_identity:
+                return True
+        return False
+
     def _mapped_stored_row_matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
         store_id = msg.get("store_id")
+        content = normalize_content_value(msg.get("content")) or ""
+        has_externalized_placeholder = self._content_has_externalized_placeholder_ref(content)
+        mapped_from_active_placeholder = False
         if store_id is None:
             store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
+            mapped_from_active_placeholder = has_externalized_placeholder and store_id is not None
         if store_id is None:
             return False
+        if mapped_from_active_placeholder and self._has_prior_raw_externalized_placeholder_row(int(store_id), msg):
+            raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
+            if self._current_compress_placeholder_identity_counts.get(raw_identity, 0) <= 1:
+                return False
         try:
             stored = self._store.get(int(store_id))
         except Exception:
@@ -3955,9 +4088,6 @@ class LCMEngine(ContextEngine):
                     "role": "assistant",
                     "content": placeholder,
                 }
-                tool_calls = replay_msg.get("tool_calls") or original_msg.get("tool_calls")
-                if tool_calls:
-                    active_message["tool_calls"] = tool_calls
             elif original_role == "system":
                 active_message = {"role": "system", "content": placeholder}
             else:
@@ -4714,8 +4844,17 @@ class LCMEngine(ContextEngine):
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
-            for idx in range(scan_start, n):
-                ignored_original_messages[idx] = self._matches_ignore_message_patterns(messages[idx])
+            previous_store_id_map = self._current_compress_store_ids_by_message_id
+            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
+            try:
+                for idx in range(scan_start, n):
+                    mapped_ignore = self._mapped_stored_row_matches_ignore_message_patterns(messages[idx])
+                    ignored_original_messages[idx] = (
+                        self._matches_ignore_message_patterns(messages[idx])
+                        or mapped_ignore
+                    )
+            finally:
+                self._current_compress_store_ids_by_message_id = previous_store_id_map
         externalize_messages = [False] * n
         prefer_existing_externalized = [False] * n
         for idx in range(scan_start, n):
@@ -4844,7 +4983,7 @@ class LCMEngine(ContextEngine):
                     self._compression_boundary_active_placeholder_digest_budget = adjusted_budget
             empty_session_all_placeholder_replay_batch = (
                 bool(empty_session_placeholder_ordinals)
-                and bool(new_messages)
+                and len(new_messages) > 1
                 and all(
                     self._is_ignored_active_replay_placeholder(
                         msg,
@@ -5037,6 +5176,14 @@ class LCMEngine(ContextEngine):
             "[Externalized payload: kind=raw_payload;"
         )
 
+    def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
+        return (
+            str(msg.get("role") or "unknown"),
+            normalize_content_value(msg.get("content")) or "",
+            self._stable_tool_calls_identity(msg.get("tool_calls")),
+            str(msg.get("tool_call_id") or ""),
+        )
+
     def _get_store_id_map_for_messages(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
         """Map current raw message objects back to store_ids in stable order.
 
@@ -5101,9 +5248,40 @@ class LCMEngine(ContextEngine):
                 if surplus_count > 0:
                     active_surplus_skips[identity] = surplus_count
 
+        placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
+        for msg in messages:
+            msg_content = normalize_content_value(msg.get("content")) or ""
+            if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
+                raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
+                placeholder_identity_counts[raw_identity] = placeholder_identity_counts.get(raw_identity, 0) + 1
+        self._current_compress_placeholder_identity_counts = placeholder_identity_counts
+
         ids_by_message_id: dict[int, int] = {}
         store_idx = 0
         for msg in messages:
+            msg_content = normalize_content_value(msg.get("content")) or ""
+            if msg.get("store_id") is None and self._content_has_externalized_placeholder_ref(msg_content):
+                raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
+                if placeholder_identity_counts.get(raw_identity, 0) > 1:
+                    probe_idx = store_idx
+                    while probe_idx < len(candidates):
+                        stored = candidates[probe_idx]
+                        if self._raw_externalized_placeholder_replay_identity(stored) == raw_identity:
+                            ids_by_message_id[id(msg)] = stored["store_id"]
+                            store_idx = probe_idx + 1
+                            break
+                        probe_idx += 1
+                else:
+                    probe_idx = len(candidates) - 1
+                    while probe_idx >= store_idx:
+                        stored = candidates[probe_idx]
+                        if self._raw_externalized_placeholder_replay_identity(stored) == raw_identity:
+                            ids_by_message_id[id(msg)] = stored["store_id"]
+                            store_idx = probe_idx + 1
+                            break
+                        probe_idx -= 1
+                if id(msg) in ids_by_message_id:
+                    continue
             message_identity = self._message_replay_identity(msg)
             if id(msg) in generated_surplus_skip_message_ids:
                 continue

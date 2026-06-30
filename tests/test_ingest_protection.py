@@ -3280,7 +3280,7 @@ def test_existing_quarantined_assistant_row_rebinds_after_ignore_pattern_added(t
 
     second_rows = second._store.get_session_messages(second.current_session_id)
     assert [row["role"] for row in second_rows] == ["system", "assistant", "user"]
-    assert "assistant output quarantined" in str(second_active[1].get("content", ""))
+    assert "LCM active replay placeholder: message ignored" in str(second_active[1].get("content", ""))
     assert BROKEN_ASSISTANT_MARKER not in str(second_active[1].get("content", ""))
 
 

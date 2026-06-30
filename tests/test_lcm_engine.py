@@ -17,6 +17,7 @@ from agent.context_engine import ContextEngine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.externalize import externalize_ingest_payload
 from hermes_lcm.tokens import count_message_tokens, count_messages_tokens
 
 
@@ -4482,7 +4483,7 @@ class TestMessageFiltering:
             second.on_session_start("session", platform="telegram", context_length=1000)
             second._ingest_messages([{"role": "user", "content": placeholder}])
 
-            assert second._store.get_session_messages("session") == []
+            assert second._store.get_session_messages("session")[0]["content"] == placeholder
             assert second._ingest_cursor == 1
         finally:
             second.shutdown()
@@ -5155,6 +5156,655 @@ class TestMessageFiltering:
             assert ignored_store_id not in nodes[0].source_ids
         finally:
             second.shutdown()
+
+    def test_preflight_filters_stored_externalized_rows_ignored_by_current_filter(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_externalized_preflight.db"
+        hermes_home = tmp_path / "hermes-externalized-preflight"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10_000,
+                context_threshold=0.01,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        ignored_store_id = first._store.append(
+            "session",
+            {"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200},
+        )
+        stored_externalized_row = first._store.get(ignored_store_id)
+        assert stored_externalized_row is not None
+        assert "Externalized payload:" in stored_externalized_row["content"]
+        assert "SECRET_PAYLOAD_MARKER" not in stored_externalized_row["content"]
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10_000,
+                context_threshold=0.01,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            messages = [
+                stored_externalized_row,
+                {"role": "assistant", "content": "fresh tail response " + "f" * 200},
+            ]
+
+            assert second.should_compress_preflight(messages) is True
+            rows = second._store.get_session_messages("session")
+            assert [row["store_id"] for row in rows] == [ignored_store_id, ignored_store_id + 1]
+            assert rows[1]["content"].startswith("fresh tail response")
+
+            result = second.compress(messages, current_tokens=count_messages_tokens(messages))
+            result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+            assert "Externalized payload:" not in result_text
+            assert "SECRET_PAYLOAD_MARKER" not in result_text
+        finally:
+            second.shutdown()
+
+    def test_user_copied_externalized_placeholder_after_ignored_externalized_row_is_not_filtered(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "lcm_msg_ignore_externalized_literal_copy.db"
+        hermes_home = tmp_path / "hermes-externalized-literal-copy"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        ignored_store_id = first._store.append(
+            "session",
+            {"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200},
+        )
+        stored_externalized_row = first._store.get(ignored_store_id)
+        assert stored_externalized_row is not None
+        placeholder_literal = stored_externalized_row["content"]
+        assert "Externalized payload:" in placeholder_literal
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            captured: dict[str, str] = {}
+
+            def summary(**kwargs):
+                captured["text"] = kwargs["text"]
+                return "literal externalized placeholder summary\n[Expand for details: literal externalized placeholder]", 1
+
+            monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+            messages = [
+                {"role": "user", "content": placeholder_literal},
+                {"role": "user", "content": "visible backlog objective " + "v" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ]
+            second.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            rows = second._store.get_session_messages("session")
+            assert rows[1]["content"].startswith("visible backlog objective")
+            assert "Externalized payload:" not in captured["text"]
+            assert "visible backlog objective" in captured["text"]
+            assert "SECRET_PAYLOAD_MARKER" not in captured["text"]
+            nodes = second._dag.get_session_nodes("session")
+            assert nodes
+            assert ignored_store_id not in nodes[0].source_ids
+        finally:
+            second.shutdown()
+
+    def test_duplicate_stored_externalized_rows_ignored_by_current_filter_are_all_filtered(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "lcm_msg_ignore_duplicate_externalized_replay.db"
+        hermes_home = tmp_path / "hermes-duplicate-externalized-replay"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        payload = "SECRET_PAYLOAD_MARKER duplicated externalized row " + "x" * 200
+        first._store.append("session", {"role": "user", "content": payload})
+        first._store.append("session", {"role": "user", "content": payload})
+        rows = first._store.get_session_messages("session")
+        assert len(rows) == 2
+        assert rows[0]["content"] == rows[1]["content"]
+        assert "Externalized payload:" in rows[0]["content"]
+        placeholder_literal = rows[0]["content"]
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            captured: dict[str, str] = {}
+
+            def summary(**kwargs):
+                captured["text"] = kwargs["text"]
+                return "visible summary\n[Expand for details: visible summary]", 1
+
+            monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+            messages = [
+                {"role": "user", "content": placeholder_literal},
+                {"role": "user", "content": placeholder_literal},
+                {"role": "user", "content": "visible backlog objective " + "v" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ]
+            second.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            stored_after = second._store.get_session_messages("session")
+            externalized_rows = [row for row in stored_after if row["content"].startswith("[Externalized payload:")]
+            assert [row["store_id"] for row in externalized_rows] == [rows[0]["store_id"], rows[1]["store_id"]]
+            assert "visible backlog objective" in captured["text"]
+            assert "Externalized payload:" not in captured["text"]
+            assert "SECRET_PAYLOAD_MARKER" not in captured["text"]
+            nodes = second._dag.get_session_nodes("session")
+            assert nodes
+            assert rows[0]["store_id"] not in nodes[0].source_ids
+            assert rows[1]["store_id"] not in nodes[0].source_ids
+        finally:
+            second.shutdown()
+
+    def test_tool_call_externalized_payload_hidden_text_is_ignored_by_current_filter(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "lcm_msg_ignore_tool_call_externalized_payload.db"
+        hermes_home = tmp_path / "hermes-tool-call-externalized-ignore"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                large_output_externalization_path=str(tmp_path / "externalized"),
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        externalized = externalize_ingest_payload(
+            "DROP_TOOL_CALL_SECRET hidden argument " + "x" * 200,
+            role="assistant",
+            session_id="session",
+            field_path="tool_calls[0].function.arguments",
+            config=first._config,
+            hermes_home=str(hermes_home),
+        )
+        assert externalized is not None
+        ignored_store_id = first._store.append(
+            "session",
+            {
+                "role": "assistant",
+                "content": "visible assistant tool call",
+                "tool_calls": [
+                    {
+                        "id": "call_secret",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": externalized["placeholder"]},
+                    }
+                ],
+            },
+        )
+        stored_row = first._store.get(ignored_store_id)
+        assert stored_row is not None
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["DROP_TOOL_CALL_SECRET"],
+                large_output_externalization_path=str(tmp_path / "externalized"),
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            captured: dict[str, str] = {}
+
+            def summary(**kwargs):
+                captured["text"] = kwargs["text"]
+                return "visible summary\n[Expand for details: visible summary]", 1
+
+            monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+            messages = [
+                stored_row,
+                {"role": "user", "content": "visible backlog objective " + "v" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ]
+            second.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            assert "visible backlog objective" in captured["text"]
+            assert "visible assistant tool call" not in captured["text"]
+            assert "DROP_TOOL_CALL_SECRET" not in captured["text"]
+            nodes = second._dag.get_session_nodes("session")
+            assert nodes
+            assert ignored_store_id not in nodes[0].source_ids
+        finally:
+            second.shutdown()
+
+    def test_ignored_tool_call_externalized_payload_active_replay_drops_tool_refs(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_tool_call_externalized_active_replay.db"
+        hermes_home = tmp_path / "hermes-tool-call-externalized-active-replay"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10_000,
+                large_output_externalization_path=str(tmp_path / "externalized"),
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        externalized = externalize_ingest_payload(
+            "DROP_TOOL_CALL_SECRET hidden argument " + "x" * 200,
+            role="assistant",
+            session_id="session",
+            field_path="tool_calls[0].function.arguments",
+            config=first._config,
+            hermes_home=str(hermes_home),
+        )
+        assert externalized is not None
+        ignored_store_id = first._store.append(
+            "session",
+            {
+                "role": "assistant",
+                "content": "visible assistant tool call",
+                "tool_calls": [
+                    {
+                        "id": "call_secret",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": externalized["placeholder"]},
+                    }
+                ],
+            },
+        )
+        stored_row = first._store.get(ignored_store_id)
+        assert stored_row is not None
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=10,
+                leaf_chunk_tokens=10_000,
+                ignore_message_patterns=["DROP_TOOL_CALL_SECRET"],
+                large_output_externalization_path=str(tmp_path / "externalized"),
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            result = second.compress(
+                [
+                    stored_row,
+                    {"role": "tool", "tool_call_id": "call_secret", "content": "tool result"},
+                    {"role": "user", "content": "fresh visible request"},
+                ],
+                current_tokens=10_000,
+            )
+            result_text = json.dumps(result, ensure_ascii=False)
+            assert "Externalized LCM ingest payload:" not in result_text
+            assert "DROP_TOOL_CALL_SECRET" not in result_text
+            assert all(not msg.get("tool_calls") for msg in result)
+        finally:
+            second.shutdown()
+
+    def test_tool_call_multiple_externalized_payload_parts_are_matched_individually(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_tool_call_externalized_parts.db"
+        hermes_home = tmp_path / "hermes-tool-call-externalized-parts"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                large_output_externalization_path=str(tmp_path / "externalized"),
+                ignore_message_patterns=[r"^DROP_TOOL_CALL_SECRET"],
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            engine.on_session_start("session", platform="telegram", context_length=1000)
+            first_payload = externalize_ingest_payload(
+                "benign hidden argument " + "b" * 100,
+                role="assistant",
+                session_id="session",
+                field_path="tool_calls[0].function.arguments.first",
+                config=engine._config,
+                hermes_home=str(hermes_home),
+            )
+            second_payload = externalize_ingest_payload(
+                "DROP_TOOL_CALL_SECRET second hidden argument " + "x" * 100,
+                role="assistant",
+                session_id="session",
+                field_path="tool_calls[0].function.arguments.second",
+                config=engine._config,
+                hermes_home=str(hermes_home),
+            )
+            assert first_payload is not None and second_payload is not None
+            row = {
+                "session_id": "session",
+                "role": "assistant",
+                "content": "visible assistant tool call",
+                "tool_calls": [
+                    {
+                        "id": "call_secret",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": json.dumps(
+                                {
+                                    "first": first_payload["placeholder"],
+                                    "second": second_payload["placeholder"],
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+            assert engine._matches_ignore_message_patterns(row, stored_row=True) is True
+        finally:
+            engine.shutdown()
+
+    def test_active_externalized_stub_without_store_id_is_filtered_after_ignore_added(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_externalized_active_stub.db"
+        hermes_home = tmp_path / "hermes-externalized-active-stub"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10_000,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            first.on_session_start("session", platform="telegram", context_length=1000)
+            active = first.compress(
+                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
+                current_tokens=10_000,
+            )
+            active_stub = {"role": "user", "content": active[0]["content"]}
+            ignored_store_id = first._store.get_session_messages("session")[0]["store_id"]
+            assert "Externalized payload:" in active_stub["content"]
+        finally:
+            first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10_000,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            messages = [active_stub, {"role": "assistant", "content": "fresh tail response"}]
+            result = second.compress(messages, current_tokens=10_000)
+            result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+            assert "Externalized payload:" not in result_text
+            rows = second._store.get_session_messages("session")
+            assert [row["store_id"] for row in rows] == [ignored_store_id, ignored_store_id + 1]
+        finally:
+            second.shutdown()
+
+    def test_active_externalized_stub_followed_by_user_is_not_re_stored_after_ignore_added(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_externalized_active_stub_then_user.db"
+        hermes_home = tmp_path / "hermes-externalized-active-stub-then-user"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10_000,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            first.on_session_start("session", platform="telegram", context_length=1000)
+            active = first.compress(
+                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
+                current_tokens=10_000,
+            )
+            active_stub = {"role": "user", "content": active[0]["content"]}
+            ignored_store_id = first._store.get_session_messages("session")[0]["store_id"]
+        finally:
+            first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10_000,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            messages = [active_stub, {"role": "user", "content": "fresh visible request"}]
+            result = second.compress(messages, current_tokens=10_000)
+            result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+            assert "Externalized payload:" not in result_text
+            rows = second._store.get_session_messages("session")
+            assert [row["store_id"] for row in rows] == [ignored_store_id, ignored_store_id + 1]
+            assert rows[1]["content"] == "fresh visible request"
+        finally:
+            second.shutdown()
+
+    def test_copied_ingest_externalized_placeholder_literal_keeps_source_lineage(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "lcm_msg_ignore_ingest_externalized_literal_copy.db"
+        hermes_home = tmp_path / "hermes-ingest-externalized-literal-copy"
+        engine = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                large_output_externalization_path=str(tmp_path / "externalized"),
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            engine.on_session_start("session", platform="telegram", context_length=1000)
+            externalized = externalize_ingest_payload(
+                "DROP: copied ingest placeholder payload " + "x" * 200,
+                role="user",
+                session_id="session",
+                field_path="content",
+                config=engine._config,
+                hermes_home=str(hermes_home),
+            )
+            assert externalized is not None
+            placeholder_literal = externalized["placeholder"]
+            captured: dict[str, str] = {}
+
+            def summary(**kwargs):
+                captured["text"] = kwargs["text"]
+                return "literal ingest placeholder summary\n[Expand for details: literal ingest placeholder]", 1
+
+            monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+            messages = [
+                {"role": "user", "content": placeholder_literal},
+                {"role": "user", "content": "visible backlog objective " + "v" * 200},
+                {"role": "assistant", "content": "fresh tail response"},
+            ]
+            engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            rows = engine._store.get_session_messages("session")
+            assert rows[0]["content"] == placeholder_literal
+            assert placeholder_literal in captured["text"]
+            assert "visible backlog objective" in captured["text"]
+            nodes = engine._dag.get_session_nodes("session")
+            assert nodes
+            assert rows[0]["store_id"] in nodes[0].source_ids
+        finally:
+            engine.shutdown()
+
+    def test_known_ignored_eof_dependent_reply_is_removed_from_noop_active_context(
+        self, tmp_path, monkeypatch
+    ):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_eof_dependent_system_anchor.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        dependent_reply = "dependent reply from ignored turn"
+
+        def summary(**kwargs):
+            return "visible summary\n[Expand for details: visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+        first_result = engine.compress(
+            [
+                {"role": "system", "content": "system anchor"},
+                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored turn"},
+                {"role": "assistant", "content": dependent_reply},
+            ],
+            current_tokens=10_000,
+        )
+        assert dependent_reply in "\n".join(str(msg.get("content", "")) for msg in first_result)
+        assert engine._load_generated_ignored_dependent_reply_hashes()
+
+        result = engine.compress(first_result, current_tokens=count_messages_tokens(first_result))
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+        rows_text = "\n".join(row["content"] for row in engine._store.get_session_messages("user-123"))
+
+        assert "system anchor" in result_text
+        assert "SECRET" not in result_text
+        assert dependent_reply not in result_text
+        assert dependent_reply in rows_text
+
+    def test_singleton_copied_externalized_placeholder_after_ignored_row_is_lossless(self, tmp_path):
+        db_path = tmp_path / "lcm_msg_ignore_externalized_singleton_literal_copy.db"
+        hermes_home = tmp_path / "hermes-externalized-singleton-literal-copy"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        ignored_store_id = first._store.append(
+            "session",
+            {"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200},
+        )
+        stored_externalized_row = first._store.get(ignored_store_id)
+        assert stored_externalized_row is not None
+        placeholder_literal = stored_externalized_row["content"]
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=10,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        try:
+            second.on_session_start("session", platform="telegram", context_length=1000)
+            result = second.compress(
+                [{"role": "user", "content": placeholder_literal}],
+                current_tokens=10_000,
+            )
+
+            rows = second._store.get_session_messages("session")
+            result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+            assert [row["store_id"] for row in rows] == [ignored_store_id]
+            assert "Externalized payload:" not in result_text
+            assert "SECRET_PAYLOAD_MARKER" not in result_text
+        finally:
+            second.shutdown()
+
+    def test_known_ignored_eof_dependent_reply_after_visible_user_without_system_is_removed(
+        self, tmp_path, monkeypatch
+    ):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_eof_dependent_no_system_visible_prefix.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        dependent_reply = "dependent reply from ignored turn"
+
+        def summary(**kwargs):
+            return "visible summary\n[Expand for details: visible]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+        first_result = engine.compress(
+            [
+                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+                {"role": "user", "content": "SECRET ignored turn"},
+                {"role": "assistant", "content": dependent_reply},
+            ],
+            current_tokens=10_000,
+        )
+        assert dependent_reply in "\n".join(str(msg.get("content", "")) for msg in first_result)
+        assert engine._load_generated_ignored_dependent_reply_hashes()
+
+        result = engine.compress(first_result, current_tokens=count_messages_tokens(first_result))
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+        rows_text = "\n".join(row["content"] for row in engine._store.get_session_messages("user-123"))
+
+        assert "visible summary" in result_text
+        assert "SECRET" not in result_text
+        assert dependent_reply not in result_text
+        assert dependent_reply in rows_text
 
     def test_dependent_assistant_reply_to_ignored_backlog_is_not_summarized(self, tmp_path, monkeypatch):
         engine = self._make_engine(
@@ -6116,9 +6766,8 @@ class TestMessageFiltering:
 
         assert result[0]["role"] == "assistant"
         assert "LCM active replay placeholder: message ignored" in str(result[0].get("content", ""))
-        assert result[0].get("tool_calls") == replay_messages[0]["tool_calls"]
-        assert result[0].get("tool_calls") != messages[0]["tool_calls"]
-        assert "sk-ignore" not in str(result[0].get("tool_calls", ""))
+        assert result[0].get("tool_calls") is None
+        assert "sk-ignore" not in json.dumps(result, ensure_ascii=False)
         assert "api_key" not in str(result[0].get("content", ""))
 
     def test_empty_ingest_clears_compression_boundary_replay_flag(self, tmp_path):
