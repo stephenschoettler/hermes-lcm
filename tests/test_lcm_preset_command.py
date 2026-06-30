@@ -3,7 +3,7 @@
 from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.presets import preset_status_payload
+from hermes_lcm.presets import get_preset, preset_match_confidence, preset_status_payload
 
 
 _PRESET_ENV_VARS = (
@@ -164,6 +164,37 @@ def test_lcm_preset_suggest_reports_benchmark_backed_route_confidence_when_host_
     assert "provider=openai-codex; model=gpt-5.3-codex-spark" in result
     assert payload["match_confidence"] == "benchmark-backed-route"
     assert any("benchmark evidence: score=92.941" in reason for reason in payload["confidence_reasons"])
+
+
+def test_lcm_preset_suggest_keeps_non_spark_gpt5_128k_context_only(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    engine = _engine(tmp_path, context_length=128_000)
+    engine.update_model(
+        model="gpt-5",
+        provider="openai-codex",
+        context_length=128_000,
+    )
+
+    result = handle_lcm_command("preset suggest", engine)
+    payload = preset_status_payload(engine, environ={})
+
+    assert "suggested_preset: codex_spark_context" in result
+    assert "match_confidence: context-only" in result
+    assert "provider/model family was not verified by host metadata" in result
+    assert payload["match_confidence"] == "context-only"
+    assert any("provider/model family was not verified" in reason for reason in payload["confidence_reasons"])
+
+
+def test_lcm_preset_confidence_does_not_treat_spark_route_as_long_context_match(tmp_path, monkeypatch):
+    _clear_preset_env(monkeypatch)
+    engine = _engine(tmp_path, context_length=272_000)
+    engine.update_model(
+        model="gpt-5.3-codex-spark",
+        provider="openai-codex",
+        context_length=272_000,
+    )
+
+    assert preset_match_confidence(engine, get_preset("codex_gpt_long_context")) == "context-only"
 
 
 def test_lcm_preset_suggest_declines_unbenchmarked_context_window(tmp_path):

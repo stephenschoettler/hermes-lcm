@@ -204,7 +204,12 @@ def preset_match_confidence(engine: Any, preset: LCMPreset | None = None) -> str
         return "none"
     provider = str(getattr(engine, "provider", "") or "").strip().lower()
     model = str(getattr(engine, "model", "") or "").strip().lower()
-    if provider == "openai-codex" and ("codex" in model or "gpt-5" in model):
+    is_spark_route = "gpt-5.3-codex-spark" in model
+    if preset.name == "codex_spark_context":
+        if provider == "openai-codex" and is_spark_route:
+            return "benchmark-backed-route"
+        return "context-only"
+    if provider == "openai-codex" and not is_spark_route and ("codex" in model or "gpt-5" in model):
         return "benchmark-backed-route"
     return "context-only"
 
