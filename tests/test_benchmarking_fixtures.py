@@ -83,6 +83,29 @@ def test_fixture_expands_scrubbed_benchmark_repeat_markers():
     assert fixture.messages[2]["content"].endswith("[scrubbed benchmark repeat 003/003]")
 
 
+@pytest.mark.parametrize("repeat", [3, "3", 3.0])
+def test_fixture_accepts_integral_benchmark_repeat_markers(repeat):
+    fixture = fixture_from_dict({
+        "name": "repeat_shape",
+        "messages": [
+            {"role": "user", "content": "repeat me", "benchmark_repeat": repeat},
+        ],
+    })
+
+    assert len(fixture.messages) == 3
+
+
+@pytest.mark.parametrize("repeat", [1.9, "1.9", True])
+def test_fixture_rejects_non_integer_benchmark_repeat_markers(repeat):
+    with pytest.raises(ValueError, match="benchmark_repeat must be an integer"):
+        fixture_from_dict({
+            "name": "fractional_repeat",
+            "messages": [
+                {"role": "user", "content": "repeat me", "benchmark_repeat": repeat},
+            ],
+        })
+
+
 def test_fixture_rejects_unbounded_benchmark_repeat_marker():
     with pytest.raises(ValueError, match="benchmark_repeat exceeds maximum"):
         fixture_from_dict({

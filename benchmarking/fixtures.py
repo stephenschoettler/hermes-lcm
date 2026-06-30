@@ -51,10 +51,16 @@ def _expand_benchmark_repeated_messages(messages: list[dict[str, Any]]) -> list[
     expanded: list[dict[str, Any]] = []
     for message in messages:
         raw_repeat = message.get("benchmark_repeat", 1)
+        if isinstance(raw_repeat, bool):
+            raise ValueError("benchmark_repeat must be an integer")
+        if isinstance(raw_repeat, str) and not re.fullmatch(r"[+-]?\d+", raw_repeat.strip()):
+            raise ValueError("benchmark_repeat must be an integer")
         try:
             repeat = int(raw_repeat)
         except (TypeError, ValueError) as exc:
             raise ValueError("benchmark_repeat must be an integer") from exc
+        if isinstance(raw_repeat, float) and not raw_repeat.is_integer():
+            raise ValueError("benchmark_repeat must be an integer")
         if repeat < 1:
             raise ValueError("benchmark_repeat must be positive")
         if repeat > _MAX_BENCHMARK_MESSAGE_REPEAT:
