@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -295,12 +296,17 @@ def _git_runtime_identity(root: Path) -> dict[str, Any]:
 
     def _git(*args: str) -> str | None:
         try:
+            popen_kwargs = {
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "timeout": 1,
+            }
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
             result = subprocess.run(
                 ["git", "-C", str(root), *args],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=1,
+                **popen_kwargs,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             logger.debug("LCM git identity probe failed at %s: %s", root, exc)
