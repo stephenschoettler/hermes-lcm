@@ -77,6 +77,9 @@ Core capabilities:
   payloads instead of dumping everything into the prompt
 - **Agent tools** - `lcm_grep`, `lcm_load_session`, `lcm_describe`,
   `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+- **Plugin context recall** - keeps tool results from installed Hermes plugins,
+  such as [Hermes Tweet](https://github.com/Xquik-dev/hermes-tweet), searchable
+  after compaction so X/Twitter research context can be recovered later.
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
   source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with
