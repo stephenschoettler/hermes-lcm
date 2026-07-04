@@ -2048,10 +2048,12 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     session_id = engine.current_session_id
     conversation_id = engine.current_conversation_id
     if not session_id:
+        full_status = engine.get_status()
         return json.dumps({
             "error": "No active session",
             "read_only": True,
-            "runtime_identity": engine.get_runtime_identity(),
+            "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
+            "ingest_protection": full_status.get("ingest_protection"),
         })
 
     full_status = engine.get_status()
@@ -2171,6 +2173,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
             "latest_nodes": latest_nodes,
         },
         "externalized_refs": _inspect_externalized_refs(engine, session_id, limit),
+        "ingest_protection": full_status.get("ingest_protection"),
         "filters": {
             "session_keys": session_keys,
             "ignored": engine.current_session_ignored,

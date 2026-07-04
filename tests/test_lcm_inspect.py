@@ -147,6 +147,31 @@ def test_lcm_inspect_reports_bounded_metadata_without_content(tmp_path):
         assert "content_preview" not in result["externalized_refs"]["items"][0]
         assert "content" not in result["externalized_refs"]["items"][0]
         assert "content_chars" not in result["externalized_refs"]["items"][0]
+        assert result["ingest_protection"]["sensitive_patterns_enabled"] is False
+        assert "api_key" in result["ingest_protection"]["sensitive_patterns"]
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_inspect_includes_sensitive_pattern_status(tmp_path):
+    engine = _make_engine(
+        tmp_path,
+        sensitive_patterns_enabled=True,
+        sensitive_patterns=["api_key", "typoed_pattern"],
+    )
+    try:
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        protection = result["ingest_protection"]
+        assert protection["sensitive_patterns_enabled"] is True
+        assert protection["enabled"] is True
+        assert protection["sensitive_patterns"] == ["api_key", "typoed_pattern"]
+        assert protection["patterns"] == ["api_key", "typoed_pattern"]
+        assert protection["active_patterns"] == ["api_key"]
+        assert protection["unknown_patterns"] == ["typoed_pattern"]
+        assert protection["source"] == "default"
+        assert protection["lossless_recovery"] is False
+        assert "placeholder_format" in protection
     finally:
         engine.shutdown()
 
