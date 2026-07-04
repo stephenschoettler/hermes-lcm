@@ -86,20 +86,21 @@ Expected signals:
 
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
-- tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+- tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and `lcm_doctor`
 
 Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.18.1 (7 tools)
+  ✓ hermes-lcm v0.18.1 (8 tools)
 
 Provider Plugins:
   Context Engine: lcm
 ```
 
-For source checkouts, `lcm_status`, `/lcm status`, `lcm_doctor`, and
-`/lcm doctor` also report the loaded plugin path and best-effort git identity:
+For source checkouts, `lcm_status`, `/lcm status`, `lcm_inspect`,
+`lcm_doctor`, and `/lcm doctor` also report the loaded plugin path and
+best-effort git identity:
 `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`.
 
 ## Troubleshooting
@@ -119,8 +120,8 @@ LCM tools are still available through the context-engine schema/dispatch path
 registration (Path A) on those hosts because Path A would shadow Path B and lose
 current-turn ingest.
 
-Healthy signals are the same as above: selected context engine `lcm`, the seven
-`lcm_*` tools in the live tool list, and `lcm_status` / `lcm_doctor` responding
+Healthy signals are the same as above: selected context engine `lcm`, the eight
+`lcm_*` tools in the live tool list, and `lcm_status` / `lcm_inspect` / `lcm_doctor` responding
 after one normal message initializes the session.
 
 ### `/lcm status` looks unbound after restart
@@ -191,7 +192,7 @@ FTS shadow tables, DAG summaries, or externalized payload JSON that were written
 before the setting was enabled. Non-password placeholders include a short
 truncated SHA-256 digest for correlation. `password_assignment` placeholders omit
 the digest to avoid making password-like values easier to dictionary-check.
-`lcm_status` and `lcm_doctor` expose the enabled state, configured pattern names,
+`lcm_status`, `lcm_inspect`, and `lcm_doctor` expose the enabled state, configured pattern names,
 unknown names, source, and placeholder format without exposing raw secret values.
 
 ### Cache policy boundary

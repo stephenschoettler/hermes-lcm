@@ -62,6 +62,7 @@ from .schemas import (
     LCM_EXPAND,
     LCM_EXPAND_QUERY,
     LCM_GREP,
+    LCM_INSPECT,
     LCM_LOAD_SESSION,
     LCM_STATUS,
 )
@@ -2996,6 +2997,7 @@ class LCMEngine(ContextEngine):
             LCM_EXPAND,
             LCM_EXPAND_QUERY,
             LCM_STATUS,
+            LCM_INSPECT,
             LCM_DOCTOR,
         ]
 
@@ -3003,7 +3005,7 @@ class LCMEngine(ContextEngine):
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
-        if messages and self._session_id and not (
+        if name != "lcm_inspect" and messages and self._session_id and not (
             self._session_ignored or self._session_stateless or self._thread_context_stateless()
         ):
             try:
@@ -3018,6 +3020,7 @@ class LCMEngine(ContextEngine):
             "lcm_expand": lcm_tools.lcm_expand,
             "lcm_expand_query": lcm_tools.lcm_expand_query,
             "lcm_status": lcm_tools.lcm_status,
+            "lcm_inspect": lcm_tools.lcm_inspect,
             "lcm_doctor": lcm_tools.lcm_doctor,
         }
         handler = handlers.get(name)

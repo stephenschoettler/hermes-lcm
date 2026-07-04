@@ -12,6 +12,7 @@ EXPECTED_LCM_TOOLS = {
     "lcm_expand",
     "lcm_expand_query",
     "lcm_status",
+    "lcm_inspect",
     "lcm_doctor",
 }
 

@@ -1350,6 +1350,7 @@ class TestEngineABC:
         assert "lcm_expand" in names
         assert "lcm_load_session" in names
         assert "lcm_status" in names
+        assert "lcm_inspect" in names
         assert "lcm_doctor" in names
         assert "lcm_expand_query" in names
 

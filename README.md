@@ -76,7 +76,8 @@ Core capabilities:
 - **Bounded recovery** - pages raw messages, child summaries, and externalized
   payloads instead of dumping everything into the prompt
 - **Agent tools** - `lcm_grep`, `lcm_load_session`, `lcm_describe`,
-  `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+  `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and
+  `lcm_doctor`
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
   source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with
@@ -176,20 +177,22 @@ Expected signals:
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
 - tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`,
-  `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+  `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and
+  `lcm_doctor`
 
 Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.18.1 (7 tools)
+  ✓ hermes-lcm v0.18.1 (8 tools)
 
 Provider Plugins:
   Context Engine: lcm
 ```
 
-For source checkouts, `lcm_status`, `/lcm status`, `lcm_doctor`, and
-`/lcm doctor` also report the loaded plugin path and best-effort git identity:
+For source checkouts, `lcm_status`, `/lcm status`, `lcm_inspect`,
+`lcm_doctor`, and `/lcm doctor` also report the loaded plugin path and
+best-effort git identity:
 `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`.
 
 If startup logs say LCM tools are available through `context-engine schemas` or
@@ -236,6 +239,7 @@ outside the LCM database.
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message from a cross-session `lcm_grep` result. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
+| `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
 
 ### Slash commands
@@ -374,7 +378,7 @@ FTS shadow tables, DAG summaries, or externalized payload JSON that were written
 before the setting was enabled. Non-password placeholders include a short
 truncated SHA-256 digest for correlation. `password_assignment` placeholders omit
 the digest to avoid making password-like values easier to dictionary-check.
-`lcm_status` and `lcm_doctor` expose the enabled state, configured pattern names,
+`lcm_status`, `lcm_inspect`, and `lcm_doctor` expose the enabled state, configured pattern names,
 unknown names, source, and placeholder format without exposing raw secret values.
 
 ### Threshold ownership
