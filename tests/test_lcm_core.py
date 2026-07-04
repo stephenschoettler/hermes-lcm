@@ -1014,6 +1014,36 @@ class TestTokens:
         assert count_message_tokens(msg) == count_message_tokens(normalized_msg)
         assert count_message_tokens(msg) > 100
 
+    def test_count_tokens_is_memoized(self):
+        from hermes_lcm.tokens import _count_tokens_cached
+
+        text = "a repeated content string used across a turn " * 20
+        first = count_tokens(text)
+        before = _count_tokens_cached.cache_info()
+        for _ in range(5):
+            assert count_tokens(text) == first
+        after = _count_tokens_cached.cache_info()
+        assert after.hits >= before.hits + 5
+
+    def test_fallback_token_estimate_scales_up_for_cjk(self):
+        from hermes_lcm.tokens import _fallback_token_estimate
+
+        latin = "the quick brown fox " * 20
+        cjk = "検索対象データ処理" * 20
+        assert _fallback_token_estimate(latin) == len(latin) // 4 + 1
+        assert _fallback_token_estimate(cjk) > len(cjk) // 4 + 1
+
+    def test_count_tokens_tolerates_non_string_unhashable_input(self):
+        assert count_tokens({"api_key": 1}) >= 0
+        msg = {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [
+                {"function": {"name": "lookup", "arguments": {"api_key": 1}}}
+            ],
+        }
+        assert count_message_tokens(msg) > 0
+
     def test_count_messages_tokens(self):
         msgs = [
             {"role": "user", "content": "hello"},
