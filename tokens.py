@@ -34,10 +34,13 @@ def _fallback_token_estimate(text: str) -> int:
     # Latin text is ~4 chars/token, but CJK and other non-Latin scripts
     # tokenize far denser (~1-2 tokens/char). A flat len//4 undercounts them
     # ~3-4x, so preflight under-triggers and assembly can overflow the real
-    # budget. Scale the divisor down as the non-ASCII share rises.
+    # budget. ASCII-only text is overwhelmingly common and can use the cheap
+    # legacy estimate without scanning every character.
     length = len(text)
     if length == 0:
         return 0
+    if text.isascii():
+        return length // _CHARS_PER_TOKEN + 1
     non_ascii = sum(1 for ch in text if ord(ch) > 127)
     ratio = non_ascii / length
     if ratio >= 0.5:
@@ -61,7 +64,7 @@ def _count_tokens_core(text) -> int:
     return len(text) // _CHARS_PER_TOKEN + 1
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=2048)
 def _count_tokens_cached(text: str) -> int:
     # tiktoken encoding is the dominant per-turn cost: assembly and preflight
     # re-count the same content many times per turn. The encoder is decided
@@ -70,10 +73,10 @@ def _count_tokens_cached(text: str) -> int:
 
 
 # Cap what the LRU may retain by reference. Very large strings are the ones
-# least likely to recur identically, and caching them would let the 8192-entry
-# LRU pin hundreds of MB; count those uncached (cost is proportional to size
-# either way).
-_MAX_CACHEABLE_TOKEN_TEXT_CHARS = 32_768
+# least likely to recur identically, and caching them would still let the
+# bounded LRU pin unnecessary memory; count those uncached (cost is
+# proportional to size either way).
+_MAX_CACHEABLE_TOKEN_TEXT_CHARS=4096_768
 
 
 def count_tokens(text) -> int:

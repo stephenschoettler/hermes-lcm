@@ -1025,6 +1025,13 @@ class TestTokens:
         after = _count_tokens_cached.cache_info()
         assert after.hits >= before.hits + 5
 
+    def test_fallback_token_estimate_ascii_fast_path_skips_character_scan(self):
+        from hermes_lcm.tokens import _fallback_token_estimate
+
+        text = "a" * 80_000
+
+        assert _fallback_token_estimate(text) == len(text) // 4 + 1
+
     def test_fallback_token_estimate_scales_up_for_cjk(self):
         from hermes_lcm.tokens import _fallback_token_estimate
 
@@ -1032,6 +1039,19 @@ class TestTokens:
         cjk = "検索対象データ処理" * 20
         assert _fallback_token_estimate(latin) == len(latin) // 4 + 1
         assert _fallback_token_estimate(cjk) > len(cjk) // 4 + 1
+
+    def test_count_tokens_does_not_cache_large_strings(self):
+        from hermes_lcm import tokens as token_module
+
+        token_module._count_tokens_cached.cache_clear()
+        oversized = "x" * (token_module._MAX_CACHEABLE_TOKEN_TEXT_CHARS + 1)
+        first = token_module.count_tokens(oversized)
+        before = token_module._count_tokens_cached.cache_info()
+        assert token_module.count_tokens(oversized) == first
+        after = token_module._count_tokens_cached.cache_info()
+
+        assert after.currsize == before.currsize == 0
+        assert after.hits == before.hits == 0
 
     def test_count_tokens_tolerates_non_string_unhashable_input(self):
         assert count_tokens({"api_key": 1}) >= 0
