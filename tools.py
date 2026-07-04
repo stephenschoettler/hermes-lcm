@@ -2021,6 +2021,125 @@ def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[bytes, bool]
     return bytes(prefix), False
 
 
+def _read_json_string_from_stream(read_char, *, capture: bool = False) -> str | None:
+    """Read a JSON string after its opening quote, optionally returning its decoded value."""
+    raw_parts: list[str] = []
+    while True:
+        ch = read_char()
+        if not ch:
+            raise ValueError("unterminated string")
+        if ch == '"':
+            break
+        if ord(ch) < 0x20:
+            raise ValueError("control character in string")
+        if ch == "\\":
+            esc = read_char()
+            if esc not in {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}:
+                raise ValueError("invalid escape")
+            if capture:
+                raw_parts.append("\\" + esc)
+            if esc == "u":
+                digits = "".join(read_char() for _ in range(4))
+                if len(digits) != 4 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                    raise ValueError("invalid unicode escape")
+                if capture:
+                    raw_parts.append(digits)
+            continue
+        if capture:
+            raw_parts.append(ch)
+    if not capture:
+        return None
+    return json.loads('"' + "".join(raw_parts) + '"')
+
+
+def _redact_externalized_payload_content_for_json_load(path: Path) -> str:
+    """Return payload JSON with top-level content string replaced by an empty string."""
+    out: list[str] = []
+    pushback = ""
+    depth = 0
+    expect_key_at_top = False
+    pending_top_key = ""
+
+    with path.open("r", encoding="utf-8") as handle:
+        def read_char() -> str:
+            nonlocal pushback
+            if pushback:
+                ch = pushback
+                pushback = ""
+                return ch
+            return handle.read(1)
+
+        def unread_char(ch: str) -> None:
+            nonlocal pushback
+            pushback = ch
+
+        while True:
+            ch = read_char()
+            if not ch:
+                break
+
+            if ch == '"':
+                out.append(ch)
+                if depth == 1 and expect_key_at_top:
+                    key = _read_json_string_from_stream(read_char, capture=True)
+                    # Reconstructing via json.dumps keeps the redacted document valid and small;
+                    # json.loads below validates the resulting payload structure.
+                    out[-1] = json.dumps(key)
+                    expect_key_at_top = False
+                    pending_top_key = key or ""
+                else:
+                    value = _read_json_string_from_stream(read_char, capture=True)
+                    out[-1] = json.dumps(value)
+                continue
+
+            out.append(ch)
+            if ch == "{":
+                depth += 1
+                if depth == 1:
+                    expect_key_at_top = True
+            elif ch == "[":
+                depth += 1
+            elif ch == "}":
+                if depth == 1:
+                    expect_key_at_top = False
+                    pending_top_key = ""
+                depth -= 1
+            elif ch == "]":
+                depth -= 1
+            elif depth == 1 and pending_top_key:
+                if ch == ":":
+                    while True:
+                        value_ch = read_char()
+                        if not value_ch:
+                            break
+                        if value_ch in " \t\n\r":
+                            out.append(value_ch)
+                            continue
+                        break
+                    if pending_top_key == "content" and value_ch == '"':
+                        out.append('""')
+                        _read_json_string_from_stream(read_char, capture=False)
+                    elif value_ch:
+                        unread_char(value_ch)
+                    pending_top_key = ""
+            elif depth == 1 and ch == ",":
+                expect_key_at_top = True
+
+    return "".join(out)
+
+
+def _validate_externalized_payload_json(path: Path) -> tuple[bool, str]:
+    """Validate payload JSON without materializing the externalized content body."""
+    try:
+        redacted = _redact_externalized_payload_content_for_json_load(path)
+        payload = json.loads(redacted)
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False, ""
+    if not isinstance(payload, dict) or not isinstance(payload.get("content", ""), str):
+        return False, ""
+    return True, payload.get("session_id") or ""
+
+
 def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, session_id: str) -> dict[str, Any]:
     if not ref or Path(ref).name != ref:
         return {"readable": False, "error": "invalid_ref"}
@@ -2049,14 +2168,9 @@ def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, sessio
     if not payload_session_id:
         return {"readable": False, "error": "session_metadata_unavailable"}
 
-    payload = load_externalized_payload(
-        ref,
-        config=engine._config,
-        hermes_home=engine._hermes_home,
-    )
-    if payload is None:
+    valid_payload, payload_session_id = _validate_externalized_payload_json(path)
+    if not valid_payload:
         return {"readable": False, "error": "invalid_payload"}
-    payload_session_id = payload.get("session_id") or ""
     if payload_session_id != session_id:
         return {"readable": False, "error": "session_mismatch"}
 

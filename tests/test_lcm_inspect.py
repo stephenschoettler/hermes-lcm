@@ -470,6 +470,72 @@ def test_lcm_inspect_rejects_malformed_payload_after_matching_session_metadata(t
         engine.shutdown()
 
 
+@pytest.mark.parametrize(
+    ("payload_text", "ref"),
+    [
+        ('{"kind":"tool_result","session_id":"sess-current",\f"content":"x"}', "payload-formfeed.json"),
+        ('{"kind":"tool_result","session_id":"sess-current",\u00a0"content":"x"}', "payload-nbsp.json"),
+        ('{"kind":"tool_result","session_id":"sess-current","content":"x","content_chars":١}', "payload-unicode-digit.json"),
+        ('{"kind":"tool_result","session_id":"sess-current","content":"x","content_chars":' + '1' * 5000 + '}', "payload-long-int.json"),
+    ],
+)
+def test_lcm_inspect_rejects_json_decoder_incompatible_payload_syntax(tmp_path, payload_text, ref):
+    engine = _make_engine(tmp_path)
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=True,
+        )
+        (storage_dir / ref).write_text(payload_text, encoding="utf-8")
+        engine._store.append(
+            "sess-current",
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=12; bytes=12; ref={ref}]"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        item = result["externalized_refs"]["items"][0]
+        assert item["readable"] is False
+        assert item["error"] == "invalid_payload"
+        assert "file_size_bytes" not in item
+        assert "modified_at" not in item
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_inspect_preserves_json_load_duplicate_key_semantics(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=True,
+        )
+        ref = "payload-duplicate-content.json"
+        (storage_dir / ref).write_text(
+            '{"kind":"tool_result","session_id":"sess-current","content":1,"content":"x"}',
+            encoding="utf-8",
+        )
+        engine._store.append(
+            "sess-current",
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=1; bytes=1; ref={ref}]"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        item = result["externalized_refs"]["items"][0]
+        assert item["readable"] is True
+        assert item["payload_session_id"] == "sess-current"
+        assert "content" not in item
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_inspect_caps_payload_validation_to_returned_refs(tmp_path, monkeypatch):
     engine = _make_engine(tmp_path)
     try:
