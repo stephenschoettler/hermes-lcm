@@ -826,6 +826,26 @@ class LCMEngine(ContextEngine):
         return "lcm"
 
     @property
+    def last_compression_status(self) -> str:
+        """Public status for the most recent compression/preflight attempt.
+
+        Host runtimes use this to distinguish a real compaction boundary from
+        an LCM no-op (for example, when request pressure is high but all
+        compactable raw backlog is protected by the fresh tail).
+        """
+        return self._last_compression_status
+
+    @property
+    def last_compression_noop_reason(self) -> str:
+        """Human-readable reason for the latest no-op compression decision."""
+        return self._last_compression_noop_reason
+
+    @property
+    def last_compression_was_noop(self) -> bool:
+        """Whether the most recent compression/preflight decision was a no-op."""
+        return self._last_compression_status == "noop"
+
+    @property
     def current_session_id(self) -> str:
         """User-facing "current session" id surfaced by LCM tools.
 

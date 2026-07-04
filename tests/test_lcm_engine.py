@@ -1472,8 +1472,9 @@ class TestEngineABC:
         try:
             assert count_messages_tokens(messages) >= instance.threshold_tokens
             assert not instance.should_compress_preflight(messages)
-            assert instance._last_compression_status == "noop"
-            assert "below leaf chunk threshold" in instance._last_compression_noop_reason
+            assert instance.last_compression_status == "noop"
+            assert instance.last_compression_was_noop is True
+            assert "below leaf chunk threshold" in instance.last_compression_noop_reason
         finally:
             instance.shutdown()
 
