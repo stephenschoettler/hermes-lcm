@@ -1,6 +1,7 @@
 """Tests for LCM core components: store, DAG, tokens, config, escalation."""
 
 import copy
+import hashlib
 import json
 import re
 import sqlite3
@@ -4040,6 +4041,32 @@ class TestIngestExternalization:
         assert stored[0]["content"] == marker
         assert not output_dir.exists()
 
+    def test_ingest_preserves_marker_without_preview_proof(self, tmp_path, monkeypatch):
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(tmp_path)
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "NO_PREVIEW_PROOF_NEEDLE:" + ("x" * 1000)
+        persisted_path = host_storage / "call_no_preview.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 1.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n"
+            "</persisted-output>"
+        )
+
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_no_preview", "content": marker},
+        ])
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"] == marker
+        assert not output_dir.exists()
+
     def test_ingest_forces_durable_recovery_below_generic_externalization_threshold(self, tmp_path, monkeypatch):
         import tempfile
 
@@ -4106,17 +4133,35 @@ class TestIngestExternalization:
             {"role": "tool", "tool_call_id": "call_secret", "content": marker},
         ]
 
-        engine._ingest_messages(messages)
+        active_messages = engine._ingest_messages(messages)
 
         stored = engine._store.get_session_messages("ingest-session")
         assert "SECRETSECRET" not in stored[1]["content"]
+        assert "SECRETSECRET" not in active_messages[1]["content"]
         payload_file = next(output_dir.glob("*.json"))
-        payload = json.loads(payload_file.read_text())
+        payload_text = payload_file.read_text()
+        payload = json.loads(payload_text)
+        assert "SECRETSECRET" not in payload_text
+        assert preview not in payload_text
         assert "SECRETSECRET" not in payload["content"]
         assert "[LCM sensitive redaction:" in payload["content"]
         assert payload["persisted_output_source_path"] == str(persisted_path)
         assert payload["persisted_output_expected_chars"] == len(full_result)
-        assert payload["persisted_output_preview_prefix"] == preview
+        preview_sha256 = hashlib.sha256(preview.encode("utf-8")).hexdigest()
+        assert payload["persisted_output_preview_sha256"] == preview_sha256
+        from hermes_lcm.ingest_protection import _persisted_output_preview_prefix_digest
+        redacted_preview_sha256 = _persisted_output_preview_prefix_digest(active_messages[1]["content"])
+        assert payload["persisted_output_redacted_preview_sha256"] == redacted_preview_sha256
+        assert "persisted_output_preview_prefix" not in payload
+        assert payload["persisted_output_markers"] == [
+            {
+                "source_path": str(persisted_path),
+                "expected_chars": len(full_result),
+                "preview_sha256": preview_sha256,
+                "redacted_preview_sha256": redacted_preview_sha256,
+            }
+        ]
+        assert "SECRETSECRET" not in payload_file.read_text()
 
         from dataclasses import replace
         replay_config = replace(
@@ -4129,6 +4174,64 @@ class TestIngestExternalization:
         replay_with_redaction_disabled._ingest_cursor_needs_reconcile = True
         replay_with_redaction_disabled._ingest_messages(messages)
         assert replay_with_redaction_disabled._store.get_session_count("ingest-session") == 2
+
+        persisted_path.unlink()
+        replay_from_active = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay_from_active._session_id = "ingest-session"
+        replay_from_active._ingest_cursor_needs_reconcile = True
+        replay_from_active._ingest_messages(active_messages)
+        assert replay_from_active._store.get_session_count("ingest-session") == 2
+
+    def test_replay_matches_legacy_preview_prefix_payload_for_redacted_active_marker(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_threshold_chars=10,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "api_key = LEGACYSECRET1234567890 suffix"
+        preview = full_result[:32]
+        persisted_path = host_storage / "call_legacy_secret.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+        messages = [{"role": "tool", "tool_call_id": "call_legacy_secret", "content": marker}]
+
+        active_messages = engine._ingest_messages(messages)
+        assert engine._store.get_session_count("ingest-session") == 1
+        assert "LEGACYSECRET" not in active_messages[0]["content"]
+
+        legacy_payload_file = next(output_dir.glob("*.json"))
+        legacy_payload = json.loads(legacy_payload_file.read_text())
+        legacy_payload["persisted_output_preview_prefix"] = preview
+        legacy_payload.pop("persisted_output_preview_sha256", None)
+        legacy_payload.pop("persisted_output_redacted_preview_sha256", None)
+        for entry in legacy_payload.get("persisted_output_markers", []):
+            entry["preview_prefix"] = preview
+            entry.pop("preview_sha256", None)
+            entry.pop("redacted_preview_sha256", None)
+        legacy_payload_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+        persisted_path.unlink()
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(active_messages)
+
+        assert replay._store.get_session_count("ingest-session") == 1
 
     def test_ingest_reconciles_recovered_persisted_output_marker_after_restart(self, tmp_path, monkeypatch):
         import tempfile
@@ -4296,6 +4399,15 @@ class TestIngestExternalization:
         engine._ingest_messages(original_messages)
         assert engine._store.get_session_count("ingest-session") == 2
 
+        legacy_payload_file = next(output_dir.glob("*.json"))
+        legacy_payload = json.loads(legacy_payload_file.read_text())
+        legacy_payload["persisted_output_preview_prefix"] = preview
+        legacy_payload.pop("persisted_output_preview_sha256", None)
+        for entry in legacy_payload.get("persisted_output_markers", []):
+            entry["preview_prefix"] = preview
+            entry.pop("preview_sha256", None)
+        legacy_payload_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
         second_path = host_storage / "call_retry_second.txt"
         second_path.write_text(full_result, encoding="utf-8")
         second_marker = (
@@ -4325,7 +4437,11 @@ class TestIngestExternalization:
         marker_paths = {entry["source_path"] for entry in marker_entries}
         assert str(first_path) in marker_paths
         assert str(second_path) in marker_paths
-        assert all(entry.get("preview_prefix") == preview for entry in marker_entries)
+        expected_preview_sha256 = hashlib.sha256(preview.encode("utf-8")).hexdigest()
+        assert all(entry.get("preview_sha256") == expected_preview_sha256 for entry in marker_entries)
+        assert all("preview_prefix" not in entry for entry in marker_entries)
+        assert payload["persisted_output_preview_sha256"] == expected_preview_sha256
+        assert "persisted_output_preview_prefix" not in payload
 
         second_path.unlink()
         replay_after_cleanup = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
@@ -4422,6 +4538,48 @@ class TestIngestExternalization:
         replay_with_file._ingest_messages(messages)
 
         assert replay_with_file._store.get_session_count("ingest-session") == 1
+
+        persisted_path.unlink()
+        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        replay._session_id = "ingest-session"
+        replay._ingest_cursor_needs_reconcile = True
+        replay._ingest_messages(messages)
+
+        assert replay._store.get_session_count("ingest-session") == 1
+
+    def test_replay_reconciles_redacted_inline_persisted_marker_when_externalization_disabled(self, tmp_path, monkeypatch):
+        import tempfile
+        from hermes_lcm.engine import LCMEngine
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        engine, output_dir = self._engine(
+            tmp_path,
+            large_output_externalization_enabled=False,
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["api_key"],
+        )
+        host_storage = tmp_path / "hermes-results"
+        host_storage.mkdir()
+        full_result = "api_key = INLINESECRET1234567890 suffix"
+        preview = full_result[:32]
+        persisted_path = host_storage / "call_disabled_secret.txt"
+        persisted_path.write_text(full_result, encoding="utf-8")
+        marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
+            f"Full output saved to: {persisted_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
+            "</persisted-output>"
+        )
+        messages = [{"role": "tool", "tool_call_id": "call_disabled_secret", "content": marker}]
+
+        engine._ingest_messages(messages)
+        stored = engine._store.get_session_messages("ingest-session")
+        assert "INLINESECRET" not in stored[0]["content"]
+        assert "[LCM sensitive redaction:" in stored[0]["content"]
+        assert not output_dir.exists()
 
         persisted_path.unlink()
         replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))

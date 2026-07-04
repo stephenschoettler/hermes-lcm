@@ -45,6 +45,12 @@ def _content_digest_prefix(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
 
 
+def _preview_sha256(preview_prefix: Any) -> str:
+    if not preview_prefix:
+        return ""
+    return hashlib.sha256(str(preview_prefix).encode("utf-8")).hexdigest()
+
+
 def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -145,7 +151,10 @@ def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None
         return None
     source_path = metadata.get("persisted_output_source_path")
     expected_chars = metadata.get("persisted_output_expected_chars")
-    preview_prefix = metadata.get("persisted_output_preview_prefix")
+    preview_sha256 = metadata.get("persisted_output_preview_sha256") or _preview_sha256(
+        metadata.get("persisted_output_preview_prefix")
+    )
+    redacted_preview_sha256 = metadata.get("persisted_output_redacted_preview_sha256")
     if source_path is None or expected_chars is None:
         return None
     try:
@@ -159,16 +168,28 @@ def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None
         "source_path": source_path,
         "expected_chars": expected_chars,
     }
-    if preview_prefix:
-        entry["preview_prefix"] = str(preview_prefix)
+    if preview_sha256:
+        entry["preview_sha256"] = str(preview_sha256)
+    if redacted_preview_sha256:
+        entry["redacted_preview_sha256"] = str(redacted_preview_sha256)
     return entry
 
 
-def _persisted_output_marker_entries(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
+def _persisted_output_marker_entries(
+    payload: Dict[str, Any],
+    *,
+    include_legacy_preview_prefix: bool = False,
+) -> list[Dict[str, Any]]:
     entries: list[Dict[str, Any]] = []
-    seen: set[tuple[str, int, str]] = set()
+    seen: set[tuple[str, int, str, str]] = set()
 
-    def add(source_path: Any, expected_chars: Any, preview_prefix: Any = None) -> None:
+    def add(
+        source_path: Any,
+        expected_chars: Any,
+        preview_prefix: Any = None,
+        preview_sha256: Any = None,
+        redacted_preview_sha256: Any = None,
+    ) -> None:
         if source_path is None or expected_chars is None:
             return
         try:
@@ -178,51 +199,165 @@ def _persisted_output_marker_entries(payload: Dict[str, Any]) -> list[Dict[str, 
         source = str(source_path)
         if not source:
             return
-        preview = str(preview_prefix or "")
-        key = (source, chars, preview)
+        preview_digest = str(preview_sha256 or "") or _preview_sha256(preview_prefix)
+        redacted_preview_digest = str(redacted_preview_sha256 or "")
+        key = (source, chars, preview_digest, redacted_preview_digest)
         if key in seen:
             return
         seen.add(key)
         entry = {"source_path": source, "expected_chars": chars}
-        if preview:
-            entry["preview_prefix"] = preview
+        if preview_digest:
+            entry["preview_sha256"] = preview_digest
+        if redacted_preview_digest:
+            entry["redacted_preview_sha256"] = redacted_preview_digest
+        if include_legacy_preview_prefix and preview_prefix:
+            entry["legacy_preview_prefix"] = str(preview_prefix)
         entries.append(entry)
 
     add(
         payload.get("persisted_output_source_path"),
         payload.get("persisted_output_expected_chars"),
         payload.get("persisted_output_preview_prefix"),
+        payload.get("persisted_output_preview_sha256"),
+        payload.get("persisted_output_redacted_preview_sha256"),
     )
     markers = payload.get("persisted_output_markers")
     if isinstance(markers, list):
         for marker in markers:
             if not isinstance(marker, dict):
                 continue
-            add(marker.get("source_path"), marker.get("expected_chars"), marker.get("preview_prefix"))
+            add(
+                marker.get("source_path"),
+                marker.get("expected_chars"),
+                marker.get("preview_prefix"),
+                marker.get("preview_sha256"),
+                marker.get("redacted_preview_sha256"),
+            )
     return entries
 
 
-def _merge_persisted_output_marker_metadata(payload: Dict[str, Any], metadata: Dict[str, Any] | None) -> bool:
+def _safe_persisted_output_metadata(metadata: Dict[str, Any] | None) -> Dict[str, Any]:
     marker = _persisted_output_marker_entry_from_metadata(metadata)
     if marker is None:
-        return False
+        return {}
+    safe = {
+        "persisted_output_source_path": marker["source_path"],
+        "persisted_output_expected_chars": marker["expected_chars"],
+    }
+    if marker.get("preview_sha256"):
+        safe["persisted_output_preview_sha256"] = marker["preview_sha256"]
+    if marker.get("redacted_preview_sha256"):
+        safe["persisted_output_redacted_preview_sha256"] = marker["redacted_preview_sha256"]
+    return safe
+
+
+def _persisted_output_marker_preview_digests(marker: Dict[str, Any]) -> set[str]:
+    return {
+        str(value)
+        for value in (
+            marker.get("preview_sha256"),
+            marker.get("redacted_preview_sha256"),
+        )
+        if value
+    }
+
+
+def _redacted_legacy_preview_sha256(marker: Dict[str, Any], config) -> str:
+    legacy_preview_prefix = marker.get("legacy_preview_prefix")
+    if not legacy_preview_prefix:
+        return ""
+    try:
+        from .ingest_protection import redact_sensitive_value
+    except Exception:
+        return ""
+    redacted_preview = redact_sensitive_value(
+        str(legacy_preview_prefix),
+        config,
+        parse_json_strings=False,
+    )
+    return _preview_sha256(redacted_preview)
+
+
+def _persisted_output_marker_matches_preview_digest(
+    marker: Dict[str, Any],
+    preview_sha256: str,
+    *,
+    config,
+) -> bool:
+    if not preview_sha256:
+        return True
+    if preview_sha256 in _persisted_output_marker_preview_digests(marker):
+        return True
+    return preview_sha256 == _redacted_legacy_preview_sha256(marker, config)
+
+
+def _sanitize_persisted_output_marker_metadata(payload: Dict[str, Any]) -> bool:
+    """Remove legacy raw persisted-output previews from durable metadata.
+
+    Older payloads stored marker preview text as ``preview_prefix``. That preview
+    is enough to leak secrets when the recovered content itself has been
+    redacted, so durable metadata now stores only SHA-256 proofs. This helper is
+    intentionally tolerant of old payloads and rewrites them opportunistically
+    when they are touched again.
+    """
+    changed = False
     entries = _persisted_output_marker_entries(payload)
-    key = (marker["source_path"], marker["expected_chars"], marker.get("preview_prefix", ""))
+
+    if "persisted_output_preview_prefix" in payload:
+        payload.pop("persisted_output_preview_prefix", None)
+        changed = True
+
+    marker_list = payload.get("persisted_output_markers")
+    if entries and marker_list != entries:
+        payload["persisted_output_markers"] = entries
+        changed = True
+
+    first_digest = next((entry.get("preview_sha256") for entry in entries if entry.get("preview_sha256")), "")
+    if first_digest and payload.get("persisted_output_preview_sha256") != first_digest:
+        payload["persisted_output_preview_sha256"] = first_digest
+        changed = True
+
+    first_redacted_digest = next(
+        (entry.get("redacted_preview_sha256") for entry in entries if entry.get("redacted_preview_sha256")),
+        "",
+    )
+    if first_redacted_digest and payload.get("persisted_output_redacted_preview_sha256") != first_redacted_digest:
+        payload["persisted_output_redacted_preview_sha256"] = first_redacted_digest
+        changed = True
+
+    return changed
+
+
+def _merge_persisted_output_marker_metadata(payload: Dict[str, Any], metadata: Dict[str, Any] | None) -> bool:
+    changed = _sanitize_persisted_output_marker_metadata(payload)
+    marker = _persisted_output_marker_entry_from_metadata(metadata)
+    if marker is None:
+        return changed
+    entries = _persisted_output_marker_entries(payload)
+    key = (
+        marker["source_path"],
+        marker["expected_chars"],
+        marker.get("preview_sha256", ""),
+        marker.get("redacted_preview_sha256", ""),
+    )
     if any(
         (
             entry["source_path"],
             entry["expected_chars"],
-            entry.get("preview_prefix", ""),
+            entry.get("preview_sha256", ""),
+            entry.get("redacted_preview_sha256", ""),
         ) == key
         for entry in entries
     ):
-        return False
+        return changed
     entries.append(marker)
     payload["persisted_output_markers"] = entries
     payload.setdefault("persisted_output_source_path", marker["source_path"])
     payload.setdefault("persisted_output_expected_chars", marker["expected_chars"])
-    if marker.get("preview_prefix"):
-        payload.setdefault("persisted_output_preview_prefix", marker["preview_prefix"])
+    if marker.get("preview_sha256"):
+        payload.setdefault("persisted_output_preview_sha256", marker["preview_sha256"])
+    if marker.get("redacted_preview_sha256"):
+        payload.setdefault("persisted_output_redacted_preview_sha256", marker["redacted_preview_sha256"])
     return True
 
 
@@ -409,7 +544,7 @@ def find_externalized_tool_result_content_for_call(
     session_id: str = "",
     expected_chars: int | None = None,
     persisted_output_source_path: str | None = None,
-    persisted_output_preview_prefix: str | None = None,
+    persisted_output_preview_sha256: str | None = None,
     config,
     hermes_home: str = "",
 ) -> str | None:
@@ -443,16 +578,20 @@ def find_externalized_tool_result_content_for_call(
         content = payload.get("content")
         if not isinstance(content, str):
             continue
-        if expected_chars is not None or persisted_output_source_path or persisted_output_preview_prefix:
+        if expected_chars is not None or persisted_output_source_path or persisted_output_preview_sha256:
             marker_matches = False
-            for marker in _persisted_output_marker_entries(payload):
+            for marker in _persisted_output_marker_entries(payload, include_legacy_preview_prefix=True):
                 if expected_chars is not None and marker.get("expected_chars") != expected_chars:
                     continue
                 if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
                     continue
                 if (
-                    persisted_output_preview_prefix
-                    and marker.get("preview_prefix") != persisted_output_preview_prefix
+                    persisted_output_preview_sha256
+                    and not _persisted_output_marker_matches_preview_digest(
+                        marker,
+                        persisted_output_preview_sha256,
+                        config=config,
+                    )
                 ):
                     continue
                 marker_matches = True
@@ -622,7 +761,7 @@ def maybe_externalize_payload(
         "created_at": time.time(),
     }
     if metadata:
-        payload.update({k: v for k, v in metadata.items() if v is not None})
+        payload.update(_safe_persisted_output_metadata(metadata))
         _merge_persisted_output_marker_metadata(payload, metadata)
     try:
         _write_externalized_payload(path, payload)

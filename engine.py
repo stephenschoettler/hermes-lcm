@@ -48,7 +48,7 @@ from .ingest_protection import (
     _expected_persisted_output_chars,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
-    _persisted_output_preview_prefix,
+    _persisted_output_preview_prefix_digest,
     _persisted_output_saved_path,
     assistant_output_quarantine_reason,
     extract_all_externalized_payload_refs,
@@ -4278,26 +4278,51 @@ class LCMEngine(ContextEngine):
             session_id=session_id,
         )
 
+    def _has_durable_persisted_output_replay_identity(self, msg: Dict[str, Any]) -> bool:
+        role = str(msg.get("role") or "unknown")
+        content = normalize_content_value(msg.get("content")) or ""
+        if role != "tool" or not _is_hermes_persisted_output_marker(content):
+            return False
+        expected_chars = _expected_persisted_output_chars(content)
+        persisted_output_source_path = _persisted_output_saved_path(content)
+        persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
+        if (
+            expected_chars is None
+            or not persisted_output_source_path
+            or not persisted_output_preview_sha256
+        ):
+            return False
+        durable_content = find_externalized_tool_result_content_for_call(
+            tool_call_id=str(msg.get("tool_call_id") or ""),
+            session_id=str(msg.get("session_id") or self._session_id or ""),
+            expected_chars=expected_chars,
+            persisted_output_source_path=persisted_output_source_path,
+            persisted_output_preview_sha256=persisted_output_preview_sha256,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        return durable_content is not None
+
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if role == "tool" and _is_hermes_persisted_output_marker(content):
             expected_chars = _expected_persisted_output_chars(content)
             persisted_output_source_path = _persisted_output_saved_path(content)
-            persisted_output_preview_prefix = _persisted_output_preview_prefix(content)
+            persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
             durable_content = None
             if (
                 not stored_row
                 and expected_chars is not None
                 and persisted_output_source_path
-                and persisted_output_preview_prefix
+                and persisted_output_preview_sha256
             ):
                 durable_content = find_externalized_tool_result_content_for_call(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
                     session_id=str(msg.get("session_id") or self._session_id or ""),
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
-                    persisted_output_preview_prefix=persisted_output_preview_prefix,
+                    persisted_output_preview_sha256=persisted_output_preview_sha256,
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
@@ -4947,12 +4972,21 @@ class LCMEngine(ContextEngine):
             ignored_messages=ignored_original_messages,
         )
         if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = replay_messages
-            if self._compiled_ignore_message_patterns:
-                reconcile_messages = [
-                    original_msg if ignored_original_messages[idx] else replay_msg
-                    for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-                ]
+            reconcile_messages = [
+                original_msg
+                if (
+                    (
+                        str(original_msg.get("role") or "") == "tool"
+                        and self._has_durable_persisted_output_replay_identity(original_msg)
+                    )
+                    or (
+                        self._compiled_ignore_message_patterns
+                        and ignored_original_messages[idx]
+                    )
+                )
+                else replay_msg
+                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
+            ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)

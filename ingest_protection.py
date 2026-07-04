@@ -182,6 +182,15 @@ def _persisted_output_preview_prefix(text: str | None) -> str | None:
     return preview
 
 
+def _persisted_output_preview_prefix_digest(text: str | None) -> str | None:
+    preview_prefix = _persisted_output_preview_prefix(text)
+    if not preview_prefix:
+        return None
+    return hashlib.sha256(
+        preview_prefix.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+
+
 def _persisted_output_saved_path(text: str | None) -> str | None:
     if not isinstance(text, str):
         return None
@@ -280,7 +289,7 @@ def recover_hermes_persisted_output(text: str | None) -> str | None:
     if recovered is None or len(recovered) != expected_chars:
         return None
     preview_prefix = _persisted_output_preview_prefix(text)
-    if preview_prefix is not None and not recovered.startswith(preview_prefix):
+    if not preview_prefix or not recovered.startswith(preview_prefix):
         return None
     return recovered
 
@@ -1007,7 +1016,8 @@ def protect_message_for_ingest(
                 metadata={
                     "persisted_output_source_path": _persisted_output_saved_path(raw_normalized_content),
                     "persisted_output_expected_chars": _expected_persisted_output_chars(raw_normalized_content),
-                    "persisted_output_preview_prefix": _persisted_output_preview_prefix(raw_normalized_content),
+                    "persisted_output_preview_sha256": _persisted_output_preview_prefix_digest(raw_normalized_content),
+                    "persisted_output_redacted_preview_sha256": _persisted_output_preview_prefix_digest(normalized_content),
                 },
             )
 
