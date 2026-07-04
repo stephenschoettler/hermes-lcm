@@ -1113,6 +1113,24 @@ class TestMessageStore:
         assert scoped_results == []
         assert {result["session_id"] for result in all_results} == {"sess1", "sess2"}
 
+    def test_like_fallback_relevance_sort_finds_recent_match_beyond_first_page(self, store):
+        # Regression: with more matching rows than the candidate fetch limit,
+        # the relevance/hybrid LIKE fallback fetched an arbitrary storage-order
+        # (oldest-first) slice with no ORDER BY, so the most relevant recent
+        # match beyond the first page was never scored. It must now scan
+        # recent-first up to the candidate cap. The CJK query forces the LIKE
+        # fallback path (FTS cannot tokenize it).
+        for i in range(60):
+            store.append("sess1", {"role": "user", "content": f"検索対象 background note {i}"})
+        needle_id = store.append(
+            "sess1", {"role": "user", "content": "検索対象 検索対象 検索対象 top match"}
+        )
+
+        results = store.search("検索対象", session_id="sess1", limit=5, sort="relevance")
+
+        assert results, "expected LIKE-fallback matches"
+        assert results[0]["store_id"] == needle_id
+
     def test_source_stored_and_filterable(self, store):
         store.append("sess1", {"role": "user", "content": "docker in cli"}, source="cli")
         store.append("sess2", {"role": "user", "content": "docker in discord"}, source="discord")

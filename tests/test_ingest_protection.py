@@ -3071,6 +3071,28 @@ def test_ignore_message_patterns_scan_only_new_tail_after_cursor(tmp_path):
     assert [row["content"] for row in rows][-2:] == ["old message 49", "new message"]
 
 
+def test_ignore_message_pattern_drop_is_counted_and_surfaced_in_status(tmp_path):
+    engine = _engine(tmp_path)
+    engine._compiled_ignore_message_patterns = [_CountingIgnorePattern()]
+
+    engine._ingest_messages([
+        {"role": "user", "content": "keep this substantive turn"},
+        {"role": "user", "content": "DROP: noisy heartbeat"},
+    ])
+
+    # The matched message is not persisted (unchanged behavior)...
+    rows = engine._store.get_session_messages(engine.current_session_id)
+    assert [row["content"] for row in rows] == ["keep this substantive turn"]
+    # ...but the drop is no longer silent: it is counted and visible in status.
+    assert engine._ignore_pattern_dropped_count == 1
+    status = engine.get_status()
+    assert status["ignore_pattern_dropped_count"] == 1
+
+    doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    drop_check = next(c for c in doctor["checks"] if c["check"] == "ignore_pattern_drops")
+    assert drop_check["status"] == "warn"
+
+
 def test_live_placeholder_text_does_not_match_ignore_pattern_via_payload(tmp_path):
     engine = _engine(tmp_path)
     pattern = _CountingIgnorePattern()

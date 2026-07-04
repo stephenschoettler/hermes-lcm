@@ -34,6 +34,7 @@ from .externalize import (
     build_transcript_gc_placeholder,
     extract_externalized_ref,
     find_externalized_payload_for_message,
+    is_externalized_placeholder,
     load_externalized_payload,
     maybe_externalize_tool_output,
 )
@@ -465,6 +466,13 @@ class LCMEngine(ContextEngine):
             self._config.ignore_message_patterns
         )
         self._ignored_message_count: int = 0
+        # Raw messages permanently dropped because they matched
+        # ignore_message_patterns. These are NOT persisted anywhere, so an
+        # over-broad operator pattern silently discards substantive turns from
+        # the "lossless" store. Count + log them so the loss is at least
+        # visible; full lossless retention (store with ignored=1) is a larger
+        # follow-up that touches cursor reconciliation and FTS.
+        self._ignore_pattern_dropped_count: int = 0
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -534,6 +542,16 @@ class LCMEngine(ContextEngine):
         self._last_condensation_suppressed_reason = ""
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        # Ingest-failure tracking. The core promise is that nothing is ever
+        # lost, but a swallowed persistence error (disk full, DB locked,
+        # corruption) silently breaks it: the turn continues while messages
+        # exist only in the volatile host list. Surface it instead of hiding
+        # it in a debug log so get_status()/doctor can escalate. Store-scoped,
+        # not session-scoped, so it is not cleared on session reset.
+        self._ingest_failure_count = 0
+        self._consecutive_ingest_failures = 0
+        self._last_ingest_error = ""
+        self._last_ingest_error_time: float = 0
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
@@ -931,6 +949,32 @@ class LCMEngine(ContextEngine):
         self._last_boundary_skip_time = 0
         return False
 
+    def _record_ingest_success(self) -> None:
+        self._consecutive_ingest_failures = 0
+
+    def _record_ingest_failure(self, where: str, error: Exception) -> None:
+        """Track a swallowed ingest error so it is operator-visible.
+
+        Escalates to error level once failures are consecutive: a single
+        transient lock is a warning, but a sustained inability to persist
+        means the lossless guarantee is broken and must not stay hidden.
+        """
+        self._ingest_failure_count += 1
+        self._consecutive_ingest_failures += 1
+        self._last_ingest_error = f"{type(error).__name__}: {error}"
+        self._last_ingest_error_time = time.time()
+        message = "LCM ingest failed (%s): %s [consecutive=%d, total=%d]"
+        args = (
+            where,
+            error,
+            self._consecutive_ingest_failures,
+            self._ingest_failure_count,
+        )
+        if self._consecutive_ingest_failures >= 3:
+            logger.error(message, *args)
+        else:
+            logger.warning(message, *args)
+
     def ingest(self, messages: List[Dict[str, Any]]) -> None:
         """Persist messages to the durable store every turn.
 
@@ -949,12 +993,13 @@ class LCMEngine(ContextEngine):
         if self._session_id and messages:
             try:
                 self._ingest_messages(messages)
+                self._record_ingest_success()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
                 )
             except Exception as e:
-                logger.warning("Ingest during per-turn ingest(): %s", e)
+                self._record_ingest_failure("per-turn ingest()", e)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._session_ignored or self._session_stateless or self._thread_context_stateless():
@@ -995,8 +1040,18 @@ class LCMEngine(ContextEngine):
         if self._session_id and messages:
             try:
                 replay_messages = self._ingest_messages(messages)
+                self._record_ingest_success()
             except Exception as e:
-                logger.warning("Ingest during preflight: %s", e)
+                # Fail closed for NORMAL threshold compaction: the store did not
+                # accept this turn, so do not compact against a store missing the
+                # latest messages - that could rebuild active context without
+                # them. But still honor emergency overflow recovery, whose whole
+                # job is to keep the prompt under the provider limit; it converges
+                # via deterministic L3 truncation without needing the store write.
+                self._record_ingest_failure("preflight", e)
+                if self._should_force_overflow_recovery(observed_tokens=rough):
+                    return True
+                return False
         if replay_messages is not None and replay_messages != messages:
             if self._compression_boundary_cooldown_active():
                 return False
@@ -3104,6 +3159,10 @@ class LCMEngine(ContextEngine):
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "ingest_failure_count": self._ingest_failure_count,
+            "consecutive_ingest_failures": self._consecutive_ingest_failures,
+            "last_ingest_error": self._last_ingest_error,
+            "last_ingest_error_time": self._last_ingest_error_time,
             "model": self.model,
             "provider": self.provider,
             "context_length_source": self._context_length_source,
@@ -3164,6 +3223,7 @@ class LCMEngine(ContextEngine):
             status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
             status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
             status["ignored_message_count"] = self._ignored_message_count
+            status["ignore_pattern_dropped_count"] = self._ignore_pattern_dropped_count
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
@@ -5129,11 +5189,25 @@ class LCMEngine(ContextEngine):
                         active_message["content"] = self._ignored_active_replay_placeholder(original_text)
                         active_replay_messages[absolute_idx] = active_message
                     excerpt = original_text[:80].replace("\n", " ")
-                    logger.debug(
-                        "LCM ignore_message_patterns dropped %s message: %r",
-                        original_msg.get("role", "unknown"),
-                        excerpt,
-                    )
+                    if ignored_original_messages[absolute_idx]:
+                        # A raw message matched ignore_message_patterns and is
+                        # discarded here - never persisted anywhere. Count and
+                        # log it (INFO) so an over-broad pattern silently eating
+                        # substantive turns is at least visible to the operator.
+                        self._ignore_pattern_dropped_count += 1
+                        logger.info(
+                            "LCM ignore_message_patterns dropped %s message "
+                            "(not persisted; total dropped=%d): %r",
+                            original_msg.get("role", "unknown"),
+                            self._ignore_pattern_dropped_count,
+                            excerpt,
+                        )
+                    else:
+                        logger.debug(
+                            "LCM ignore_message_patterns dropped %s message: %r",
+                            original_msg.get("role", "unknown"),
+                            excerpt,
+                        )
                     continue
                 kept.append((absolute_idx, replay_msg))
             messages_to_store_with_index = kept
@@ -5445,7 +5519,13 @@ class LCMEngine(ContextEngine):
             if not content:
                 continue
 
-            ref = extract_externalized_ref(content)
+            # Only take the fast ref-branch when the ENTIRE row is the
+            # externalized placeholder. A ref merely embedded in surrounding
+            # text (e.g. a recall-tool result that quotes a placeholder) must
+            # fall through to the content-equality lookup below, which tombstones
+            # only when the full row content matches the stored payload -
+            # otherwise the surrounding, never-externalized text is lost.
+            ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
             if ref:
                 externalized = load_externalized_payload(
                     ref,

@@ -1037,14 +1037,28 @@ class MessageStore:
                         offset += len(tie_rows)
                     break
         else:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                    FROM messages
-                    WHERE {' AND '.join(where)}
-                    LIMIT ?""",
-                [*base_args, fetch_limit],
-            ).fetchall()
-            add_rows(rows)
+            # Deterministic, recent-biased candidate scan for relevance/hybrid.
+            # Without an ORDER BY the LIKE fallback scored an arbitrary
+            # storage-order slice, so the best matches beyond the first page
+            # were never examined (final ranking still happens in Python below).
+            candidate_cap = compute_search_candidate_cap(limit)
+            offset = 0
+            while offset < candidate_cap:
+                batch_limit = min(fetch_limit, candidate_cap - offset)
+                rows = self._conn.execute(
+                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                        FROM messages
+                        WHERE {' AND '.join(where)}
+                        ORDER BY timestamp DESC, store_id DESC
+                        LIMIT ? OFFSET ?""",
+                    [*base_args, batch_limit, offset],
+                ).fetchall()
+                if not rows:
+                    break
+                add_rows(rows)
+                offset += len(rows)
+                if len(rows) < batch_limit:
+                    break
 
         results.sort(key=lambda result: _fallback_result_sort_key(result, sort))
         for result in results:
