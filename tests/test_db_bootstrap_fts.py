@@ -247,3 +247,34 @@ def test_check_disk_space_uses_portable_fallback_when_statvfs_is_unavailable(mon
     )
 
     assert db_bootstrap._check_disk_space(str(tmp_path / "lcm.db")) is True
+
+
+def test_run_versioned_migrations_refuses_newer_schema(tmp_path):
+    from hermes_lcm.db_bootstrap import (
+        SchemaVersionTooNewError,
+        ensure_metadata_table,
+        run_versioned_migrations,
+    )
+
+    conn = sqlite3.connect(tmp_path / "future.db")
+    try:
+        ensure_metadata_table(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', '99')"
+        )
+        conn.commit()
+        with pytest.raises(SchemaVersionTooNewError):
+            run_versioned_migrations(conn)
+    finally:
+        conn.close()
+
+
+def test_run_versioned_migrations_accepts_current_schema(tmp_path):
+    from hermes_lcm.db_bootstrap import run_versioned_migrations, get_schema_version, SCHEMA_VERSION
+
+    conn = sqlite3.connect(tmp_path / "fresh.db")
+    try:
+        run_versioned_migrations(conn)
+        assert get_schema_version(conn) == SCHEMA_VERSION
+    finally:
+        conn.close()

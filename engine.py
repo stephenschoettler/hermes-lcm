@@ -27,6 +27,7 @@ from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .escalation import (
     SummaryCircuitBreaker,
+    SummarySpendGuard,
     _strip_reasoning_blocks,
     summarize_with_escalation,
 )
@@ -529,6 +530,16 @@ class LCMEngine(ContextEngine):
         self._summary_circuit_breaker = SummaryCircuitBreaker(
             failure_threshold=self._config.summary_circuit_breaker_failure_threshold,
             cooldown_seconds=self._config.summary_circuit_breaker_cooldown_seconds,
+        )
+        # Rate-limit summarizer spend so a pathologically looping compaction that
+        # keeps succeeding cannot burn auxiliary-model budget without bound. When
+        # tripped, escalation falls back to deterministic L3 truncation. Config
+        # fields are optional (getattr defaults) to avoid config sprawl; set
+        # summary_spend_max_calls=0 to disable.
+        self._summary_spend_guard = SummarySpendGuard(
+            max_calls=int(getattr(self._config, "summary_spend_max_calls", 24)),
+            window_seconds=float(getattr(self._config, "summary_spend_window_seconds", 600.0)),
+            backoff_seconds=float(getattr(self._config, "summary_spend_backoff_seconds", 1800.0)),
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
@@ -1271,6 +1282,7 @@ class LCMEngine(ContextEngine):
                     model=self._config.summary_model,
                     fallback_models=self._config.summary_fallback_models,
                     circuit_breaker=self._summary_circuit_breaker,
+                    spend_guard=self._summary_spend_guard,
                     timeout=self._config.summary_timeout_ms / 1000,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
@@ -1337,6 +1349,12 @@ class LCMEngine(ContextEngine):
             observed_tokens=observed_prompt_tokens,
             messages=messages,
         )
+        # NOTE: deliberately do NOT clear the spend guard on force_overflow.
+        # force_overflow is automatic (set every turn the prompt exceeds the
+        # assembly cap), which is exactly the sustained-over-cap state a runaway
+        # compaction loop produces - clearing it per turn would defeat the guard
+        # in the case it exists for. A tripped guard still converges the
+        # emergency via deterministic L3 truncation (no LLM spend).
         recovery_assembly_cap = (
             self._overflow_recovery_assembly_cap(
                 observed_tokens=observed_prompt_tokens,
@@ -5889,6 +5907,7 @@ class LCMEngine(ContextEngine):
                 model=self._config.summary_model,
                 fallback_models=self._config.summary_fallback_models,
                 circuit_breaker=self._summary_circuit_breaker,
+                spend_guard=self._summary_spend_guard,
                 timeout=self._config.summary_timeout_ms / 1000,
                 l2_budget_ratio=self._config.l2_budget_ratio,
                 l3_truncate_tokens=self._config.l3_truncate_tokens,

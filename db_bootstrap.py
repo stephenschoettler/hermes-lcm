@@ -17,6 +17,16 @@ from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
+
+class SchemaVersionTooNewError(RuntimeError):
+    """Raised when a database was written by a newer LCM schema than this build.
+
+    Opening and migrating such a database with older code risks silently
+    corrupting data written under semantics this build does not understand, so
+    we refuse rather than degrade.
+    """
+
+
 SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
@@ -598,6 +608,13 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     ensure_migration_state_table(conn)
 
     current_version = get_schema_version(conn)
+    if current_version > SCHEMA_VERSION:
+        raise SchemaVersionTooNewError(
+            f"LCM database schema version {current_version} is newer than this "
+            f"build supports (v{SCHEMA_VERSION}). Refusing to open to avoid "
+            f"corrupting data written by a newer hermes-lcm. Upgrade the plugin "
+            f"or restore a pre-upgrade backup (.db/-wal/-shm)."
+        )
     if current_version < 2:
         mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
         current_version = 2

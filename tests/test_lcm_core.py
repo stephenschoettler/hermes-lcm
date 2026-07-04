@@ -377,6 +377,58 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert (second_summary, second_level) == ("fallback summary", 1)
         assert calls == ["primary-model", "fallback-model", "fallback-model"]
 
+    def test_spend_guard_trips_and_backs_off(self):
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        g = SummarySpendGuard(max_calls=3, window_seconds=100, backoff_seconds=50)
+        t = 1000.0
+        for _ in range(3):
+            assert g.allows(now=t) is True
+            g.record_call(now=t)
+        assert g.allows(now=t) is False        # budget exhausted -> backoff
+        assert g.allows(now=t + 49) is False   # still backing off
+        assert g.allows(now=t + 51) is True    # backoff elapsed, window reset
+
+    def test_spend_guard_clear_and_disable(self):
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        g = SummarySpendGuard(max_calls=1, window_seconds=100, backoff_seconds=100)
+        g.record_call(now=0)
+        assert g.allows(now=10) is False
+        g.clear()
+        assert g.allows(now=10) is True
+
+        disabled = SummarySpendGuard(max_calls=0)
+        for _ in range(5):
+            disabled.record_call(now=0)
+        assert disabled.allows(now=0) is True
+
+    def test_summarize_falls_to_l3_when_spend_guard_backs_off(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            return "should never be used"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        guard = SummarySpendGuard(max_calls=1, window_seconds=3600, backoff_seconds=3600)
+        guard.record_call()
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            spend_guard=guard,
+        )
+
+        assert level == 3          # deterministic fallback, no spend
+        assert calls == []         # LLM never invoked while backing off
+
     def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
         from hermes_lcm.extraction import _call_extraction_llm
 
