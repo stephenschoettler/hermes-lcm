@@ -635,6 +635,8 @@ def ensure_external_content_fts(
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
+    refuse_schema_version_too_new(conn)
+
     ensure_metadata_table(conn)
     ensure_migration_state_table(conn)
 
