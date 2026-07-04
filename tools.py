@@ -2031,7 +2031,8 @@ def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, sessio
             create=False,
         )
         path = storage_dir / ref
-        stat = path.stat()
+        if not path.exists():
+            return {"readable": False, "error": "missing"}
         if not path.is_file():
             return {"readable": False, "error": "not_a_file"}
         metadata_prefix, _ = _read_externalized_payload_metadata_prefix(path)
@@ -2048,6 +2049,24 @@ def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, sessio
     if not payload_session_id:
         return {"readable": False, "error": "session_metadata_unavailable"}
 
+    payload = load_externalized_payload(
+        ref,
+        config=engine._config,
+        hermes_home=engine._hermes_home,
+    )
+    if payload is None:
+        return {"readable": False, "error": "invalid_payload"}
+    payload_session_id = payload.get("session_id") or ""
+    if payload_session_id != session_id:
+        return {"readable": False, "error": "session_mismatch"}
+
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {"readable": False, "error": "missing"}
+    except OSError as exc:
+        return {"readable": False, "error": str(exc)}
+
     metadata: dict[str, Any] = {
         "readable": True,
         "file_size_bytes": stat.st_size,
@@ -2062,7 +2081,8 @@ def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int)
     message_total = engine._store.get_session_count(session_id)
     rows = engine._store.load_session_page(session_id, limit=_LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT)
     scan_truncated = message_total > len(rows)
-    all_items: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+    total_known = 0
     seen: set[tuple[int, str]] = set()
     for row in rows:
         refs: list[str] = []
@@ -2075,6 +2095,9 @@ def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int)
             if key in seen:
                 continue
             seen.add(key)
+            total_known += 1
+            if len(items) >= limit:
+                continue
             metadata = _inspect_externalized_payload_metadata(engine, ref, session_id)
             item: dict[str, Any] = {
                 "externalized_ref": ref,
@@ -2089,16 +2112,16 @@ def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int)
             if row.get("tool_call_id"):
                 item["tool_call_id"] = row.get("tool_call_id")
             item.update(metadata)
-            all_items.append(item)
+            items.append(item)
 
     return {
-        "total_known": len(all_items),
+        "total_known": total_known,
         "total_known_exact": not scan_truncated,
         "scanned_messages": len(rows),
         "scan_truncated": scan_truncated,
-        "returned": min(len(all_items), limit),
-        "has_more": len(all_items) > limit or scan_truncated,
-        "items": all_items[:limit],
+        "returned": len(items),
+        "has_more": total_known > len(items) or scan_truncated,
+        "items": items,
     }
 
 

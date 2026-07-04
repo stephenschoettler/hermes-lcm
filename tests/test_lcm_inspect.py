@@ -439,6 +439,67 @@ def test_lcm_inspect_rejects_payload_refs_when_session_metadata_is_beyond_prefix
         engine.shutdown()
 
 
+def test_lcm_inspect_rejects_malformed_payload_after_matching_session_metadata(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=True,
+        )
+        ref = "payload-corrupt-after-content.json"
+        (storage_dir / ref).write_text(
+            '{"kind":"tool_result","session_id":"sess-current","content":"unterminated',
+            encoding="utf-8",
+        )
+        engine._store.append(
+            "sess-current",
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=12; bytes=12; ref={ref}]"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        item = result["externalized_refs"]["items"][0]
+        assert item["readable"] is False
+        assert item["error"] == "invalid_payload"
+        assert "file_size_bytes" not in item
+        assert "modified_at" not in item
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_inspect_caps_payload_validation_to_returned_refs(tmp_path, monkeypatch):
+    engine = _make_engine(tmp_path)
+    try:
+        for index in range(5):
+            ref = _write_externalized_payload(engine, ref=f"payload-{index}.json")
+            engine._store.append(
+                "sess-current",
+                {"role": "assistant", "content": f"placeholder [Externalized tool output: tool_call_id=call-{index}; chars=17; bytes=17; ref={ref}]"},
+                source="discord",
+                conversation_id="discord:channel:thread",
+            )
+
+        calls = []
+
+        def fake_metadata(_engine, ref, session_id):
+            calls.append((ref, session_id))
+            return {"readable": True, "payload_session_id": session_id}
+
+        monkeypatch.setattr(lcm_tools, "_inspect_externalized_payload_metadata", fake_metadata)
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {"limit": 2}))
+
+        assert result["externalized_refs"]["total_known"] == 5
+        assert result["externalized_refs"]["returned"] == 2
+        assert result["externalized_refs"]["has_more"] is True
+        assert len(calls) == 2
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_inspect_finds_externalized_refs_inside_decoded_tool_calls(tmp_path):
     engine = _make_engine(tmp_path)
     try:
