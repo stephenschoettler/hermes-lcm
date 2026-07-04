@@ -3929,3 +3929,32 @@ def test_ingest_externalizes_crlf_wrapped_base64_block(tmp_path):
     _store_id, content, _tool_calls = _single_message_row(engine, role="user")
     assert GENERIC_BASE64[:120] not in content
     assert "[Externalized" in content
+
+
+def test_private_key_redaction_fallback_preserves_large_complete_key(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    engine = _sensitive_engine(tmp_path)
+    monkeypatch.setattr(ip, "_regex_engine", None)
+    monkeypatch.setattr(ip, "_SENSITIVE_REGEX_CATALOG", {})
+    key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        + "A" * (ip._SENSITIVE_STDLIB_MAX_CHARS + 10)
+        + "\n-----END PRIVATE KEY-----"
+    )
+
+    redacted = ip.redact_sensitive_text("prefix " + key + " suffix", engine._config)
+
+    assert "BEGIN PRIVATE KEY" not in redacted
+    assert "END PRIVATE KEY" not in redacted
+    assert "[LCM sensitive redaction: name=private_key" in redacted
+    assert redacted.startswith("prefix ")
+    assert redacted.endswith(" suffix")
+
+
+def test_wrapped_base64_scan_ignores_long_single_line_without_regex_backtracking():
+    from hermes_lcm.ingest_protection import contains_long_base64_run
+
+    not_payload = "A" * 80_000
+
+    assert contains_long_base64_run(not_payload) is False

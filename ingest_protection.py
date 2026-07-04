@@ -91,11 +91,11 @@ _BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{4096,})(?![
 # 4096-char contiguous run, so _BASE64_RUN_RE misses it entirely. Match a block
 # of consecutive base64-alphabet lines; looks_like_long_base64 makes the final
 # call on the whitespace-compacted block.
-_WRAPPED_BASE64_LINE = r"[A-Za-z0-9+/=_-]{40,}"
-_WRAPPED_BASE64_BLOCK_RE = re.compile(
-    rf"(?:{_WRAPPED_BASE64_LINE}\r?\n){{15,}}{_WRAPPED_BASE64_LINE}"
-)
+_WRAPPED_BASE64_MIN_LINE_CHARS = 40
 _BASE64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_\s-]+$")
+_BASE64_LINE_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
+_PRIVATE_KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE)
+_PRIVATE_KEY_END_RE = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE)
 _EXTERNALIZED_PLACEHOLDER_PREFIX = "[Externalized LCM ingest payload:"
 _QUARANTINED_ASSISTANT_KIND = "quarantined_assistant_output"
 _QUARANTINED_ASSISTANT_REASON = "high_repetition"
@@ -216,18 +216,109 @@ def _apply_sensitive_pattern(name: str, repl, text: str) -> str:
                         _SENSITIVE_MATCH_TIMEOUT_SECONDS,
                     )
                 return text
-        elif len(text) > _SENSITIVE_STDLIB_MAX_CHARS:
-            if name not in _SENSITIVE_STDLIB_SKIP_WARNED:
-                _SENSITIVE_STDLIB_SKIP_WARNED.add(name)
-                logger.warning(
-                    "LCM sensitive redaction %r skipped on a %d-char input without "
-                    "the optional 'regex' package (install 'regex' for "
-                    "timeout-guarded matching on large payloads)",
-                    name,
-                    len(text),
-                )
-            return text
+        elif name == "private_key":
+            return _redact_private_key_blocks(text)
     return _SENSITIVE_PATTERN_CATALOG[name].sub(repl, text)
+
+
+
+
+def _redact_private_key_blocks(text: str) -> str:
+    """Redact PEM private-key blocks with a linear scanner.
+
+    This keeps large valid keys protected even when the optional ``regex``
+    package is unavailable, without running the stdlib DOTALL private-key
+    pattern over a pathological multi-MB input. Unmatched BEGIN headers are
+    left intact; there is no complete key block to redact.
+    """
+    if "PRIVATE KEY-----" not in text:
+        return text
+    parts: list[str] = []
+    cursor = 0
+    changed = False
+    while True:
+        begin = _PRIVATE_KEY_BEGIN_RE.search(text, cursor)
+        if begin is None:
+            parts.append(text[cursor:])
+            break
+        end = _PRIVATE_KEY_END_RE.search(text, begin.end())
+        if end is None:
+            parts.append(text[cursor:])
+            break
+        block_end = end.end()
+        secret = text[begin.start():block_end]
+        parts.append(text[cursor:begin.start()])
+        parts.append(_sensitive_placeholder("private_key", secret))
+        cursor = block_end
+        changed = True
+    return "".join(parts) if changed else text
+
+
+def _is_wrapped_base64_line(line: str) -> bool:
+    stripped = line.strip("\r\n")
+    return (
+        len(stripped) >= _WRAPPED_BASE64_MIN_LINE_CHARS
+        and _BASE64_LINE_ALPHABET_RE.fullmatch(stripped) is not None
+    )
+
+
+def _iter_wrapped_base64_blocks(text: str):
+    """Yield (start, end, payload) for line-wrapped base64 blocks.
+
+    Implemented as a line scanner instead of a wide regex so long
+    base64-alphabet single lines that are not actually wrapped do not trigger
+    repeated failed block matches.
+    """
+    offset = 0
+    block_start: int | None = None
+    block_parts: list[str] = []
+    block_end = 0
+
+    def finish_block():
+        nonlocal block_start, block_parts, block_end
+        if block_start is not None and block_parts:
+            payload = "".join(block_parts)
+            start, end = block_start, block_end
+            block_start = None
+            block_parts = []
+            block_end = 0
+            if looks_like_long_base64(payload):
+                return (start, end, payload)
+        block_start = None
+        block_parts = []
+        block_end = 0
+        return None
+
+    for line in text.splitlines(keepends=True):
+        line_start = offset
+        offset += len(line)
+        if _is_wrapped_base64_line(line):
+            if block_start is None:
+                block_start = line_start
+            block_parts.append(line)
+            block_end = offset
+            continue
+        block = finish_block()
+        if block is not None:
+            yield block
+    block = finish_block()
+    if block is not None:
+        yield block
+
+
+def _replace_wrapped_base64_blocks(text: str, replace) -> str:
+    chunks: list[str] = []
+    cursor = 0
+    changed = False
+    for start, end, payload in _iter_wrapped_base64_blocks(text):
+        chunks.append(text[cursor:start])
+        chunks.append(replace(payload))
+        cursor = end
+        changed = True
+    if not changed:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
 
 
 def is_externalized_ingest_placeholder(text: str) -> bool:
@@ -246,8 +337,8 @@ def contains_long_base64_run(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_
     # Also catch line-wrapped base64 blocks (MIME/PEM), which never form a
     # single contiguous run.
     return any(
-        looks_like_long_base64(match.group(0), min_chars=min_chars)
-        for match in _WRAPPED_BASE64_BLOCK_RE.finditer(text)
+        looks_like_long_base64(payload, min_chars=min_chars)
+        for _start, _end, payload in _iter_wrapped_base64_blocks(text)
     )
 
 
@@ -729,10 +820,7 @@ def _protect_payload_substrings(
 
     protected = _BASE64_RUN_RE.sub(replace_base64_run, protected)
 
-    def replace_wrapped_base64(match: re.Match[str]) -> str:
-        payload = match.group(0)
-        if not looks_like_long_base64(payload):
-            return payload
+    def replace_wrapped_base64(payload: str) -> str:
         return _placeholder_for_payload(
             payload,
             role=role,
@@ -744,7 +832,7 @@ def _protect_payload_substrings(
 
     # Line-wrapped base64 (MIME/PEM) is not a single contiguous run; externalize
     # it here too so it does not land inline in SQLite/FTS/WAL/backups.
-    return _WRAPPED_BASE64_BLOCK_RE.sub(replace_wrapped_base64, protected)
+    return _replace_wrapped_base64_blocks(protected, replace_wrapped_base64)
 
 
 def _maybe_parse_json_string(text: str) -> Any | None:
