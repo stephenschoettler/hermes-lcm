@@ -70,7 +70,7 @@ def _seed_messages(engine):
     return engine._store.load_session_page("sess-current", limit=10)
 
 
-def _write_externalized_payload(engine, *, ref="payload-test.json"):
+def _write_externalized_payload(engine, *, ref="payload-test.json", session_id="sess-current"):
     storage_dir = get_large_output_storage_dir(
         engine._config,
         hermes_home=engine._hermes_home,
@@ -80,7 +80,7 @@ def _write_externalized_payload(engine, *, ref="payload-test.json"):
         "kind": "tool_result",
         "tool_call_id": "call-1",
         "role": "tool",
-        "session_id": "sess-current",
+        "session_id": session_id,
         "field_path": "content",
         "content_chars": 17,
         "content_bytes": 17,
@@ -143,6 +143,7 @@ def test_lcm_inspect_reports_bounded_metadata_without_content(tmp_path):
         assert result["externalized_refs"]["items"][0]["externalized_ref"] == ref
         assert result["externalized_refs"]["items"][0]["readable"] is True
         assert result["externalized_refs"]["items"][0]["file_size_bytes"] > 0
+        assert result["externalized_refs"]["items"][0]["payload_session_id"] == "sess-current"
         assert result["externalized_refs"]["items"][0]["store_id"] == rows[-1]["store_id"]
         assert "content_preview" not in result["externalized_refs"]["items"][0]
         assert "content" not in result["externalized_refs"]["items"][0]
@@ -243,6 +244,197 @@ def test_lcm_inspect_externalized_ref_scan_reports_truncation(tmp_path, monkeypa
         assert result["externalized_refs"]["total_known_exact"] is False
         assert result["externalized_refs"]["has_more"] is True
         assert result["externalized_refs"]["total_known"] == 0
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_inspect_payload_metadata_prefix_stops_before_content(tmp_path):
+    path = tmp_path / "payload.json"
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "tool_result",
+                "session_id": "sess-current",
+                "content": "SECRET_PAYLOAD_BODY" * 1024,
+                "content_chars": 19 * 1024,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    prefix, stopped_at_content = lcm_tools._read_externalized_payload_metadata_prefix(path)
+
+    assert stopped_at_content is True
+    assert b'"session_id"' in prefix
+    assert b'"content"' in prefix
+    assert b"SECRET_PAYLOAD_BODY" not in prefix
+
+
+def test_lcm_inspect_payload_metadata_parser_uses_top_level_session_owner():
+    fields, content_key_seen = lcm_tools._inspect_top_level_json_string_fields_before_content(
+        json.dumps(
+            {
+                "metadata": {"session_id": "nested-session"},
+                "session_id": "top-level-session",
+                "content": "payload body",
+            }
+        )
+    )
+
+    assert content_key_seen is True
+    assert fields["session_id"] == "top-level-session"
+
+    fields, content_key_seen = lcm_tools._inspect_top_level_json_string_fields_before_content(
+        '{"session_id":"first","session_id":"second","content":"payload body"}'
+    )
+
+    assert content_key_seen is True
+    assert fields["session_id"] == "second"
+
+
+def test_lcm_inspect_rejects_cross_session_externalized_refs(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        ref = _write_externalized_payload(
+            engine,
+            ref="payload-other-session.json",
+            session_id="other-session",
+        )
+        store_id = engine._store.append(
+            "sess-current",
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=17; bytes=17; ref={ref}]"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        item = result["externalized_refs"]["items"][0]
+        assert item["externalized_ref"] == ref
+        assert item["store_id"] == store_id
+        assert item["readable"] is False
+        assert item["error"] == "session_mismatch"
+        assert "file_size_bytes" not in item
+        assert "modified_at" not in item
+        assert "payload_session_id" not in item
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_inspect_rejects_nested_session_spoofed_externalized_refs(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=True,
+        )
+        ref = "payload-nested-spoof.json"
+        (storage_dir / ref).write_text(
+            json.dumps(
+                {
+                    "metadata": {"session_id": "sess-current"},
+                    "session_id": "other-session",
+                    "content": "payload body",
+                    "content_chars": 12,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        engine._store.append(
+            "sess-current",
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=12; bytes=12; ref={ref}]"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        item = result["externalized_refs"]["items"][0]
+        assert item["readable"] is False
+        assert item["error"] == "session_mismatch"
+        assert "file_size_bytes" not in item
+        assert "modified_at" not in item
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_inspect_rejects_payload_refs_without_session_metadata(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=True,
+        )
+        ref = "payload-without-session.json"
+        (storage_dir / ref).write_text(
+            json.dumps(
+                {
+                    "kind": "tool_result",
+                    "content": "legacy payload body",
+                    "content_chars": 19,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        engine._store.append(
+            "sess-current",
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=19; bytes=19; ref={ref}]"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        item = result["externalized_refs"]["items"][0]
+        assert item["readable"] is False
+        assert item["error"] == "session_metadata_unavailable"
+        assert "file_size_bytes" not in item
+        assert "modified_at" not in item
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_inspect_rejects_payload_refs_when_session_metadata_is_beyond_prefix(tmp_path):
+    engine = _make_engine(tmp_path)
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=True,
+        )
+        ref = "payload-session-beyond-prefix.json"
+        (storage_dir / ref).write_text(
+            json.dumps(
+                {
+                    "kind": "tool_result",
+                    "padding": "x" * 20_000,
+                    "session_id": "sess-current",
+                    "content": "payload body",
+                    "content_chars": 12,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        engine._store.append(
+            "sess-current",
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=12; bytes=12; ref={ref}]"},
+            source="discord",
+            conversation_id="discord:channel:thread",
+        )
+
+        result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
+
+        item = result["externalized_refs"]["items"][0]
+        assert item["readable"] is False
+        assert item["error"] == "session_metadata_unavailable"
+        assert "file_size_bytes" not in item
+        assert "modified_at" not in item
     finally:
         engine.shutdown()
 

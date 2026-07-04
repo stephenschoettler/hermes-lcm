@@ -207,6 +207,7 @@ _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS = 20_000
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
+_LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
 
 
 def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
@@ -1960,7 +1961,67 @@ def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: 
     return highest
 
 
-def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str) -> dict[str, Any]:
+def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
+    decoder = json.JSONDecoder()
+    fields: dict[str, str] = {}
+    length = len(text)
+    index = 0
+    while index < length and text[index].isspace():
+        index += 1
+    if index >= length or text[index] != "{":
+        return fields, False
+    index += 1
+
+    while index < length:
+        while index < length and (text[index].isspace() or text[index] == ","):
+            index += 1
+        if index >= length or text[index] == "}":
+            return fields, False
+        if text[index] != '"':
+            return fields, False
+        try:
+            key, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, False
+        if not isinstance(key, str):
+            return fields, False
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length or text[index] != ":":
+            return fields, False
+        index += 1
+        while index < length and text[index].isspace():
+            index += 1
+        if key == "content":
+            return fields, True
+        if index >= length:
+            return fields, False
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, False
+        if isinstance(value, str):
+            fields[key] = value
+    return fields, False
+
+
+def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[bytes, bool]:
+    """Read bounded JSON metadata before the externalized payload body."""
+    prefix = bytearray()
+    with path.open("rb") as handle:
+        while len(prefix) < _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES:
+            byte = handle.read(1)
+            if not byte:
+                break
+            prefix.extend(byte)
+            prefix_text = bytes(prefix).decode("utf-8", errors="replace")
+            _, content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
+            if content_key_seen:
+                return bytes(prefix), True
+    return bytes(prefix), False
+
+
+def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, session_id: str) -> dict[str, Any]:
     if not ref or Path(ref).name != ref:
         return {"readable": False, "error": "invalid_ref"}
     try:
@@ -1973,17 +2034,28 @@ def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str) -> dic
         stat = path.stat()
         if not path.is_file():
             return {"readable": False, "error": "not_a_file"}
-        with path.open("rb") as handle:
-            handle.read(1)
+        metadata_prefix, _ = _read_externalized_payload_metadata_prefix(path)
     except FileNotFoundError:
         return {"readable": False, "error": "missing"}
     except (OSError, ValueError) as exc:
         return {"readable": False, "error": str(exc)}
-    return {
+
+    prefix_text = metadata_prefix.decode("utf-8", errors="replace")
+    metadata_fields, _content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
+    payload_session_id = metadata_fields.get("session_id", "")
+    if payload_session_id and payload_session_id != session_id:
+        return {"readable": False, "error": "session_mismatch"}
+    if not payload_session_id:
+        return {"readable": False, "error": "session_metadata_unavailable"}
+
+    metadata: dict[str, Any] = {
         "readable": True,
         "file_size_bytes": stat.st_size,
         "modified_at": stat.st_mtime,
     }
+    if payload_session_id:
+        metadata["payload_session_id"] = payload_session_id
+    return metadata
 
 
 def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int) -> dict[str, Any]:
@@ -2003,7 +2075,7 @@ def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int)
             if key in seen:
                 continue
             seen.add(key)
-            metadata = _inspect_externalized_payload_metadata(engine, ref)
+            metadata = _inspect_externalized_payload_metadata(engine, ref, session_id)
             item: dict[str, Any] = {
                 "externalized_ref": ref,
                 "store_id": row.get("store_id"),
