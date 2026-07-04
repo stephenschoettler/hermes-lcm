@@ -68,6 +68,22 @@ def _missing_directory_components(path: Path) -> list[Path]:
     return list(reversed(missing))
 
 
+_WARNED_EXTERNALIZATION_PATHS: set[str] = set()
+
+
+def _warn_externalization_path_outside_base(path: Path, allowed_base: Path) -> None:
+    key = str(path)
+    if key in _WARNED_EXTERNALIZATION_PATHS:
+        return
+    _WARNED_EXTERNALIZATION_PATHS.add(key)
+    logger.warning(
+        "LCM externalized-payload path %s is outside the hermes_home base %s; "
+        "set LCM_HERMES_BASE_DIR to enforce strict containment",
+        path,
+        allowed_base,
+    )
+
+
 def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool) -> Path:
     configured = getattr(config, "large_output_externalization_path", "") or ""
     if configured:
@@ -80,6 +96,16 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
                 path.relative_to(allowed_base)
             except ValueError:
                 raise ValueError(f"Path {path} is not within allowed base {allowed_base}")
+        elif hermes_home:
+            # No explicit base configured: hermes_home is the natural default
+            # containment root. A configured path may legitimately point to
+            # another volume, so warn (once) rather than break a running
+            # deployment; set LCM_HERMES_BASE_DIR to enforce strictly.
+            allowed_base = Path(hermes_home).expanduser().resolve()
+            try:
+                path.relative_to(allowed_base)
+            except ValueError:
+                _warn_externalization_path_outside_base(path, allowed_base)
     else:
         base = Path(hermes_home).expanduser().resolve() if hermes_home else Path("~/.hermes").expanduser().resolve()
         path = base / DEFAULT_LARGE_OUTPUT_DIRNAME

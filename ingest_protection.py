@@ -87,6 +87,14 @@ _DATA_URI_BASE64_RE = re.compile(
 )
 
 _BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{4096,})(?![A-Za-z0-9+/=_-])")
+# Line-wrapped base64 (MIME 76 / PEM 64 chars per line) never forms a single
+# 4096-char contiguous run, so _BASE64_RUN_RE misses it entirely. Match a block
+# of consecutive base64-alphabet lines; looks_like_long_base64 makes the final
+# call on the whitespace-compacted block.
+_WRAPPED_BASE64_LINE = r"[A-Za-z0-9+/=_-]{40,}"
+_WRAPPED_BASE64_BLOCK_RE = re.compile(
+    rf"(?:{_WRAPPED_BASE64_LINE}\r?\n){{15,}}{_WRAPPED_BASE64_LINE}"
+)
 _BASE64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_\s-]+$")
 _EXTERNALIZED_PLACEHOLDER_PREFIX = "[Externalized LCM ingest payload:"
 _QUARANTINED_ASSISTANT_KIND = "quarantined_assistant_output"
@@ -130,6 +138,97 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     ),
 }
 
+# Sensitive redaction runs synchronously in the ingest path. The private_key
+# pattern (lazy `.*?` under DOTALL) rescans to end-of-string for every unmatched
+# BEGIN header, so a multi-MB payload with many headers and no END is O(n^2) and
+# can block a turn for minutes. Guard it: prefer the optional `regex` engine with
+# a match timeout (fail-open on timeout), and when `regex` is unavailable bound
+# the input length the stdlib DOTALL pattern is applied to.
+try:  # pragma: no cover - exercised when the optional dependency is absent
+    import regex as _regex_engine
+except Exception:  # pragma: no cover - keep the plugin importable in minimal installs
+    _regex_engine = None
+
+_SENSITIVE_MATCH_TIMEOUT_SECONDS = 1.0
+# Legitimate PEM keys are a few KB; above this a DOTALL rescan is the attack, not
+# a real key, so fail-open rather than block ingest.
+_SENSITIVE_STDLIB_MAX_CHARS = 262_144
+_BACKTRACKING_RISKY_SENSITIVE_PATTERNS = frozenset({"private_key"})
+_SENSITIVE_TIMEOUT_WARNED: set[str] = set()
+_SENSITIVE_STDLIB_SKIP_WARNED: set[str] = set()
+_SENSITIVE_REGEX_CATALOG: dict[str, Any] = {}
+
+
+def _regex_engine_flags(re_flags: int) -> int:
+    mapped = 0
+    if re_flags & re.IGNORECASE:
+        mapped |= _regex_engine.IGNORECASE
+    if re_flags & re.DOTALL:
+        mapped |= _regex_engine.DOTALL
+    if re_flags & re.MULTILINE:
+        mapped |= _regex_engine.MULTILINE
+    if re_flags & re.VERBOSE:
+        mapped |= _regex_engine.VERBOSE
+    return mapped
+
+
+def _regex_pattern_for(name: str) -> Any:
+    """Lazily compile the timeout-capable `regex` mirror of a catalog pattern."""
+    if _regex_engine is None:
+        return None
+    cached = _SENSITIVE_REGEX_CATALOG.get(name)
+    if cached is not None:
+        return cached
+    stdlib_pattern = _SENSITIVE_PATTERN_CATALOG[name]
+    compiled = _regex_engine.compile(
+        stdlib_pattern.pattern, _regex_engine_flags(stdlib_pattern.flags)
+    )
+    _SENSITIVE_REGEX_CATALOG[name] = compiled
+    return compiled
+
+
+def _apply_sensitive_pattern(name: str, repl, text: str) -> str:
+    """Substitute one sensitive pattern with a ReDoS-safe strategy.
+
+    Fails open (leaves the span unredacted) with a one-time warning rather than
+    blocking the ingest path on a pathological input.
+    """
+    # Only the private_key pattern (lazy `.*?` under DOTALL, which rescans to
+    # end-of-string per unmatched BEGIN header) is O(n^2) and needs a guard.
+    # The other patterns are character-class-bounded and linear, so they always
+    # run via stdlib and never fail open - a redaction bypass under CPU load
+    # would be a silent secret leak, so we restrict fail-open to the one
+    # pattern that genuinely requires it.
+    if name in _BACKTRACKING_RISKY_SENSITIVE_PATTERNS:
+        regex_pattern = _regex_pattern_for(name)
+        if regex_pattern is not None:
+            try:
+                return regex_pattern.sub(
+                    repl, text, timeout=_SENSITIVE_MATCH_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                if name not in _SENSITIVE_TIMEOUT_WARNED:
+                    _SENSITIVE_TIMEOUT_WARNED.add(name)
+                    logger.warning(
+                        "LCM sensitive redaction %r timed out after %.3gs; leaving "
+                        "span unredacted for this input",
+                        name,
+                        _SENSITIVE_MATCH_TIMEOUT_SECONDS,
+                    )
+                return text
+        elif len(text) > _SENSITIVE_STDLIB_MAX_CHARS:
+            if name not in _SENSITIVE_STDLIB_SKIP_WARNED:
+                _SENSITIVE_STDLIB_SKIP_WARNED.add(name)
+                logger.warning(
+                    "LCM sensitive redaction %r skipped on a %d-char input without "
+                    "the optional 'regex' package (install 'regex' for "
+                    "timeout-guarded matching on large payloads)",
+                    name,
+                    len(text),
+                )
+            return text
+    return _SENSITIVE_PATTERN_CATALOG[name].sub(repl, text)
+
 
 def is_externalized_ingest_placeholder(text: str) -> bool:
     return isinstance(text, str) and bool(_INGEST_PLACEHOLDER_RE.fullmatch(text.strip()))
@@ -142,7 +241,14 @@ def contains_data_uri_base64(text: str) -> bool:
 def contains_long_base64_run(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_CHARS) -> bool:
     if not isinstance(text, str) or len(text) < min_chars:
         return False
-    return any(looks_like_long_base64(match.group(1), min_chars=min_chars) for match in _BASE64_RUN_RE.finditer(text))
+    if any(looks_like_long_base64(match.group(1), min_chars=min_chars) for match in _BASE64_RUN_RE.finditer(text)):
+        return True
+    # Also catch line-wrapped base64 blocks (MIME/PEM), which never form a
+    # single contiguous run.
+    return any(
+        looks_like_long_base64(match.group(0), min_chars=min_chars)
+        for match in _WRAPPED_BASE64_BLOCK_RE.finditer(text)
+    )
 
 
 def extract_ingest_externalized_refs(text: str) -> list[str]:
@@ -280,8 +386,11 @@ def redact_sensitive_text(text: str, config) -> str:
         return text
     protected = text
     for name in active_names:
-        pattern = _SENSITIVE_PATTERN_CATALOG[name]
-        protected = pattern.sub(lambda match, pattern_name=name: _redact_match(pattern_name, match), protected)
+        protected = _apply_sensitive_pattern(
+            name,
+            lambda match, pattern_name=name: _redact_match(pattern_name, match),
+            protected,
+        )
     return protected
 
 
@@ -541,8 +650,12 @@ def looks_like_long_base64(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_CH
         return False
     if not _BASE64_ALPHABET_RE.match(text):
         return False
-    base64_chars = sum(1 for ch in text if ch.isalnum() or ch in "+/=_-")
-    ratio = base64_chars / max(1, len(text))
+    # Compute the base64 density over the whitespace-stripped content, not the
+    # raw text: otherwise line-ending overhead sinks the ratio and canonical
+    # CRLF-wrapped MIME (76/78 = 0.974) and PEM (64/66 = 0.970) blocks fall
+    # below 0.98 and are wrongly left inline.
+    base64_chars = sum(1 for ch in compact if ch.isalnum() or ch in "+/=_-")
+    ratio = base64_chars / max(1, len(compact))
     if ratio < 0.98:
         return False
     # Require at least a bit of mixed alphabet so a long log line of one
@@ -614,7 +727,24 @@ def _protect_payload_substrings(
             hermes_home=hermes_home,
         ) or payload
 
-    return _BASE64_RUN_RE.sub(replace_base64_run, protected)
+    protected = _BASE64_RUN_RE.sub(replace_base64_run, protected)
+
+    def replace_wrapped_base64(match: re.Match[str]) -> str:
+        payload = match.group(0)
+        if not looks_like_long_base64(payload):
+            return payload
+        return _placeholder_for_payload(
+            payload,
+            role=role,
+            session_id=session_id,
+            field_path=field_path,
+            config=config,
+            hermes_home=hermes_home,
+        ) or payload
+
+    # Line-wrapped base64 (MIME/PEM) is not a single contiguous run; externalize
+    # it here too so it does not land inline in SQLite/FTS/WAL/backups.
+    return _WRAPPED_BASE64_BLOCK_RE.sub(replace_wrapped_base64, protected)
 
 
 def _maybe_parse_json_string(text: str) -> Any | None:

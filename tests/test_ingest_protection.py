@@ -3877,3 +3877,55 @@ def test_readme_documents_storage_boundary_payload_guard():
     assert "upstream/outside LCM scope" in readme
     assert "historical rows already present in `lcm.db`" in readme
     assert "backup-first cleanup or migration" in readme
+
+
+def test_sensitive_private_key_redaction_is_redos_safe_on_pathological_input(tmp_path):
+    import time as _time
+
+    engine = _sensitive_engine(tmp_path)
+
+    small = "-----BEGIN RSA PRIVATE KEY-----\nabcdef\n-----END RSA PRIVATE KEY-----"
+    assert "BEGIN RSA PRIVATE KEY" not in redact_sensitive_text(small, engine._config)
+
+    pathological = ("-----BEGIN PRIVATE KEY-----\n" + "A" * 64 + "\n") * 20000
+    start = _time.perf_counter()
+    result = redact_sensitive_text(pathological, engine._config)
+    assert _time.perf_counter() - start < 3.0
+    assert isinstance(result, str)
+
+
+def test_sensitive_private_key_fallback_bounds_input_without_regex(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    monkeypatch.setattr(ip, "_regex_engine", None)
+    ip._SENSITIVE_REGEX_CATALOG.clear()
+    engine = _sensitive_engine(tmp_path)
+
+    small = "-----BEGIN RSA PRIVATE KEY-----\nabcdef\n-----END RSA PRIVATE KEY-----"
+    assert "BEGIN RSA PRIVATE KEY" not in ip.redact_sensitive_text(small, engine._config)
+
+    big = "-----BEGIN PRIVATE KEY-----\n" + "A" * (ip._SENSITIVE_STDLIB_MAX_CHARS + 10)
+    assert ip.redact_sensitive_text(big, engine._config) == big
+
+
+def test_ingest_externalizes_line_wrapped_base64_block(tmp_path):
+    engine = _engine(tmp_path)
+    wrapped = "\n".join(GENERIC_BASE64[i:i + 64] for i in range(0, len(GENERIC_BASE64), 64))
+
+    engine._ingest_messages([{"role": "user", "content": f"attachment:\n{wrapped}\nend"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert GENERIC_BASE64[:120] not in content
+    assert wrapped[:200] not in content
+    assert "[Externalized" in content
+
+
+def test_ingest_externalizes_crlf_wrapped_base64_block(tmp_path):
+    engine = _engine(tmp_path)
+    wrapped = "\r\n".join(GENERIC_BASE64[i:i + 76] for i in range(0, len(GENERIC_BASE64), 76))
+
+    engine._ingest_messages([{"role": "user", "content": f"attachment:\r\n{wrapped}\r\nend"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert GENERIC_BASE64[:120] not in content
+    assert "[Externalized" in content
