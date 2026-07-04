@@ -2328,6 +2328,32 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_advance_frontier_is_monotonic_under_stale_read(self, tmp_path):
+        import dataclasses
+
+        store = LifecycleStateStore(tmp_path / "lifecycle-frontier.db")
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            store.advance_frontier("c1", "s1", 10)
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+
+            # Simulate a racing caller whose read predates the advance to 10:
+            # it sees a stale frontier of 0 and tries to advance to a lower
+            # value. SQL-side MAX must keep the checkpoint monotonic instead of
+            # regressing it (which would force the same range to compact twice).
+            stale = dataclasses.replace(
+                store.get_by_conversation("c1"), current_frontier_store_id=0
+            )
+            store.get_by_conversation = lambda cid: stale
+            try:
+                store.advance_frontier("c1", "s1", 5)
+            finally:
+                del store.get_by_conversation
+
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+        finally:
+            store.close()
+
     def test_init_upgrades_legacy_db_and_keeps_missing_state_safe(self, tmp_path):
         db_path = tmp_path / "legacy-lifecycle.db"
         conn = sqlite3.connect(db_path)
