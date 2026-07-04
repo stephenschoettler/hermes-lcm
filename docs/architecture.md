@@ -71,4 +71,5 @@ lightweight ABC stub.
 
 - [Operator guide](operator-guide.md)
 - [Retrieval tools reference](retrieval-tools.md)
+- [Opt-in async/background compaction design](async-background-compaction.md)
 - [Benchmarking and stress checks](../benchmarks/README.md)
