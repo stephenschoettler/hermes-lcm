@@ -977,9 +977,10 @@ def protect_message_for_ingest(
     """
     msg = dict(message or {})
     role = str(msg.get("role") or "unknown")
-    raw_normalized_content = normalize_content_value(msg.get("content"))
+    raw_content = msg.get("content")
+    raw_normalized_content = normalize_content_value(raw_content)
     original_content = redact_sensitive_value(
-        msg.get("content"),
+        raw_content,
         config,
         parse_json_strings=False,
     )

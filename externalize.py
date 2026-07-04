@@ -129,6 +129,82 @@ def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
             os.close(fd)
 
 
+def _replace_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    try:
+        _write_externalized_payload(tmp_path, payload)
+        tmp_path.replace(path)
+        _fsync_directory(path.parent)
+    except OSError:
+        _unlink_partial_payload(tmp_path)
+        raise
+
+
+def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if not metadata:
+        return None
+    source_path = metadata.get("persisted_output_source_path")
+    expected_chars = metadata.get("persisted_output_expected_chars")
+    if source_path is None or expected_chars is None:
+        return None
+    try:
+        expected_chars = int(expected_chars)
+    except (TypeError, ValueError):
+        return None
+    source_path = str(source_path)
+    if not source_path:
+        return None
+    return {
+        "source_path": source_path,
+        "expected_chars": expected_chars,
+    }
+
+
+def _persisted_output_marker_entries(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
+    entries: list[Dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add(source_path: Any, expected_chars: Any) -> None:
+        if source_path is None or expected_chars is None:
+            return
+        try:
+            chars = int(expected_chars)
+        except (TypeError, ValueError):
+            return
+        source = str(source_path)
+        if not source:
+            return
+        key = (source, chars)
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append({"source_path": source, "expected_chars": chars})
+
+    add(payload.get("persisted_output_source_path"), payload.get("persisted_output_expected_chars"))
+    markers = payload.get("persisted_output_markers")
+    if isinstance(markers, list):
+        for marker in markers:
+            if not isinstance(marker, dict):
+                continue
+            add(marker.get("source_path"), marker.get("expected_chars"))
+    return entries
+
+
+def _merge_persisted_output_marker_metadata(payload: Dict[str, Any], metadata: Dict[str, Any] | None) -> bool:
+    marker = _persisted_output_marker_entry_from_metadata(metadata)
+    if marker is None:
+        return False
+    entries = _persisted_output_marker_entries(payload)
+    key = (marker["source_path"], marker["expected_chars"])
+    if any((entry["source_path"], entry["expected_chars"]) == key for entry in entries):
+        return False
+    entries.append(marker)
+    payload["persisted_output_markers"] = entries
+    payload.setdefault("persisted_output_source_path", marker["source_path"])
+    payload.setdefault("persisted_output_expected_chars", marker["expected_chars"])
+    return True
+
+
 def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
     return get_large_output_storage_dir(config, hermes_home=hermes_home, create=True)
 
@@ -345,10 +421,17 @@ def find_externalized_tool_result_content_for_call(
         content = payload.get("content")
         if not isinstance(content, str):
             continue
-        if expected_chars is not None and payload.get("persisted_output_expected_chars") != expected_chars:
-            continue
-        if persisted_output_source_path and payload.get("persisted_output_source_path") != persisted_output_source_path:
-            continue
+        if expected_chars is not None or persisted_output_source_path:
+            marker_matches = False
+            for marker in _persisted_output_marker_entries(payload):
+                if expected_chars is not None and marker.get("expected_chars") != expected_chars:
+                    continue
+                if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
+                    continue
+                marker_matches = True
+                break
+            if not marker_matches:
+                continue
         return content
     return None
 
@@ -458,21 +541,32 @@ def maybe_externalize_payload(
         logger.warning("Large payload externalization skipped (non-blocking): %s", exc)
         return None
 
-    existing = None
-    if not metadata:
-        existing = find_externalized_payload_for_message(
-            content,
-            tool_call_id=tool_call_id,
-            session_id=session_id,
-            kind=kind,
-            role=role,
-            config=config,
-            hermes_home=hermes_home,
-        )
+    existing = find_externalized_payload_for_message(
+        content,
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+        kind=kind,
+        role=role,
+        config=config,
+        hermes_home=hermes_home,
+    )
     if existing is not None:
+        existing_path = storage_dir / existing["ref"]
+        existing_payload = None
+        if metadata:
+            try:
+                existing_payload = json.loads(existing_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_payload = None
+            if existing_payload is not None and _merge_persisted_output_marker_metadata(existing_payload, metadata):
+                try:
+                    _replace_externalized_payload(existing_path, existing_payload)
+                    existing = _externalized_summary(existing_path, existing_payload)
+                except OSError as exc:
+                    logger.warning("Large payload metadata update skipped (non-blocking): %s", exc)
         return {
             "placeholder": _build_externalized_placeholder(existing),
-            "path": storage_dir / existing["ref"],
+            "path": existing_path,
             "payload": existing,
         }
 
@@ -502,6 +596,7 @@ def maybe_externalize_payload(
     }
     if metadata:
         payload.update({k: v for k, v in metadata.items() if v is not None})
+        _merge_persisted_output_marker_metadata(payload, metadata)
     try:
         _write_externalized_payload(path, payload)
     except OSError as exc:

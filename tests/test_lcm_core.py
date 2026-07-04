@@ -4087,6 +4087,8 @@ class TestIngestExternalization:
         host_storage = tmp_path / "hermes-results"
         host_storage.mkdir()
         full_result = "api_key = SECRETSECRET1234567890 suffix"
+        preview = full_result[:32]
+        assert "SECRETSECRET" in preview
         persisted_path = host_storage / "call_secret.txt"
         persisted_path.write_text(full_result, encoding="utf-8")
         marker = (
@@ -4094,8 +4096,8 @@ class TestIngestExternalization:
             f"This tool result was too large ({len(full_result):,} characters, 0.0 KB).\n"
             f"Full output saved to: {persisted_path}\n"
             "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
-            "Preview (first 30 chars):\n"
-            f"{full_result[:30]}\n...\n"
+            f"Preview (first {len(preview)} chars):\n"
+            f"{preview}\n"
             "</persisted-output>"
         )
 
@@ -4259,7 +4261,7 @@ class TestIngestExternalization:
         replay_after_cleanup._ingest_messages(original_messages + retry_messages)
         assert replay_after_cleanup._store.get_session_count("ingest-session") == 4
 
-    def test_replay_matches_same_recovered_content_from_distinct_persisted_paths_after_cleanup(self, tmp_path, monkeypatch):
+    def test_replay_reuses_same_content_persisted_output_payload_across_marker_paths(self, tmp_path, monkeypatch):
         import tempfile
         from hermes_lcm.engine import LCMEngine
 
@@ -4267,38 +4269,53 @@ class TestIngestExternalization:
         engine, output_dir = self._engine(tmp_path)
         host_storage = tmp_path / "hermes-results"
         host_storage.mkdir()
-        full_result = "SAME_CONTENT_DIFFERENT_PATH:" + ("z" * 1000)
-        first_path = host_storage / "call_same_first.txt"
-        second_path = host_storage / "call_same_second.txt"
+        full_result = "SAME_CONTENT_RETRY_NEEDLE:\n" + ("same" * 1000)
+        first_path = host_storage / "call_retry_first.txt"
         first_path.write_text(full_result, encoding="utf-8")
-        second_path.write_text(full_result, encoding="utf-8")
-
-        def marker_for(path):
-            return (
-                "<persisted-output>\n"
-                f"This tool result was too large ({len(full_result):,} characters, 1.0 KB).\n"
-                f"Full output saved to: {path}\n"
-                "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
-                "Preview (first 30 chars):\n"
-                f"{full_result[:30]}\n...\n"
-                "</persisted-output>"
-            )
-
+        first_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 3.9 KB).\n"
+            f"Full output saved to: {first_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
         original_messages = [
-            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_same", "function": {"name": "dump", "arguments": "{}"}}]},
-            {"role": "tool", "tool_call_id": "call_same", "content": marker_for(first_path)},
-        ]
-        retry_messages = [
-            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_same", "function": {"name": "dump", "arguments": "{}"}}]},
-            {"role": "tool", "tool_call_id": "call_same", "content": marker_for(second_path)},
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": first_marker},
         ]
         engine._ingest_messages(original_messages)
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        second_path = host_storage / "call_retry_second.txt"
+        second_path.write_text(full_result, encoding="utf-8")
+        second_marker = (
+            "<persisted-output>\n"
+            f"This tool result was too large ({len(full_result):,} characters, 3.9 KB).\n"
+            f"Full output saved to: {second_path}\n"
+            "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+            "Preview (first 30 chars):\n"
+            f"{full_result[:30]}\n...\n"
+            "</persisted-output>"
+        )
+        retry_messages = [
+            {"role": "assistant", "content": "Calling again", "tool_calls": [{"id": "call_retry", "function": {"name": "dump", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_retry", "content": second_marker},
+        ]
         replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
         replay._session_id = "ingest-session"
         replay._ingest_cursor_needs_reconcile = True
         replay._ingest_messages(original_messages + retry_messages)
-        payloads = [json.loads(path.read_text()) for path in output_dir.glob("*.json")]
-        assert {payload.get("persisted_output_source_path") for payload in payloads} == {str(first_path), str(second_path)}
+
+        assert replay._store.get_session_count("ingest-session") == 4
+        payload_files = list(output_dir.glob("*.json"))
+        assert len(payload_files) == 1
+        payload = json.loads(payload_files[0].read_text())
+        assert payload["content"] == full_result
+        marker_paths = {entry["source_path"] for entry in payload.get("persisted_output_markers", [])}
+        assert str(first_path) in marker_paths
+        assert str(second_path) in marker_paths
 
         second_path.unlink()
         replay_after_cleanup = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
