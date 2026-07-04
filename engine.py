@@ -48,6 +48,7 @@ from .ingest_protection import (
     _expected_persisted_output_chars,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
+    _persisted_output_preview_prefix,
     _persisted_output_saved_path,
     assistant_output_quarantine_reason,
     extract_all_externalized_payload_refs,
@@ -4281,30 +4282,37 @@ class LCMEngine(ContextEngine):
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if role == "tool" and _is_hermes_persisted_output_marker(content):
-            recovered_content = recover_hermes_persisted_output(content)
-            if recovered_content is not None:
-                content = normalize_content_value(
-                    redact_sensitive_value(
-                        recovered_content,
-                        self._config,
-                        parse_json_strings=False,
-                    )
-                ) or ""
-            elif not stored_row:
-                expected_chars = _expected_persisted_output_chars(content)
-                persisted_output_source_path = _persisted_output_saved_path(content)
-                durable_content = None
-                if expected_chars is not None and persisted_output_source_path:
-                    durable_content = find_externalized_tool_result_content_for_call(
-                        tool_call_id=str(msg.get("tool_call_id") or ""),
-                        session_id=str(msg.get("session_id") or self._session_id or ""),
-                        expected_chars=expected_chars,
-                        persisted_output_source_path=persisted_output_source_path,
-                        config=self._config,
-                        hermes_home=self._hermes_home,
-                    )
-                if durable_content is not None:
-                    content = durable_content
+            expected_chars = _expected_persisted_output_chars(content)
+            persisted_output_source_path = _persisted_output_saved_path(content)
+            persisted_output_preview_prefix = _persisted_output_preview_prefix(content)
+            durable_content = None
+            if (
+                not stored_row
+                and expected_chars is not None
+                and persisted_output_source_path
+                and persisted_output_preview_prefix
+            ):
+                durable_content = find_externalized_tool_result_content_for_call(
+                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    session_id=str(msg.get("session_id") or self._session_id or ""),
+                    expected_chars=expected_chars,
+                    persisted_output_source_path=persisted_output_source_path,
+                    persisted_output_preview_prefix=persisted_output_preview_prefix,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+            if durable_content is not None:
+                content = durable_content
+            else:
+                recovered_content = recover_hermes_persisted_output(content)
+                if recovered_content is not None:
+                    content = normalize_content_value(
+                        redact_sensitive_value(
+                            recovered_content,
+                            self._config,
+                            parse_json_strings=False,
+                        )
+                    ) or ""
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")

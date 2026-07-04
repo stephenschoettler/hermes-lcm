@@ -1007,6 +1007,7 @@ def protect_message_for_ingest(
                 metadata={
                     "persisted_output_source_path": _persisted_output_saved_path(raw_normalized_content),
                     "persisted_output_expected_chars": _expected_persisted_output_chars(raw_normalized_content),
+                    "persisted_output_preview_prefix": _persisted_output_preview_prefix(raw_normalized_content),
                 },
             )
 

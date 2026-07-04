@@ -145,6 +145,7 @@ def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None
         return None
     source_path = metadata.get("persisted_output_source_path")
     expected_chars = metadata.get("persisted_output_expected_chars")
+    preview_prefix = metadata.get("persisted_output_preview_prefix")
     if source_path is None or expected_chars is None:
         return None
     try:
@@ -154,17 +155,20 @@ def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None
     source_path = str(source_path)
     if not source_path:
         return None
-    return {
+    entry = {
         "source_path": source_path,
         "expected_chars": expected_chars,
     }
+    if preview_prefix:
+        entry["preview_prefix"] = str(preview_prefix)
+    return entry
 
 
 def _persisted_output_marker_entries(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     entries: list[Dict[str, Any]] = []
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int, str]] = set()
 
-    def add(source_path: Any, expected_chars: Any) -> None:
+    def add(source_path: Any, expected_chars: Any, preview_prefix: Any = None) -> None:
         if source_path is None or expected_chars is None:
             return
         try:
@@ -174,19 +178,27 @@ def _persisted_output_marker_entries(payload: Dict[str, Any]) -> list[Dict[str, 
         source = str(source_path)
         if not source:
             return
-        key = (source, chars)
+        preview = str(preview_prefix or "")
+        key = (source, chars, preview)
         if key in seen:
             return
         seen.add(key)
-        entries.append({"source_path": source, "expected_chars": chars})
+        entry = {"source_path": source, "expected_chars": chars}
+        if preview:
+            entry["preview_prefix"] = preview
+        entries.append(entry)
 
-    add(payload.get("persisted_output_source_path"), payload.get("persisted_output_expected_chars"))
+    add(
+        payload.get("persisted_output_source_path"),
+        payload.get("persisted_output_expected_chars"),
+        payload.get("persisted_output_preview_prefix"),
+    )
     markers = payload.get("persisted_output_markers")
     if isinstance(markers, list):
         for marker in markers:
             if not isinstance(marker, dict):
                 continue
-            add(marker.get("source_path"), marker.get("expected_chars"))
+            add(marker.get("source_path"), marker.get("expected_chars"), marker.get("preview_prefix"))
     return entries
 
 
@@ -195,13 +207,22 @@ def _merge_persisted_output_marker_metadata(payload: Dict[str, Any], metadata: D
     if marker is None:
         return False
     entries = _persisted_output_marker_entries(payload)
-    key = (marker["source_path"], marker["expected_chars"])
-    if any((entry["source_path"], entry["expected_chars"]) == key for entry in entries):
+    key = (marker["source_path"], marker["expected_chars"], marker.get("preview_prefix", ""))
+    if any(
+        (
+            entry["source_path"],
+            entry["expected_chars"],
+            entry.get("preview_prefix", ""),
+        ) == key
+        for entry in entries
+    ):
         return False
     entries.append(marker)
     payload["persisted_output_markers"] = entries
     payload.setdefault("persisted_output_source_path", marker["source_path"])
     payload.setdefault("persisted_output_expected_chars", marker["expected_chars"])
+    if marker.get("preview_prefix"):
+        payload.setdefault("persisted_output_preview_prefix", marker["preview_prefix"])
     return True
 
 
@@ -388,6 +409,7 @@ def find_externalized_tool_result_content_for_call(
     session_id: str = "",
     expected_chars: int | None = None,
     persisted_output_source_path: str | None = None,
+    persisted_output_preview_prefix: str | None = None,
     config,
     hermes_home: str = "",
 ) -> str | None:
@@ -421,12 +443,17 @@ def find_externalized_tool_result_content_for_call(
         content = payload.get("content")
         if not isinstance(content, str):
             continue
-        if expected_chars is not None or persisted_output_source_path:
+        if expected_chars is not None or persisted_output_source_path or persisted_output_preview_prefix:
             marker_matches = False
             for marker in _persisted_output_marker_entries(payload):
                 if expected_chars is not None and marker.get("expected_chars") != expected_chars:
                     continue
                 if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
+                    continue
+                if (
+                    persisted_output_preview_prefix
+                    and marker.get("preview_prefix") != persisted_output_preview_prefix
+                ):
                     continue
                 marker_matches = True
                 break

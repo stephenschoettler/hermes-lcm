@@ -4101,27 +4101,34 @@ class TestIngestExternalization:
             "</persisted-output>"
         )
 
-        engine._ingest_messages([
+        messages = [
+            {"role": "assistant", "content": "Calling", "tool_calls": [{"id": "call_secret", "function": {"name": "dump", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "call_secret", "content": marker},
-        ])
+        ]
+
+        engine._ingest_messages(messages)
 
         stored = engine._store.get_session_messages("ingest-session")
-        assert "SECRETSECRET" not in stored[0]["content"]
+        assert "SECRETSECRET" not in stored[1]["content"]
         payload_file = next(output_dir.glob("*.json"))
         payload = json.loads(payload_file.read_text())
         assert "SECRETSECRET" not in payload["content"]
         assert "[LCM sensitive redaction:" in payload["content"]
         assert payload["persisted_output_source_path"] == str(persisted_path)
         assert payload["persisted_output_expected_chars"] == len(full_result)
+        assert payload["persisted_output_preview_prefix"] == preview
 
-        persisted_path.unlink()
-        replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
-        replay._session_id = "ingest-session"
-        replay._ingest_cursor_needs_reconcile = True
-        replay._ingest_messages([
-            {"role": "tool", "tool_call_id": "call_secret", "content": marker},
-        ])
-        assert replay._store.get_session_count("ingest-session") == 1
+        from dataclasses import replace
+        replay_config = replace(
+            engine._config,
+            sensitive_patterns_enabled=False,
+            sensitive_patterns=[],
+        )
+        replay_with_redaction_disabled = LCMEngine(config=replay_config, hermes_home=str(tmp_path / "hermes"))
+        replay_with_redaction_disabled._session_id = "ingest-session"
+        replay_with_redaction_disabled._ingest_cursor_needs_reconcile = True
+        replay_with_redaction_disabled._ingest_messages(messages)
+        assert replay_with_redaction_disabled._store.get_session_count("ingest-session") == 2
 
     def test_ingest_reconciles_recovered_persisted_output_marker_after_restart(self, tmp_path, monkeypatch):
         import tempfile
@@ -4270,6 +4277,7 @@ class TestIngestExternalization:
         host_storage = tmp_path / "hermes-results"
         host_storage.mkdir()
         full_result = "SAME_CONTENT_RETRY_NEEDLE:\n" + ("same" * 1000)
+        preview = full_result[:30]
         first_path = host_storage / "call_retry_first.txt"
         first_path.write_text(full_result, encoding="utf-8")
         first_marker = (
@@ -4278,7 +4286,7 @@ class TestIngestExternalization:
             f"Full output saved to: {first_path}\n"
             "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
             "Preview (first 30 chars):\n"
-            f"{full_result[:30]}\n...\n"
+            f"{preview}\n...\n"
             "</persisted-output>"
         )
         original_messages = [
@@ -4296,7 +4304,7 @@ class TestIngestExternalization:
             f"Full output saved to: {second_path}\n"
             "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
             "Preview (first 30 chars):\n"
-            f"{full_result[:30]}\n...\n"
+            f"{preview}\n...\n"
             "</persisted-output>"
         )
         retry_messages = [
@@ -4313,9 +4321,11 @@ class TestIngestExternalization:
         assert len(payload_files) == 1
         payload = json.loads(payload_files[0].read_text())
         assert payload["content"] == full_result
-        marker_paths = {entry["source_path"] for entry in payload.get("persisted_output_markers", [])}
+        marker_entries = payload.get("persisted_output_markers", [])
+        marker_paths = {entry["source_path"] for entry in marker_entries}
         assert str(first_path) in marker_paths
         assert str(second_path) in marker_paths
+        assert all(entry.get("preview_prefix") == preview for entry in marker_entries)
 
         second_path.unlink()
         replay_after_cleanup = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
