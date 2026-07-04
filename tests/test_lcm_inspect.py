@@ -144,6 +144,7 @@ def test_lcm_inspect_reports_bounded_metadata_without_content(tmp_path):
         assert result["externalized_refs"]["items"][0]["readable"] is True
         assert result["externalized_refs"]["items"][0]["file_size_bytes"] > 0
         assert result["externalized_refs"]["items"][0]["payload_session_id"] == "sess-current"
+        assert result["externalized_refs"]["items"][0]["payload_validation"] == "metadata_prefix"
         assert result["externalized_refs"]["items"][0]["store_id"] == rows[-1]["store_id"]
         assert "content_preview" not in result["externalized_refs"]["items"][0]
         assert "content" not in result["externalized_refs"]["items"][0]
@@ -263,12 +264,37 @@ def test_lcm_inspect_payload_metadata_prefix_stops_before_content(tmp_path):
         encoding="utf-8",
     )
 
-    prefix, stopped_at_content = lcm_tools._read_externalized_payload_metadata_prefix(path)
+    prefix_text, stopped_at_content, prefix_truncated = lcm_tools._read_externalized_payload_metadata_prefix(path)
 
     assert stopped_at_content is True
-    assert b'"session_id"' in prefix
-    assert b'"content"' in prefix
-    assert b"SECRET_PAYLOAD_BODY" not in prefix
+    assert prefix_truncated is False
+    assert '"session_id"' in prefix_text
+    assert '"content"' in prefix_text
+    assert "SECRET_PAYLOAD_BODY" not in prefix_text
+
+
+def test_lcm_inspect_payload_metadata_prefix_accepts_valid_non_ascii_before_content(tmp_path):
+    path = tmp_path / "payload.json"
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "tool_result",
+                "session_id": "sess-current",
+                "label": "café",
+                "content": "SECRET_PAYLOAD_BODY" * 1024,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    prefix_text, stopped_at_content, prefix_truncated = lcm_tools._read_externalized_payload_metadata_prefix(path)
+
+    assert stopped_at_content is True
+    assert prefix_truncated is False
+    assert '"label"' in prefix_text
+    assert "café" in prefix_text
+    assert "SECRET_PAYLOAD_BODY" not in prefix_text
 
 
 def test_lcm_inspect_payload_metadata_parser_uses_top_level_session_owner():
@@ -291,6 +317,13 @@ def test_lcm_inspect_payload_metadata_parser_uses_top_level_session_owner():
 
     assert content_key_seen is True
     assert fields["session_id"] == "second"
+
+    fields, content_key_seen = lcm_tools._inspect_top_level_json_string_fields_before_content(
+        '{"session_id":"first","session_id":123,"content":"payload body"}'
+    )
+
+    assert content_key_seen is True
+    assert "session_id" not in fields
 
 
 def test_lcm_inspect_rejects_cross_session_externalized_refs(tmp_path):
@@ -439,7 +472,7 @@ def test_lcm_inspect_rejects_payload_refs_when_session_metadata_is_beyond_prefix
         engine.shutdown()
 
 
-def test_lcm_inspect_rejects_malformed_payload_after_matching_session_metadata(tmp_path):
+def test_lcm_inspect_uses_bounded_prefix_for_payload_readability(tmp_path):
     engine = _make_engine(tmp_path)
     try:
         storage_dir = get_large_output_storage_dir(
@@ -462,10 +495,11 @@ def test_lcm_inspect_rejects_malformed_payload_after_matching_session_metadata(t
         result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
 
         item = result["externalized_refs"]["items"][0]
-        assert item["readable"] is False
-        assert item["error"] == "invalid_payload"
-        assert "file_size_bytes" not in item
-        assert "modified_at" not in item
+        assert item["readable"] is True
+        assert item["payload_session_id"] == "sess-current"
+        assert item["payload_validation"] == "metadata_prefix"
+        assert item["file_size_bytes"] > 0
+        assert "content" not in item
     finally:
         engine.shutdown()
 
@@ -475,12 +509,12 @@ def test_lcm_inspect_rejects_malformed_payload_after_matching_session_metadata(t
     [
         ('{"kind":"tool_result","session_id":"sess-current",\f"content":"x"}', "payload-formfeed.json"),
         ('{"kind":"tool_result","session_id":"sess-current",\u00a0"content":"x"}', "payload-nbsp.json"),
-        ('{"kind":"tool_result","session_id":"sess-current","content":"x","content_chars":١}', "payload-unicode-digit.json"),
-        ('{"kind":"tool_result","session_id":"sess-current","content":"x","content_chars":' + '1' * 5000 + '}', "payload-long-int.json"),
+        ('{"kind":"tool_result","session_id":"sess-current" "content":"x"}', "payload-missing-comma.json"),
         ('{"kind":"tool_result","session_id":"sess-current"}', "payload-missing-content.json"),
+        ('{"kind":"tool_result","session_id":"sess-current","content":1}', "payload-non-string-content.json"),
     ],
 )
-def test_lcm_inspect_rejects_json_decoder_incompatible_payload_syntax(tmp_path, payload_text, ref):
+def test_lcm_inspect_rejects_invalid_payload_metadata_prefix(tmp_path, payload_text, ref):
     engine = _make_engine(tmp_path)
     try:
         storage_dir = get_large_output_storage_dir(
@@ -507,7 +541,7 @@ def test_lcm_inspect_rejects_json_decoder_incompatible_payload_syntax(tmp_path, 
         engine.shutdown()
 
 
-def test_lcm_inspect_preserves_json_load_duplicate_key_semantics(tmp_path):
+def test_lcm_inspect_rejects_invalid_utf8_payload_metadata_prefix(tmp_path):
     engine = _make_engine(tmp_path)
     try:
         storage_dir = get_large_output_storage_dir(
@@ -515,14 +549,11 @@ def test_lcm_inspect_preserves_json_load_duplicate_key_semantics(tmp_path):
             hermes_home=engine._hermes_home,
             create=True,
         )
-        ref = "payload-duplicate-content.json"
-        (storage_dir / ref).write_text(
-            '{"kind":"tool_result","session_id":"sess-current","content":1,"content":"x"}',
-            encoding="utf-8",
-        )
+        ref = "payload-invalid-utf8-prefix.json"
+        (storage_dir / ref).write_bytes(b'{"kind":"tool_result","session_id":"sess-current",\xff"content":"x"}')
         engine._store.append(
             "sess-current",
-            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=1; bytes=1; ref={ref}]"},
+            {"role": "assistant", "content": f"pasted placeholder [Externalized tool output: tool_call_id=call-1; chars=12; bytes=12; ref={ref}]"},
             source="discord",
             conversation_id="discord:channel:thread",
         )
@@ -530,9 +561,10 @@ def test_lcm_inspect_preserves_json_load_duplicate_key_semantics(tmp_path):
         result = json.loads(engine.handle_tool_call("lcm_inspect", {}))
 
         item = result["externalized_refs"]["items"][0]
-        assert item["readable"] is True
-        assert item["payload_session_id"] == "sess-current"
-        assert "content" not in item
+        assert item["readable"] is False
+        assert item["error"] == "invalid_payload"
+        assert "file_size_bytes" not in item
+        assert "modified_at" not in item
     finally:
         engine.shutdown()
 

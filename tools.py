@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import re
@@ -1966,15 +1967,19 @@ def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dic
     fields: dict[str, str] = {}
     length = len(text)
     index = 0
-    while index < length and text[index].isspace():
-        index += 1
+
+    def skip_json_whitespace(pos: int) -> int:
+        while pos < length and text[pos] in " \t\n\r":
+            pos += 1
+        return pos
+
+    index = skip_json_whitespace(index)
     if index >= length or text[index] != "{":
         return fields, False
     index += 1
 
-    while index < length:
-        while index < length and (text[index].isspace() or text[index] == ","):
-            index += 1
+    while True:
+        index = skip_json_whitespace(index)
         if index >= length or text[index] == "}":
             return fields, False
         if text[index] != '"':
@@ -1985,15 +1990,13 @@ def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dic
             return fields, False
         if not isinstance(key, str):
             return fields, False
-        while index < length and text[index].isspace():
-            index += 1
+        index = skip_json_whitespace(index)
         if index >= length or text[index] != ":":
             return fields, False
         index += 1
-        while index < length and text[index].isspace():
-            index += 1
+        index = skip_json_whitespace(index)
         if key == "content":
-            return fields, True
+            return fields, index < length and text[index] == '"'
         if index >= length:
             return fields, False
         try:
@@ -2002,142 +2005,55 @@ def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dic
             return fields, False
         if isinstance(value, str):
             fields[key] = value
-    return fields, False
+        elif key == "session_id":
+            fields.pop(key, None)
+        index = skip_json_whitespace(index)
+        if index >= length:
+            return fields, False
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] == "}":
+            return fields, False
+        return fields, False
 
 
-def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[bytes, bool]:
-    """Read bounded JSON metadata before the externalized payload body."""
+def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, bool]:
+    """Read bounded JSON metadata before the externalized payload body.
+
+    Returns ``(prefix_text, content_string_seen, prefix_truncated)``. The content
+    string body is intentionally not consumed; ``lcm_inspect`` reports bounded
+    metadata only and leaves full JSON/body validation to explicit expansion.
+    """
     prefix = bytearray()
+    text_parts: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    prefix_truncated = False
     with path.open("rb") as handle:
         while len(prefix) < _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES:
             byte = handle.read(1)
             if not byte:
                 break
             prefix.extend(byte)
-            prefix_text = bytes(prefix).decode("utf-8", errors="replace")
+            try:
+                decoded = decoder.decode(byte, final=False)
+            except UnicodeDecodeError as exc:
+                raise ValueError("invalid_payload") from exc
+            if decoded:
+                text_parts.append(decoded)
+            prefix_text = "".join(text_parts)
             _, content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
             if content_key_seen:
-                return bytes(prefix), True
-    return bytes(prefix), False
-
-
-def _read_json_string_from_stream(read_char, *, capture: bool = False) -> str | None:
-    """Read a JSON string after its opening quote, optionally returning its decoded value."""
-    raw_parts: list[str] = []
-    while True:
-        ch = read_char()
-        if not ch:
-            raise ValueError("unterminated string")
-        if ch == '"':
-            break
-        if ord(ch) < 0x20:
-            raise ValueError("control character in string")
-        if ch == "\\":
-            esc = read_char()
-            if esc not in {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}:
-                raise ValueError("invalid escape")
-            if capture:
-                raw_parts.append("\\" + esc)
-            if esc == "u":
-                digits = "".join(read_char() for _ in range(4))
-                if len(digits) != 4 or any(c not in "0123456789abcdefABCDEF" for c in digits):
-                    raise ValueError("invalid unicode escape")
-                if capture:
-                    raw_parts.append(digits)
-            continue
-        if capture:
-            raw_parts.append(ch)
-    if not capture:
-        return None
-    return json.loads('"' + "".join(raw_parts) + '"')
-
-
-def _redact_externalized_payload_content_for_json_load(path: Path) -> str:
-    """Return payload JSON with top-level content string replaced by an empty string."""
-    out: list[str] = []
-    pushback = ""
-    depth = 0
-    expect_key_at_top = False
-    pending_top_key = ""
-
-    with path.open("r", encoding="utf-8") as handle:
-        def read_char() -> str:
-            nonlocal pushback
-            if pushback:
-                ch = pushback
-                pushback = ""
-                return ch
-            return handle.read(1)
-
-        def unread_char(ch: str) -> None:
-            nonlocal pushback
-            pushback = ch
-
-        while True:
-            ch = read_char()
-            if not ch:
-                break
-
-            if ch == '"':
-                out.append(ch)
-                if depth == 1 and expect_key_at_top:
-                    key = _read_json_string_from_stream(read_char, capture=True)
-                    # Reconstructing via json.dumps keeps the redacted document valid and small;
-                    # json.loads below validates the resulting payload structure.
-                    out[-1] = json.dumps(key)
-                    expect_key_at_top = False
-                    pending_top_key = key or ""
-                else:
-                    value = _read_json_string_from_stream(read_char, capture=True)
-                    out[-1] = json.dumps(value)
-                continue
-
-            out.append(ch)
-            if ch == "{":
-                depth += 1
-                if depth == 1:
-                    expect_key_at_top = True
-            elif ch == "[":
-                depth += 1
-            elif ch == "}":
-                if depth == 1:
-                    expect_key_at_top = False
-                    pending_top_key = ""
-                depth -= 1
-            elif ch == "]":
-                depth -= 1
-            elif depth == 1 and pending_top_key:
-                if ch == ":":
-                    while True:
-                        value_ch = read_char()
-                        if not value_ch:
-                            break
-                        if value_ch in " \t\n\r":
-                            out.append(value_ch)
-                            continue
-                        break
-                    if pending_top_key == "content" and value_ch == '"':
-                        out.append('""')
-                        _read_json_string_from_stream(read_char, capture=False)
-                    elif value_ch:
-                        unread_char(value_ch)
-                    pending_top_key = ""
-            elif depth == 1 and ch == ",":
-                expect_key_at_top = True
-
-    return "".join(out)
-
-
-def _validate_externalized_payload_json(path: Path) -> tuple[bool, str]:
-    """Validate payload JSON without materializing the externalized content body."""
-    try:
-        redacted = _redact_externalized_payload_content_for_json_load(path)
-        payload = json.loads(redacted)
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
-        return False, ""
-    if not isinstance(payload, dict) or "content" not in payload or not isinstance(payload.get("content"), str):
-        return False, ""
-    return True, payload.get("session_id") or ""
+                return prefix_text, True, False
+        prefix_truncated = len(prefix) >= _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES and bool(handle.read(1))
+    if not prefix_truncated:
+        try:
+            final_text = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if final_text:
+            text_parts.append(final_text)
+    return "".join(text_parts), False, prefix_truncated
 
 
 def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, session_id: str) -> dict[str, Any]:
@@ -2154,25 +2070,21 @@ def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, sessio
             return {"readable": False, "error": "missing"}
         if not path.is_file():
             return {"readable": False, "error": "not_a_file"}
-        metadata_prefix, _ = _read_externalized_payload_metadata_prefix(path)
+        metadata_prefix_text, content_key_seen, prefix_truncated = _read_externalized_payload_metadata_prefix(path)
     except FileNotFoundError:
         return {"readable": False, "error": "missing"}
     except (OSError, ValueError) as exc:
         return {"readable": False, "error": str(exc)}
 
-    prefix_text = metadata_prefix.decode("utf-8", errors="replace")
-    metadata_fields, _content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
+    metadata_fields, _content_key_seen = _inspect_top_level_json_string_fields_before_content(metadata_prefix_text)
     payload_session_id = metadata_fields.get("session_id", "")
     if payload_session_id and payload_session_id != session_id:
         return {"readable": False, "error": "session_mismatch"}
     if not payload_session_id:
         return {"readable": False, "error": "session_metadata_unavailable"}
-
-    valid_payload, payload_session_id = _validate_externalized_payload_json(path)
-    if not valid_payload:
-        return {"readable": False, "error": "invalid_payload"}
-    if payload_session_id != session_id:
-        return {"readable": False, "error": "session_mismatch"}
+    if not content_key_seen:
+        error = "metadata_prefix_truncated" if prefix_truncated else "invalid_payload"
+        return {"readable": False, "error": error}
 
     try:
         stat = path.stat()
@@ -2185,6 +2097,7 @@ def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, sessio
         "readable": True,
         "file_size_bytes": stat.st_size,
         "modified_at": stat.st_mtime,
+        "payload_validation": "metadata_prefix",
     }
     if payload_session_id:
         metadata["payload_session_id"] = payload_session_id
