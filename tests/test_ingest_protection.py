@@ -4023,3 +4023,12 @@ def test_wrapped_base64_scan_ignores_hex_hash_inventory():
     hex_lines = "\n".join(f"{i:064x}" for i in range(96))
 
     assert contains_long_base64_run(hex_lines) is False
+
+def test_wrapped_base64_scan_preserves_short_terminal_line():
+    from hermes_lcm.ingest_protection import contains_long_base64_run
+
+    full_line = "QUJD" * 16
+    terminal = "REVG" * 4
+    payload = "\n".join([full_line] * 70 + [terminal])
+
+    assert contains_long_base64_run(payload) is True
