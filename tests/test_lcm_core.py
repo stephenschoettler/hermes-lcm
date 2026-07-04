@@ -1113,6 +1113,21 @@ class TestMessageStore:
         assert scoped_results == []
         assert {result["session_id"] for result in all_results} == {"sess1", "sess2"}
 
+    def test_like_fallback_relevance_sort_does_not_drop_older_best_match_at_candidate_cap(self, store):
+        # Regression: relevance LIKE fallback must order by relevance before
+        # applying the candidate cap. A recent-first window can miss an older
+        # row with a higher term score.
+        needle_id = store.append(
+            "sess1", {"role": "user", "content": "検索対象 検索対象 検索対象 older best match"}
+        )
+        for i in range(520):
+            store.append("sess1", {"role": "user", "content": f"検索対象 recent filler {i}"})
+
+        results = store.search("検索対象", session_id="sess1", limit=5, sort="relevance")
+
+        assert results, "expected LIKE-fallback matches"
+        assert results[0]["store_id"] == needle_id
+
     def test_like_fallback_relevance_sort_finds_recent_match_beyond_first_page(self, store):
         # Regression: with more matching rows than the candidate fetch limit,
         # the relevance/hybrid LIKE fallback fetched an arbitrary storage-order

@@ -2958,6 +2958,25 @@ class TestEngineABC:
             [{"role": "user", "content": "over-limit turn"}]
         ) is True
 
+    def test_tool_call_ingest_failure_is_surfaced_in_status(self, engine):
+        engine.on_session_start("live-search-failure", platform="telegram", context_length=200000)
+
+        def boom(_messages):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        engine._ingest_messages = boom
+
+        engine.handle_tool_call(
+            "lcm_status",
+            {},
+            messages=[{"role": "user", "content": "turn that cannot be persisted"}],
+        )
+
+        status = engine.get_status()
+        assert status["ingest_failure_count"] == 1
+        assert status["consecutive_ingest_failures"] == 1
+        assert "OperationalError" in status["last_ingest_error"]
+
     def test_lcm_grep_ingests_live_history_before_search(self, engine):
         engine.on_session_start("live-search", platform="telegram", context_length=200000)
         messages = [

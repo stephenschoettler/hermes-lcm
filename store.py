@@ -903,16 +903,16 @@ class MessageStore:
         collapse_risky_repeats = contains_risky_fts_ascii(query)
         order_by = ""
         order_args: list[Any] = []
+        role_bias = "CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
+
+        def count_expr(term: str) -> tuple[str, list[Any]]:
+            return (
+                "((LENGTH(LOWER(content)) - LENGTH(REPLACE(LOWER(content), LOWER(?), ''))) "
+                "/ NULLIF(LENGTH(?), 0))",
+                [term, term],
+            )
+
         if normalized_sort == "recency":
-            role_bias = "CASE role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
-
-            def count_expr(term: str) -> tuple[str, list[Any]]:
-                return (
-                    "((LENGTH(LOWER(content)) - LENGTH(REPLACE(LOWER(content), LOWER(?), ''))) "
-                    "/ NULLIF(LENGTH(?), 0))",
-                    [term, term],
-                )
-
             score_exprs: list[str] = []
             for term in terms:
                 if collapse_risky_repeats:
@@ -1037,10 +1037,35 @@ class MessageStore:
                         offset += len(tie_rows)
                     break
         else:
-            # Deterministic, recent-biased candidate scan for relevance/hybrid.
-            # Without an ORDER BY the LIKE fallback scored an arbitrary
-            # storage-order slice, so the best matches beyond the first page
-            # were never examined (final ranking still happens in Python below).
+            # Deterministic relevance/hybrid candidate scan for LIKE fallback.
+            # Apply the same coarse score/directness ordering before the hard
+            # candidate cap that Python uses below; otherwise a recent-biased
+            # window can exclude older but materially better relevance matches.
+            score_exprs: list[str] = []
+            order_args = []
+            for term in terms:
+                if collapse_risky_repeats:
+                    score_exprs.append("CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
+                    order_args.append(f"%{escape_like(term)}%")
+                else:
+                    expr, expr_args = count_expr(term)
+                    score_exprs.append(expr)
+                    order_args.extend(expr_args)
+            score_expr = " + ".join(score_exprs) if score_exprs else "0"
+            directness_expr = "0.0 + 0"
+
+            if normalized_sort == "hybrid":
+                primary_expr = (
+                    f"(({score_expr}) / (1 + (MAX(0.0, "
+                    f"((strftime('%s','now') - timestamp) / 3600.0)) * {AGE_DECAY_RATE})))"
+                )
+            else:
+                primary_expr = f"({score_expr})"
+
+            order_by = (
+                f"ORDER BY {primary_expr} DESC, ({directness_expr}) DESC, "
+                f"{role_bias} ASC, timestamp DESC, store_id DESC"
+            )
             candidate_cap = compute_search_candidate_cap(limit)
             offset = 0
             while offset < candidate_cap:
@@ -1049,9 +1074,9 @@ class MessageStore:
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
                         WHERE {' AND '.join(where)}
-                        ORDER BY timestamp DESC, store_id DESC
+                        {order_by}
                         LIMIT ? OFFSET ?""",
-                    [*base_args, batch_limit, offset],
+                    [*base_args, *order_args, batch_limit, offset],
                 ).fetchall()
                 if not rows:
                     break

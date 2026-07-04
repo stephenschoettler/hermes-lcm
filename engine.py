@@ -3063,8 +3063,9 @@ class LCMEngine(ContextEngine):
         ):
             try:
                 self._ingest_messages(messages)
+                self._record_ingest_success()
             except Exception as e:
-                logger.warning("Ingest during tool call failed: %s", e)
+                self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
