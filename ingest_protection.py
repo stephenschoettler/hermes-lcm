@@ -92,6 +92,7 @@ _BASE64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/=_-]{4096,})(?![
 # of consecutive base64-alphabet lines; looks_like_long_base64 makes the final
 # call on the whitespace-compacted block.
 _WRAPPED_BASE64_MIN_LINE_CHARS = 40
+_WRAPPED_BASE64_MIN_TERMINAL_LINE_CHARS = 16
 _BASE64_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_\s-]+$")
 _BASE64_LINE_ALPHABET_RE = re.compile(r"^[A-Za-z0-9+/=_-]+$")
 _PRIVATE_KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE)
@@ -231,7 +232,7 @@ def _redact_private_key_blocks(text: str) -> str:
     pattern over a pathological multi-MB input. Unmatched BEGIN headers are
     left intact; there is no complete key block to redact.
     """
-    if "PRIVATE KEY-----" not in text:
+    if "private key-----" not in text.lower():
         return text
     parts: list[str] = []
     cursor = 0
@@ -258,6 +259,17 @@ def _is_wrapped_base64_line(line: str) -> bool:
     stripped = line.strip("\r\n")
     return (
         len(stripped) >= _WRAPPED_BASE64_MIN_LINE_CHARS
+        and _BASE64_LINE_ALPHABET_RE.fullmatch(stripped) is not None
+    )
+
+
+def _is_wrapped_base64_terminal_line(line: str) -> bool:
+    stripped = line.strip("\r\n")
+    return (
+        _WRAPPED_BASE64_MIN_TERMINAL_LINE_CHARS
+        <= len(stripped)
+        < _WRAPPED_BASE64_MIN_LINE_CHARS
+        and len(stripped) % 4 == 0
         and _BASE64_LINE_ALPHABET_RE.fullmatch(stripped) is not None
     )
 
@@ -304,7 +316,11 @@ def _iter_wrapped_base64_blocks(text: str):
     for line in text.splitlines(keepends=True):
         line_start = offset
         offset += len(line)
-        if _is_wrapped_base64_line(line):
+        if _is_wrapped_base64_line(line) or (
+            block_start is not None
+            and block_parts
+            and _is_wrapped_base64_terminal_line(line)
+        ):
             if block_start is None:
                 block_start = line_start
             block_parts.append(line)

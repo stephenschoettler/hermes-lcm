@@ -3931,6 +3931,45 @@ def test_ingest_externalizes_crlf_wrapped_base64_block(tmp_path):
     assert "[Externalized" in content
 
 
+def test_ingest_externalizes_wrapped_base64_with_short_terminal_line(tmp_path):
+    engine = _engine(tmp_path)
+    payload = base64.b64encode(bytes((i * 37) % 256 for i in range(3096))).decode("ascii")
+    assert len(payload) == 4096 + 32
+    wrapped = "\n".join(payload[i:i + 64] for i in range(0, len(payload), 64))
+    terminal_line = wrapped.rsplit("\n", 1)[1]
+    assert len(terminal_line) == 32
+
+    engine._ingest_messages([{"role": "user", "content": f"attachment:\n{wrapped}\nend"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert payload[:120] not in content
+    assert terminal_line not in content
+    assert content.startswith("attachment:\n[Externalized")
+    assert content.endswith("end")
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == wrapped + "\n"
+
+
+def test_private_key_redaction_fallback_is_case_insensitive(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    engine = _sensitive_engine(tmp_path)
+    monkeypatch.setattr(ip, "_regex_engine", None)
+    monkeypatch.setattr(ip, "_SENSITIVE_REGEX_CATALOG", {})
+    begin = "-----begin " + "private key" + "-----"
+    end = "-----EnD " + "PrIvAtE kEy" + "-----"
+    key = begin + "\n" + ("A" * 64) + "\n" + end
+
+    redacted = ip.redact_sensitive_text("prefix " + key + " suffix", engine._config)
+
+    assert "begin private key" not in redacted.lower()
+    assert "end private key" not in redacted.lower()
+    assert "[LCM sensitive redaction: name=private_key" in redacted
+    assert redacted.startswith("prefix ")
+    assert redacted.endswith(" suffix")
+
+
 def test_private_key_redaction_fallback_preserves_large_complete_key(tmp_path, monkeypatch):
     import hermes_lcm.ingest_protection as ip
 
