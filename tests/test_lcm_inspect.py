@@ -477,6 +477,7 @@ def test_lcm_inspect_rejects_malformed_payload_after_matching_session_metadata(t
         ('{"kind":"tool_result","session_id":"sess-current",\u00a0"content":"x"}', "payload-nbsp.json"),
         ('{"kind":"tool_result","session_id":"sess-current","content":"x","content_chars":١}', "payload-unicode-digit.json"),
         ('{"kind":"tool_result","session_id":"sess-current","content":"x","content_chars":' + '1' * 5000 + '}', "payload-long-int.json"),
+        ('{"kind":"tool_result","session_id":"sess-current"}', "payload-missing-content.json"),
     ],
 )
 def test_lcm_inspect_rejects_json_decoder_incompatible_payload_syntax(tmp_path, payload_text, ref):

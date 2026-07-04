@@ -2135,7 +2135,7 @@ def _validate_externalized_payload_json(path: Path) -> tuple[bool, str]:
         payload = json.loads(redacted)
     except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         return False, ""
-    if not isinstance(payload, dict) or not isinstance(payload.get("content", ""), str):
+    if not isinstance(payload, dict) or "content" not in payload or not isinstance(payload.get("content"), str):
         return False, ""
     return True, payload.get("session_id") or ""
 
