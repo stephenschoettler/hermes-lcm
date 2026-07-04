@@ -5167,3 +5167,16 @@ class TestLCMEngineCloning:
             shutdown = getattr(clone, "shutdown", None)
             if callable(shutdown):
                 shutdown()
+
+def test_count_tokens_skips_lru_for_large_strings(monkeypatch):
+    import hermes_lcm.tokens as tokens
+
+    tokens._count_tokens_cached.cache_clear()
+    monkeypatch.setattr(tokens, "_get_encoder", lambda: None)
+    large = "x" * (tokens._MAX_CACHEABLE_TOKEN_TEXT_CHARS + 1)
+
+    first = tokens.count_tokens(large)
+    second = tokens.count_tokens(large)
+
+    assert first == second
+    assert tokens._count_tokens_cached.cache_info().currsize == 0
