@@ -5229,14 +5229,39 @@ class LCMEngine(ContextEngine):
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
         stored_identity_counts: dict[tuple[Any, ...], int] = {}
         stored_cleanup_identity_counts: dict[tuple[Any, ...], int] = {}
+        # Capture each candidate's identity (and its cleanup variant) here - both
+        # are already computed for the counts below, so this adds no work. The
+        # match-probe loops reuse them instead of recomputing
+        # _message_replay_identity(stored_row=True) for every (message, probe)
+        # pair. That call is expensive when a stored row carries an externalized
+        # payload (JSON canonicalization + a payload-file read), so eliminating
+        # the O(candidates^2) recomputes removes repeated disk reads on
+        # tool-output-heavy histories. Raw-placeholder identities stay lazy (see
+        # the memo below) since most rows never need them.
+        stored_identities: list[tuple[Any, ...]] = []
+        stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
         for stored in candidates:
             identity = self._message_replay_identity(stored, stored_row=True)
-            stored_identity_counts[identity] = stored_identity_counts.get(identity, 0) + 1
+            stored_identities.append(identity)
             cleanup_identity = self._active_cleanup_replay_identity(identity)
+            stored_cleanup_identities.append(cleanup_identity)
+            stored_identity_counts[identity] = stored_identity_counts.get(identity, 0) + 1
             if cleanup_identity is not None:
                 stored_cleanup_identity_counts[cleanup_identity] = (
                     stored_cleanup_identity_counts.get(cleanup_identity, 0) + 1
                 )
+
+        # Lazily memoize raw-placeholder identities: only the placeholder-ref
+        # paths need them, and most histories have few (or none), so computing
+        # them on demand keeps the common case free.
+        _raw_placeholder_identity_cache: dict[int, tuple[str, str, str, str]] = {}
+
+        def stored_raw_placeholder_identity(probe_idx: int) -> tuple[str, str, str, str]:
+            cached = _raw_placeholder_identity_cache.get(probe_idx)
+            if cached is None:
+                cached = self._raw_externalized_placeholder_replay_identity(candidates[probe_idx])
+                _raw_placeholder_identity_cache[probe_idx] = cached
+            return cached
         active_surplus_skips: dict[tuple[Any, ...], int] = {}
         generated_surplus_skip_message_ids: set[int] = set()
         generated_placeholder_message_ids = getattr(
@@ -5279,8 +5304,7 @@ class LCMEngine(ContextEngine):
         ) -> int | None:
             probe_idx = start_idx
             while probe_idx < len(candidates):
-                stored = candidates[probe_idx]
-                if self._raw_externalized_placeholder_replay_identity(stored) == raw_identity:
+                if stored_raw_placeholder_identity(probe_idx) == raw_identity:
                     return probe_idx
                 probe_idx += 1
             return None
@@ -5297,13 +5321,12 @@ class LCMEngine(ContextEngine):
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = start_idx
             while probe_idx < len(candidates):
-                stored = candidates[probe_idx]
-                stored_identity = self._message_replay_identity(stored, stored_row=True)
+                stored_identity = stored_identities[probe_idx]
                 if stored_identity == message_identity:
                     return probe_idx
                 if (
                     wanted_cleanup_identity is not None
-                    and self._active_cleanup_replay_identity(stored_identity) == wanted_cleanup_identity
+                    and stored_cleanup_identities[probe_idx] == wanted_cleanup_identity
                 ):
                     return probe_idx
                 probe_idx += 1
@@ -5369,7 +5392,7 @@ class LCMEngine(ContextEngine):
                     probe_idx = len(candidates) - 1
                     while first_match_idx is not None and probe_idx >= first_match_idx:
                         stored = candidates[probe_idx]
-                        if self._raw_externalized_placeholder_replay_identity(stored) == raw_identity:
+                        if stored_raw_placeholder_identity(probe_idx) == raw_identity:
                             candidate_suffix_ids = matched_remaining_message_ids(
                                 msg_idx + 1,
                                 probe_idx + 1,
