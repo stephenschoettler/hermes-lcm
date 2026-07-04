@@ -846,18 +846,22 @@ class LifecycleStateStore:
             if state is None or state.current_session_id != session_id:
                 return state
             now = time.time()
+            conn = self._conn
+            assert conn is not None
             # MAX() in SQL keeps the advance monotonic even if a concurrent
             # writer bumped the frontier between the read above and this write.
             # A Python-side max() over the stale read could otherwise regress
             # the checkpoint and force the same range to be compacted twice.
-            self._conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE lcm_lifecycle_state
                 SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
                     updated_at = ?
-                WHERE conversation_id = ?
+                WHERE conversation_id = ? AND current_session_id = ?
                 """,
-                (int(frontier_store_id or 0), now, conversation_id),
+                (int(frontier_store_id or 0), now, conversation_id, session_id),
             )
-            self._conn.commit()
+            if cursor.rowcount == 0:
+                return self.get_by_conversation(conversation_id)
+            conn.commit()
             return self.get_by_conversation(conversation_id)
