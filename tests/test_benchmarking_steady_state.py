@@ -53,3 +53,36 @@ def test_steady_state_report_serializes(tmp_path):
     assert data["iterations"] == 2
     assert data["history_sizes"] == [20]
     assert data["samples"] and data["samples"][0]["case"] == "baseline"
+
+
+def test_steady_state_rejects_populated_output_directory(tmp_path):
+    (tmp_path / "old.json").write_text("{}")
+
+    try:
+        run_steady_state(tmp_path, history_sizes=(20,), iterations=1, cases=(SteadyStateCase(name="baseline"),))
+    except FileExistsError as exc:
+        assert "not empty" in str(exc)
+    else:
+        raise AssertionError("expected FileExistsError")
+
+
+def test_steady_state_isolates_each_target_size(tmp_path, monkeypatch):
+    import benchmarking.steady_state as steady
+
+    built = []
+    original = steady._build_engine
+
+    def tracking_build(case, run_dir):
+        built.append(run_dir.name)
+        return original(case, run_dir)
+
+    monkeypatch.setattr(steady, "_build_engine", tracking_build)
+    report = run_steady_state(
+        tmp_path,
+        history_sizes=(20, 22),
+        iterations=1,
+        cases=(SteadyStateCase(name="baseline"),),
+    )
+
+    assert len(report.samples) == 2
+    assert built == ["baseline-20", "baseline-22"]

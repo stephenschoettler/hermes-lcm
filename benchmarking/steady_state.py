@@ -169,51 +169,53 @@ def _measure_case(
     history_sizes: tuple[int, ...],
     iterations: int,
 ) -> list[SteadyStateSample]:
-    engine = _build_engine(case, run_dir)
-    history: list[dict[str, Any]] = []
-    next_index = 0
     samples: list[SteadyStateSample] = []
 
     for target in sorted(history_sizes):
-        # Grow the history to the target size (ingesting as we go so the store
-        # tracks it, mirroring how turns accumulate in production).
-        while len(history) < target:
-            history.extend(_synthetic_turn(next_index))
-            next_index += 1
-            engine.ingest(history)
+        target_run_dir = run_dir / f"{case.name}-{target}"
+        engine = _build_engine(case, target_run_dir)
+        history: list[dict[str, Any]] = []
+        next_index = 0
+        try:
+            # Build an independent history for each target so a nearby smaller
+            # target cannot pre-populate store/identity maps for the next one.
+            while len(history) < target:
+                history.extend(_synthetic_turn(next_index))
+                next_index += 1
+                engine.ingest(history)
 
-        ingest_ms: list[float] = []
-        preflight_ms: list[float] = []
-        writes: list[int] = []
-        for _ in range(iterations):
-            history.extend(_synthetic_turn(next_index))
-            next_index += 1
+            ingest_ms: list[float] = []
+            preflight_ms: list[float] = []
+            writes: list[int] = []
+            for _ in range(iterations):
+                history.extend(_synthetic_turn(next_index))
+                next_index += 1
 
-            before_changes = _total_changes(engine)
-            t0 = time.perf_counter()
-            engine.ingest(history)
-            t1 = time.perf_counter()
-            engine.should_compress_preflight(history)
-            t2 = time.perf_counter()
+                before_changes = _total_changes(engine)
+                t0 = time.perf_counter()
+                engine.ingest(history)
+                t1 = time.perf_counter()
+                engine.should_compress_preflight(history)
+                t2 = time.perf_counter()
 
-            ingest_ms.append((t1 - t0) * 1000.0)
-            preflight_ms.append((t2 - t1) * 1000.0)
-            writes.append(max(0, _total_changes(engine) - before_changes))
+                ingest_ms.append((t1 - t0) * 1000.0)
+                preflight_ms.append((t2 - t1) * 1000.0)
+                writes.append(max(0, _total_changes(engine) - before_changes))
 
-        samples.append(
-            SteadyStateSample(
-                case=case.name,
-                history_size=len(history),
-                iterations=iterations,
-                ingest_p50_ms=round(statistics.median(ingest_ms), 4),
-                ingest_p95_ms=round(_percentile(ingest_ms, 95), 4),
-                preflight_p50_ms=round(statistics.median(preflight_ms), 4),
-                preflight_p95_ms=round(_percentile(preflight_ms, 95), 4),
-                row_writes_per_turn=round(statistics.mean(writes), 2) if writes else 0.0,
+            samples.append(
+                SteadyStateSample(
+                    case=case.name,
+                    history_size=len(history),
+                    iterations=iterations,
+                    ingest_p50_ms=round(statistics.median(ingest_ms), 4),
+                    ingest_p95_ms=round(_percentile(ingest_ms, 95), 4),
+                    preflight_p50_ms=round(statistics.median(preflight_ms), 4),
+                    preflight_p95_ms=round(_percentile(preflight_ms, 95), 4),
+                    row_writes_per_turn=round(statistics.mean(writes), 2) if writes else 0.0,
+                )
             )
-        )
-
-    engine.shutdown()
+        finally:
+            engine.shutdown()
     return samples
 
 
@@ -225,6 +227,8 @@ def run_steady_state(
     cases: tuple[SteadyStateCase, ...] = DEFAULT_CASES,
     progress: Optional[Callable[[str], None]] = None,
 ) -> SteadyStateReport:
+    if run_dir.exists() and any(run_dir.iterdir()):
+        raise FileExistsError(f"steady-state output directory is not empty: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
     report = SteadyStateReport(history_sizes=tuple(sorted(history_sizes)), iterations=iterations)
     for case in cases:
