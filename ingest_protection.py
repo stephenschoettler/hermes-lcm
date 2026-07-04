@@ -215,7 +215,7 @@ def _apply_sensitive_pattern(name: str, repl, text: str) -> str:
                         name,
                         _SENSITIVE_MATCH_TIMEOUT_SECONDS,
                     )
-                return text
+                return _redact_private_key_blocks(text)
         elif name == "private_key":
             return _redact_private_key_blocks(text)
     return _SENSITIVE_PATTERN_CATALOG[name].sub(repl, text)
@@ -262,6 +262,18 @@ def _is_wrapped_base64_line(line: str) -> bool:
     )
 
 
+def _looks_like_hex_hash_inventory(payload: str) -> bool:
+    """Return True for newline inventories of hex digests, not base64 payloads."""
+    lines = [line.strip() for line in payload.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    digest_lengths = {40, 56, 64, 96, 128}
+    return all(
+        len(line) in digest_lengths and re.fullmatch(r"[0-9a-fA-F]+", line) is not None
+        for line in lines
+    )
+
+
 def _iter_wrapped_base64_blocks(text: str):
     """Yield (start, end, payload) for line-wrapped base64 blocks.
 
@@ -282,7 +294,7 @@ def _iter_wrapped_base64_blocks(text: str):
             block_start = None
             block_parts = []
             block_end = 0
-            if looks_like_long_base64(payload):
+            if not _looks_like_hex_hash_inventory(payload) and looks_like_long_base64(payload):
                 return (start, end, payload)
         block_start = None
         block_parts = []

@@ -3958,3 +3958,29 @@ def test_wrapped_base64_scan_ignores_long_single_line_without_regex_backtracking
     not_payload = "A" * 80_000
 
     assert contains_long_base64_run(not_payload) is False
+
+def test_sensitive_private_key_regex_timeout_preserves_prior_redactions(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    class TimeoutPattern:
+        def sub(self, repl, text, timeout=None):
+            raise TimeoutError("synthetic timeout")
+
+    engine = _sensitive_engine(tmp_path)
+    monkeypatch.setattr(ip, "_regex_pattern_for", lambda name: TimeoutPattern())
+    text = "api_key=sk-test-secret-value-123456 and -----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+
+    redacted = ip.redact_sensitive_text(text, engine._config)
+
+    assert "sk-test-secret-value" not in redacted
+    assert "BEGIN PRIVATE KEY" not in redacted
+    assert "[LCM sensitive redaction: name=api_key" in redacted
+    assert "[LCM sensitive redaction: name=private_key" in redacted
+
+
+def test_wrapped_base64_scan_ignores_hex_hash_inventory():
+    from hermes_lcm.ingest_protection import contains_long_base64_run
+
+    hex_lines = "\n".join(f"{i:064x}" for i in range(96))
+
+    assert contains_long_base64_run(hex_lines) is False
