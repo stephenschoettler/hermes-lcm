@@ -552,6 +552,60 @@ ahead of the target boundary reports `status: noop` and is safe to retry.
 A no-op apply does not write a new rolling backup, so the previous
 known-good `*-rotate-latest.sqlite3` snapshot survives idempotent retries.
 
+## Import and backfill
+
+`scripts/import_lossless_claw.py` is the local, dry-run-by-default operator path
+for moving OpenClaw history into a Hermes-LCM `lcm.db`. It supports two source
+families:
+
+- `--source-db <path>`: import from an existing lossless-claw/OpenClaw SQLite
+  `lcm.db`. Use `--include-summaries` when you also want compatible source
+  summaries imported into Hermes `summary_nodes`.
+- `--source-jsonl <path>` / `--source-jsonl-dir <path>`: import OpenClaw JSONL
+  session exports when there is no source SQLite database, for example fresh
+  installs, plugin-off catch-up, or one-off session migrations. JSONL import is
+  raw-message-only because the session files do not contain a summary DAG.
+
+Examples:
+
+```bash
+# SQLite source, dry-run
+python scripts/import_lossless_claw.py \
+  --source-db ~/.openclaw/path/to/lcm.db \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --json
+
+# JSONL source directory, dry-run
+python scripts/import_lossless_claw.py \
+  --source-jsonl-dir ~/.openclaw/agents/sammy/sessions \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --json
+
+# Apply only after reviewing the report
+python scripts/import_lossless_claw.py \
+  --source-jsonl-dir ~/.openclaw/agents/sammy/sessions \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --import-id sammy-jsonl-2026-07 \
+  --apply
+```
+
+Safety and reconciliation behavior:
+
+- dry-run is default; writes require `--apply`
+- apply mode backs up an existing target DB before writing
+- `--json` reports `scanned`, `eligible`, `would_import`, `imported`,
+  `skipped_existing`, `skipped_empty`, `invalid_rows`, `warnings`, and summary
+  counters
+- reruns are idempotent for the same `--import-id`; pass a stable explicit
+  import id if the same source files may be copied to different paths
+- JSONL imports preserve session id, role, content, timestamp, tool call/result
+  metadata, and provenance in target `session_id` / `source`
+- no OpenClaw config or separate secret tables are imported; raw transcripts,
+  summaries, and tool payloads may still contain sensitive user data
+
 ## Related references
 
 - [Retrieval tools reference](retrieval-tools.md)

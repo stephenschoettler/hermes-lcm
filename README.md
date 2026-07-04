@@ -565,13 +565,39 @@ when those sources still belong to a previous session.
 
 ## OpenClaw/lossless-claw import
 
-`hermes-lcm` includes an opt-in operator script for backfilling raw message rows
-from a lossless-claw/OpenClaw LCM SQLite database into the local hermes-lcm
-SQLite store:
+`hermes-lcm` includes an opt-in operator script for backfilling OpenClaw history
+into the local hermes-lcm SQLite store. It supports two source shapes:
+
+1. **SQLite LCM database** (`--source-db`) for migrations from an existing
+   lossless-claw/OpenClaw `lcm.db`.
+2. **JSONL session exports** (`--source-jsonl` / `--source-jsonl-dir`) for fresh
+   installs, plugin-off catch-up, or migrations where no source SQLite database
+   is available.
+
+SQLite source example:
 
 ```bash
 python scripts/import_lossless_claw.py \
   --source-db ~/.openclaw/path/to/lcm.db \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy
+```
+
+JSONL source example:
+
+```bash
+python scripts/import_lossless_claw.py \
+  --source-jsonl ~/.openclaw/agents/sammy/sessions/session-a.jsonl \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --json
+```
+
+For a directory of session exports:
+
+```bash
+python scripts/import_lossless_claw.py \
+  --source-jsonl-dir ~/.openclaw/agents/sammy/sessions \
   --target-db ~/.hermes/lcm.db \
   --agent sammy
 ```
@@ -583,23 +609,29 @@ The script is intentionally conservative:
   for that profile
 - writes create a timestamped target DB backup first when the target already
   exists
-- only raw messages are imported; summary DAG import is out of scope
+- SQLite imports can include OpenClaw summaries with `--include-summaries`; this
+  migrates compatible summary rows into Hermes `summary_nodes`
+- JSONL imports migrate raw message rows only; JSONL does not carry a summary DAG
 - imported rows keep explicit provenance in `session_id` and `source`, for
-  example `openclaw-lcm:agent:sammy:<source-session>`
-- the default provenance identity is the source `conversations.session_id`,
+  example `openclaw-lcm:agent:sammy:<source-session>` or
+  `openclaw-jsonl:agent:sammy:<source-session>`
+- the SQLite default provenance identity is the source `conversations.session_id`,
   preserving source session boundaries even when many conversations share one
   `session_key`
-- pass `--session-identity session_key` only when you intentionally want
-  conversations with the same source session key grouped into one imported LCM
-  session
+- pass `--session-identity session_key` only for SQLite imports when you
+  intentionally want conversations with the same source session key grouped into
+  one imported LCM session
 - reruns are idempotent for the same `--import-id`; the default `import_id` is
-  path-derived, so pass a stable `--import-id` if you may import the same copied
-  DB from different paths
+  source-path-derived, so pass a stable `--import-id` if you may import the same
+  copied DB or JSONL export set from different paths
+- `--json` prints a reconciliation report with `scanned`, `eligible`,
+  `would_import`, `imported`, `skipped_existing`, `skipped_empty`,
+  `invalid_rows`, `warnings`, and summary counters
 - changing `--agent`, `--namespace`, or `--session-identity` under the same
   `--import-id` is treated as the same import and will skip already-tracked
   source messages; use a new `--import-id` for a different mapping
-- no OpenClaw config or separate secret tables are imported, but raw transcripts
-  and tool payloads are imported and may contain sensitive user data
+- no OpenClaw config or separate secret tables are imported, but raw transcripts,
+  summaries, and tool payloads may contain sensitive user data
 
 This is a local archive migration path. It does not make LCM a general memory
 provider, and it does not change the current-session retrieval contract for
