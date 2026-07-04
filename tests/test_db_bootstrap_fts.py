@@ -379,3 +379,30 @@ def test_lifecycle_state_store_refuses_newer_schema_before_writable_pragmas_or_d
 
     assert _journal_mode(db_path) == "delete"
     assert _table_names(db_path) == {"metadata"}
+
+def test_message_store_refuses_newer_schema_before_configuring_connection(tmp_path, monkeypatch):
+    from hermes_lcm.store import MessageStore
+    import hermes_lcm.store as store_module
+
+    db_path = tmp_path / "newer-before-pragmas.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+        (str(db_bootstrap.SCHEMA_VERSION + 1),),
+    )
+    conn.commit()
+    conn.close()
+
+    called = False
+
+    def fail_if_called(conn):
+        nonlocal called
+        called = True
+        raise AssertionError("configure_connection should not run for future schemas")
+
+    monkeypatch.setattr(store_module, "configure_connection", fail_if_called)
+
+    with pytest.raises(db_bootstrap.SchemaVersionTooNewError):
+        MessageStore(db_path)
+    assert called is False
