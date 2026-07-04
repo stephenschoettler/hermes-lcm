@@ -306,6 +306,53 @@ def find_externalized_payload_for_message(
     return fallback_match
 
 
+def find_externalized_tool_result_content_for_call(
+    *,
+    tool_call_id: str,
+    session_id: str = "",
+    expected_chars: int | None = None,
+    persisted_output_source_path: str | None = None,
+    config,
+    hermes_home: str = "",
+) -> str | None:
+    """Return durable externalized tool-result content for a matching marker.
+
+    This is used only for replay identity recovery when Hermes' temporary
+    persisted-output file has already been cleaned up but LCM previously stored
+    the recovered full tool output durably. A reused tool-call id alone is not
+    sufficient proof; marker-specific metadata captured before redaction must
+    match when provided.
+    """
+    if not tool_call_id:
+        return None
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    if not storage_dir.exists() or not storage_dir.is_dir():
+        return None
+    for path in sorted(storage_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("kind", "tool_result") != "tool_result":
+            continue
+        if (payload.get("tool_call_id") or "") != tool_call_id:
+            continue
+        if session_id and (payload.get("session_id") or "") != session_id:
+            continue
+        payload_role = payload.get("role") or ""
+        if payload_role and payload_role != "tool":
+            continue
+        content = payload.get("content")
+        if not isinstance(content, str):
+            continue
+        if expected_chars is not None and payload.get("persisted_output_expected_chars") != expected_chars:
+            continue
+        if persisted_output_source_path and payload.get("persisted_output_source_path") != persisted_output_source_path:
+            continue
+        return content
+    return None
+
+
 def externalize_ingest_payload(
     content: str,
     *,
@@ -388,19 +435,21 @@ def maybe_externalize_payload(
     role: str = "",
     config,
     hermes_home: str = "",
+    force: bool = False,
+    metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
-    """Externalize one oversized normalized payload if configured.
+    """Externalize one normalized payload if configured.
 
     Returns a dict with a compact placeholder and the durable JSON payload path,
-    or ``None`` when disabled, below threshold, or storage is unavailable. On
-    storage failure callers should keep the original content so there is no
-    silent data loss.
+    or ``None`` when disabled, below threshold and not forced, or storage is
+    unavailable. On storage failure callers should keep the original content so
+    there is no silent data loss.
     """
     if not getattr(config, "large_output_externalization_enabled", False):
         return None
 
     threshold = max(1, int(getattr(config, "large_output_externalization_threshold_chars", 0) or 0))
-    if not content or len(content) <= threshold:
+    if not content or (len(content) <= threshold and not force):
         return None
 
     try:
@@ -409,15 +458,17 @@ def maybe_externalize_payload(
         logger.warning("Large payload externalization skipped (non-blocking): %s", exc)
         return None
 
-    existing = find_externalized_payload_for_message(
-        content,
-        tool_call_id=tool_call_id,
-        session_id=session_id,
-        kind=kind,
-        role=role,
-        config=config,
-        hermes_home=hermes_home,
-    )
+    existing = None
+    if not metadata:
+        existing = find_externalized_payload_for_message(
+            content,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            kind=kind,
+            role=role,
+            config=config,
+            hermes_home=hermes_home,
+        )
     if existing is not None:
         return {
             "placeholder": _build_externalized_placeholder(existing),
@@ -449,6 +500,8 @@ def maybe_externalize_payload(
         "content_bytes": len(content.encode("utf-8")),
         "created_at": time.time(),
     }
+    if metadata:
+        payload.update({k: v for k, v in metadata.items() if v is not None})
     try:
         _write_externalized_payload(path, payload)
     except OSError as exc:

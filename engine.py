@@ -34,6 +34,7 @@ from .externalize import (
     build_transcript_gc_placeholder,
     extract_externalized_ref,
     find_externalized_payload_for_message,
+    find_externalized_tool_result_content_for_call,
     load_externalized_payload,
     maybe_externalize_tool_output,
 )
@@ -44,13 +45,17 @@ from .extraction import (
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
+    _expected_persisted_output_chars,
+    _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
+    _persisted_output_saved_path,
     assistant_output_quarantine_reason,
     extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
+    recover_hermes_persisted_output,
     redact_sensitive_text,
     redact_sensitive_value,
     restore_ingest_payload_placeholders,
@@ -4273,7 +4278,33 @@ class LCMEngine(ContextEngine):
         )
 
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        if role == "tool" and _is_hermes_persisted_output_marker(content):
+            recovered_content = recover_hermes_persisted_output(content)
+            if recovered_content is not None:
+                content = normalize_content_value(
+                    redact_sensitive_value(
+                        recovered_content,
+                        self._config,
+                        parse_json_strings=False,
+                    )
+                ) or ""
+            elif not stored_row:
+                expected_chars = _expected_persisted_output_chars(content)
+                persisted_output_source_path = _persisted_output_saved_path(content)
+                durable_content = None
+                if expected_chars is not None and persisted_output_source_path:
+                    durable_content = find_externalized_tool_result_content_for_call(
+                        tool_call_id=str(msg.get("tool_call_id") or ""),
+                        session_id=str(msg.get("session_id") or self._session_id or ""),
+                        expected_chars=expected_chars,
+                        persisted_output_source_path=persisted_output_source_path,
+                        config=self._config,
+                        hermes_home=self._hermes_home,
+                    )
+                if durable_content is not None:
+                    content = durable_content
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")
@@ -4293,7 +4324,7 @@ class LCMEngine(ContextEngine):
                 content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
-            str(msg.get("role") or "unknown"),
+            role,
             content,
             str(msg.get("tool_call_id") or ""),
             tool_calls_identity,
@@ -4561,12 +4592,25 @@ class LCMEngine(ContextEngine):
                 and self._is_quarantined_assistant_replay_identity(candidate_prefix[0])
                 and self._is_quarantined_assistant_replay_identity(sanitized_replay_tail[0])
             )
+            candidate_singleton_original_content = (
+                normalize_content_value(candidate_identity_messages[0].get("content")) or ""
+                if len(candidate_identity_messages) == 1
+                else ""
+            )
             has_externalized_singleton_replay = (
                 matches_raw_tail
                 and len(candidate_prefix) == 1
                 and raw_session_count == 1
-                and bool(extract_externalized_ref(normalize_content_value(candidate_identity_messages[0].get("content")) or ""))
+                and bool(extract_externalized_ref(candidate_singleton_original_content))
                 and candidate_prefix == stored_tail
+            )
+            has_persisted_marker_singleton_replay = (
+                matches_raw_tail
+                and len(candidate_prefix) == 1
+                and raw_session_count == 1
+                and candidate_prefix == stored_tail
+                and candidate_prefix[0][0] == "tool"
+                and _is_hermes_persisted_output_marker(candidate_singleton_original_content)
             )
             has_filtered_full_replay = (
                 matches_sanitized_tail
@@ -4612,6 +4656,7 @@ class LCMEngine(ContextEngine):
             if (
                 has_effective_full_replay
                 or has_externalized_singleton_replay
+                or has_persisted_marker_singleton_replay
                 or has_raw_full_replay
                 or has_scaffold_suffix_replay
                 or has_raw_cleanup_replay
@@ -5135,7 +5180,15 @@ class LCMEngine(ContextEngine):
                         excerpt,
                     )
                     continue
-                kept.append((absolute_idx, replay_msg))
+                store_msg = replay_msg
+                if (
+                    str(original_msg.get("role") or "") == "tool"
+                    and _is_hermes_persisted_output_marker(
+                        normalize_content_value(original_msg.get("content")) or ""
+                    )
+                ):
+                    store_msg = original_msg
+                kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
 
         if not messages_to_store_with_index:

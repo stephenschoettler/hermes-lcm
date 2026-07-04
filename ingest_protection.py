@@ -13,7 +13,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
+import stat
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
@@ -105,6 +108,20 @@ _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*r
 _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
 )
+_PERSISTED_OUTPUT_TAG = "<persisted-output>"
+_PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
+_PERSISTED_OUTPUT_SAVED_TO_RE = re.compile(r"^Full output saved to:\s*(?P<path>.+?)\s*$", re.MULTILINE)
+_PERSISTED_OUTPUT_PREVIEW_RE = re.compile(
+    r"^Preview \(first \d+ chars\):\s*\r?\n(?P<preview>.*?)\r?\n</persisted-output>\s*$",
+    re.MULTILINE | re.DOTALL,
+)
+_PERSISTED_OUTPUT_CHAR_COUNT_RE = re.compile(r"too large\s*\((?P<count>[\d,]+)\s+characters\b", re.IGNORECASE)
+_UNRECOVERABLE_TRUNCATION_RE = re.compile(
+    r"\[Truncated:\s*tool response was [\d,]+ chars\.\s*Full output could not be saved to sandbox\.\]",
+    re.IGNORECASE,
+)
+_HERMES_RESULTS_DIRNAME = "hermes-results"
+_MAX_RECOVERED_PERSISTED_OUTPUT_BYTES = 64 * 1024 * 1024
 _SENSITIVE_PLACEHOLDER_PREFIX = "[LCM sensitive redaction:"
 _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     "api_key": re.compile(
@@ -133,6 +150,139 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
 
 def is_externalized_ingest_placeholder(text: str) -> bool:
     return isinstance(text, str) and bool(_INGEST_PLACEHOLDER_RE.fullmatch(text.strip()))
+
+
+def _is_unrecoverable_tool_truncation_marker(text: str | None) -> bool:
+    return isinstance(text, str) and bool(_UNRECOVERABLE_TRUNCATION_RE.search(text))
+
+
+def _expected_persisted_output_chars(text: str | None) -> int | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_CHAR_COUNT_RE.search(text)
+    if not match:
+        return None
+    try:
+        return int(match.group("count").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _persisted_output_preview_prefix(text: str | None) -> str | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_PREVIEW_RE.search(text.strip())
+    if not match:
+        return None
+    preview = match.group("preview")
+    if preview.endswith("\r\n..."):
+        preview = preview[: -len("\r\n...")]
+    elif preview.endswith("\n..."):
+        preview = preview[: -len("\n...")]
+    return preview
+
+
+def _persisted_output_saved_path(text: str | None) -> str | None:
+    if not isinstance(text, str):
+        return None
+    match = _PERSISTED_OUTPUT_SAVED_TO_RE.search(text.strip())
+    if not match:
+        return None
+    raw_path = match.group("path").strip()
+    if not raw_path or "\x00" in raw_path:
+        return None
+    return raw_path
+
+
+def _safe_temp_hermes_results_file(path: Path) -> Path | None:
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        return None
+    parent = path.parent
+    if parent.name != _HERMES_RESULTS_DIRNAME:
+        return None
+    try:
+        expected_parent = (Path(tempfile.gettempdir()) / _HERMES_RESULTS_DIRNAME).resolve()
+        parent_is_valid_dir = parent.exists() and parent.is_dir() and not parent.is_symlink()
+        if not parent_is_valid_dir or parent.resolve() != expected_parent:
+            return None
+        return expected_parent / path.name
+    except OSError:
+        return None
+
+
+def _is_hermes_persisted_output_marker(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    marker = text.strip()
+    return (
+        marker.startswith(_PERSISTED_OUTPUT_TAG)
+        and marker.endswith(_PERSISTED_OUTPUT_CLOSING_TAG)
+        and _expected_persisted_output_chars(marker) is not None
+        and _PERSISTED_OUTPUT_SAVED_TO_RE.search(marker) is not None
+    )
+
+
+def _read_regular_file_no_symlink(path: Path) -> str | None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd: int | None = None
+    try:
+        lstat_result = os.lstat(str(path))
+        if not stat.S_ISREG(lstat_result.st_mode):
+            return None
+        if lstat_result.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
+            return None
+        fd = os.open(str(path), flags)
+        stats = os.fstat(fd)
+        if not stat.S_ISREG(stats.st_mode):
+            return None
+        if stats.st_size > _MAX_RECOVERED_PERSISTED_OUTPUT_BYTES:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            fd = None
+            return handle.read().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def recover_hermes_persisted_output(text: str | None) -> str | None:
+    """Recover Hermes host `<persisted-output>` content when the backing file is safe.
+
+    Recovery is intentionally conservative: the marker must include Hermes'
+    character count, the file path must be an absolute basename under a
+    `hermes-results` temp directory, the target must be a regular non-symlink
+    file, and the recovered character count must match the marker. If any check
+    fails, callers should keep the marker/preview instead of claiming lossless
+    recovery from an unsafe or stale file.
+    """
+    if not isinstance(text, str) or not _is_hermes_persisted_output_marker(text):
+        return None
+    expected_chars = _expected_persisted_output_chars(text)
+    if expected_chars is None:
+        return None
+    raw_path = _persisted_output_saved_path(text)
+    if raw_path is None:
+        return None
+    path = Path(raw_path)
+    safe_path = _safe_temp_hermes_results_file(path)
+    if safe_path is None:
+        return None
+    recovered = _read_regular_file_no_symlink(safe_path)
+    if recovered is None or len(recovered) != expected_chars:
+        return None
+    preview_prefix = _persisted_output_preview_prefix(text)
+    if preview_prefix is not None and not recovered.startswith(preview_prefix):
+        return None
+    return recovered
 
 
 def contains_data_uri_base64(text: str) -> bool:
@@ -827,20 +977,73 @@ def protect_message_for_ingest(
     """
     msg = dict(message or {})
     role = str(msg.get("role") or "unknown")
+    raw_normalized_content = normalize_content_value(msg.get("content"))
     original_content = redact_sensitive_value(
         msg.get("content"),
         config,
         parse_json_strings=False,
     )
     normalized_content = normalize_content_value(original_content)
+    recovered_persisted_output = recover_hermes_persisted_output(raw_normalized_content) if role == "tool" else None
+    recovered_externalized = None
+    if recovered_persisted_output is not None:
+        recovered_content = redact_sensitive_value(
+            recovered_persisted_output,
+            config,
+            parse_json_strings=False,
+        )
+        normalized_recovered_content = normalize_content_value(recovered_content)
+        if normalized_recovered_content:
+            recovered_externalized = maybe_externalize_payload(
+                normalized_recovered_content,
+                kind="tool_result",
+                tool_call_id=str(msg.get("tool_call_id") or ""),
+                session_id=session_id,
+                role=role,
+                config=config,
+                hermes_home=hermes_home,
+                force=True,
+                metadata={
+                    "persisted_output_source_path": _persisted_output_saved_path(raw_normalized_content),
+                    "persisted_output_expected_chars": _expected_persisted_output_chars(raw_normalized_content),
+                },
+            )
+
+    # A host-side truncation marker without durable recovered storage is not
+    # lossless. Keep the marker/preview visible inline instead of hiding it
+    # behind an LCM externalized-payload ref that would look recoverable.
+    preserve_truncation_marker_inline = (
+        role == "tool"
+        and recovered_externalized is None
+        and isinstance(normalized_content, str)
+        and (
+            _is_hermes_persisted_output_marker(normalized_content)
+            or _is_unrecoverable_tool_truncation_marker(normalized_content)
+        )
+    )
 
     # Preserve the pre-existing opt-in large-output behavior on message content.
     # The always-on storage-boundary sanitizer below is a narrower safety net for
     # inline media/base64 substrings, including cases below the generic threshold
     # or when generic externalization is disabled.
     if normalized_content:
-        if is_externalized_ingest_placeholder(normalized_content) or is_externalized_placeholder(normalized_content):
+        if recovered_externalized:
+            msg["content"] = recovered_externalized["placeholder"]
+        elif (
+            is_externalized_ingest_placeholder(normalized_content)
+            or is_externalized_placeholder(normalized_content)
+        ):
             msg["content"] = original_content
+        elif preserve_truncation_marker_inline:
+            msg["content"] = _protect_value(
+                original_content,
+                role=role,
+                session_id=session_id,
+                field_path="content",
+                config=config,
+                hermes_home=hermes_home,
+                parse_json_strings=False,
+            )
         else:
             reason = (
                 assistant_output_quarantine_reason(normalized_content)
