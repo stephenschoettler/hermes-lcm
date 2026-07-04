@@ -1002,7 +1002,7 @@ class MessageStore:
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
-                    [*base_args, *order_args, batch_limit, offset],
+                    [*base_args, *exact_args, *order_args, batch_limit, offset],
                 ).fetchall()
                 scanned_rows += len(rows)
                 add_rows(rows)
@@ -1052,6 +1052,19 @@ class MessageStore:
                     score_exprs.append(expr)
                     order_args.extend(expr_args)
             score_expr = " + ".join(score_exprs) if score_exprs else "0"
+            exact_exprs: list[str] = []
+            exact_args: list[Any] = []
+            for phrase in phrases:
+                phrase_text = (phrase or "").strip()
+                if phrase_text:
+                    exact_exprs.append("CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END")
+                    exact_args.append(phrase_text)
+            for term in terms:
+                term_text = (term or "").strip()
+                if term_text:
+                    exact_exprs.append("CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END")
+                    exact_args.append(term_text)
+            exact_expr = " + ".join(exact_exprs) if exact_exprs else "0"
             directness_expr = "0.0 + 0"
 
             if normalized_sort == "hybrid":
@@ -1063,7 +1076,7 @@ class MessageStore:
                 primary_expr = f"({score_expr})"
 
             order_by = (
-                f"ORDER BY {primary_expr} DESC, ({directness_expr}) DESC, "
+                f"ORDER BY ({exact_expr}) DESC, {primary_expr} DESC, ({directness_expr}) DESC, "
                 f"{role_bias} ASC, timestamp DESC, store_id DESC"
             )
             candidate_cap = compute_search_candidate_cap(limit)

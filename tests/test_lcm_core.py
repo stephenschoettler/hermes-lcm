@@ -5150,3 +5150,23 @@ class TestLCMEngineCloning:
             shutdown = getattr(clone, "shutdown", None)
             if callable(shutdown):
                 shutdown()
+
+
+def test_like_fallback_relevance_preserves_exact_match_before_candidate_cap(tmp_path):
+    from hermes_lcm.store import MessageStore
+    import hermes_lcm.store as store_module
+
+    original = store_module.compute_search_candidate_cap
+    store_module.compute_search_candidate_cap = lambda limit: 2
+    try:
+        store = MessageStore(tmp_path / "lcm.db")
+        try:
+            for idx in range(4):
+                store.append("s", {"role": "assistant", "content": f"needle filler filler filler {idx}"})
+            store.append("s", {"role": "assistant", "content": "needle"})
+            results = store.search("needle", session_id="s", limit=1, sort="relevance")
+            assert results[0]["content"] == "needle"
+        finally:
+            store.close()
+    finally:
+        store_module.compute_search_candidate_cap = original
