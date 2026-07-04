@@ -53,6 +53,41 @@ def _spec():
     )
 
 
+def _make_future_schema_db(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+            (str(db_bootstrap.SCHEMA_VERSION + 1),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _journal_mode(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _table_names(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def integrity_calls(monkeypatch):
     """Spy that counts real integrity-check invocations by table name."""
@@ -308,55 +343,39 @@ def test_message_store_refuses_newer_schema_before_startup_ddl(tmp_path):
     from hermes_lcm.store import MessageStore
 
     db_path = tmp_path / "newer-message.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute(
-        "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
-        (str(db_bootstrap.SCHEMA_VERSION + 1),),
-    )
-    conn.commit()
-    conn.close()
+    _make_future_schema_db(db_path)
+    assert _journal_mode(db_path) == "delete"
 
     with pytest.raises(db_bootstrap.SchemaVersionTooNewError):
         MessageStore(db_path)
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-    finally:
-        conn.close()
-    assert tables == {"metadata"}
+    assert _journal_mode(db_path) == "delete"
+    assert _table_names(db_path) == {"metadata"}
 
 
 def test_summary_dag_refuses_newer_schema_before_startup_ddl(tmp_path):
     from hermes_lcm.dag import SummaryDAG
 
     db_path = tmp_path / "newer-dag.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute(
-        "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
-        (str(db_bootstrap.SCHEMA_VERSION + 1),),
-    )
-    conn.commit()
-    conn.close()
+    _make_future_schema_db(db_path)
+    assert _journal_mode(db_path) == "delete"
 
     with pytest.raises(db_bootstrap.SchemaVersionTooNewError):
         SummaryDAG(db_path)
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        tables = {
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-    finally:
-        conn.close()
-    assert tables == {"metadata"}
+    assert _journal_mode(db_path) == "delete"
+    assert _table_names(db_path) == {"metadata"}
+
+
+def test_lifecycle_state_store_refuses_newer_schema_before_writable_pragmas_or_ddl(tmp_path):
+    from hermes_lcm.lifecycle_state import LifecycleStateStore
+
+    db_path = tmp_path / "newer-lifecycle.db"
+    _make_future_schema_db(db_path)
+    assert _journal_mode(db_path) == "delete"
+
+    with pytest.raises(db_bootstrap.SchemaVersionTooNewError):
+        LifecycleStateStore(db_path)
+
+    assert _journal_mode(db_path) == "delete"
+    assert _table_names(db_path) == {"metadata"}

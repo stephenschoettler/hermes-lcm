@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, run_versioned_migrations
+from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
 
 
 @dataclass
@@ -51,6 +51,7 @@ class LifecycleStateStore:
             check_same_thread=False,
             isolation_level=None,
         )
+        refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
         run_versioned_migrations(self._conn)

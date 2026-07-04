@@ -531,15 +531,14 @@ class LCMEngine(ContextEngine):
             failure_threshold=self._config.summary_circuit_breaker_failure_threshold,
             cooldown_seconds=self._config.summary_circuit_breaker_cooldown_seconds,
         )
-        # Rate-limit summarizer spend so a pathologically looping compaction that
+        # Summary spend guard: process-local sliding window so a loop that
         # keeps succeeding cannot burn auxiliary-model budget without bound. When
-        # tripped, escalation falls back to deterministic L3 truncation. Config
-        # fields are optional (getattr defaults) to avoid config sprawl; set
+        # tripped, escalation falls back to deterministic L3 truncation. Set
         # summary_spend_max_calls=0 to disable.
         self._summary_spend_guard = SummarySpendGuard(
-            max_calls=int(getattr(self._config, "summary_spend_max_calls", 24)),
-            window_seconds=float(getattr(self._config, "summary_spend_window_seconds", 600.0)),
-            backoff_seconds=float(getattr(self._config, "summary_spend_backoff_seconds", 1800.0)),
+            max_calls=int(self._config.summary_spend_max_calls),
+            window_seconds=float(self._config.summary_spend_window_seconds),
+            backoff_seconds=float(self._config.summary_spend_backoff_seconds),
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""

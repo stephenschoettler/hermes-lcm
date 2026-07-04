@@ -246,8 +246,8 @@ class MessageStore:
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        configure_connection(self._conn)
         refuse_schema_version_too_new(self._conn)
+        configure_connection(self._conn)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
