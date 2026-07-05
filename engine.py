@@ -577,6 +577,8 @@ class LCMEngine(ContextEngine):
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
         self._auxiliary_lineage_session_ids: set[str] = set()
+        self._auxiliary_last_prompt_tokens: dict[str, int] = {}
+        self._auxiliary_session_generations: dict[str, int] = {}
         self._lcm_bypass_lineage_session_ids: set[str] = set()
         self._lcm_bypass_lineage_platforms: dict[str, set[str]] = {}
         self._lcm_non_bypass_platforms: dict[str, set[str]] = {}
@@ -704,6 +706,8 @@ class LCMEngine(ContextEngine):
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.clear()
             self._auxiliary_lineage_session_ids.clear()
+            self._auxiliary_last_prompt_tokens.clear()
+            self._auxiliary_session_generations.clear()
             self._lcm_bypass_lineage_session_ids.clear()
             self._lcm_bypass_lineage_platforms.clear()
             self._lcm_non_bypass_platforms.clear()
@@ -973,6 +977,32 @@ class LCMEngine(ContextEngine):
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         if self._thread_context_stateless():
+            auxiliary_session_id = self._thread_context_session_id()
+            if auxiliary_session_id:
+                prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+                caller_generation = self._in_process_auxiliary_caller_generation(
+                    auxiliary_session_id
+                )
+                with self._auxiliary_session_lock:
+                    active_generation = self._auxiliary_session_generations.get(
+                        auxiliary_session_id
+                    )
+                    if active_generation is None and caller_generation:
+                        self._auxiliary_last_prompt_tokens.pop(auxiliary_session_id, None)
+                        self._auxiliary_session_generations[
+                            auxiliary_session_id
+                        ] = caller_generation
+                        active_generation = caller_generation
+                    generation_matches = (
+                        caller_generation == 0
+                        if active_generation is None
+                        else caller_generation == active_generation
+                    )
+                    if (
+                        auxiliary_session_id in self._auxiliary_session_ids
+                        and generation_matches
+                    ):
+                        self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
             return
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
@@ -1519,7 +1549,14 @@ class LCMEngine(ContextEngine):
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
                 return False
-            tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+            if prompt_tokens is not None:
+                tokens = prompt_tokens
+            else:
+                auxiliary_session_id = self._thread_context_session_id()
+                if auxiliary_session_id:
+                    tokens = self._current_auxiliary_prompt_tokens(auxiliary_session_id)
+                else:
+                    tokens = self.last_prompt_tokens
             if self._should_force_overflow_recovery(observed_tokens=tokens):
                 return True
             if self.threshold_tokens <= 0:
@@ -1893,9 +1930,16 @@ class LCMEngine(ContextEngine):
         self._last_compression_noop_reason = ""
 
         if self._bypasses_lcm_context_management():
+            bypass_current_tokens = current_tokens
+            if bypass_current_tokens is None:
+                auxiliary_session_id = self._thread_context_session_id()
+                if auxiliary_session_id:
+                    bypass_current_tokens = self._current_auxiliary_prompt_tokens(
+                        auxiliary_session_id
+                    )
             return self._compress_lcm_bypassed_session(
                 messages,
-                current_tokens=current_tokens,
+                current_tokens=bypass_current_tokens,
                 focus_topic=focus_topic,
                 force=force,
             )
@@ -2438,6 +2482,23 @@ class LCMEngine(ContextEngine):
             return stack[-1]
         return ""
 
+    def _current_auxiliary_prompt_tokens(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        caller_generation = self._in_process_auxiliary_caller_generation(session_id)
+        with self._auxiliary_session_lock:
+            if session_id not in self._auxiliary_session_ids:
+                return 0
+            active_generation = self._auxiliary_session_generations.get(session_id)
+            generation_matches = (
+                caller_generation == 0
+                if active_generation is None
+                else caller_generation == active_generation
+            )
+            if not generation_matches:
+                return 0
+            return self._auxiliary_last_prompt_tokens.get(session_id, 0)
+
     def _thread_context_has_auxiliary_session(self, session_id: str) -> bool:
         with self._auxiliary_session_lock:
             return session_id in self._auxiliary_session_ids
@@ -2519,15 +2580,30 @@ class LCMEngine(ContextEngine):
         return bool(self._thread_context_session_id())
 
     def _register_auxiliary_session(self, session_id: str) -> None:
+        generation = self._in_process_auxiliary_caller_generation(session_id)
         with self._auxiliary_session_lock:
+            previous_generation = self._auxiliary_session_generations.get(session_id)
             self._auxiliary_session_ids.add(session_id)
             self._auxiliary_lineage_session_ids.add(session_id)
+            if generation:
+                if previous_generation != generation:
+                    self._auxiliary_last_prompt_tokens.pop(session_id, None)
+                self._auxiliary_session_generations[session_id] = generation
+            else:
+                self._auxiliary_last_prompt_tokens.pop(session_id, None)
+                self._auxiliary_session_generations.pop(session_id, None)
 
-    def _deactivate_auxiliary_session(self, session_id: str) -> None:
+    def _deactivate_auxiliary_session(self, session_id: str, *, generation: int = 0) -> bool:
         if not session_id:
-            return
+            return False
         with self._auxiliary_session_lock:
+            active_generation = self._auxiliary_session_generations.get(session_id)
+            if generation and active_generation and generation != active_generation:
+                return False
             self._auxiliary_session_ids.discard(session_id)
+            self._auxiliary_last_prompt_tokens.pop(session_id, None)
+            self._auxiliary_session_generations.pop(session_id, None)
+            return True
 
     def _mark_thread_context_stateless(self, session_id: str) -> None:
         self._register_auxiliary_session(session_id)
@@ -2545,13 +2621,20 @@ class LCMEngine(ContextEngine):
         self._sync_thread_context_current_auxiliary()
 
     def _handoff_auxiliary_session(self, old_session_id: str, new_session_id: str) -> None:
+        generation = self._in_process_auxiliary_caller_generation(new_session_id)
         with self._auxiliary_session_lock:
             if old_session_id:
+                self._auxiliary_last_prompt_tokens.pop(old_session_id, None)
+                self._auxiliary_session_generations.pop(old_session_id, None)
                 self._auxiliary_session_ids.discard(old_session_id)
                 self._auxiliary_lineage_session_ids.add(old_session_id)
             if new_session_id:
                 self._auxiliary_session_ids.add(new_session_id)
                 self._auxiliary_lineage_session_ids.add(new_session_id)
+                if generation:
+                    self._auxiliary_session_generations[new_session_id] = generation
+                else:
+                    self._auxiliary_session_generations.pop(new_session_id, None)
         stack = self._thread_context_auxiliary_stack()
         had_thread_marker = old_session_id in stack or new_session_id in stack
         stack[:] = [
@@ -2566,6 +2649,7 @@ class LCMEngine(ContextEngine):
     def _unmark_thread_context_auxiliary_session(self, session_id: str) -> None:
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.discard(session_id)
+            self._auxiliary_session_generations.pop(session_id, None)
         self._clear_thread_context_stateless(session_id)
 
     def _get_allowed_hermes_base(self) -> Path | None:
@@ -2619,6 +2703,25 @@ class LCMEngine(ContextEngine):
         if getattr(caller_self, "ephemeral_system_prompt", None) and log_prefix.startswith("[subagent-"):
             return True
         return False
+
+    def _in_process_auxiliary_caller_generation(self, session_id: str) -> int:
+        frame = inspect.currentframe()
+        try:
+            frame = frame.f_back if frame is not None else None
+            for _ in range(32):
+                if frame is None:
+                    return 0
+                caller_self = frame.f_locals.get("self")
+                if not self._caller_is_auxiliary_agent_frame(caller_self):
+                    frame = frame.f_back
+                    continue
+                caller_session = str(getattr(caller_self, "session_id", "") or "")
+                if not session_id or caller_session == session_id:
+                    return id(caller_self)
+                frame = frame.f_back
+        finally:
+            del frame
+        return 0
 
     def _in_process_parent_session_id(
         self,
@@ -3849,9 +3952,12 @@ class LCMEngine(ContextEngine):
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         if self._has_auxiliary_lineage_session(session_id) and session_id != self._session_id:
             current_thread_session_id = self._thread_context_session_id()
-            with self._auxiliary_session_lock:
-                self._auxiliary_session_ids.discard(session_id)
-            if current_thread_session_id == session_id:
+            ended_generation = self._in_process_auxiliary_caller_generation(session_id)
+            deactivated = self._deactivate_auxiliary_session(
+                session_id,
+                generation=ended_generation,
+            )
+            if deactivated and current_thread_session_id == session_id:
                 self._clear_thread_context_stateless(session_id)
             return
         current_session_bypasses = session_id == self._session_id and self._bypasses_lcm_context_management()
