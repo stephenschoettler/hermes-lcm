@@ -10,13 +10,29 @@ This is the smallest viable substrate for cross-turn/session lifecycle state:
 
 from __future__ import annotations
 
+import functools
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, run_versioned_migrations
+
+
+def _synchronized(method):
+    """Serialize a read-modify-write method on the store's reentrant lock.
+
+    The lifecycle connection is shared across threads (check_same_thread=False,
+    autocommit). Without serialization, two callers reading state and then
+    writing can interleave and clobber each other's update.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -42,6 +58,11 @@ class LifecycleStateStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
+        # The connection is opened check_same_thread=False in autocommit mode
+        # and is shared across the gateway thread, dispatcher, and sub-agents.
+        # Serialize read-modify-write flows so concurrent binds/frontier
+        # advances cannot interleave and regress the checkpoint.
+        self._lock = threading.RLock()
         self._init_db()
 
     def _init_db(self) -> None:
@@ -120,6 +141,7 @@ class LifecycleStateStore:
         ).fetchone()
         return self._row_to_state(row)
 
+    @_synchronized
     def bind_session(
         self,
         session_id: str,
@@ -226,6 +248,7 @@ class LifecycleStateStore:
         assert state is not None
         return state
 
+    @_synchronized
     def finalize_session(
         self,
         conversation_id: str | None,
@@ -271,6 +294,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(state.conversation_id)
 
+    @_synchronized
     def record_rollover(
         self,
         conversation_id: str,
@@ -563,6 +587,7 @@ class LifecycleStateStore:
             "categories": categories,
         }
 
+    @_synchronized
     def record_debt(
         self,
         conversation_id: str | None,
@@ -611,6 +636,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def record_maintenance_attempt(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -630,6 +656,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def record_reset(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -652,6 +679,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def prune_empty_sessions(
         self,
         *,
@@ -813,19 +841,27 @@ class LifecycleStateStore:
     ) -> LifecycleState | None:
         if not conversation_id:
             return None
-        state = self.get_by_conversation(conversation_id)
-        if state is None or state.current_session_id != session_id:
-            return state
-        frontier = max(int(frontier_store_id or 0), state.current_frontier_store_id)
-        now = time.time()
-        self._conn.execute(
-            """
-            UPDATE lcm_lifecycle_state
-            SET current_frontier_store_id = ?,
-                updated_at = ?
-            WHERE conversation_id = ?
-            """,
-            (frontier, now, conversation_id),
-        )
-        self._conn.commit()
-        return self.get_by_conversation(conversation_id)
+        with self._lock:
+            state = self.get_by_conversation(conversation_id)
+            if state is None or state.current_session_id != session_id:
+                return state
+            now = time.time()
+            conn = self._conn
+            assert conn is not None
+            # MAX() in SQL keeps the advance monotonic even if a concurrent
+            # writer bumped the frontier between the read above and this write.
+            # A Python-side max() over the stale read could otherwise regress
+            # the checkpoint and force the same range to be compacted twice.
+            cursor = conn.execute(
+                """
+                UPDATE lcm_lifecycle_state
+                SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                    updated_at = ?
+                WHERE conversation_id = ? AND current_session_id = ?
+                """,
+                (int(frontier_store_id or 0), now, conversation_id, session_id),
+            )
+            if cursor.rowcount == 0:
+                return self.get_by_conversation(conversation_id)
+            conn.commit()
+            return self.get_by_conversation(conversation_id)

@@ -2328,6 +2328,65 @@ class TestLifecycleStateStore:
 
         state.close()
 
+    def test_advance_frontier_is_monotonic_under_stale_read(self, tmp_path):
+        import dataclasses
+
+        store = LifecycleStateStore(tmp_path / "lifecycle-frontier.db")
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            store.advance_frontier("c1", "s1", 10)
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+
+            # Simulate a racing caller whose read predates the advance to 10:
+            # it sees a stale frontier of 0 and tries to advance to a lower
+            # value. SQL-side MAX must keep the checkpoint monotonic instead of
+            # regressing it (which would force the same range to compact twice).
+            stale = dataclasses.replace(
+                store.get_by_conversation("c1"), current_frontier_store_id=0
+            )
+            store.get_by_conversation = lambda cid: stale
+            try:
+                store.advance_frontier("c1", "s1", 5)
+            finally:
+                del store.get_by_conversation
+
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+        finally:
+            store.close()
+
+    def test_advance_frontier_refuses_stale_session_after_rebind(self, tmp_path):
+        db_path = tmp_path / "lifecycle-frontier-rebind.db"
+        store = LifecycleStateStore(db_path)
+        racer = LifecycleStateStore(db_path)
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            original_get = store.get_by_conversation
+            state_seen_before_rebind = []
+
+            def get_and_rebind_once(conversation_id):
+                state = original_get(conversation_id)
+                if not state_seen_before_rebind:
+                    state_seen_before_rebind.append(state.current_session_id)
+                    racer.bind_session("s2", conversation_id="c1")
+                return state
+
+            store.get_by_conversation = get_and_rebind_once
+            try:
+                returned = store.advance_frontier("c1", "s1", 123)
+            finally:
+                del store.get_by_conversation
+
+            final = store.get_by_conversation("c1")
+            assert state_seen_before_rebind == ["s1"]
+            assert returned is not None
+            assert returned.current_session_id == "s2"
+            assert returned.current_frontier_store_id == 0
+            assert final.current_session_id == "s2"
+            assert final.current_frontier_store_id == 0
+        finally:
+            store.close()
+            racer.close()
+
     def test_init_upgrades_legacy_db_and_keeps_missing_state_safe(self, tmp_path):
         db_path = tmp_path / "legacy-lifecycle.db"
         conn = sqlite3.connect(db_path)
