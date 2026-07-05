@@ -3877,3 +3877,158 @@ def test_readme_documents_storage_boundary_payload_guard():
     assert "upstream/outside LCM scope" in readme
     assert "historical rows already present in `lcm.db`" in readme
     assert "backup-first cleanup or migration" in readme
+
+
+def test_sensitive_private_key_redaction_is_redos_safe_on_pathological_input(tmp_path):
+    import time as _time
+
+    engine = _sensitive_engine(tmp_path)
+
+    small = "-----BEGIN RSA PRIVATE KEY-----\nabcdef\n-----END RSA PRIVATE KEY-----"
+    assert "BEGIN RSA PRIVATE KEY" not in redact_sensitive_text(small, engine._config)
+
+    pathological = ("-----BEGIN PRIVATE KEY-----\n" + "A" * 64 + "\n") * 20000
+    start = _time.perf_counter()
+    result = redact_sensitive_text(pathological, engine._config)
+    assert _time.perf_counter() - start < 3.0
+    assert isinstance(result, str)
+
+
+def test_sensitive_private_key_fallback_bounds_input_without_regex(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    monkeypatch.setattr(ip, "_regex_engine", None)
+    ip._SENSITIVE_REGEX_CATALOG.clear()
+    engine = _sensitive_engine(tmp_path)
+
+    small = "-----BEGIN RSA PRIVATE KEY-----\nabcdef\n-----END RSA PRIVATE KEY-----"
+    assert "BEGIN RSA PRIVATE KEY" not in ip.redact_sensitive_text(small, engine._config)
+
+    big = "-----BEGIN PRIVATE KEY-----\n" + "A" * (ip._SENSITIVE_STDLIB_MAX_CHARS + 10)
+    assert ip.redact_sensitive_text(big, engine._config) == big
+
+
+def test_ingest_externalizes_line_wrapped_base64_block(tmp_path):
+    engine = _engine(tmp_path)
+    wrapped = "\n".join(GENERIC_BASE64[i:i + 64] for i in range(0, len(GENERIC_BASE64), 64))
+
+    engine._ingest_messages([{"role": "user", "content": f"attachment:\n{wrapped}\nend"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert GENERIC_BASE64[:120] not in content
+    assert wrapped[:200] not in content
+    assert "[Externalized" in content
+
+
+def test_ingest_externalizes_crlf_wrapped_base64_block(tmp_path):
+    engine = _engine(tmp_path)
+    wrapped = "\r\n".join(GENERIC_BASE64[i:i + 76] for i in range(0, len(GENERIC_BASE64), 76))
+
+    engine._ingest_messages([{"role": "user", "content": f"attachment:\r\n{wrapped}\r\nend"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert GENERIC_BASE64[:120] not in content
+    assert "[Externalized" in content
+
+
+def test_ingest_externalizes_wrapped_base64_with_short_terminal_line(tmp_path):
+    engine = _engine(tmp_path)
+    payload = base64.b64encode(bytes((i * 37) % 256 for i in range(3096))).decode("ascii")
+    assert len(payload) == 4096 + 32
+    wrapped = "\n".join(payload[i:i + 64] for i in range(0, len(payload), 64))
+    terminal_line = wrapped.rsplit("\n", 1)[1]
+    assert len(terminal_line) == 32
+
+    engine._ingest_messages([{"role": "user", "content": f"attachment:\n{wrapped}\nend"}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="user")
+    assert payload[:120] not in content
+    assert terminal_line not in content
+    assert content.startswith("attachment:\n[Externalized")
+    assert content.endswith("end")
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["content"] == wrapped + "\n"
+
+
+def test_private_key_redaction_fallback_is_case_insensitive(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    engine = _sensitive_engine(tmp_path)
+    monkeypatch.setattr(ip, "_regex_engine", None)
+    monkeypatch.setattr(ip, "_SENSITIVE_REGEX_CATALOG", {})
+    begin = "-----begin " + "private key" + "-----"
+    end = "-----EnD " + "PrIvAtE kEy" + "-----"
+    key = begin + "\n" + ("A" * 64) + "\n" + end
+
+    redacted = ip.redact_sensitive_text("prefix " + key + " suffix", engine._config)
+
+    assert "begin private key" not in redacted.lower()
+    assert "end private key" not in redacted.lower()
+    assert "[LCM sensitive redaction: name=private_key" in redacted
+    assert redacted.startswith("prefix ")
+    assert redacted.endswith(" suffix")
+
+
+def test_private_key_redaction_fallback_preserves_large_complete_key(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    engine = _sensitive_engine(tmp_path)
+    monkeypatch.setattr(ip, "_regex_engine", None)
+    monkeypatch.setattr(ip, "_SENSITIVE_REGEX_CATALOG", {})
+    key = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        + "A" * (ip._SENSITIVE_STDLIB_MAX_CHARS + 10)
+        + "\n-----END PRIVATE KEY-----"
+    )
+
+    redacted = ip.redact_sensitive_text("prefix " + key + " suffix", engine._config)
+
+    assert "BEGIN PRIVATE KEY" not in redacted
+    assert "END PRIVATE KEY" not in redacted
+    assert "[LCM sensitive redaction: name=private_key" in redacted
+    assert redacted.startswith("prefix ")
+    assert redacted.endswith(" suffix")
+
+
+def test_wrapped_base64_scan_ignores_long_single_line_without_regex_backtracking():
+    from hermes_lcm.ingest_protection import contains_long_base64_run
+
+    not_payload = "A" * 80_000
+
+    assert contains_long_base64_run(not_payload) is False
+
+def test_sensitive_private_key_regex_timeout_preserves_prior_redactions(tmp_path, monkeypatch):
+    import hermes_lcm.ingest_protection as ip
+
+    class TimeoutPattern:
+        def sub(self, repl, text, timeout=None):
+            raise TimeoutError("synthetic timeout")
+
+    engine = _sensitive_engine(tmp_path)
+    monkeypatch.setattr(ip, "_regex_pattern_for", lambda name: TimeoutPattern())
+    text = "api_key=sk-test-secret-value-123456 and -----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+
+    redacted = ip.redact_sensitive_text(text, engine._config)
+
+    assert "sk-test-secret-value" not in redacted
+    assert "BEGIN PRIVATE KEY" not in redacted
+    assert "[LCM sensitive redaction: name=api_key" in redacted
+    assert "[LCM sensitive redaction: name=private_key" in redacted
+
+
+def test_wrapped_base64_scan_ignores_hex_hash_inventory():
+    from hermes_lcm.ingest_protection import contains_long_base64_run
+
+    hex_lines = "\n".join(f"{i:064x}" for i in range(96))
+
+    assert contains_long_base64_run(hex_lines) is False
+
+def test_wrapped_base64_scan_preserves_short_terminal_line():
+    from hermes_lcm.ingest_protection import contains_long_base64_run
+
+    full_line = "QUJD" * 16
+    terminal = "REVG" * 4
+    payload = "\n".join([full_line] * 70 + [terminal])
+
+    assert contains_long_base64_run(payload) is True
