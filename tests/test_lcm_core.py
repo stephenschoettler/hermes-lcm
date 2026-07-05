@@ -378,6 +378,58 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert (second_summary, second_level) == ("fallback summary", 1)
         assert calls == ["primary-model", "fallback-model", "fallback-model"]
 
+    def test_spend_guard_trips_and_backs_off(self):
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        g = SummarySpendGuard(max_calls=3, window_seconds=100, backoff_seconds=50)
+        t = 1000.0
+        for _ in range(3):
+            assert g.allows(now=t) is True
+            g.record_call(now=t)
+        assert g.allows(now=t) is False        # budget exhausted -> backoff
+        assert g.allows(now=t + 49) is False   # still backing off
+        assert g.allows(now=t + 51) is True    # backoff elapsed, window reset
+
+    def test_spend_guard_clear_and_disable(self):
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        g = SummarySpendGuard(max_calls=1, window_seconds=100, backoff_seconds=100)
+        g.record_call(now=0)
+        assert g.allows(now=10) is False
+        g.clear()
+        assert g.allows(now=10) is True
+
+        disabled = SummarySpendGuard(max_calls=0)
+        for _ in range(5):
+            disabled.record_call(now=0)
+        assert disabled.allows(now=0) is True
+
+    def test_summarize_falls_to_l3_when_spend_guard_backs_off(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import SummarySpendGuard
+
+        calls = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            calls.append(model)
+            return "should never be used"
+
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        guard = SummarySpendGuard(max_calls=1, window_seconds=3600, backoff_seconds=3600)
+        guard.record_call()
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            model="primary-model",
+            spend_guard=guard,
+        )
+
+        assert level == 3          # deterministic fallback, no spend
+        assert calls == []         # LLM never invoked while backing off
+
     def test_extraction_call_passes_provider_and_stripped_model(self, monkeypatch):
         from hermes_lcm.extraction import _call_extraction_llm
 
@@ -2328,6 +2380,65 @@ class TestLifecycleStateStore:
         assert state.get_by_session("missing") is None
 
         state.close()
+
+    def test_advance_frontier_is_monotonic_under_stale_read(self, tmp_path):
+        import dataclasses
+
+        store = LifecycleStateStore(tmp_path / "lifecycle-frontier.db")
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            store.advance_frontier("c1", "s1", 10)
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+
+            # Simulate a racing caller whose read predates the advance to 10:
+            # it sees a stale frontier of 0 and tries to advance to a lower
+            # value. SQL-side MAX must keep the checkpoint monotonic instead of
+            # regressing it (which would force the same range to compact twice).
+            stale = dataclasses.replace(
+                store.get_by_conversation("c1"), current_frontier_store_id=0
+            )
+            store.get_by_conversation = lambda cid: stale
+            try:
+                store.advance_frontier("c1", "s1", 5)
+            finally:
+                del store.get_by_conversation
+
+            assert store.get_by_conversation("c1").current_frontier_store_id == 10
+        finally:
+            store.close()
+
+    def test_advance_frontier_refuses_stale_session_after_rebind(self, tmp_path):
+        db_path = tmp_path / "lifecycle-frontier-rebind.db"
+        store = LifecycleStateStore(db_path)
+        racer = LifecycleStateStore(db_path)
+        try:
+            store.bind_session("s1", conversation_id="c1")
+            original_get = store.get_by_conversation
+            state_seen_before_rebind = []
+
+            def get_and_rebind_once(conversation_id):
+                state = original_get(conversation_id)
+                if not state_seen_before_rebind:
+                    state_seen_before_rebind.append(state.current_session_id)
+                    racer.bind_session("s2", conversation_id="c1")
+                return state
+
+            store.get_by_conversation = get_and_rebind_once
+            try:
+                returned = store.advance_frontier("c1", "s1", 123)
+            finally:
+                del store.get_by_conversation
+
+            final = store.get_by_conversation("c1")
+            assert state_seen_before_rebind == ["s1"]
+            assert returned is not None
+            assert returned.current_session_id == "s2"
+            assert returned.current_frontier_store_id == 0
+            assert final.current_session_id == "s2"
+            assert final.current_frontier_store_id == 0
+        finally:
+            store.close()
+            racer.close()
 
     def test_init_upgrades_legacy_db_and_keeps_missing_state_safe(self, tmp_path):
         db_path = tmp_path / "legacy-lifecycle.db"
