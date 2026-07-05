@@ -1067,6 +1067,69 @@ class TestTokens:
         assert count_message_tokens(msg) == count_message_tokens(normalized_msg)
         assert count_message_tokens(msg) > 100
 
+    def test_count_tokens_is_memoized(self):
+        from hermes_lcm.tokens import _count_tokens_cached
+
+        text = "a repeated content string used across a turn " * 20
+        first = count_tokens(text)
+        before = _count_tokens_cached.cache_info()
+        for _ in range(5):
+            assert count_tokens(text) == first
+        after = _count_tokens_cached.cache_info()
+        assert after.hits >= before.hits + 5
+
+    def test_fallback_token_estimate_ascii_fast_path_skips_character_scan(self):
+        from hermes_lcm.tokens import _fallback_token_estimate
+
+        text = "a" * 80_000
+
+        assert _fallback_token_estimate(text) == len(text) // 4 + 1
+
+    def test_fallback_token_estimate_scales_up_for_cjk(self):
+        from hermes_lcm.tokens import _fallback_token_estimate
+
+        latin = "the quick brown fox " * 20
+        cjk = "検索対象データ処理" * 20
+        assert _fallback_token_estimate(latin) == len(latin) // 4 + 1
+        assert _fallback_token_estimate(cjk) > len(cjk) // 4 + 1
+
+    def test_count_tokens_cache_boundary_is_literal_32_kib(self, monkeypatch):
+        from hermes_lcm import tokens as token_module
+
+        assert token_module._MAX_CACHEABLE_TOKEN_TEXT_CHARS == 32_768
+
+        monkeypatch.setattr(token_module, "_get_encoder", lambda: None)
+        token_module._count_tokens_cached.cache_clear()
+
+        boundary = "x" * 32_768
+        first = token_module.count_tokens(boundary)
+        before = token_module._count_tokens_cached.cache_info()
+        assert before.currsize == 1
+        assert token_module.count_tokens(boundary) == first
+        after_boundary = token_module._count_tokens_cached.cache_info()
+        assert after_boundary.currsize == 1
+        assert after_boundary.hits == before.hits + 1
+
+        oversized = "x" * 32_769
+        assert token_module.count_tokens(oversized) > 0
+        before_oversized_repeat = token_module._count_tokens_cached.cache_info()
+        assert token_module.count_tokens(oversized) > 0
+        after_oversized_repeat = token_module._count_tokens_cached.cache_info()
+
+        assert after_oversized_repeat.currsize == before_oversized_repeat.currsize == 1
+        assert after_oversized_repeat.hits == before_oversized_repeat.hits
+
+    def test_count_tokens_tolerates_non_string_unhashable_input(self):
+        assert count_tokens({"api_key": 1}) >= 0
+        msg = {
+            "role": "assistant",
+            "content": "calling",
+            "tool_calls": [
+                {"function": {"name": "lookup", "arguments": {"api_key": 1}}}
+            ],
+        }
+        assert count_message_tokens(msg) > 0
+
     def test_count_messages_tokens(self):
         msgs = [
             {"role": "user", "content": "hello"},
@@ -6179,3 +6242,18 @@ class TestLCMEngineCloning:
             shutdown = getattr(clone, "shutdown", None)
             if callable(shutdown):
                 shutdown()
+
+def test_count_tokens_skips_lru_for_large_strings(monkeypatch):
+    import hermes_lcm.tokens as tokens
+
+    assert tokens._MAX_CACHEABLE_TOKEN_TEXT_CHARS == 32_768
+
+    tokens._count_tokens_cached.cache_clear()
+    monkeypatch.setattr(tokens, "_get_encoder", lambda: None)
+    large = "x" * 32_769
+
+    first = tokens.count_tokens(large)
+    second = tokens.count_tokens(large)
+
+    assert first == second
+    assert tokens._count_tokens_cached.cache_info().currsize == 0

@@ -2920,6 +2920,23 @@ class TestEngineABC:
         assert "store_messages" in status
         assert "dag_nodes" in status
 
+    def test_placeholder_metadata_write_skips_when_unchanged(self, engine):
+        conn = engine._store._conn
+        if not engine._ignored_placeholder_count_metadata_keys():
+            pytest.skip("no placeholder metadata keys bound for this session")
+
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 2})
+        changes_after_first = conn.total_changes
+
+        # Identical payload: no UPSERT executed, so no fsync commit either.
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 2})
+        assert conn.total_changes == changes_after_first
+
+        # A changed payload still writes.
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 3})
+        assert conn.total_changes > changes_after_first
+        assert engine._load_generated_ignored_placeholder_hash_counts().get("a" * 16) == 3
+
     def test_lcm_grep_ingests_live_history_before_search(self, engine):
         engine.on_session_start("live-search", platform="telegram", context_length=200000)
         messages = [

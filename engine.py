@@ -3601,7 +3601,16 @@ class LCMEngine(ContextEngine):
                 return
             serialized = json.dumps(payload, sort_keys=True)
             with self._store._write_lock:
+                wrote = False
                 for key in count_keys:
+                    # Skip the write (and its fsync commit under synchronous=FULL)
+                    # when the stored value already matches. This runs on every
+                    # ingest and was previously an unconditional UPSERT+commit.
+                    existing = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?", (key,)
+                    ).fetchone()
+                    if existing is not None and existing[0] == serialized:
+                        continue
                     conn.execute(
                         """
                         INSERT INTO metadata(key, value)
@@ -3610,7 +3619,9 @@ class LCMEngine(ContextEngine):
                         """,
                         (key, serialized),
                     )
-                conn.commit()
+                    wrote = True
+                if wrote:
+                    conn.commit()
         except Exception:
             logger.debug("LCM ignored placeholder count metadata write failed", exc_info=True)
 
@@ -3679,7 +3690,15 @@ class LCMEngine(ContextEngine):
                 return
             serialized = json.dumps(payload, sort_keys=True)
             with self._store._write_lock:
+                wrote = False
                 for key in ordinal_keys:
+                    # Skip the write (and its fsync commit) when unchanged; see
+                    # the counts writer above for rationale.
+                    existing = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?", (key,)
+                    ).fetchone()
+                    if existing is not None and existing[0] == serialized:
+                        continue
                     conn.execute(
                         """
                         INSERT INTO metadata(key, value)
@@ -3688,7 +3707,9 @@ class LCMEngine(ContextEngine):
                         """,
                         (key, serialized),
                     )
-                conn.commit()
+                    wrote = True
+                if wrote:
+                    conn.commit()
         except Exception:
             logger.debug("LCM ignored placeholder ordinal metadata write failed", exc_info=True)
 
