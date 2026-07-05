@@ -45,6 +45,12 @@ def _content_digest_prefix(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
 
 
+def _preview_sha256(preview_prefix: Any) -> str:
+    if not preview_prefix:
+        return ""
+    return hashlib.sha256(str(preview_prefix).encode("utf-8")).hexdigest()
+
+
 def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
@@ -68,6 +74,22 @@ def _missing_directory_components(path: Path) -> list[Path]:
     return list(reversed(missing))
 
 
+_WARNED_EXTERNALIZATION_PATHS: set[str] = set()
+
+
+def _warn_externalization_path_outside_base(path: Path, allowed_base: Path) -> None:
+    key = str(path)
+    if key in _WARNED_EXTERNALIZATION_PATHS:
+        return
+    _WARNED_EXTERNALIZATION_PATHS.add(key)
+    logger.warning(
+        "LCM externalized-payload path %s is outside the hermes_home base %s; "
+        "set LCM_HERMES_BASE_DIR to enforce strict containment",
+        path,
+        allowed_base,
+    )
+
+
 def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool) -> Path:
     configured = getattr(config, "large_output_externalization_path", "") or ""
     if configured:
@@ -80,6 +102,16 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
                 path.relative_to(allowed_base)
             except ValueError:
                 raise ValueError(f"Path {path} is not within allowed base {allowed_base}")
+        elif hermes_home:
+            # No explicit base configured: hermes_home is the natural default
+            # containment root. A configured path may legitimately point to
+            # another volume, so warn (once) rather than break a running
+            # deployment; set LCM_HERMES_BASE_DIR to enforce strictly.
+            allowed_base = Path(hermes_home).expanduser().resolve()
+            try:
+                path.relative_to(allowed_base)
+            except ValueError:
+                _warn_externalization_path_outside_base(path, allowed_base)
     else:
         base = Path(hermes_home).expanduser().resolve() if hermes_home else Path("~/.hermes").expanduser().resolve()
         path = base / DEFAULT_LARGE_OUTPUT_DIRNAME
@@ -127,6 +159,232 @@ def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _replace_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    try:
+        _write_externalized_payload(tmp_path, payload)
+        tmp_path.replace(path)
+        _fsync_directory(path.parent)
+    except OSError:
+        _unlink_partial_payload(tmp_path)
+        raise
+
+
+def _persisted_output_marker_entry_from_metadata(metadata: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if not metadata:
+        return None
+    source_path = metadata.get("persisted_output_source_path")
+    expected_chars = metadata.get("persisted_output_expected_chars")
+    preview_sha256 = metadata.get("persisted_output_preview_sha256") or _preview_sha256(
+        metadata.get("persisted_output_preview_prefix")
+    )
+    redacted_preview_sha256 = metadata.get("persisted_output_redacted_preview_sha256")
+    if source_path is None or expected_chars is None:
+        return None
+    try:
+        expected_chars = int(expected_chars)
+    except (TypeError, ValueError):
+        return None
+    source_path = str(source_path)
+    if not source_path:
+        return None
+    entry = {
+        "source_path": source_path,
+        "expected_chars": expected_chars,
+    }
+    if preview_sha256:
+        entry["preview_sha256"] = str(preview_sha256)
+    if redacted_preview_sha256:
+        entry["redacted_preview_sha256"] = str(redacted_preview_sha256)
+    return entry
+
+
+def _persisted_output_marker_entries(
+    payload: Dict[str, Any],
+    *,
+    include_legacy_preview_prefix: bool = False,
+) -> list[Dict[str, Any]]:
+    entries: list[Dict[str, Any]] = []
+    seen: set[tuple[str, int, str, str]] = set()
+
+    def add(
+        source_path: Any,
+        expected_chars: Any,
+        preview_prefix: Any = None,
+        preview_sha256: Any = None,
+        redacted_preview_sha256: Any = None,
+    ) -> None:
+        if source_path is None or expected_chars is None:
+            return
+        try:
+            chars = int(expected_chars)
+        except (TypeError, ValueError):
+            return
+        source = str(source_path)
+        if not source:
+            return
+        preview_digest = str(preview_sha256 or "") or _preview_sha256(preview_prefix)
+        redacted_preview_digest = str(redacted_preview_sha256 or "")
+        key = (source, chars, preview_digest, redacted_preview_digest)
+        if key in seen:
+            return
+        seen.add(key)
+        entry = {"source_path": source, "expected_chars": chars}
+        if preview_digest:
+            entry["preview_sha256"] = preview_digest
+        if redacted_preview_digest:
+            entry["redacted_preview_sha256"] = redacted_preview_digest
+        if include_legacy_preview_prefix and preview_prefix:
+            entry["legacy_preview_prefix"] = str(preview_prefix)
+        entries.append(entry)
+
+    add(
+        payload.get("persisted_output_source_path"),
+        payload.get("persisted_output_expected_chars"),
+        payload.get("persisted_output_preview_prefix"),
+        payload.get("persisted_output_preview_sha256"),
+        payload.get("persisted_output_redacted_preview_sha256"),
+    )
+    markers = payload.get("persisted_output_markers")
+    if isinstance(markers, list):
+        for marker in markers:
+            if not isinstance(marker, dict):
+                continue
+            add(
+                marker.get("source_path"),
+                marker.get("expected_chars"),
+                marker.get("preview_prefix"),
+                marker.get("preview_sha256"),
+                marker.get("redacted_preview_sha256"),
+            )
+    return entries
+
+
+def _safe_persisted_output_metadata(metadata: Dict[str, Any] | None) -> Dict[str, Any]:
+    marker = _persisted_output_marker_entry_from_metadata(metadata)
+    if marker is None:
+        return {}
+    safe = {
+        "persisted_output_source_path": marker["source_path"],
+        "persisted_output_expected_chars": marker["expected_chars"],
+    }
+    if marker.get("preview_sha256"):
+        safe["persisted_output_preview_sha256"] = marker["preview_sha256"]
+    if marker.get("redacted_preview_sha256"):
+        safe["persisted_output_redacted_preview_sha256"] = marker["redacted_preview_sha256"]
+    return safe
+
+
+def _persisted_output_marker_preview_digests(marker: Dict[str, Any]) -> set[str]:
+    return {
+        str(value)
+        for value in (
+            marker.get("preview_sha256"),
+            marker.get("redacted_preview_sha256"),
+        )
+        if value
+    }
+
+
+def _redacted_legacy_preview_sha256(marker: Dict[str, Any], config) -> str:
+    legacy_preview_prefix = marker.get("legacy_preview_prefix")
+    if not legacy_preview_prefix:
+        return ""
+    try:
+        from .ingest_protection import redact_sensitive_value
+    except Exception:
+        return ""
+    redacted_preview = redact_sensitive_value(
+        str(legacy_preview_prefix),
+        config,
+        parse_json_strings=False,
+    )
+    return _preview_sha256(redacted_preview)
+
+
+def _persisted_output_marker_matches_preview_digest(
+    marker: Dict[str, Any],
+    preview_sha256: str,
+    *,
+    config,
+) -> bool:
+    if not preview_sha256:
+        return True
+    if preview_sha256 in _persisted_output_marker_preview_digests(marker):
+        return True
+    return preview_sha256 == _redacted_legacy_preview_sha256(marker, config)
+
+
+def _sanitize_persisted_output_marker_metadata(payload: Dict[str, Any]) -> bool:
+    """Remove legacy raw persisted-output previews from durable metadata.
+
+    Older payloads stored marker preview text as ``preview_prefix``. That preview
+    is enough to leak secrets when the recovered content itself has been
+    redacted, so durable metadata now stores only SHA-256 proofs. This helper is
+    intentionally tolerant of old payloads and rewrites them opportunistically
+    when they are touched again.
+    """
+    changed = False
+    entries = _persisted_output_marker_entries(payload)
+
+    if "persisted_output_preview_prefix" in payload:
+        payload.pop("persisted_output_preview_prefix", None)
+        changed = True
+
+    marker_list = payload.get("persisted_output_markers")
+    if entries and marker_list != entries:
+        payload["persisted_output_markers"] = entries
+        changed = True
+
+    first_digest = next((entry.get("preview_sha256") for entry in entries if entry.get("preview_sha256")), "")
+    if first_digest and payload.get("persisted_output_preview_sha256") != first_digest:
+        payload["persisted_output_preview_sha256"] = first_digest
+        changed = True
+
+    first_redacted_digest = next(
+        (entry.get("redacted_preview_sha256") for entry in entries if entry.get("redacted_preview_sha256")),
+        "",
+    )
+    if first_redacted_digest and payload.get("persisted_output_redacted_preview_sha256") != first_redacted_digest:
+        payload["persisted_output_redacted_preview_sha256"] = first_redacted_digest
+        changed = True
+
+    return changed
+
+
+def _merge_persisted_output_marker_metadata(payload: Dict[str, Any], metadata: Dict[str, Any] | None) -> bool:
+    changed = _sanitize_persisted_output_marker_metadata(payload)
+    marker = _persisted_output_marker_entry_from_metadata(metadata)
+    if marker is None:
+        return changed
+    entries = _persisted_output_marker_entries(payload)
+    key = (
+        marker["source_path"],
+        marker["expected_chars"],
+        marker.get("preview_sha256", ""),
+        marker.get("redacted_preview_sha256", ""),
+    )
+    if any(
+        (
+            entry["source_path"],
+            entry["expected_chars"],
+            entry.get("preview_sha256", ""),
+            entry.get("redacted_preview_sha256", ""),
+        ) == key
+        for entry in entries
+    ):
+        return changed
+    entries.append(marker)
+    payload["persisted_output_markers"] = entries
+    payload.setdefault("persisted_output_source_path", marker["source_path"])
+    payload.setdefault("persisted_output_expected_chars", marker["expected_chars"])
+    if marker.get("preview_sha256"):
+        payload.setdefault("persisted_output_preview_sha256", marker["preview_sha256"])
+    if marker.get("redacted_preview_sha256"):
+        payload.setdefault("persisted_output_redacted_preview_sha256", marker["redacted_preview_sha256"])
+    return True
 
 
 def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
@@ -306,6 +564,70 @@ def find_externalized_payload_for_message(
     return fallback_match
 
 
+def find_externalized_tool_result_content_for_call(
+    *,
+    tool_call_id: str,
+    session_id: str = "",
+    expected_chars: int | None = None,
+    persisted_output_source_path: str | None = None,
+    persisted_output_preview_sha256: str | None = None,
+    config,
+    hermes_home: str = "",
+) -> str | None:
+    """Return durable externalized tool-result content for a matching marker.
+
+    This is used only for replay identity recovery when Hermes' temporary
+    persisted-output file has already been cleaned up but LCM previously stored
+    the recovered full tool output durably. A reused tool-call id alone is not
+    sufficient proof; marker-specific metadata captured before redaction must
+    match when provided.
+    """
+    if not tool_call_id:
+        return None
+    storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+    if not storage_dir.exists() or not storage_dir.is_dir():
+        return None
+    for path in sorted(storage_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("kind", "tool_result") != "tool_result":
+            continue
+        if (payload.get("tool_call_id") or "") != tool_call_id:
+            continue
+        if session_id and (payload.get("session_id") or "") != session_id:
+            continue
+        payload_role = payload.get("role") or ""
+        if payload_role and payload_role != "tool":
+            continue
+        content = payload.get("content")
+        if not isinstance(content, str):
+            continue
+        if expected_chars is not None or persisted_output_source_path or persisted_output_preview_sha256:
+            marker_matches = False
+            for marker in _persisted_output_marker_entries(payload, include_legacy_preview_prefix=True):
+                if expected_chars is not None and marker.get("expected_chars") != expected_chars:
+                    continue
+                if persisted_output_source_path and marker.get("source_path") != persisted_output_source_path:
+                    continue
+                if (
+                    persisted_output_preview_sha256
+                    and not _persisted_output_marker_matches_preview_digest(
+                        marker,
+                        persisted_output_preview_sha256,
+                        config=config,
+                    )
+                ):
+                    continue
+                marker_matches = True
+                break
+            if not marker_matches:
+                continue
+        return content
+    return None
+
+
 def externalize_ingest_payload(
     content: str,
     *,
@@ -388,19 +710,21 @@ def maybe_externalize_payload(
     role: str = "",
     config,
     hermes_home: str = "",
+    force: bool = False,
+    metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
-    """Externalize one oversized normalized payload if configured.
+    """Externalize one normalized payload if configured.
 
     Returns a dict with a compact placeholder and the durable JSON payload path,
-    or ``None`` when disabled, below threshold, or storage is unavailable. On
-    storage failure callers should keep the original content so there is no
-    silent data loss.
+    or ``None`` when disabled, below threshold and not forced, or storage is
+    unavailable. On storage failure callers should keep the original content so
+    there is no silent data loss.
     """
     if not getattr(config, "large_output_externalization_enabled", False):
         return None
 
     threshold = max(1, int(getattr(config, "large_output_externalization_threshold_chars", 0) or 0))
-    if not content or len(content) <= threshold:
+    if not content or (len(content) <= threshold and not force):
         return None
 
     try:
@@ -419,9 +743,22 @@ def maybe_externalize_payload(
         hermes_home=hermes_home,
     )
     if existing is not None:
+        existing_path = storage_dir / existing["ref"]
+        existing_payload = None
+        if metadata:
+            try:
+                existing_payload = json.loads(existing_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing_payload = None
+            if existing_payload is not None and _merge_persisted_output_marker_metadata(existing_payload, metadata):
+                try:
+                    _replace_externalized_payload(existing_path, existing_payload)
+                    existing = _externalized_summary(existing_path, existing_payload)
+                except OSError as exc:
+                    logger.warning("Large payload metadata update skipped (non-blocking): %s", exc)
         return {
             "placeholder": _build_externalized_placeholder(existing),
-            "path": storage_dir / existing["ref"],
+            "path": existing_path,
             "payload": existing,
         }
 
@@ -449,6 +786,9 @@ def maybe_externalize_payload(
         "content_bytes": len(content.encode("utf-8")),
         "created_at": time.time(),
     }
+    if metadata:
+        payload.update(_safe_persisted_output_metadata(metadata))
+        _merge_persisted_output_marker_metadata(payload, metadata)
     try:
         _write_externalized_payload(path, payload)
     except OSError as exc:

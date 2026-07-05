@@ -96,3 +96,60 @@ def test_engine_state_db_path_fallback_outside_allowed_base_rejected(monkeypatch
 
     with pytest.raises(ValueError, match="not within allowed base"):
         engine._state_db_path()
+
+
+def _resolved(p) -> Path:
+    return Path(str(p)).expanduser().resolve()
+
+
+def test_externalization_path_outside_hermes_home_warns_but_does_not_break(monkeypatch, tmp_path, caplog):
+    import logging
+    from hermes_lcm.externalize import get_large_output_storage_dir, _WARNED_EXTERNALIZATION_PATHS
+
+    monkeypatch.delenv("LCM_HERMES_BASE_DIR", raising=False)
+    _WARNED_EXTERNALIZATION_PATHS.clear()
+    outside = tmp_path / "other-volume" / "payloads"
+
+    class Config:
+        large_output_externalization_path = str(outside)
+
+    with caplog.at_level(logging.WARNING):
+        path = get_large_output_storage_dir(
+            Config(), hermes_home=str(tmp_path / "hermes"), create=False
+        )
+
+    assert path == _resolved(outside)
+    assert any("outside the hermes_home base" in r.message for r in caplog.records)
+
+
+def test_externalization_path_within_hermes_home_does_not_warn(monkeypatch, tmp_path, caplog):
+    import logging
+    from hermes_lcm.externalize import get_large_output_storage_dir, _WARNED_EXTERNALIZATION_PATHS
+
+    monkeypatch.delenv("LCM_HERMES_BASE_DIR", raising=False)
+    _WARNED_EXTERNALIZATION_PATHS.clear()
+    hermes_home = tmp_path / "hermes"
+    inside = hermes_home / "custom-outputs"
+
+    class Config:
+        large_output_externalization_path = str(inside)
+
+    with caplog.at_level(logging.WARNING):
+        path = get_large_output_storage_dir(Config(), hermes_home=str(hermes_home), create=False)
+
+    assert path == _resolved(inside)
+    assert not any("outside the hermes_home base" in r.message for r in caplog.records)
+
+
+def test_externalization_path_strict_containment_when_base_set(monkeypatch, tmp_path):
+    from hermes_lcm.externalize import get_large_output_storage_dir
+
+    monkeypatch.setenv("LCM_HERMES_BASE_DIR", str(tmp_path / "allowed"))
+
+    class Config:
+        large_output_externalization_path = str(tmp_path / "elsewhere" / "payloads")
+
+    with pytest.raises(ValueError):
+        get_large_output_storage_dir(
+            Config(), hermes_home=str(tmp_path / "allowed" / "hermes"), create=False
+        )
