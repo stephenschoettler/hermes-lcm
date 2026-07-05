@@ -27,6 +27,7 @@ from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .escalation import (
     SummaryCircuitBreaker,
+    SummarySpendGuard,
     _strip_reasoning_blocks,
     summarize_with_escalation,
 )
@@ -34,6 +35,7 @@ from .externalize import (
     build_transcript_gc_placeholder,
     extract_externalized_ref,
     find_externalized_payload_for_message,
+    find_externalized_tool_result_content_for_call,
     load_externalized_payload,
     maybe_externalize_tool_output,
 )
@@ -44,13 +46,18 @@ from .extraction import (
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
+    _expected_persisted_output_chars,
+    _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
+    _persisted_output_preview_prefix_digest,
+    _persisted_output_saved_path,
     assistant_output_quarantine_reason,
     extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
+    recover_hermes_persisted_output,
     redact_sensitive_text,
     redact_sensitive_value,
     restore_ingest_payload_placeholders,
@@ -529,6 +536,15 @@ class LCMEngine(ContextEngine):
         self._summary_circuit_breaker = SummaryCircuitBreaker(
             failure_threshold=self._config.summary_circuit_breaker_failure_threshold,
             cooldown_seconds=self._config.summary_circuit_breaker_cooldown_seconds,
+        )
+        # Summary spend guard: process-local sliding window so a loop that
+        # keeps succeeding cannot burn auxiliary-model budget without bound. When
+        # tripped, escalation falls back to deterministic L3 truncation. Set
+        # summary_spend_max_calls=0 to disable.
+        self._summary_spend_guard = SummarySpendGuard(
+            max_calls=int(self._config.summary_spend_max_calls),
+            window_seconds=float(self._config.summary_spend_window_seconds),
+            backoff_seconds=float(self._config.summary_spend_backoff_seconds),
         )
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
@@ -1271,6 +1287,7 @@ class LCMEngine(ContextEngine):
                     model=self._config.summary_model,
                     fallback_models=self._config.summary_fallback_models,
                     circuit_breaker=self._summary_circuit_breaker,
+                    spend_guard=self._summary_spend_guard,
                     timeout=self._config.summary_timeout_ms / 1000,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
@@ -1337,6 +1354,12 @@ class LCMEngine(ContextEngine):
             observed_tokens=observed_prompt_tokens,
             messages=messages,
         )
+        # NOTE: deliberately do NOT clear the spend guard on force_overflow.
+        # force_overflow is automatic (set every turn the prompt exceeds the
+        # assembly cap), which is exactly the sustained-over-cap state a runaway
+        # compaction loop produces - clearing it per turn would defeat the guard
+        # in the case it exists for. A tripped guard still converges the
+        # emergency via deterministic L3 truncation (no LLM spend).
         recovery_assembly_cap = (
             self._overflow_recovery_assembly_cap(
                 observed_tokens=observed_prompt_tokens,
@@ -4272,8 +4295,66 @@ class LCMEngine(ContextEngine):
             session_id=session_id,
         )
 
-    def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+    def _has_durable_persisted_output_replay_identity(self, msg: Dict[str, Any]) -> bool:
+        role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        if role != "tool" or not _is_hermes_persisted_output_marker(content):
+            return False
+        expected_chars = _expected_persisted_output_chars(content)
+        persisted_output_source_path = _persisted_output_saved_path(content)
+        persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
+        if (
+            expected_chars is None
+            or not persisted_output_source_path
+            or not persisted_output_preview_sha256
+        ):
+            return False
+        durable_content = find_externalized_tool_result_content_for_call(
+            tool_call_id=str(msg.get("tool_call_id") or ""),
+            session_id=str(msg.get("session_id") or self._session_id or ""),
+            expected_chars=expected_chars,
+            persisted_output_source_path=persisted_output_source_path,
+            persisted_output_preview_sha256=persisted_output_preview_sha256,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        return durable_content is not None
+
+    def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        role = str(msg.get("role") or "unknown")
+        content = normalize_content_value(msg.get("content")) or ""
+        if role == "tool" and _is_hermes_persisted_output_marker(content):
+            expected_chars = _expected_persisted_output_chars(content)
+            persisted_output_source_path = _persisted_output_saved_path(content)
+            persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
+            durable_content = None
+            if (
+                not stored_row
+                and expected_chars is not None
+                and persisted_output_source_path
+                and persisted_output_preview_sha256
+            ):
+                durable_content = find_externalized_tool_result_content_for_call(
+                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    session_id=str(msg.get("session_id") or self._session_id or ""),
+                    expected_chars=expected_chars,
+                    persisted_output_source_path=persisted_output_source_path,
+                    persisted_output_preview_sha256=persisted_output_preview_sha256,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+            if durable_content is not None:
+                content = durable_content
+            else:
+                recovered_content = recover_hermes_persisted_output(content)
+                if recovered_content is not None:
+                    content = normalize_content_value(
+                        redact_sensitive_value(
+                            recovered_content,
+                            self._config,
+                            parse_json_strings=False,
+                        )
+                    ) or ""
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")
@@ -4293,7 +4374,7 @@ class LCMEngine(ContextEngine):
                 content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
-            str(msg.get("role") or "unknown"),
+            role,
             content,
             str(msg.get("tool_call_id") or ""),
             tool_calls_identity,
@@ -4561,12 +4642,25 @@ class LCMEngine(ContextEngine):
                 and self._is_quarantined_assistant_replay_identity(candidate_prefix[0])
                 and self._is_quarantined_assistant_replay_identity(sanitized_replay_tail[0])
             )
+            candidate_singleton_original_content = (
+                normalize_content_value(candidate_identity_messages[0].get("content")) or ""
+                if len(candidate_identity_messages) == 1
+                else ""
+            )
             has_externalized_singleton_replay = (
                 matches_raw_tail
                 and len(candidate_prefix) == 1
                 and raw_session_count == 1
-                and bool(extract_externalized_ref(normalize_content_value(candidate_identity_messages[0].get("content")) or ""))
+                and bool(extract_externalized_ref(candidate_singleton_original_content))
                 and candidate_prefix == stored_tail
+            )
+            has_persisted_marker_singleton_replay = (
+                matches_raw_tail
+                and len(candidate_prefix) == 1
+                and raw_session_count == 1
+                and candidate_prefix == stored_tail
+                and candidate_prefix[0][0] == "tool"
+                and _is_hermes_persisted_output_marker(candidate_singleton_original_content)
             )
             has_filtered_full_replay = (
                 matches_sanitized_tail
@@ -4612,6 +4706,7 @@ class LCMEngine(ContextEngine):
             if (
                 has_effective_full_replay
                 or has_externalized_singleton_replay
+                or has_persisted_marker_singleton_replay
                 or has_raw_full_replay
                 or has_scaffold_suffix_replay
                 or has_raw_cleanup_replay
@@ -4894,12 +4989,21 @@ class LCMEngine(ContextEngine):
             ignored_messages=ignored_original_messages,
         )
         if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = replay_messages
-            if self._compiled_ignore_message_patterns:
-                reconcile_messages = [
-                    original_msg if ignored_original_messages[idx] else replay_msg
-                    for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-                ]
+            reconcile_messages = [
+                original_msg
+                if (
+                    (
+                        str(original_msg.get("role") or "") == "tool"
+                        and self._has_durable_persisted_output_replay_identity(original_msg)
+                    )
+                    or (
+                        self._compiled_ignore_message_patterns
+                        and ignored_original_messages[idx]
+                    )
+                )
+                else replay_msg
+                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
+            ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
@@ -5135,7 +5239,15 @@ class LCMEngine(ContextEngine):
                         excerpt,
                     )
                     continue
-                kept.append((absolute_idx, replay_msg))
+                store_msg = replay_msg
+                if (
+                    str(original_msg.get("role") or "") == "tool"
+                    and _is_hermes_persisted_output_marker(
+                        normalize_content_value(original_msg.get("content")) or ""
+                    )
+                ):
+                    store_msg = original_msg
+                kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
 
         if not messages_to_store_with_index:
@@ -5912,6 +6024,7 @@ class LCMEngine(ContextEngine):
                 model=self._config.summary_model,
                 fallback_models=self._config.summary_fallback_models,
                 circuit_breaker=self._summary_circuit_breaker,
+                spend_guard=self._summary_spend_guard,
                 timeout=self._config.summary_timeout_ms / 1000,
                 l2_budget_ratio=self._config.l2_budget_ratio,
                 l3_truncate_tokens=self._config.l3_truncate_tokens,
