@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import re
@@ -12,7 +13,9 @@ from typing import Any, Dict, TYPE_CHECKING
 
 from .externalize import (
     extract_externalized_ref,
+    extract_externalized_refs,
     find_externalized_payload_for_message,
+    get_large_output_storage_dir,
     load_externalized_payload,
 )
 from .diagnostics import (
@@ -34,6 +37,7 @@ from .ingest_protection import (
 from .model_routing import apply_lcm_model_route
 from .presets import preset_status_payload
 from .search_query import AGE_DECAY_RATE, normalize_search_sort
+from .session_patterns import build_session_match_keys, compile_session_pattern
 from .store import build_message_fts_spec
 
 if TYPE_CHECKING:
@@ -201,6 +205,10 @@ _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
 _LCM_LOAD_SESSION_DEFAULT_MAX_CONTENT_CHARS = 4000
 _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS = 20_000
+_LCM_INSPECT_DEFAULT_LIMIT = 20
+_LCM_INSPECT_HARD_LIMIT_CAP = 200
+_LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
+_LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
 
 
 def _slice_content_for_response(content: str, max_tokens: int, content_offset: int = 0) -> dict[str, Any]:
@@ -1845,6 +1853,466 @@ def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, An
     }
 
 
+def _matched_session_patterns(session_keys: list[str], patterns: list[str]) -> list[str]:
+    """Return configured session glob patterns that match the supplied keys."""
+    matched: list[str] = []
+    for pattern in patterns:
+        try:
+            compiled = compile_session_pattern(pattern)
+        except re.error:
+            continue
+        if any(compiled.match(key) for key in session_keys if key):
+            matched.append(pattern)
+    return matched
+
+
+def _inspect_externalized_refs_from_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        sources = [value]
+    else:
+        try:
+            sources = [json.dumps(value, ensure_ascii=False)]
+        except (TypeError, ValueError):
+            sources = [str(value)]
+
+    refs: list[str] = []
+    for source in sources:
+        for ref in extract_ingest_externalized_refs(source) + extract_externalized_refs(source):
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
+def _inspect_message_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    """Return row metadata only; never include raw message content."""
+    content = row.get("content") or ""
+    item: dict[str, Any] = {
+        "store_id": row.get("store_id"),
+        "session_id": row.get("session_id") or "",
+        "source": row.get("source") or "",
+        "conversation_id": row.get("conversation_id") or "",
+        "role": row.get("role") or "unknown",
+        "timestamp": row.get("timestamp", 0),
+        "token_estimate": row.get("token_estimate", 0),
+        "content_chars": len(content),
+    }
+    if row.get("tool_call_id"):
+        item["tool_call_id"] = row.get("tool_call_id")
+    if row.get("tool_name"):
+        item["tool_name"] = row.get("tool_name")
+
+    refs: list[str] = []
+    for value in (row.get("content"), row.get("tool_calls")):
+        for ref in _inspect_externalized_refs_from_value(value):
+            if ref not in refs:
+                refs.append(ref)
+    if refs:
+        item["externalized_refs"] = refs
+    return item
+
+
+def _inspect_lifecycle_state(engine: "LCMEngine", session_id: str, conversation_id: str) -> dict[str, Any] | None:
+    state = None
+    if conversation_id:
+        state = engine._lifecycle.get_by_conversation(conversation_id)
+    if state is None and session_id:
+        state = engine._lifecycle.get_by_session(session_id)
+    if state is None:
+        return None
+    return {
+        "conversation_id": state.conversation_id,
+        "current_session_id": state.current_session_id,
+        "last_finalized_session_id": state.last_finalized_session_id,
+        "current_frontier_store_id": state.current_frontier_store_id,
+        "last_finalized_frontier_store_id": state.last_finalized_frontier_store_id,
+        "debt_kind": state.debt_kind,
+        "debt_size_estimate": state.debt_size_estimate,
+        "current_bound_at": state.current_bound_at,
+        "last_finalized_at": state.last_finalized_at,
+        "debt_updated_at": state.debt_updated_at,
+        "last_maintenance_attempt_at": state.last_maintenance_attempt_at,
+        "last_rollover_at": state.last_rollover_at,
+        "last_reset_at": state.last_reset_at,
+        "updated_at": state.updated_at,
+    }
+
+
+def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: str) -> int:
+    highest = 0
+    rows = engine._dag._conn.execute(
+        """
+        SELECT source_ids
+        FROM summary_nodes
+        WHERE session_id = ? AND source_type = 'messages'
+        """,
+        (session_id,),
+    ).fetchall()
+    for (raw_source_ids,) in rows:
+        try:
+            source_ids = json.loads(raw_source_ids or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for source_id in source_ids:
+            try:
+                highest = max(highest, int(source_id))
+            except (TypeError, ValueError, OverflowError):
+                continue
+    return highest
+
+
+def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
+    decoder = json.JSONDecoder()
+    fields: dict[str, str] = {}
+    length = len(text)
+    index = 0
+
+    def skip_json_whitespace(pos: int) -> int:
+        while pos < length and text[pos] in " \t\n\r":
+            pos += 1
+        return pos
+
+    index = skip_json_whitespace(index)
+    if index >= length or text[index] != "{":
+        return fields, False
+    index += 1
+
+    while True:
+        index = skip_json_whitespace(index)
+        if index >= length or text[index] == "}":
+            return fields, False
+        if text[index] != '"':
+            return fields, False
+        try:
+            key, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, False
+        if not isinstance(key, str):
+            return fields, False
+        index = skip_json_whitespace(index)
+        if index >= length or text[index] != ":":
+            return fields, False
+        index += 1
+        index = skip_json_whitespace(index)
+        if key == "content":
+            return fields, index < length and text[index] == '"'
+        if index >= length:
+            return fields, False
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            return fields, False
+        if isinstance(value, str):
+            fields[key] = value
+        elif key == "session_id":
+            fields.pop(key, None)
+        index = skip_json_whitespace(index)
+        if index >= length:
+            return fields, False
+        if text[index] == ",":
+            index += 1
+            continue
+        if text[index] == "}":
+            return fields, False
+        return fields, False
+
+
+def _read_externalized_payload_metadata_prefix(path: Path) -> tuple[str, bool, bool]:
+    """Read bounded JSON metadata before the externalized payload body.
+
+    Returns ``(prefix_text, content_string_seen, prefix_truncated)``. The content
+    string body is intentionally not consumed; ``lcm_inspect`` reports bounded
+    metadata only and leaves full JSON/body validation to explicit expansion.
+    """
+    prefix = bytearray()
+    text_parts: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    prefix_truncated = False
+    with path.open("rb") as handle:
+        while len(prefix) < _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES:
+            byte = handle.read(1)
+            if not byte:
+                break
+            prefix.extend(byte)
+            try:
+                decoded = decoder.decode(byte, final=False)
+            except UnicodeDecodeError as exc:
+                raise ValueError("invalid_payload") from exc
+            if decoded:
+                text_parts.append(decoded)
+            prefix_text = "".join(text_parts)
+            _, content_key_seen = _inspect_top_level_json_string_fields_before_content(prefix_text)
+            if content_key_seen:
+                return prefix_text, True, False
+        prefix_truncated = len(prefix) >= _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES and bool(handle.read(1))
+    if not prefix_truncated:
+        try:
+            final_text = decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid_payload") from exc
+        if final_text:
+            text_parts.append(final_text)
+    return "".join(text_parts), False, prefix_truncated
+
+
+def _inspect_externalized_payload_metadata(engine: "LCMEngine", ref: str, session_id: str) -> dict[str, Any]:
+    if not ref or Path(ref).name != ref:
+        return {"readable": False, "error": "invalid_ref"}
+    try:
+        storage_dir = get_large_output_storage_dir(
+            engine._config,
+            hermes_home=engine._hermes_home,
+            create=False,
+        )
+        path = storage_dir / ref
+        if not path.exists():
+            return {"readable": False, "error": "missing"}
+        if not path.is_file():
+            return {"readable": False, "error": "not_a_file"}
+        metadata_prefix_text, content_key_seen, prefix_truncated = _read_externalized_payload_metadata_prefix(path)
+    except FileNotFoundError:
+        return {"readable": False, "error": "missing"}
+    except (OSError, ValueError) as exc:
+        return {"readable": False, "error": str(exc)}
+
+    metadata_fields, _content_key_seen = _inspect_top_level_json_string_fields_before_content(metadata_prefix_text)
+    payload_session_id = metadata_fields.get("session_id", "")
+    if payload_session_id and payload_session_id != session_id:
+        return {"readable": False, "error": "session_mismatch"}
+    if not payload_session_id:
+        return {"readable": False, "error": "session_metadata_unavailable"}
+    if not content_key_seen:
+        error = "metadata_prefix_truncated" if prefix_truncated else "invalid_payload"
+        return {"readable": False, "error": error}
+
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {"readable": False, "error": "missing"}
+    except OSError as exc:
+        return {"readable": False, "error": str(exc)}
+
+    metadata: dict[str, Any] = {
+        "readable": True,
+        "file_size_bytes": stat.st_size,
+        "modified_at": stat.st_mtime,
+        "payload_validation": "metadata_prefix",
+    }
+    if payload_session_id:
+        metadata["payload_session_id"] = payload_session_id
+    return metadata
+
+
+def _inspect_externalized_refs(engine: "LCMEngine", session_id: str, limit: int) -> dict[str, Any]:
+    message_total = engine._store.get_session_count(session_id)
+    rows = engine._store.load_session_page(session_id, limit=_LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT)
+    scan_truncated = message_total > len(rows)
+    items: list[dict[str, Any]] = []
+    total_known = 0
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        refs: list[str] = []
+        for value in (row.get("content"), row.get("tool_calls")):
+            for ref in _inspect_externalized_refs_from_value(value):
+                if ref not in refs:
+                    refs.append(ref)
+        for ref in refs:
+            key = (int(row.get("store_id") or 0), ref)
+            if key in seen:
+                continue
+            seen.add(key)
+            total_known += 1
+            if len(items) >= limit:
+                continue
+            metadata = _inspect_externalized_payload_metadata(engine, ref, session_id)
+            item: dict[str, Any] = {
+                "externalized_ref": ref,
+                "store_id": row.get("store_id"),
+                "session_id": row.get("session_id") or "",
+                "source": row.get("source") or "",
+                "conversation_id": row.get("conversation_id") or "",
+                "role": row.get("role") or "unknown",
+                "timestamp": row.get("timestamp", 0),
+                "readable": metadata.get("readable") is True,
+            }
+            if row.get("tool_call_id"):
+                item["tool_call_id"] = row.get("tool_call_id")
+            item.update(metadata)
+            items.append(item)
+
+    return {
+        "total_known": total_known,
+        "total_known_exact": not scan_truncated,
+        "scanned_messages": len(rows),
+        "scan_truncated": scan_truncated,
+        "returned": len(items),
+        "has_more": total_known > len(items) or scan_truncated,
+        "items": items,
+    }
+
+
+def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
+    """Return a read-only metadata inventory of the current LCM session."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    raw_limit_arg = args.get("limit", _LCM_INSPECT_DEFAULT_LIMIT)
+    parsed_limit, limit_error = _parse_strict_int(raw_limit_arg, "limit")
+    if limit_error:
+        return json.dumps({"error": limit_error})
+    if parsed_limit is None or parsed_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    requested_limit = parsed_limit
+    limit = min(requested_limit, _LCM_INSPECT_HARD_LIMIT_CAP)
+
+    session_id = engine.current_session_id
+    conversation_id = engine.current_conversation_id
+    if not session_id:
+        full_status = engine.get_status()
+        return json.dumps({
+            "error": "No active session",
+            "read_only": True,
+            "runtime_identity": full_status.get("runtime_identity") or engine.get_runtime_identity(),
+            "ingest_protection": full_status.get("ingest_protection"),
+        })
+
+    full_status = engine.get_status()
+    runtime_identity = full_status.get("runtime_identity") or engine.get_runtime_identity()
+    lifecycle = _inspect_lifecycle_state(engine, session_id, conversation_id)
+
+    store_totals_row = engine._store._conn.execute(
+        """
+        SELECT COUNT(*), MIN(store_id), MAX(store_id), COALESCE(SUM(token_estimate), 0)
+        FROM messages
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    message_total = int(store_totals_row[0] or 0) if store_totals_row else 0
+    min_store_id = store_totals_row[1] if store_totals_row else None
+    max_store_id = store_totals_row[2] if store_totals_row else None
+    estimated_tokens = int(store_totals_row[3] or 0) if store_totals_row else 0
+    fresh_tail_count = max(0, int(engine._config.fresh_tail_count or 0))
+    fresh_tail_limit = min(limit, fresh_tail_count) if fresh_tail_count > 0 else 0
+    fresh_tail_items = [
+        _inspect_message_metadata(row)
+        for row in engine._store.get_session_tail(session_id, fresh_tail_limit)
+    ]
+
+    depth_stats = engine._dag.get_session_depth_stats(session_id)
+    total_dag_nodes = sum(info["count"] for info in depth_stats.values())
+    total_dag_tokens = sum(info["tokens"] for info in depth_stats.values())
+    total_dag_source_tokens = sum(info["source_tokens"] for info in depth_stats.values())
+    latest_node_rows = engine._dag._conn.execute(
+        """
+        SELECT node_id, session_id, depth, token_count, source_token_count,
+               source_type, created_at, earliest_at, latest_at, expand_hint
+        FROM summary_nodes
+        WHERE session_id = ?
+        ORDER BY created_at DESC, node_id DESC
+        LIMIT ?
+        """,
+        (session_id, limit),
+    ).fetchall()
+    latest_nodes = [
+        {
+            "node_id": int(row[0]),
+            "session_id": row[1],
+            "depth": int(row[2]),
+            "token_count": int(row[3] or 0),
+            "source_token_count": int(row[4] or 0),
+            "source_type": row[5],
+            "created_at": row[6],
+            "earliest_at": row[7],
+            "latest_at": row[8],
+            "expand_hint_available": bool(row[9]),
+            "expand_hint_chars": len(row[9] or ""),
+        }
+        for row in latest_node_rows
+    ]
+
+    highest_compacted_source_store_id = _inspect_highest_compacted_source_store_id(engine, session_id)
+    lifecycle_current_frontier = int((lifecycle or {}).get("current_frontier_store_id") or 0)
+    lifecycle_finalized_frontier = int((lifecycle or {}).get("last_finalized_frontier_store_id") or 0)
+    runtime_last_compacted = int(getattr(engine, "_last_compacted_store_id", 0) or 0)
+
+    platform = engine.current_session_platform
+    session_keys = build_session_match_keys(session_id, platform=platform)
+    ignore_patterns = list(engine._config.ignore_session_patterns or [])
+    stateless_patterns = list(engine._config.stateless_session_patterns or [])
+
+    response: dict[str, Any] = {
+        "read_only": True,
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+        "limit": limit,
+        "runtime_identity": runtime_identity,
+        "lineage": {
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "session_platform": platform,
+            "side_channel_active": engine.side_channel_active,
+            "bound_session_id": getattr(engine, "_session_id", ""),
+            "bound_conversation_id": getattr(engine, "_conversation_id", ""),
+            "lifecycle": lifecycle,
+            "source_lineage": full_status.get("source_lineage"),
+        },
+        "messages": {
+            "total": message_total,
+            "estimated_tokens": estimated_tokens,
+            "min_store_id": min_store_id,
+            "max_store_id": max_store_id,
+            "fresh_tail_count": fresh_tail_count,
+            "pre_tail_message_count": max(0, message_total - fresh_tail_count),
+            "fresh_tail": {
+                "returned": len(fresh_tail_items),
+                "items": fresh_tail_items,
+            },
+        },
+        "compaction": {
+            "last": {
+                "status": full_status.get("last_compression_status", "idle"),
+                "noop_reason": full_status.get("last_compression_noop_reason", ""),
+                "condensation_suppressed_reason": full_status.get("condensation_suppressed_reason", ""),
+                "compression_count": engine.compression_count,
+                "last_prompt_tokens": engine.last_prompt_tokens,
+                "threshold_tokens": engine.threshold_tokens,
+            },
+            "frontier": {
+                "runtime_last_compacted_store_id": runtime_last_compacted,
+                "highest_compacted_source_store_id": highest_compacted_source_store_id,
+                "lifecycle_current_frontier_store_id": lifecycle_current_frontier,
+                "lifecycle_last_finalized_frontier_store_id": lifecycle_finalized_frontier,
+            },
+        },
+        "dag": {
+            "total_nodes": total_dag_nodes,
+            "total_tokens": total_dag_tokens,
+            "total_source_tokens": total_dag_source_tokens,
+            "depths": {f"d{depth}": info for depth, info in sorted(depth_stats.items())},
+            "latest_nodes": latest_nodes,
+        },
+        "externalized_refs": _inspect_externalized_refs(engine, session_id, limit),
+        "ingest_protection": full_status.get("ingest_protection"),
+        "filters": {
+            "session_keys": session_keys,
+            "ignored": engine.current_session_ignored,
+            "stateless": engine.current_session_stateless,
+            "ignore_session_patterns": ignore_patterns,
+            "stateless_session_patterns": stateless_patterns,
+            "matched_ignore_session_patterns": _matched_session_patterns(session_keys, ignore_patterns),
+            "matched_stateless_session_patterns": _matched_session_patterns(session_keys, stateless_patterns),
+            "ignore_message_patterns": list(engine._config.ignore_message_patterns or []),
+            "ignored_message_count": full_status.get("ignored_message_count", 0),
+        },
+    }
+    if requested_limit > _LCM_INSPECT_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    return json.dumps(response)
+
+
 def lcm_status(args: Dict[str, Any], **kwargs) -> str:
     """Quick health overview of the LCM engine for the current session."""
     engine = _require_engine(kwargs)
@@ -1942,6 +2410,9 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "condensation_fanin": engine._config.condensation_fanin,
             "summary_model": engine._config.summary_model or "(auxiliary)",
             "summary_timeout_ms": engine._config.summary_timeout_ms,
+            "summary_spend_max_calls": engine._config.summary_spend_max_calls,
+            "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
+            "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "config_sources": config_sources,

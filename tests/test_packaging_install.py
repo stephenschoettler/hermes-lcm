@@ -15,6 +15,7 @@ EXPECTED_LCM_TOOLS = {
     "lcm_expand",
     "lcm_expand_query",
     "lcm_status",
+    "lcm_inspect",
     "lcm_doctor",
 }
 
@@ -583,7 +584,7 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
 
     # Call each registered handler with messages=... kwarg
     test_messages = [{"role": "user", "content": "test"}]
-    for tool_name in ("lcm_grep", "lcm_status", "lcm_doctor"):
+    for tool_name in ("lcm_grep", "lcm_status", "lcm_inspect", "lcm_doctor"):
         handler = registered.get(tool_name)
         assert handler is not None, f"handler for {tool_name} not registered"
         result = handler({"query": tool_name}, messages=test_messages)

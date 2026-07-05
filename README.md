@@ -76,7 +76,8 @@ Core capabilities:
 - **Bounded recovery** - pages raw messages, child summaries, and externalized
   payloads instead of dumping everything into the prompt
 - **Agent tools** - `lcm_grep`, `lcm_load_session`, `lcm_describe`,
-  `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+  `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and
+  `lcm_doctor`
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
   source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with
@@ -176,20 +177,22 @@ Expected signals:
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
 - tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`,
-  `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+  `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and
+  `lcm_doctor`
 
 Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.18.1 (7 tools)
+  ✓ hermes-lcm v0.18.1 (8 tools)
 
 Provider Plugins:
   Context Engine: lcm
 ```
 
-For source checkouts, `lcm_status`, `/lcm status`, `lcm_doctor`, and
-`/lcm doctor` also report the loaded plugin path and best-effort git identity:
+For source checkouts, `lcm_status`, `/lcm status`, `lcm_inspect`,
+`lcm_doctor`, and `/lcm doctor` also report the loaded plugin path and
+best-effort git identity:
 `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`.
 
 If startup logs say LCM tools are available through `context-engine schemas` or
@@ -236,6 +239,7 @@ outside the LCM database.
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message from a cross-session `lcm_grep` result. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
+| `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
 
 ### Slash commands
@@ -374,7 +378,7 @@ FTS shadow tables, DAG summaries, or externalized payload JSON that were written
 before the setting was enabled. Non-password placeholders include a short
 truncated SHA-256 digest for correlation. `password_assignment` placeholders omit
 the digest to avoid making password-like values easier to dictionary-check.
-`lcm_status` and `lcm_doctor` expose the enabled state, configured pattern names,
+`lcm_status`, `lcm_inspect`, and `lcm_doctor` expose the enabled state, configured pattern names,
 unknown names, source, and placeholder format without exposing raw secret values.
 
 ### Threshold ownership
@@ -488,6 +492,16 @@ it.
 pattern sources, whether the current session is ignored/stateless, and a
 process-lifetime `ignored_message_count`.
 
+Ignored/stateless sessions are a storage ownership boundary, not a context-window
+opt-out. LCM does not ingest raw messages or create DAG nodes for sessions that
+match `LCM_IGNORE_SESSION_PATTERNS`, `LCM_STATELESS_SESSION_PATTERNS`, or the
+in-process auxiliary/thread stateless marker. If those sessions cross the normal
+context threshold, LCM delegates the compaction call to Hermes' native
+`ContextCompressor` so the active request is still bounded before model overflow.
+If the native compressor is unavailable, LCM falls back to a deterministic
+head/tail trim as a last-resort safety net, still without writing the bypassed
+session to `lcm.db`.
+
 ### Large tool-output handling
 
 Storage-boundary payload guard contract: LCM prevents media-ish inline payloads from being written into plugin-local SQLite rows at the storage boundary.
@@ -565,13 +579,39 @@ when those sources still belong to a previous session.
 
 ## OpenClaw/lossless-claw import
 
-`hermes-lcm` includes an opt-in operator script for backfilling raw message rows
-from a lossless-claw/OpenClaw LCM SQLite database into the local hermes-lcm
-SQLite store:
+`hermes-lcm` includes an opt-in operator script for backfilling OpenClaw history
+into the local hermes-lcm SQLite store. It supports two source shapes:
+
+1. **SQLite LCM database** (`--source-db`) for migrations from an existing
+   lossless-claw/OpenClaw `lcm.db`.
+2. **JSONL session exports** (`--source-jsonl` / `--source-jsonl-dir`) for fresh
+   installs, plugin-off catch-up, or migrations where no source SQLite database
+   is available.
+
+SQLite source example:
 
 ```bash
 python scripts/import_lossless_claw.py \
   --source-db ~/.openclaw/path/to/lcm.db \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy
+```
+
+JSONL source example:
+
+```bash
+python scripts/import_lossless_claw.py \
+  --source-jsonl ~/.openclaw/agents/sammy/sessions/session-a.jsonl \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --json
+```
+
+For a directory of session exports:
+
+```bash
+python scripts/import_lossless_claw.py \
+  --source-jsonl-dir ~/.openclaw/agents/sammy/sessions \
   --target-db ~/.hermes/lcm.db \
   --agent sammy
 ```
@@ -583,23 +623,29 @@ The script is intentionally conservative:
   for that profile
 - writes create a timestamped target DB backup first when the target already
   exists
-- only raw messages are imported; summary DAG import is out of scope
+- SQLite imports can include OpenClaw summaries with `--include-summaries`; this
+  migrates compatible summary rows into Hermes `summary_nodes`
+- JSONL imports migrate raw message rows only; JSONL does not carry a summary DAG
 - imported rows keep explicit provenance in `session_id` and `source`, for
-  example `openclaw-lcm:agent:sammy:<source-session>`
-- the default provenance identity is the source `conversations.session_id`,
+  example `openclaw-lcm:agent:sammy:<source-session>` or
+  `openclaw-jsonl:agent:sammy:<source-session>`
+- the SQLite default provenance identity is the source `conversations.session_id`,
   preserving source session boundaries even when many conversations share one
   `session_key`
-- pass `--session-identity session_key` only when you intentionally want
-  conversations with the same source session key grouped into one imported LCM
-  session
+- pass `--session-identity session_key` only for SQLite imports when you
+  intentionally want conversations with the same source session key grouped into
+  one imported LCM session
 - reruns are idempotent for the same `--import-id`; the default `import_id` is
-  path-derived, so pass a stable `--import-id` if you may import the same copied
-  DB from different paths
+  source-path-derived, so pass a stable `--import-id` if you may import the same
+  copied DB or JSONL export set from different paths
+- `--json` prints a reconciliation report with `scanned`, `eligible`,
+  `would_import`, `imported`, `skipped_existing`, `skipped_empty`,
+  `invalid_rows`, `warnings`, and summary counters
 - changing `--agent`, `--namespace`, or `--session-identity` under the same
   `--import-id` is treated as the same import and will skip already-tracked
   source messages; use a new `--import-id` for a different mapping
-- no OpenClaw config or separate secret tables are imported, but raw transcripts
-  and tool payloads are imported and may contain sensitive user data
+- no OpenClaw config or separate secret tables are imported, but raw transcripts,
+  summaries, and tool payloads may contain sensitive user data
 
 This is a local archive migration path. It does not make LCM a general memory
 provider, and it does not change the current-session retrieval contract for

@@ -22,6 +22,7 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     configure_connection,
     ensure_external_content_fts,
+    refuse_schema_version_too_new,
     run_versioned_migrations,
 )
 from .config import LCMConfig
@@ -245,6 +246,7 @@ class MessageStore:
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -491,22 +493,25 @@ class MessageStore:
 
     def get_range(self, session_id: str, start_id: int = 0,
                   end_id: int | None = None,
-                  limit: int = 1000) -> List[Dict[str, Any]]:
+                  limit: int = 1000,
+                  conversation_id: str | None = None) -> List[Dict[str, Any]]:
         """Get messages in a store_id range for a session."""
+        where = ["session_id = ?", "store_id >= ?"]
+        args: list[Any] = [session_id, start_id]
+        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        if conversation_clause:
+            where.append(conversation_clause)
+            args.extend(conversation_args)
         if end_id is not None:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-                   WHERE session_id = ? AND store_id >= ? AND store_id <= ?
-                   ORDER BY store_id LIMIT ?""",
-                (session_id, start_id, end_id, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-                   WHERE session_id = ? AND store_id >= ?
-                   ORDER BY store_id LIMIT ?""",
-                (session_id, start_id, limit),
-            ).fetchall()
+            where.append("store_id <= ?")
+            args.append(end_id)
+        args.append(limit)
+        rows = self._conn.execute(
+            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+               WHERE {' AND '.join(where)}
+               ORDER BY store_id LIMIT ?""",
+            args,
+        ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def _session_load_where(
@@ -1052,19 +1057,9 @@ class MessageStore:
                     score_exprs.append(expr)
                     order_args.extend(expr_args)
             score_expr = " + ".join(score_exprs) if score_exprs else "0"
-            exact_exprs: list[str] = []
-            exact_args: list[Any] = []
-            for phrase in phrases:
-                phrase_text = (phrase or "").strip()
-                if phrase_text:
-                    exact_exprs.append("CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END")
-                    exact_args.append(phrase_text)
-            for term in terms:
-                term_text = (term or "").strip()
-                if term_text:
-                    exact_exprs.append("CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END")
-                    exact_args.append(term_text)
-            exact_expr = " + ".join(exact_exprs) if exact_exprs else "0"
+            exact_query = (query or "").strip()
+            exact_expr = "CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END" if exact_query else "0"
+            exact_args: list[Any] = [exact_query] if exact_query else []
             directness_expr = "0.0 + 0"
 
             if normalized_sort == "hybrid":
@@ -1076,7 +1071,7 @@ class MessageStore:
                 primary_expr = f"({score_expr})"
 
             order_by = (
-                f"ORDER BY ({exact_expr}) DESC, {primary_expr} DESC, ({directness_expr}) DESC, "
+                f"ORDER BY {primary_expr} DESC, ({exact_expr}) DESC, ({directness_expr}) DESC, "
                 f"{role_bias} ASC, timestamp DESC, store_id DESC"
             )
             candidate_cap = compute_search_candidate_cap(limit)

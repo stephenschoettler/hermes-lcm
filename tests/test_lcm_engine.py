@@ -5,9 +5,11 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -1350,6 +1352,7 @@ class TestEngineABC:
         assert "lcm_expand" in names
         assert "lcm_load_session" in names
         assert "lcm_status" in names
+        assert "lcm_inspect" in names
         assert "lcm_doctor" in names
         assert "lcm_expand_query" in names
 
@@ -1472,8 +1475,48 @@ class TestEngineABC:
         try:
             assert count_messages_tokens(messages) >= instance.threshold_tokens
             assert not instance.should_compress_preflight(messages)
-            assert instance._last_compression_status == "noop"
-            assert "below leaf chunk threshold" in instance._last_compression_noop_reason
+            assert instance.last_compression_status == "noop"
+            assert instance.last_compression_was_noop is True
+            assert "below leaf chunk threshold" in instance.last_compression_noop_reason
+        finally:
+            instance.shutdown()
+
+    def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),
+            fresh_tail_count=4,
+            leaf_chunk_tokens=100,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.context_length = 1000
+        instance.threshold_tokens = 100
+        noop_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "tiny old backlog"},
+            {"role": "assistant", "content": "tiny old answer"},
+            {"role": "user", "content": "fresh " + "x" * 500},
+            {"role": "assistant", "content": "fresh " + "y" * 500},
+            {"role": "user", "content": "fresh " + "z" * 500},
+        ]
+        eligible_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old backlog " + "x" * 600},
+            {"role": "assistant", "content": "old answer " + "y" * 600},
+            {"role": "user", "content": "fresh " + "a" * 200},
+            {"role": "assistant", "content": "fresh " + "b" * 200},
+            {"role": "user", "content": "fresh " + "c" * 200},
+        ]
+
+        try:
+            assert instance.should_compress_preflight(noop_messages) is False
+            assert instance.last_compression_was_noop is True
+            assert instance.last_compression_noop_reason
+
+            assert instance.should_compress_preflight(eligible_messages) is True
+            assert instance.last_compression_status == "pending"
+            assert instance.last_compression_was_noop is False
+            assert instance.last_compression_noop_reason == ""
         finally:
             instance.shutdown()
 
@@ -1534,6 +1577,1549 @@ class TestEngineABC:
         try:
             assert count_messages_tokens(messages) >= instance.threshold_tokens
             assert instance.should_compress_preflight(messages)
+        finally:
+            instance.shutdown()
+
+    @staticmethod
+    def _oversized_bypass_messages():
+        return [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old bypass backlog " + "x" * 400},
+            {"role": "assistant", "content": "old bypass answer " + "y" * 400},
+            {"role": "user", "content": "fresh bypass tail " + "z" * 400},
+        ]
+
+    @pytest.mark.parametrize(
+        ("session_id", "config_kwargs"),
+        [
+            ("ignored:session", {"ignore_session_patterns": ["ignored:*"]}),
+            ("stateless:session", {"stateless_session_patterns": ["stateless:*"]}),
+        ],
+    )
+    def test_bypassed_sessions_request_host_compaction_without_lcm_writes(
+        self,
+        tmp_path,
+        session_id,
+        config_kwargs,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / f"{session_id.replace(':', '-')}.db"),
+            **config_kwargs,
+        )
+        instance = LCMEngine(config=config)
+        messages = self._oversized_bypass_messages()
+        try:
+            instance.on_session_start(session_id, platform="cli", context_length=1_000)
+            instance.threshold_tokens = 20
+
+            assert count_messages_tokens(messages) >= instance.threshold_tokens
+            instance.ingest(messages)
+            instance.on_session_end(session_id, messages)
+
+            assert instance._store.get_session_count(session_id) == 0
+            assert instance._dag.get_session_node_count(session_id) == 0
+            assert instance.should_compress_preflight(messages)
+            assert instance.should_compress(instance.threshold_tokens + 1)
+        finally:
+            instance.shutdown()
+
+    @pytest.mark.parametrize(
+        ("session_id", "config_kwargs"),
+        [
+            ("ignored:session", {"ignore_session_patterns": ["ignored:*"]}),
+            ("stateless:session", {"stateless_session_patterns": ["stateless:*"]}),
+        ],
+    )
+    def test_bypassed_compression_boundary_child_stays_out_of_lcm_storage(
+        self,
+        tmp_path,
+        session_id,
+        config_kwargs,
+    ):
+        child_session_id = "compressed-child"
+        grandchild_session_id = "compressed-grandchild"
+        config = LCMConfig(
+            database_path=str(tmp_path / f"boundary-{session_id.replace(':', '-')}.db"),
+            **config_kwargs,
+        )
+        instance = LCMEngine(config=config)
+        messages = self._oversized_bypass_messages()
+        child_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "child turn " + "x" * 400},
+        ]
+        try:
+            instance.on_session_start(session_id, platform="cli", context_length=1_000)
+            instance.threshold_tokens = 20
+            assert instance.should_compress_preflight(messages)
+
+            instance.on_session_start(
+                child_session_id,
+                boundary_reason="compression",
+                old_session_id=session_id,
+                platform="cli",
+                context_length=1_000,
+            )
+            instance.ingest(child_messages)
+            instance.on_session_end(child_session_id, child_messages)
+            instance.threshold_tokens = 20
+
+            assert instance._store.get_session_count(session_id) == 0
+            assert instance._store.get_session_count(child_session_id) == 0
+            assert instance._dag.get_session_node_count(session_id) == 0
+            assert instance._dag.get_session_node_count(child_session_id) == 0
+            assert instance.should_compress_preflight(child_messages)
+
+            instance.on_session_start(
+                grandchild_session_id,
+                boundary_reason="compression",
+                old_session_id=child_session_id,
+                platform="cli",
+                context_length=1_000,
+            )
+            instance.ingest(child_messages)
+            instance.threshold_tokens = 20
+
+            assert instance._store.get_session_count(grandchild_session_id) == 0
+            assert instance._dag.get_session_node_count(grandchild_session_id) == 0
+            assert instance.should_compress_preflight(child_messages)
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_compression_boundary_child_without_platform_keeps_lineage(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "boundary-missing-platform.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        child_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "child without platform must stay bypassed"},
+        ]
+        try:
+            instance.on_session_start("ignored-source", platform="cron", context_length=1_000)
+            assert instance._bypasses_lcm_context_management()
+
+            instance.on_session_start(
+                "compressed-child",
+                boundary_reason="compression",
+                old_session_id="ignored-source",
+                context_length=1_000,
+            )
+
+            assert instance._session_id == "compressed-child"
+            assert instance._session_platform == ""
+            assert not instance._session_ignored
+            assert instance._session_stateless
+            assert instance._bypasses_lcm_context_management()
+            assert instance._has_lcm_bypass_lineage_session("compressed-child", platform="")
+
+            instance.ingest(child_messages)
+            instance.on_session_end("compressed-child", child_messages)
+
+            assert instance._store.get_session_count("ignored-source") == 0
+            assert instance._store.get_session_count("compressed-child") == 0
+            assert instance._dag.get_session_node_count("ignored-source") == 0
+            assert instance._dag.get_session_node_count("compressed-child") == 0
+        finally:
+            instance.shutdown()
+
+    @pytest.mark.parametrize(
+        ("session_id", "config_kwargs"),
+        [
+            ("ignored:session", {"ignore_session_patterns": ["ignored:*"]}),
+            ("stateless:session", {"stateless_session_patterns": ["stateless:*"]}),
+        ],
+    )
+    def test_bypassed_compression_boundary_after_rebind_stays_out_of_lcm_storage(
+        self,
+        tmp_path,
+        session_id,
+        config_kwargs,
+    ):
+        child_session_id = "compressed-after-rebind"
+        config = LCMConfig(
+            database_path=str(tmp_path / f"boundary-rebind-{session_id.replace(':', '-')}.db"),
+            **config_kwargs,
+        )
+        instance = LCMEngine(config=config)
+        child_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "child after rebind " + "x" * 400},
+        ]
+        try:
+            instance.on_session_start(session_id, platform="cli", context_length=1_000)
+            instance.on_session_start("foreground:normal", platform="cli", context_length=1_000)
+
+            instance.on_session_start(
+                child_session_id,
+                boundary_reason="compression",
+                old_session_id=session_id,
+                platform="cli",
+                context_length=1_000,
+            )
+            instance.ingest(child_messages)
+            instance.on_session_end(child_session_id, child_messages)
+
+            assert instance._store.get_session_count(session_id) == 0
+            assert instance._store.get_session_count(child_session_id) == 0
+            assert instance._dag.get_session_node_count(session_id) == 0
+            assert instance._dag.get_session_node_count(child_session_id) == 0
+        finally:
+            instance.shutdown()
+
+    def test_platform_drift_does_not_turn_normal_boundary_child_stateless(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "normal-boundary-platform-drift.db"),
+            ignore_session_patterns=["cron:*"],
+        )
+        instance = LCMEngine(config=config)
+        child_messages = [{"role": "user", "content": "normal child should persist"}]
+        try:
+            instance.on_session_start("normal:source", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal source persists"}])
+            instance.on_session_start("cron:tick", platform="cron", context_length=1_000)
+
+            instance.on_session_start(
+                "normal:child",
+                boundary_reason="compression",
+                old_session_id="normal:source",
+                platform="cron",
+                context_length=1_000,
+            )
+            instance.ingest(child_messages)
+
+            assert instance._store.get_session_count("normal:child") == 1
+            assert not instance._has_lcm_bypass_lineage_session("normal:child")
+        finally:
+            instance.shutdown()
+
+    def test_bypass_lineage_does_not_poison_reused_normal_session_id(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "reused-normal-session-id.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored must not persist"}])
+            instance.on_session_end("reused-id", [{"role": "user", "content": "ignored end"}])
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal should persist"}])
+
+            assert instance._store.get_session_count("reused-id") == 1
+            assert instance._has_lcm_bypass_lineage_session("reused-id")
+            assert not instance._has_lcm_bypass_lineage_session("reused-id", platform="cli")
+        finally:
+            instance.shutdown()
+
+    def test_bypass_lineage_does_not_poison_reused_normal_session_id_without_end(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "reused-normal-session-id-no-end.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored must not persist"}])
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal should persist"}])
+
+            assert instance._store.get_session_count("reused-id") == 1
+            assert not instance._has_lcm_bypass_lineage_session("reused-id", platform="cli")
+        finally:
+            instance.shutdown()
+
+    def test_same_id_reused_unmatched_suffix_only_end_flushes_current_normal(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "reused-unmatched-suffix-normal-end.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored prefix must not persist"}])
+            assert instance._store.get_session_count("reused-id") == 0
+            assert instance._dag.get_session_node_count("reused-id") == 0
+            assert instance._has_lcm_bypass_lineage_session("reused-id")
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            foreground_session_id = instance.current_session_id
+            foreground_platform = instance.current_session_platform
+            foreground_conversation_id = instance.current_conversation_id
+            assert foreground_session_id == "reused-id"
+            assert foreground_platform == "cli"
+            assert not instance.current_session_ignored
+            assert not instance.current_session_stateless
+            assert not instance._has_lcm_bypass_lineage_session("reused-id", platform="cli")
+
+            instance.on_session_end(
+                "reused-id",
+                [{"role": "assistant", "content": "unmatched suffix-only normal final"}],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert [(row["role"], row["content"]) for row in rows] == [
+                ("assistant", "unmatched suffix-only normal final"),
+            ]
+            assert instance._dag.get_session_node_count("reused-id") == 0
+            assert instance.current_session_id == foreground_session_id
+            assert instance.current_session_platform == foreground_platform
+            assert instance.current_conversation_id == foreground_conversation_id
+            state = instance._lifecycle.get_by_conversation(foreground_conversation_id)
+            assert state is not None
+            assert state.current_session_id is None
+            assert state.last_finalized_session_id == "reused-id"
+            assert not instance.current_session_ignored
+            assert not instance.current_session_stateless
+        finally:
+            instance.shutdown()
+
+    def test_bypass_lineage_does_not_poison_reused_normal_compression_boundary(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "reused-normal-boundary.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored must not persist"}])
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal should persist"}])
+            instance.on_session_start(
+                "normal-child",
+                boundary_reason="compression",
+                old_session_id="reused-id",
+                platform="cli",
+                context_length=1_000,
+            )
+
+            assert not instance._session_stateless
+            assert not instance._bypasses_lcm_context_management()
+            assert not instance._has_lcm_bypass_lineage_session("normal-child", platform="cli")
+        finally:
+            instance.shutdown()
+
+    def test_later_bypass_rebind_keeps_boundary_child_out_of_lcm(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "prior-normal-boundary-after-bypass-rebind.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal should persist"}])
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored must not persist"}])
+            instance.on_session_start("foreground", platform="cli", context_length=1_000)
+
+            instance.on_session_start(
+                "normal-looking-child",
+                boundary_reason="compression",
+                old_session_id="reused-id",
+                platform="cli",
+                context_length=1_000,
+            )
+            instance.ingest([{"role": "user", "content": "boundary child must stay out of LCM"}])
+
+            assert instance._session_stateless
+            assert instance._bypasses_lcm_context_management()
+            assert instance._has_lcm_bypass_lineage_session("normal-looking-child", platform="cli")
+            assert instance._store.get_session_count("reused-id") == 1
+            assert instance._store.get_session_count("normal-looking-child") == 0
+        finally:
+            instance.shutdown()
+
+    def test_platform_only_bypass_boundary_after_source_end_stays_out_of_lcm(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "platform-only-boundary-after-end.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("old-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored source"}])
+            instance.on_session_end("old-id", [{"role": "user", "content": "ignored source end"}])
+
+            instance.on_session_start("foreground", platform="cli", context_length=1_000)
+            instance.on_session_start(
+                "child-id",
+                boundary_reason="compression",
+                old_session_id="old-id",
+                platform="cli",
+                context_length=1_000,
+            )
+            instance.ingest([{"role": "user", "content": "child must stay out of LCM"}])
+
+            assert instance._store.get_session_count("old-id") == 0
+            assert instance._store.get_session_count("child-id") == 0
+            assert instance._has_lcm_bypass_lineage_session("child-id", platform="cli")
+        finally:
+            instance.shutdown()
+
+    def test_ended_bypass_boundary_child_can_reuse_id_as_normal_session(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-child-reused-normal.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("ignored:old", platform="cli", context_length=1_000)
+            instance.on_session_start(
+                "child-id",
+                boundary_reason="compression",
+                old_session_id="ignored:old",
+                platform="cli",
+                context_length=1_000,
+            )
+            instance.on_session_end("child-id", [{"role": "user", "content": "bypass child end"}])
+
+            instance.on_session_start("child-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal child-id reuse"}])
+
+            assert not instance._session_stateless
+            assert not instance._bypasses_lcm_context_management()
+            assert instance._store.get_session_count("child-id") == 1
+        finally:
+            instance.shutdown()
+
+    def test_thread_context_stateless_session_end_does_not_flush_raw_messages(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "thread-stateless-session-end.db"))
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "must not persist while thread stateless"}]
+        try:
+            instance.on_session_start("foreground:session", platform="cli", context_length=1_000)
+            instance._mark_thread_context_stateless("auxiliary:session")
+
+            instance.on_session_end("foreground:session", messages)
+
+            assert instance._store.get_session_count("foreground:session") == 0
+            assert instance._store.get_session_count("auxiliary:session") == 0
+        finally:
+            instance.shutdown()
+
+    def test_thread_context_stateless_requests_host_compaction_without_lcm_writes(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "thread-stateless.db"))
+        instance = LCMEngine(config=config)
+        messages = self._oversized_bypass_messages()
+        try:
+            instance.on_session_start("foreground:session", platform="cli", context_length=1_000)
+            instance.threshold_tokens = 20
+            instance._mark_thread_context_stateless("auxiliary:session")
+
+            assert count_messages_tokens(messages) >= instance.threshold_tokens
+            instance.ingest(messages)
+
+            assert instance._store.get_session_count("foreground:session") == 0
+            assert instance._dag.get_session_node_count("foreground:session") == 0
+            assert instance.should_compress_preflight(messages)
+            assert instance.should_compress(instance.threshold_tokens + 1)
+        finally:
+            instance.shutdown()
+
+    @pytest.mark.parametrize(
+        ("session_id", "config_kwargs"),
+        [
+            ("ignored:session", {"ignore_session_patterns": ["ignored:*"]}),
+            ("stateless:session", {"stateless_session_patterns": ["stateless:*"]}),
+        ],
+    )
+    def test_bypassed_sessions_delegate_compress_to_host_native_compressor(
+        self,
+        tmp_path,
+        monkeypatch,
+        session_id,
+        config_kwargs,
+    ):
+        calls = []
+        compacted = [
+            {"role": "system", "content": "native summary"},
+            {"role": "user", "content": "fresh tail"},
+        ]
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.compression_count = 0
+                self._last_compress_aborted = False
+                self._last_summary_error = None
+                self._last_summary_auth_failure = False
+                self._last_summary_network_failure = False
+                self._last_summary_dropped_count = 0
+                self._last_summary_fallback_used = False
+                self._last_aux_model_failure_error = None
+                self._last_aux_model_failure_model = None
+
+            def on_session_start(self, bound_session_id, **kwargs):
+                calls.append(("start", bound_session_id, kwargs))
+
+            def update_model(self, **kwargs):
+                calls.append(("update_model", kwargs))
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                calls.append(("compress", list(messages), current_tokens, focus_topic, force))
+                self.compression_count += 1
+                return list(compacted)
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / f"delegate-{session_id.replace(':', '-')}.db"),
+            **config_kwargs,
+        )
+        instance = LCMEngine(config=config)
+        messages = self._oversized_bypass_messages()
+        try:
+            instance.on_session_start(
+                session_id,
+                platform="cli",
+                model="test-model",
+                provider="test-provider",
+                base_url="https://example.invalid/v1",
+                api_key="test-key",
+                api_mode="chat_completions",
+                context_length=1_000,
+            )
+            instance.threshold_tokens = 20
+
+            result = instance.compress(messages, current_tokens=123, focus_topic="focus")
+
+            assert result == compacted
+            assert ("compress", messages, 123, "focus", False) in calls
+            assert instance.compression_count == 1
+            assert instance._store.get_session_count(session_id) == 0
+            assert instance._dag.get_session_node_count(session_id) == 0
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_sessions_honor_assembly_cap_below_threshold(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "ignored-assembly-cap.db"),
+            ignore_session_patterns=["ignored:*"],
+            max_assembly_tokens=90,
+        )
+        instance = LCMEngine(config=config)
+        messages = self._oversized_bypass_messages()
+        try:
+            instance.on_session_start("ignored:cap", platform="cli", context_length=10_000)
+            instance.threshold_tokens = 1_000
+
+            assert count_messages_tokens(messages) < instance.threshold_tokens
+            assert count_messages_tokens(messages) >= config.max_assembly_tokens
+            assert instance.should_compress_preflight(messages)
+            assert instance.should_compress(config.max_assembly_tokens)
+        finally:
+            instance.shutdown()
+
+    def test_thread_context_fallback_uses_effective_context_length_and_auxiliary_session(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        calls = []
+        init_kwargs = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                init_kwargs.append(kwargs)
+                self.compression_count = 0
+
+            def on_session_start(self, bound_session_id, **kwargs):
+                calls.append(("start", bound_session_id, kwargs))
+
+            def update_model(self, **kwargs):
+                calls.append(("update_model", kwargs))
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [{"role": "system", "content": "native compacted"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(database_path=str(tmp_path / "thread-effective-context.db"))
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start(
+                "foreground:session",
+                platform="cli",
+                model="gpt-5.5",
+                provider="openai-codex",
+                context_length=500_000,
+            )
+            instance.threshold_tokens = 20
+            instance._mark_thread_context_stateless("auxiliary:session")
+
+            result = instance.compress(self._oversized_bypass_messages(), current_tokens=123)
+
+            assert result == [{"role": "system", "content": "native compacted"}]
+            assert init_kwargs[0]["config_context_length"] == 272_000
+            assert any(call[0] == "start" and call[1] == "auxiliary:session" for call in calls)
+            assert any(
+                call[0] == "update_model" and call[1].get("context_length") == 272_000
+                for call in calls
+            )
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_update_model_failure_still_compacts(self, tmp_path, monkeypatch):
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+
+            def update_model(self, **kwargs):
+                raise RuntimeError("metadata sync failed")
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [{"role": "system", "content": "native compacted despite sync failure"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-update-model-failure.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("ignored:sync-failure", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+
+            result = instance.compress(
+                [{"role": "user", "content": "oversized " + "x" * 1_000}],
+                current_tokens=600,
+            )
+
+            assert result == [
+                {"role": "system", "content": "native compacted despite sync failure"}
+            ]
+            assert instance._store.get_session_count("ignored:sync-failure") == 0
+            assert instance._dag.get_session_node_count("ignored:sync-failure") == 0
+        finally:
+            instance.shutdown()
+
+    def test_unavailable_native_fallback_sanitizes_tool_pairs(self, tmp_path, monkeypatch):
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "fallback-tool-pairs.db"),
+            ignore_session_patterns=["ignored:*"],
+            fresh_tail_count=2,
+        )
+        instance = LCMEngine(config=config)
+        messages = [
+            {"role": "system", "content": "system"},
+            {
+                "role": "assistant",
+                "content": "calling tool",
+                "tool_calls": [{"id": "call_head", "type": "function"}],
+            },
+            {"role": "user", "content": "large middle " + "x" * 400},
+            {"role": "tool", "tool_call_id": "orphan_tail", "content": "orphan tool result"},
+            {"role": "user", "content": "fresh tail"},
+        ]
+        try:
+            instance.on_session_start("ignored:tools", platform="cli", context_length=1_000)
+
+            result = instance.compress(messages, force=True)
+
+            assert any(msg.get("tool_call_id") == "call_head" for msg in result)
+            assert not any(msg.get("tool_call_id") == "orphan_tail" for msg in result)
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_fallback_receives_redacted_messages(self, tmp_path, monkeypatch):
+        captured_messages = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                captured_messages.extend(messages)
+                self.compression_count += 1
+                return list(messages)
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-redacted-native.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        config.sensitive_patterns_enabled = True
+        config.sensitive_patterns = ["password_assignment"]
+        instance = LCMEngine(config=config)
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "password: supersecret1234 " + "x" * 400},
+            {"role": "assistant", "content": "ack"},
+        ]
+        try:
+            instance.on_session_start("ignored:redact", platform="cli", context_length=1_000)
+            instance.threshold_tokens = 20
+
+            instance.compress(messages, current_tokens=200)
+
+            serialized = json.dumps(captured_messages)
+            assert "supersecret1234" not in serialized
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_result_is_sanitized_under_cap(self, tmp_path, monkeypatch):
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [
+                    {
+                        "role": "assistant",
+                        "content": "calling tool",
+                        "tool_calls": [{"id": "call_1", "type": "function"}],
+                    },
+                    {"role": "user", "content": "interrupt before tool result"},
+                    {"role": "tool", "tool_call_id": "orphan", "content": "late result"},
+                ]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-native-sanitize-under-cap.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "oversized " + "x" * 1_000}]
+        try:
+            instance.on_session_start("ignored:native-invalid", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+
+            result = instance.compress(messages, current_tokens=600)
+
+            assert not any(msg.get("tool_call_id") == "orphan" for msg in result)
+            assert any(msg.get("tool_call_id") == "call_1" for msg in result)
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_fallback_resets_between_sessions(self, tmp_path, monkeypatch):
+        instances = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.ended = False
+                self.reset = False
+                instances.append(self)
+
+            def on_session_end(self, session_id, messages):
+                self.ended = session_id
+
+            def on_session_reset(self):
+                self.reset = True
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [{"role": "user", "content": "native compacted"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-native-reset.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "oversized " + "x" * 1_000}]
+        try:
+            instance.on_session_start("ignored:first", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+
+            instance.on_session_start("ignored:second", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+
+            assert len(instances) == 2
+            assert instances[0].ended == "ignored:first"
+            assert instances[0].reset is True
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_fallback_resets_on_session_end_even_for_same_session_id(self, tmp_path, monkeypatch):
+        instances = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.ended = False
+                self.reset = False
+                instances.append(self)
+
+            def on_session_end(self, session_id, messages):
+                self.ended = session_id
+
+            def on_session_reset(self):
+                self.reset = True
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [{"role": "user", "content": "native compacted"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-native-reset-same-id.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "oversized " + "x" * 1_000}]
+        try:
+            instance.on_session_start("ignored:reused", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+            instance.on_session_end("ignored:reused", messages)
+
+            instance.on_session_start("ignored:reused", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+
+            assert len(instances) == 2
+            assert instances[0].ended == "ignored:reused"
+            assert instances[0].reset is True
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_fallback_resets_when_same_session_id_rebinds_platform(self, tmp_path, monkeypatch):
+        instances = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.ended = False
+                self.reset = False
+                instances.append(self)
+
+            def on_session_end(self, session_id, messages):
+                self.ended = session_id
+
+            def on_session_reset(self):
+                self.reset = True
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [{"role": "user", "content": "native compacted"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-native-reset-rebind-platform.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "oversized " + "x" * 1_000}]
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+
+            instance.on_session_start("reused-id", platform="cli", context_length=2_000)
+            instance.ingest([{"role": "user", "content": "normal"}])
+            instance.on_session_start("reused-id", platform="cron", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+
+            assert len(instances) == 2
+            assert instances[0].ended == "reused-id"
+            assert instances[0].reset is True
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_fallback_resets_on_session_reset(self, tmp_path, monkeypatch):
+        instances = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.reset = False
+                instances.append(self)
+
+            def on_session_reset(self):
+                self.reset = True
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [{"role": "user", "content": "native compacted"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-native-session-reset.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "oversized " + "x" * 1_000}]
+        try:
+            instance.on_session_start("ignored:reset", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+            instance.on_session_reset()
+            instance.on_session_start("ignored:reset", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+
+            assert len(instances) == 2
+            assert instances[0].reset is True
+        finally:
+            instance.shutdown()
+
+    def test_late_bypassed_session_end_does_not_reset_active_fallback_compressor(self, tmp_path, monkeypatch):
+        instances = []
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.ended = []
+                self.reset = False
+                instances.append(self)
+
+            def on_session_end(self, session_id, messages):
+                self.ended.append(session_id)
+
+            def on_session_reset(self):
+                self.reset = True
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                self.compression_count += 1
+                return [{"role": "user", "content": "native compacted"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-late-end-active-fallback.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "oversized " + "x" * 1_000}]
+        try:
+            instance.on_session_start("ignored:old", platform="cli", context_length=2_000)
+            instance.on_session_end("ignored:old", [])
+            instance.on_session_start("ignored:active", platform="cli", context_length=2_000)
+            instance.threshold_tokens = 500
+            instance.compress(messages, current_tokens=600)
+
+            instance.on_session_end("ignored:old", [])
+
+            assert len(instances) == 1
+            assert instances[0].ended == []
+            assert instances[0].reset is False
+            assert instance._host_fallback_compressor is instances[0]
+        finally:
+            instance.shutdown()
+
+    def test_late_reused_lineage_suffix_only_session_end_stays_stateless(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-reused-normal-end.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored"}])
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal"}])
+            instance.on_session_start("foreground", platform="cli", context_length=1_000)
+
+            instance.on_session_end("reused-id", [{"role": "assistant", "content": "ambiguous late final"}])
+
+            assert instance._store.get_session_count("reused-id") == 1
+            assert instance._store.get_session_count("foreground") == 0
+        finally:
+            instance.shutdown()
+
+    def test_late_reused_bypass_session_end_does_not_write_to_foreground(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-reused-bypass-end.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal"}])
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored"}])
+            instance.on_session_start("foreground", platform="cli", context_length=1_000)
+
+            instance.on_session_end("reused-id", [{"role": "assistant", "content": "late ignored final"}])
+
+            assert instance._store.get_session_count("reused-id") == 1
+            assert instance._store.get_session_count("foreground") == 0
+        finally:
+            instance.shutdown()
+
+    def test_late_same_id_bypass_session_end_does_not_append_to_reused_normal_session(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-same-id-bypass-end.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored start"}])
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal start"}])
+
+            instance.on_session_end(
+                "reused-id",
+                [
+                    {"role": "user", "content": "ignored start"},
+                    {"role": "assistant", "content": "late bypass final"},
+                ],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert [(row["role"], row["content"]) for row in rows] == [("user", "normal start")]
+        finally:
+            instance.shutdown()
+
+    def test_late_same_id_normal_session_end_flushes_when_prefix_matches_current_store(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-same-id-normal-end.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored start"}])
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "normal start"}])
+
+            instance.on_session_end(
+                "reused-id",
+                [
+                    {"role": "user", "content": "normal start"},
+                    {"role": "assistant", "content": "normal final"},
+                ],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert [(row["role"], row["content"]) for row in rows] == [
+                ("user", "normal start"),
+                ("assistant", "normal final"),
+            ]
+        finally:
+            instance.shutdown()
+
+    def test_same_id_current_normal_first_flush_after_bypass_lineage_persists(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "same-id-normal-first-flush-after-bypass.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored start"}])
+            instance.on_session_end("reused-id", [{"role": "user", "content": "ignored end"}])
+
+            instance.on_session_start(
+                "reused-id",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=1_000,
+            )
+
+            instance.on_session_end(
+                "reused-id",
+                [
+                    {"role": "user", "content": "normal start"},
+                    {"role": "assistant", "content": "normal final"},
+                ],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert [(row["role"], row["content"], row["conversation_id"]) for row in rows] == [
+                ("user", "normal start", "normal-conversation"),
+                ("assistant", "normal final", "normal-conversation"),
+            ]
+            state = instance._lifecycle.get_by_conversation("normal-conversation")
+            assert state is not None
+            assert state.current_session_id is None
+            assert state.last_finalized_session_id == "reused-id"
+        finally:
+            instance.shutdown()
+
+    def test_off_current_normal_first_flush_after_bypass_lineage_persists_without_bypass_prefix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "off-current-normal-first-flush-after-bypass.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored start"}])
+            instance.on_session_end("reused-id", [{"role": "user", "content": "ignored end"}])
+
+            instance.on_session_start(
+                "reused-id",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=1_000,
+            )
+            instance.on_session_start(
+                "foreground",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=1_000,
+            )
+
+            instance.on_session_end(
+                "reused-id",
+                [
+                    {"role": "user", "content": "normal start"},
+                    {"role": "assistant", "content": "normal final"},
+                ],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert [(row["role"], row["content"], row["conversation_id"]) for row in rows] == [
+                ("user", "normal start", "normal-conversation"),
+                ("assistant", "normal final", "normal-conversation"),
+            ]
+            assert instance._store.get_session_count("foreground") == 0
+            state = instance._lifecycle.get_by_conversation("normal-conversation")
+            assert state is not None
+            assert state.current_session_id is None
+            assert state.last_finalized_session_id == "reused-id"
+        finally:
+            instance.shutdown()
+
+    def test_late_same_id_bypass_prefix_end_skips_when_current_normal_store_empty(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-same-id-bypass-prefix-empty-store.db"),
+            ignore_session_patterns=["cron"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            opener = {"role": "user", "content": "shared opener"}
+
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([opener])
+            assert instance._store.get_session_count("reused-id") == 0
+            assert instance._dag.get_session_nodes("reused-id") == []
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+
+            instance.on_session_end(
+                "reused-id",
+                [
+                    opener,
+                    {"role": "assistant", "content": "late ignored final"},
+                ],
+            )
+
+            assert instance._store.get_range("reused-id") == []
+            assert instance._dag.get_session_nodes("reused-id") == []
+        finally:
+            instance.shutdown()
+
+    def test_late_off_current_normal_session_end_dedupes_protected_prefix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-off-current-protected-prefix.db"),
+            ignore_session_patterns=["cron"],
+            sensitive_patterns_enabled=True,
+            sensitive_patterns=["password_assignment"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            raw_opener = {"role": "user", "content": "password = supersecret123 normal opener"}
+
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored opener"}])
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([raw_opener])
+            stored_before = instance._store.get_range("reused-id")
+            assert len(stored_before) == 1
+            assert "supersecret123" not in stored_before[0]["content"]
+            assert "LCM sensitive redaction" in stored_before[0]["content"]
+
+            instance.on_session_start("foreground", platform="cli", context_length=1_000)
+
+            instance.on_session_end(
+                "reused-id",
+                [
+                    raw_opener,
+                    {"role": "assistant", "content": "normal final"},
+                ],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert len(rows) == 2
+            assert rows[0]["content"] == stored_before[0]["content"]
+            assert rows[1]["content"] == "normal final"
+            assert all("supersecret123" not in (row["content"] or "") for row in rows)
+            assert instance._store.get_session_count("foreground") == 0
+        finally:
+            instance.shutdown()
+
+    def test_late_off_current_normal_session_end_filters_ignored_suffix(self, tmp_path, monkeypatch):
+        from hermes_lcm import message_patterns as message_patterns_mod
+
+        monkeypatch.setattr(message_patterns_mod, "_regex_engine", _FakeTimeoutRegexEngine)
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-off-current-ignored-suffix.db"),
+            ignore_session_patterns=["cron"],
+            ignore_message_patterns=["DROP_LATE_SUFFIX"],
+        )
+        instance = LCMEngine(config=config)
+        try:
+            normal_opener = {"role": "user", "content": "normal opener"}
+
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored opener"}])
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([normal_opener])
+
+            instance.on_session_start("foreground", platform="cli", context_length=1_000)
+            instance.on_session_end(
+                "reused-id",
+                [
+                    normal_opener,
+                    {"role": "assistant", "content": "normal final"},
+                    {"role": "user", "content": "DROP_LATE_SUFFIX must stay out"},
+                ],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert [(row["role"], row["content"]) for row in rows] == [
+                ("user", "normal opener"),
+                ("assistant", "normal final"),
+            ]
+            assert instance._store.get_session_count("foreground") == 0
+            assert instance._ignored_message_count == 1
+        finally:
+            instance.shutdown()
+
+    def test_late_off_current_normal_session_end_dedupes_externalized_prefix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "late-off-current-externalized-prefix.db"),
+            ignore_session_patterns=["cron"],
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=50,
+            large_output_externalization_path=str(tmp_path / "externalized"),
+        )
+        instance = LCMEngine(config=config)
+        try:
+            raw_opener = {"role": "user", "content": "externalized opener " + "x" * 200}
+
+            instance.on_session_start("reused-id", platform="cron", context_length=1_000)
+            instance.ingest([{"role": "user", "content": "ignored opener"}])
+
+            instance.on_session_start("reused-id", platform="cli", context_length=1_000)
+            instance.ingest([raw_opener])
+            stored_before = instance._store.get_range("reused-id")
+            assert len(stored_before) == 1
+            assert stored_before[0]["content"].startswith("[Externalized payload:")
+            assert "externalized opener" not in stored_before[0]["content"]
+
+            instance.on_session_start("foreground", platform="cli", context_length=1_000)
+
+            instance.on_session_end(
+                "reused-id",
+                [
+                    raw_opener,
+                    {"role": "assistant", "content": "normal final"},
+                ],
+            )
+
+            rows = instance._store.get_range("reused-id")
+            assert len(rows) == 2
+            assert rows[0]["content"] == stored_before[0]["content"]
+            assert rows[1]["content"] == "normal final"
+            assert instance._store.get_session_count("foreground") == 0
+        finally:
+            instance.shutdown()
+
+    def test_bypass_tail_trim_makes_progress_when_first_message_has_tool_call(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "bypass-trim-tool-call.db"))
+        instance = LCMEngine(config=config)
+        messages = [
+            {
+                "role": "assistant",
+                "content": "large assistant " + "x" * 1_000,
+                "tool_calls": [{"id": "call_1", "type": "function"}],
+            },
+            {"role": "user", "content": "fresh tail"},
+            {"role": "user", "content": "fresh tail 2"},
+        ]
+        try:
+            result = instance._trim_bypass_compacted_to_cap(messages, target_tokens=80)
+
+            assert count_messages_tokens(result) <= 80
+        finally:
+            instance.shutdown()
+
+    def test_bypass_tail_trim_preserves_live_user_when_dropping_oversized_tool_call_pair(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "bypass-trim-tool-call-pair.db"))
+        instance = LCMEngine(config=config)
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "latest request"},
+            {
+                "role": "assistant",
+                "content": "calling",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "big", "arguments": "x" * 10_000},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        ]
+        try:
+            result = instance._trim_bypass_compacted_to_cap(messages, target_tokens=80)
+
+            assert count_messages_tokens(result) <= 80
+            assert [(msg.get("role"), msg.get("content")) for msg in result] == [
+                ("system", "sys"),
+                ("user", "latest request"),
+            ]
+        finally:
+            instance.shutdown()
+
+    def test_bypass_tail_trim_reduces_one_or_two_oversized_messages_under_cap(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "bypass-trim-low-cap.db"))
+        instance = LCMEngine(config=config)
+        cases = [
+            [{"role": "user", "content": "x" * 10_000}],
+            [
+                {"role": "user", "content": "x" * 10_000},
+                {"role": "assistant", "content": "y" * 10_000},
+            ],
+        ]
+        try:
+            for messages in cases:
+                result = instance._trim_bypass_compacted_to_cap(messages, target_tokens=40)
+                assert count_messages_tokens(result) <= 40
+        finally:
+            instance.shutdown()
+
+    def test_bypass_tail_trim_reduces_structured_text_content_under_cap(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "bypass-trim-structured-content.db"))
+        instance = LCMEngine(config=config)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "x" * 10_000},
+                    {"type": "input_text", "text": {"value": "y" * 10_000}},
+                ],
+            }
+        ]
+        try:
+            result = instance._trim_bypass_compacted_to_cap(messages, target_tokens=80)
+            assert count_messages_tokens(result) <= 80
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_compress_uses_message_tokens_when_current_tokens_unknown(self, tmp_path, monkeypatch):
+        native_called = False
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                nonlocal native_called
+                native_called = True
+                self.compression_count += 1
+                return [{"role": "user", "content": "native compacted"}]
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-current-tokens-zero.db"),
+            ignore_session_patterns=["ignored:*"],
+        )
+        instance = LCMEngine(config=config)
+        messages = [{"role": "user", "content": "oversized " + "x" * 2_000}]
+        try:
+            instance.on_session_start("ignored:zero-tokens", platform="cli", context_length=4_000)
+            instance.threshold_tokens = 100
+            result = instance.compress(messages, current_tokens=0)
+
+            assert native_called
+            assert result == [{"role": "user", "content": "native compacted"}]
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_result_falls_back_when_still_over_cap(self, tmp_path, monkeypatch):
+        native_called = False
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self._last_compress_aborted = False
+                self._last_summary_error = None
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                nonlocal native_called
+                native_called = True
+                self.compression_count += 1
+                self._last_compress_aborted = True
+                self._last_summary_error = "native aborted"
+                return list(messages)
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-over-cap-native.db"),
+            ignore_session_patterns=["ignored:*"],
+            max_assembly_tokens=200,
+        )
+        instance = LCMEngine(config=config)
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "older " + "x" * 2_000},
+            {"role": "assistant", "content": "middle " + "y" * 2_000},
+            {"role": "user", "content": "fresh " + "z" * 2_000},
+        ]
+        try:
+            instance.on_session_start("ignored:over-cap", platform="cli", context_length=10_000)
+            instance.threshold_tokens = 1_000
+
+            result = instance.compress(messages, current_tokens=250)
+
+            assert native_called
+            assert count_messages_tokens(result) <= config.max_assembly_tokens
+            assert instance._last_compress_aborted is False
+        finally:
+            instance.shutdown()
+
+    def test_bypassed_native_exception_uses_deterministic_fallback(self, tmp_path, monkeypatch):
+        native_called = False
+
+        class FakeContextCompressor:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self._last_compress_aborted = True
+
+            def compress(self, messages, current_tokens=None, focus_topic=None, force=False):
+                nonlocal native_called
+                native_called = True
+                raise RuntimeError("native compressor failed")
+
+        agent_module = sys.modules.get("agent") or ModuleType("agent")
+        if not hasattr(agent_module, "__path__"):
+            agent_module.__path__ = []
+        compressor_module = ModuleType("agent.context_compressor")
+        setattr(compressor_module, "ContextCompressor", FakeContextCompressor)
+        monkeypatch.setitem(sys.modules, "agent", agent_module)
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", compressor_module)
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "bypass-native-exception.db"),
+            ignore_session_patterns=["ignored:*"],
+            max_assembly_tokens=200,
+        )
+        instance = LCMEngine(config=config)
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "older " + "x" * 2_000},
+            {"role": "assistant", "content": "middle " + "y" * 2_000},
+            {"role": "user", "content": "fresh " + "z" * 2_000},
+        ]
+        try:
+            instance.on_session_start("ignored:native-error", platform="cli", context_length=10_000)
+            instance.threshold_tokens = 1_000
+
+            result = instance.compress(messages, current_tokens=250)
+
+            assert native_called
+            assert count_messages_tokens(result) <= config.max_assembly_tokens
+            assert instance._last_compress_aborted is False
+            assert instance._store.get_session_count("ignored:native-error") == 0
+            assert instance._dag.get_session_node_count("ignored:native-error") == 0
         finally:
             instance.shutdown()
 
@@ -2976,6 +4562,23 @@ class TestEngineABC:
         assert status["ingest_failure_count"] == 1
         assert status["consecutive_ingest_failures"] == 1
         assert "OperationalError" in status["last_ingest_error"]
+
+    def test_placeholder_metadata_write_skips_when_unchanged(self, engine):
+        conn = engine._store._conn
+        if not engine._ignored_placeholder_count_metadata_keys():
+            pytest.skip("no placeholder metadata keys bound for this session")
+
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 2})
+        changes_after_first = conn.total_changes
+
+        # Identical payload: no UPSERT executed, so no fsync commit either.
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 2})
+        assert conn.total_changes == changes_after_first
+
+        # A changed payload still writes.
+        engine._write_generated_ignored_placeholder_hash_counts({"a" * 16: 3})
+        assert conn.total_changes > changes_after_first
+        assert engine._load_generated_ignored_placeholder_hash_counts().get("a" * 16) == 3
 
     def test_lcm_grep_ingests_live_history_before_search(self, engine):
         engine.on_session_start("live-search", platform="telegram", context_length=200000)
@@ -11207,6 +12810,1063 @@ class TestSessionRollover:
         assert [
             node.node_id for node in engine._dag.get_session_nodes("reused-continuation")
         ] == [node_id]
+
+    def test_off_current_suffix_only_late_bypass_end_after_normal_rebound_stays_stateless(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_late_bypass_suffix_after_normal.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            engine.on_session_start(
+                "reused-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            bypass_messages = [
+                {"role": "user", "content": "ignored prefix that must stay out"},
+            ]
+            engine.ingest(bypass_messages)
+            engine.on_session_end("reused-session", bypass_messages)
+            assert engine._store.get_session_count("reused-session") == 0
+
+            engine.on_session_start(
+                "reused-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            normal_messages = [
+                {"role": "user", "content": "normal rebound prefix"},
+            ]
+            engine.ingest(normal_messages)
+            assert engine._store.get_session_count("reused-session") == 1
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_suffix_only_bypass_end = [
+                {"role": "assistant", "content": "late ignored suffix must not persist"},
+            ]
+
+            engine.on_session_end("reused-session", late_suffix_only_bypass_end)
+
+            assert engine._store.get_session_count("reused-session") == 1
+            assert engine._store.get_session_count("foreground-session") == 0
+            assert engine._dag.get_session_node_count("reused-session") == 0
+            assert engine._dag.get_session_node_count("foreground-session") == 0
+            assert engine.current_session_id == "foreground-session"
+            assert engine.current_conversation_id == "foreground-conversation"
+        finally:
+            engine.shutdown()
+
+    @pytest.mark.parametrize(
+        ("bypass_session_id", "config_kwargs"),
+        [
+            ("ignored:late", {"ignore_session_patterns": ["ignored:*"]}),
+            ("stateless:late", {"stateless_session_patterns": ["stateless:*"]}),
+        ],
+    )
+    def test_direct_off_current_bypass_session_end_does_not_write_or_finalize_foreground(
+        self,
+        tmp_path,
+        bypass_session_id,
+        config_kwargs,
+    ):
+        payload_dir = tmp_path / f"payloads-{bypass_session_id.replace(':', '-')}"
+        config = LCMConfig(
+            database_path=str(tmp_path / f"direct-{bypass_session_id.replace(':', '-')}.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=64,
+            large_output_externalization_path=str(payload_dir),
+            **config_kwargs,
+        )
+        engine = LCMEngine(config=config)
+        try:
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_bypass_end = [
+                {"role": "user", "content": "should not store " + ("x" * 200)},
+            ]
+
+            engine.on_session_end(bypass_session_id, late_bypass_end)
+
+            assert engine._store.get_session_count("foreground-session") == 0
+            assert engine._store.get_session_count(bypass_session_id) == 0
+            assert engine._dag.get_session_node_count("foreground-session") == 0
+            assert engine._dag.get_session_node_count(bypass_session_id) == 0
+            assert not payload_dir.exists() or list(payload_dir.glob("*.json")) == []
+            assert engine.current_session_id == "foreground-session"
+            assert engine.current_conversation_id == "foreground-conversation"
+            foreground_state = engine._lifecycle.get_by_conversation("foreground-conversation")
+            assert foreground_state is not None
+            assert foreground_state.current_session_id == "foreground-session"
+            assert foreground_state.last_finalized_session_id != bypass_session_id
+            assert engine._lifecycle.get_by_session(bypass_session_id) is None
+        finally:
+            engine.shutdown()
+
+    def test_suffix_only_late_bypass_end_does_not_externalize_when_skipped(self, tmp_path):
+        payload_dir = tmp_path / "payloads"
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_late_bypass_no_externalized_payload.db"),
+            stateless_session_patterns=["stateless"],
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=64,
+            large_output_externalization_path=str(payload_dir),
+        )
+        engine = LCMEngine(config=config)
+        try:
+            engine.on_session_start(
+                "reused-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([{"role": "user", "content": "bypass seed"}])
+
+            engine.on_session_start(
+                "reused-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            normal_messages = [
+                {"role": "user", "content": "normal rebound prefix"},
+            ]
+            engine.ingest(normal_messages)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_suffix_only_bypass_end = [
+                {"role": "assistant", "content": "late bypass payload " + ("x" * 200)},
+            ]
+
+            engine.on_session_end("reused-session", late_suffix_only_bypass_end)
+
+            assert engine._store.get_session_count("reused-session") == 1
+            assert not payload_dir.exists() or list(payload_dir.glob("*.json")) == []
+        finally:
+            engine.shutdown()
+
+    def test_shared_opener_bypass_and_normal_ambiguity_does_not_append_bypass_suffix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_shared_opener_bypass_normal_ambiguity.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_opener = {"role": "user", "content": "shared opener"}
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([shared_opener])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest([shared_opener])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_bypass_end = [
+                shared_opener,
+                {"role": "assistant", "content": "bypass suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == ["shared opener"]
+            assert all(row["content"] != "bypass suffix must not append" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_multiple_bypass_prefixes_do_not_append_older_late_bypass_suffix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_multiple_bypass_prefixes.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_opener = {"role": "user", "content": "shared opener A"}
+            newer_bypass_opener = {"role": "user", "content": "newer bypass opener B"}
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation-a",
+                context_length=200000,
+            )
+            engine.ingest([shared_opener])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation-b",
+                context_length=200000,
+            )
+            engine.ingest([newer_bypass_opener])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest([shared_opener])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_older_bypass_end = [
+                shared_opener,
+                {"role": "assistant", "content": "older bypass suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", late_older_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == ["shared opener A"]
+            assert all(row["content"] != "older bypass suffix must not append" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_off_current_store_mismatch_does_not_append_from_recorded_prefix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_store_mismatch.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            normal_messages = [
+                {"role": "user", "content": f"A{i}"}
+                for i in range(9)
+            ]
+            divergent_end = [
+                *normal_messages[:8],
+                {"role": "assistant", "content": "B8 must not append"},
+                {"role": "assistant", "content": "new divergent suffix must not append"},
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(normal_messages)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_end("shared-session", divergent_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [f"A{i}" for i in range(9)]
+            assert all(row["content"] != "B8 must not append" for row in rows)
+            assert all(row["content"] != "new divergent suffix must not append" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_off_current_recorded_prefix_appends_when_store_normalizes_equivalent_row(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_recorded_prefix_normalized.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            normalized_prefix = {
+                "role": "assistant",
+                "content": "stored row normalizes empty tool_calls",
+                "tool_calls": [],
+            }
+            normal_suffix = {"role": "user", "content": "normal suffix must append"}
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest([normalized_prefix])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            engine.on_session_end("shared-session", [normalized_prefix, normal_suffix])
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                "stored row normalizes empty tool_calls",
+                "normal suffix must append",
+            ]
+            assert all(row["conversation_id"] != "bypass-conversation" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_off_current_store_prefix_appends_normalized_empty_tool_calls_beyond_recorded_limit(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_long_normalized_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            normal_prefix = [
+                {
+                    "role": "assistant",
+                    "content": "long prefix stores empty tool_calls as NULL",
+                    "tool_calls": [],
+                },
+                *(
+                    {"role": "user", "content": f"long normalized prefix {idx}"}
+                    for idx in range(8)
+                ),
+            ]
+            normal_suffix = {"role": "assistant", "content": "long normalized suffix must append"}
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(normal_prefix)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            engine.on_session_end("shared-session", [*normal_prefix, normal_suffix])
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                "long prefix stores empty tool_calls as NULL",
+                *(f"long normalized prefix {idx}" for idx in range(8)),
+                "long normalized suffix must append",
+            ]
+            assert normal_rows[0]["tool_calls"] is None
+            assert all(row["conversation_id"] != "bypass-conversation" for row in rows)
+        finally:
+            engine.shutdown()
+
+    @pytest.mark.parametrize("bypass_tool_calls", [[], {}])
+    def test_off_current_empty_tool_calls_bypass_tie_does_not_append_suffix(
+        self,
+        tmp_path,
+        bypass_tool_calls,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_empty_tool_calls_bypass_tie.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            bypass_prefix = {
+                "role": "assistant",
+                "content": "shared empty tool_calls opener",
+                "tool_calls": bypass_tool_calls,
+            }
+            normal_prefix = {
+                "role": "assistant",
+                "content": "shared empty tool_calls opener",
+            }
+            late_bypass_end = [
+                {
+                    "role": "assistant",
+                    "content": "shared empty tool_calls opener",
+                },
+                {
+                    "role": "assistant",
+                    "content": "empty tool_calls bypass suffix must not append",
+                },
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([bypass_prefix])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest([normal_prefix])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == ["shared empty tool_calls opener"]
+            assert normal_rows[0]["tool_calls"] is None
+            assert bypass_rows == []
+            assert all(
+                row["content"] != "empty tool_calls bypass suffix must not append"
+                for row in rows
+            )
+        finally:
+            engine.shutdown()
+
+    def test_off_current_truncated_bypass_prefix_does_not_append_ambiguous_suffix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_truncated_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_prefix = [
+                {"role": "user", "content": f"shared prefix {i}"}
+                for i in range(9)
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_bypass_end = [
+                *shared_prefix,
+                {"role": "assistant", "content": "truncated bypass suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                f"shared prefix {i}"
+                for i in range(9)
+            ]
+            assert bypass_rows == []
+            assert all(row["content"] != "truncated bypass suffix must not append" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_off_current_duplicate_short_bypass_snapshot_keeps_truncated_ambiguity(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_off_current_duplicate_short_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared8 = [
+                {"role": "user", "content": f"duplicate shared prefix {i}"}
+                for i in range(8)
+            ]
+            shared9 = [
+                *shared8,
+                {"role": "assistant", "content": "duplicate shared ninth"},
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="long-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared9)
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="short-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared8)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared9)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_bypass_end = [
+                *shared9,
+                {"role": "assistant", "content": "duplicate truncated bypass suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [
+                row
+                for row in rows
+                if row["conversation_id"] in {"long-bypass-conversation", "short-bypass-conversation"}
+            ]
+            assert [row["content"] for row in normal_rows] == [
+                *(f"duplicate shared prefix {i}" for i in range(8)),
+                "duplicate shared ninth",
+            ]
+            assert bypass_rows == []
+            assert all(
+                row["content"] != "duplicate truncated bypass suffix must not append"
+                for row in rows
+            )
+        finally:
+            engine.shutdown()
+
+    @pytest.mark.parametrize("bypass_probe", ["preflight", "compress"])
+    def test_shared_opener_bypass_probe_ambiguity_does_not_append_bypass_suffix(self, tmp_path, bypass_probe):
+        config = LCMConfig(
+            database_path=str(tmp_path / f"lcm_shared_opener_bypass_{bypass_probe}_ambiguity.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_opener = {"role": "user", "content": f"shared opener from {bypass_probe}"}
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            if bypass_probe == "preflight":
+                engine.should_compress_preflight([shared_opener])
+            else:
+                engine.compress([shared_opener], force=True)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest([shared_opener])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            late_bypass_end = [
+                shared_opener,
+                {"role": "assistant", "content": f"{bypass_probe} bypass suffix must not append"},
+            ]
+
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            assert [row["content"] for row in normal_rows] == [f"shared opener from {bypass_probe}"]
+            assert all(row["content"] != f"{bypass_probe} bypass suffix must not append" for row in rows)
+            assert engine._store.get_session_count("foreground-session") == 0
+        finally:
+            engine.shutdown()
+
+    def test_current_normal_reuse_with_tied_bypass_prefix_stores_final_suffix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_current_normal_tied_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_opener = {"role": "user", "content": "shared opener reused as normal"}
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([shared_opener])
+            engine.on_session_end("shared-session", [shared_opener])
+            assert engine._store.get_session_count("shared-session") == 0
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            normal_prefix = [shared_opener]
+            engine.ingest(normal_prefix)
+
+            normal_end = normal_prefix + [
+                {"role": "assistant", "content": "normal final suffix after tied prefix"},
+            ]
+            engine.on_session_end("shared-session", normal_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                "shared opener reused as normal",
+                "normal final suffix after tied prefix",
+            ]
+            assert bypass_rows == []
+
+            normal_state = engine._lifecycle.get_by_conversation("normal-conversation")
+            assert normal_state is not None
+            assert normal_state.current_session_id is None
+            assert normal_state.last_finalized_session_id == "shared-session"
+        finally:
+            engine.shutdown()
+
+    def test_current_normal_reuse_with_truncated_bypass_prefix_does_not_append_ambiguous_suffix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_current_normal_truncated_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared_prefix = [
+                {"role": "user", "content": f"current shared prefix {i}"}
+                for i in range(9)
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+            engine.on_session_end("shared-session", shared_prefix)
+            assert engine._store.get_session_count("shared-session") == 0
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared_prefix)
+
+            late_bypass_end = [
+                *shared_prefix,
+                {"role": "assistant", "content": "current truncated bypass suffix must not persist"},
+            ]
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                f"current shared prefix {i}"
+                for i in range(9)
+            ]
+            assert bypass_rows == []
+            assert all(row["content"] != "current truncated bypass suffix must not persist" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_current_duplicate_short_bypass_snapshot_keeps_truncated_ambiguity(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_current_duplicate_short_bypass_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            shared8 = [
+                {"role": "user", "content": f"current duplicate shared prefix {i}"}
+                for i in range(8)
+            ]
+            long_bypass = [
+                *shared8,
+                {"role": "assistant", "content": "current duplicate long bypass ninth"},
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="long-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(long_bypass)
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="short-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared8)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(shared8)
+
+            late_bypass_end = [
+                *shared8,
+                {"role": "assistant", "content": "current duplicate truncated suffix must not persist"},
+            ]
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [
+                row
+                for row in rows
+                if row["conversation_id"] in {"long-bypass-conversation", "short-bypass-conversation"}
+            ]
+            assert [row["content"] for row in normal_rows] == [
+                f"current duplicate shared prefix {i}"
+                for i in range(8)
+            ]
+            assert bypass_rows == []
+            assert all(
+                row["content"] != "current duplicate truncated suffix must not persist"
+                for row in rows
+            )
+        finally:
+            engine.shutdown()
+
+    def test_current_normal_reuse_does_not_tie_distinct_bypass_tool_call_prefix(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_current_normal_distinct_tool_call_prefix.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            bypass_prefix = [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "bypass_call",
+                            "type": "function",
+                            "function": {"name": "side_channel", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ]
+            normal_prefix = [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "normal_call",
+                            "type": "function",
+                            "function": {"name": "foreground", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ]
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest(bypass_prefix)
+            engine.on_session_end("shared-session", bypass_prefix)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            engine.ingest(normal_prefix)
+
+            late_bypass_end = bypass_prefix + [
+                {"role": "assistant", "content": "late bypass suffix must not persist"},
+            ]
+            engine.on_session_end("shared-session", late_bypass_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == [""]
+            assert normal_rows[0]["tool_calls"][0]["id"] == "normal_call"
+            assert bypass_rows == []
+            assert all(row["content"] != "late bypass suffix must not persist" for row in rows)
+        finally:
+            engine.shutdown()
+
+    def test_normal_final_after_later_stateless_rebind_uses_normal_source(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_later_stateless_rebind_normal_source.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            normal_prefix = [
+                {"role": "user", "content": "normal prefix before stateless rebind"},
+            ]
+            engine.ingest(normal_prefix)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="stateless-conversation",
+                context_length=200000,
+            )
+            engine.ingest([{"role": "user", "content": "stateless same-id turn"}])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            normal_end = normal_prefix + [
+                {"role": "assistant", "content": "normal final after stateless rebind"},
+            ]
+
+            engine.on_session_end("shared-session", normal_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            final_rows = [
+                row
+                for row in normal_rows
+                if row["content"] == "normal final after stateless rebind"
+            ]
+            stateless_rows = [row for row in rows if row["conversation_id"] == "stateless-conversation"]
+            assert len(final_rows) == 1
+            assert final_rows[0]["source"] == "cli"
+            assert stateless_rows == []
+        finally:
+            engine.shutdown()
+
+    def test_reused_normal_session_id_scopes_off_current_dedupe_to_current_conversation(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_reused_normal_id_current_conversation.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([{"role": "user", "content": "bypass seed"}])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="old-normal-conversation",
+                context_length=200000,
+            )
+            old_messages = [
+                {"role": "user", "content": "old conversation prefix"},
+                {"role": "assistant", "content": "old conversation answer"},
+            ]
+            engine.ingest(old_messages)
+            engine.on_session_end("shared-session", old_messages)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="current-normal-conversation",
+                context_length=200000,
+            )
+            current_prefix = [
+                {"role": "user", "content": "current conversation prefix"},
+            ]
+            engine.ingest(current_prefix)
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            current_end = current_prefix + [
+                {"role": "assistant", "content": "current conversation final"},
+            ]
+
+            engine.on_session_end("shared-session", current_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            old_rows = [row for row in rows if row["conversation_id"] == "old-normal-conversation"]
+            current_rows = [row for row in rows if row["conversation_id"] == "current-normal-conversation"]
+            bypass_rows = [row for row in rows if row["conversation_id"] == "bypass-conversation"]
+
+            assert [row["content"] for row in old_rows] == [
+                "old conversation prefix",
+                "old conversation answer",
+            ]
+            assert [row["content"] for row in current_rows] == [
+                "current conversation prefix",
+                "current conversation final",
+            ]
+            assert bypass_rows == []
+            current_state = engine._lifecycle.get_by_conversation("current-normal-conversation")
+            old_state = engine._lifecycle.get_by_conversation("old-normal-conversation")
+            assert current_state is not None
+            assert old_state is not None
+            assert current_state.last_finalized_session_id == "shared-session"
+            assert old_state.last_finalized_session_id == "shared-session"
+        finally:
+            engine.shutdown()
+
+    def test_later_bypass_bind_does_not_replace_normal_conversation_for_off_current_finalization(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_later_bypass_preserves_normal_conversation.db"),
+            stateless_session_patterns=["stateless"],
+        )
+        engine = LCMEngine(config=config)
+        try:
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="initial-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([{"role": "user", "content": "initial bypass seed"}])
+
+            engine.on_session_start(
+                "shared-session",
+                platform="cli",
+                conversation_id="normal-conversation",
+                context_length=200000,
+            )
+            normal_prefix = [
+                {"role": "user", "content": "normal prefix before later bypass"},
+            ]
+            engine.ingest(normal_prefix)
+
+            engine.on_session_start(
+                "shared-session",
+                platform="stateless",
+                conversation_id="later-bypass-conversation",
+                context_length=200000,
+            )
+            engine.ingest([{"role": "user", "content": "later bypass must not own final"}])
+
+            engine.on_session_start(
+                "foreground-session",
+                platform="cli",
+                conversation_id="foreground-conversation",
+                context_length=200000,
+            )
+            normal_end = normal_prefix + [
+                {"role": "assistant", "content": "normal final after later bypass"},
+            ]
+
+            engine.on_session_end("shared-session", normal_end)
+
+            rows = engine._store.get_session_messages("shared-session")
+            normal_rows = [row for row in rows if row["conversation_id"] == "normal-conversation"]
+            later_bypass_rows = [row for row in rows if row["conversation_id"] == "later-bypass-conversation"]
+            assert [row["content"] for row in normal_rows] == [
+                "normal prefix before later bypass",
+                "normal final after later bypass",
+            ]
+            assert later_bypass_rows == []
+
+            normal_state = engine._lifecycle.get_by_conversation("normal-conversation")
+            bypass_state = engine._lifecycle.get_by_conversation("later-bypass-conversation")
+            assert normal_state is not None
+            assert normal_state.last_finalized_session_id == "shared-session"
+            assert bypass_state is not None
+            assert bypass_state.last_finalized_session_id != "shared-session"
+        finally:
+            engine.shutdown()
 
     def test_auxiliary_child_worker_thread_stays_stateless_without_parent_thread_leak(self, tmp_path):
         hermes_home = tmp_path / "hermes-home"

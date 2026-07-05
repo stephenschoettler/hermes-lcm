@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import raw messages from a lossless-claw/OpenClaw LCM SQLite DB.
+"""Import OpenClaw history from SQLite or JSONL session exports.
 
 This is an operator script, not an agent tool. It only writes when --apply is
 passed; dry-run is the default.
@@ -14,7 +14,7 @@ import sqlite3
 import sys
 import time
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -46,22 +46,38 @@ from hermes_lcm.tokens import count_message_tokens  # noqa: E402
 
 
 VALID_SESSION_IDENTITIES = frozenset({"session_id", "session_key"})
+JSONL_OPENCLAW_TOOL_CALL_TYPES = frozenset({"toolCall", "tool_call", "toolUse", "tool_use"})
+JSONL_RESPONSES_FUNCTION_CALL_TYPES = frozenset({"function_call"})
+JSONL_RESPONSES_FUNCTION_OUTPUT_TYPES = frozenset({"function_call_output"})
+JSONL_RESPONSES_NATIVE_TYPES = JSONL_RESPONSES_FUNCTION_CALL_TYPES | JSONL_RESPONSES_FUNCTION_OUTPUT_TYPES
+JSONL_TOOL_CALL_TYPES = JSONL_OPENCLAW_TOOL_CALL_TYPES | JSONL_RESPONSES_FUNCTION_CALL_TYPES
 
 
 @dataclass(frozen=True)
 class ImportCandidate:
     source_message_id: int
+    source_message_key: str
     source_conversation_id: int
     source_session: str
     target_session_id: str
     source: str
     role: str
-    content: str
+    content: Any
     tool_call_id: str | None
     tool_calls: list[dict[str, Any]] | None
     tool_name: str | None
     timestamp: float
     token_estimate: int
+
+
+@dataclass(frozen=True)
+class JsonlPendingFunctionCall:
+    line_no: int
+    row: dict[str, Any]
+    row_id: str | None
+    timestamp_value: Any
+    source_session: str
+    tool_call: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -114,6 +130,8 @@ class ImportResult:
     skipped_empty: int = 0
     conversations: int = 0
     backup_path: str | None = None
+    invalid_rows: int = 0
+    warnings: list[str] = field(default_factory=list)
     summaries_scanned: int = 0
     summaries_would_import: int = 0
     summaries_imported: int = 0
@@ -133,6 +151,8 @@ class ImportResult:
             "skipped_empty": self.skipped_empty,
             "conversations": self.conversations,
             "backup_path": self.backup_path,
+            "invalid_rows": self.invalid_rows,
+            "warnings": self.warnings,
             "summaries_scanned": self.summaries_scanned,
             "summaries_would_import": self.summaries_would_import,
             "summaries_imported": self.summaries_imported,
@@ -183,6 +203,22 @@ def _require_columns(conn: sqlite3.Connection, table: str, columns: Iterable[str
 
 def _default_import_id(source_db: Path) -> str:
     return hashlib.sha256(str(source_db.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _default_jsonl_import_id(paths: Iterable[Path]) -> str:
+    resolved = "\n".join(sorted(str(path.resolve()) for path in paths))
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+
+
+def _stable_positive_int(value: str) -> int:
+    digest = hashlib.sha256(value.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
+def _jsonl_file_session_fallback(path: Path) -> str:
+    stem = _safe_segment(path.stem, "session")
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"{stem}-{digest}"
 
 
 def _parse_timestamp(value: Any, fallback: float) -> float:
@@ -461,6 +497,7 @@ def _collect_candidates(
         candidates.append(
             ImportCandidate(
                 source_message_id=int(row["message_id"]),
+                source_message_key=str(row["message_id"]),
                 source_conversation_id=conversation_id,
                 source_session=source_session,
                 target_session_id=source,
@@ -628,6 +665,7 @@ def _ensure_import_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS lcm_imported_messages (
             import_id TEXT NOT NULL,
             source_message_id INTEGER NOT NULL,
+            source_message_key TEXT,
             source_conversation_id INTEGER NOT NULL,
             source_session TEXT NOT NULL,
             target_store_id INTEGER NOT NULL,
@@ -640,6 +678,21 @@ def _ensure_import_table(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_lcm_imported_messages_target
             ON lcm_imported_messages(target_store_id)
+        """
+    )
+    columns = _table_columns(conn, "lcm_imported_messages")
+    if "source_message_key" not in columns:
+        conn.execute("ALTER TABLE lcm_imported_messages ADD COLUMN source_message_key TEXT")
+    conn.execute(
+        """UPDATE lcm_imported_messages
+           SET source_message_key = CAST(source_message_id AS TEXT)
+           WHERE source_message_key IS NULL"""
+    )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lcm_imported_messages_key
+            ON lcm_imported_messages(import_id, source_message_key)
+            WHERE source_message_key IS NOT NULL
         """
     )
 
@@ -891,6 +944,36 @@ def _existing_source_message_ids(target_db: Path, import_id: str) -> set[int]:
         conn.close()
 
 
+def _existing_source_message_keys(target_db: Path, import_id: str) -> set[str]:
+    if not target_db.exists():
+        return set()
+    conn = sqlite3.connect(target_db)
+    try:
+        if not _target_has_import_table(conn):
+            return set()
+        columns = _table_columns(conn, "lcm_imported_messages")
+        keys: set[str] = set()
+        if "source_message_key" in columns:
+            rows = conn.execute(
+                """SELECT source_message_key
+                   FROM lcm_imported_messages
+                   WHERE import_id = ? AND source_message_key IS NOT NULL""",
+                (import_id,),
+            ).fetchall()
+            keys.update(str(row[0]) for row in rows)
+        if "source_message_id" in columns:
+            rows = conn.execute(
+                """SELECT source_message_id
+                   FROM lcm_imported_messages
+                   WHERE import_id = ?""",
+                (import_id,),
+            ).fetchall()
+            keys.update(str(row[0]) for row in rows)
+        return keys
+    finally:
+        conn.close()
+
+
 def _backup_target(target_db: Path) -> str | None:
     if not target_db.exists():
         return None
@@ -909,6 +992,235 @@ def _backup_target(target_db: Path) -> str | None:
         backup_conn.close()
         source_conn.close()
     return str(backup_path)
+
+
+def _candidate_message(candidate: ImportCandidate) -> dict[str, Any]:
+    msg: dict[str, Any] = {
+        "role": candidate.role,
+        "content": candidate.content,
+    }
+    if candidate.tool_call_id:
+        msg["tool_call_id"] = candidate.tool_call_id
+    if candidate.tool_calls:
+        msg["tool_calls"] = candidate.tool_calls
+    if candidate.tool_name:
+        msg["tool_name"] = candidate.tool_name
+    return msg
+
+
+def _insert_import_candidate(
+    conn: sqlite3.Connection,
+    *,
+    import_id: str,
+    candidate: ImportCandidate,
+    protection_config: LCMConfig,
+    target_path: Path,
+) -> int:
+    protected_msg = protect_message_for_ingest(
+        _candidate_message(candidate),
+        config=protection_config,
+        hermes_home=str(target_path.parent),
+        session_id=candidate.target_session_id,
+    )
+    tool_calls_json = json.dumps(protected_msg.get("tool_calls")) if protected_msg.get("tool_calls") else None
+    cur = conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls,
+            tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+        (
+            candidate.target_session_id,
+            _normalize_source_value(candidate.source),
+            protected_msg.get("role", candidate.role),
+            normalize_content_value(protected_msg.get("content")),
+            protected_msg.get("tool_call_id"),
+            tool_calls_json,
+            protected_msg.get("tool_name"),
+            candidate.timestamp,
+            count_message_tokens(protected_msg),
+        ),
+    )
+    store_id = int(cur.lastrowid)
+    conn.execute(
+        """INSERT INTO lcm_imported_messages
+           (import_id, source_message_id, source_message_key,
+            source_conversation_id, source_session, target_store_id, imported_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            import_id,
+            candidate.source_message_id,
+            candidate.source_message_key,
+            candidate.source_conversation_id,
+            candidate.source_session,
+            store_id,
+            time.time(),
+        ),
+    )
+    return store_id
+
+
+def _process_import_candidates(
+    *,
+    source_label: str,
+    target_path: Path,
+    import_id: str,
+    candidates: list[ImportCandidate],
+    scanned: int,
+    skipped_empty: int,
+    conversations: int,
+    apply: bool,
+    summary_candidates: list[SummaryCandidate] | None = None,
+    include_summaries: bool = False,
+    invalid_rows: int = 0,
+    warnings: list[str] | None = None,
+) -> ImportResult:
+    summary_candidates = summary_candidates or []
+    warnings = list(warnings or [])
+    existing_keys = _existing_source_message_keys(target_path, import_id)
+    to_import = [
+        candidate for candidate in candidates if candidate.source_message_key not in existing_keys
+    ]
+    skipped_existing = len(candidates) - len(to_import)
+
+    if not apply:
+        summary_stats = SummaryImportStats(scanned=len(summary_candidates))
+        if include_summaries:
+            imported_message_map = _target_imported_message_map(target_path, import_id)
+            next_virtual_store_id = -1
+            for candidate in candidates:
+                if candidate.source_message_id in imported_message_map:
+                    continue
+                imported_message_map[candidate.source_message_id] = next_virtual_store_id
+                next_virtual_store_id -= 1
+            summary_stats = _process_summary_candidates(
+                conn=None,
+                import_id=import_id,
+                candidates=summary_candidates,
+                imported_messages=imported_message_map,
+                imported_summaries=_target_imported_summary_map(target_path, import_id),
+                dry_run=True,
+            )
+        return ImportResult(
+            source_db=source_label,
+            target_db=str(target_path),
+            import_id=import_id,
+            scanned=scanned,
+            eligible=len(candidates),
+            would_import=len(to_import),
+            imported=0,
+            skipped_existing=skipped_existing,
+            skipped_empty=skipped_empty,
+            conversations=conversations,
+            backup_path=None,
+            invalid_rows=invalid_rows,
+            warnings=warnings,
+            summaries_scanned=summary_stats.scanned,
+            summaries_would_import=summary_stats.would_import,
+            summaries_imported=0,
+            summaries_skipped_existing=summary_stats.skipped_existing,
+            summaries_skipped_unresolved=summary_stats.skipped_unresolved,
+        )
+
+    preflight_summary_stats = SummaryImportStats(scanned=len(summary_candidates))
+    summary_writes_planned = False
+    if include_summaries and not to_import:
+        preflight_summary_stats = _process_summary_candidates(
+            conn=None,
+            import_id=import_id,
+            candidates=summary_candidates,
+            imported_messages=_target_imported_message_map(target_path, import_id),
+            imported_summaries=_target_imported_summary_map(target_path, import_id),
+            dry_run=True,
+        )
+        summary_writes_planned = preflight_summary_stats.would_import > 0
+
+    if not to_import and not summary_writes_planned:
+        return ImportResult(
+            source_db=source_label,
+            target_db=str(target_path),
+            import_id=import_id,
+            scanned=scanned,
+            eligible=len(candidates),
+            would_import=0,
+            imported=0,
+            skipped_existing=skipped_existing,
+            skipped_empty=skipped_empty,
+            conversations=conversations,
+            backup_path=None,
+            invalid_rows=invalid_rows,
+            warnings=warnings,
+            summaries_scanned=preflight_summary_stats.scanned,
+            summaries_would_import=0,
+            summaries_imported=0,
+            summaries_skipped_existing=preflight_summary_stats.skipped_existing,
+            summaries_skipped_unresolved=preflight_summary_stats.skipped_unresolved,
+        )
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_path = _backup_target(target_path)
+    protection_config = LCMConfig.from_env()
+    protection_config.database_path = str(target_path)
+    store = MessageStore(
+        target_path,
+        ingest_protection_config=protection_config,
+        hermes_home=str(target_path.parent),
+    )
+    conn = store._conn
+    _ensure_import_table(conn)
+    imported_message_map = _imported_message_map_from_conn(conn, import_id)
+    summary_stats = SummaryImportStats(scanned=len(summary_candidates))
+    if include_summaries:
+        _ensure_summary_nodes_schema(conn)
+        _ensure_summary_import_table(conn)
+
+    imported = 0
+    try:
+        for candidate in to_import:
+            store_id = _insert_import_candidate(
+                conn,
+                import_id=import_id,
+                candidate=candidate,
+                protection_config=protection_config,
+                target_path=target_path,
+            )
+            imported_message_map[candidate.source_message_id] = store_id
+            imported += 1
+        if include_summaries:
+            summary_stats = _process_summary_candidates(
+                conn=conn,
+                import_id=import_id,
+                candidates=summary_candidates,
+                imported_messages=imported_message_map,
+                imported_summaries=_imported_summary_map_from_conn(conn, import_id),
+                dry_run=False,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        store.close()
+
+    return ImportResult(
+        source_db=source_label,
+        target_db=str(target_path),
+        import_id=import_id,
+        scanned=scanned,
+        eligible=len(candidates),
+        would_import=0,
+        imported=imported,
+        skipped_existing=skipped_existing,
+        skipped_empty=skipped_empty,
+        conversations=conversations,
+        backup_path=backup_path,
+        invalid_rows=invalid_rows,
+        warnings=warnings,
+        summaries_scanned=summary_stats.scanned,
+        summaries_would_import=0,
+        summaries_imported=summary_stats.imported,
+        summaries_skipped_existing=summary_stats.skipped_existing,
+        summaries_skipped_unresolved=summary_stats.skipped_unresolved,
+    )
 
 
 def import_lossless_claw(
@@ -949,195 +1261,808 @@ def import_lossless_claw(
             else []
         )
 
-    existing_ids = _existing_source_message_ids(target_path, resolved_import_id)
-    to_import = [candidate for candidate in candidates if candidate.source_message_id not in existing_ids]
-    skipped_existing = len(candidates) - len(to_import)
-
-    if not apply:
-        summary_stats = SummaryImportStats(scanned=len(summary_candidates))
-        if include_summaries:
-            imported_message_map = _target_imported_message_map(target_path, resolved_import_id)
-            next_virtual_store_id = -1
-            for candidate in candidates:
-                if candidate.source_message_id in imported_message_map:
-                    continue
-                imported_message_map[candidate.source_message_id] = next_virtual_store_id
-                next_virtual_store_id -= 1
-            summary_stats = _process_summary_candidates(
-                conn=None,
-                import_id=resolved_import_id,
-                candidates=summary_candidates,
-                imported_messages=imported_message_map,
-                imported_summaries=_target_imported_summary_map(target_path, resolved_import_id),
-                dry_run=True,
-            )
-        return ImportResult(
-            source_db=str(source_path),
-            target_db=str(target_path),
-            import_id=resolved_import_id,
-            scanned=scanned,
-            eligible=len(candidates),
-            would_import=len(to_import),
-            imported=0,
-            skipped_existing=skipped_existing,
-            skipped_empty=skipped_empty,
-            conversations=conversations,
-            backup_path=None,
-            summaries_scanned=summary_stats.scanned,
-            summaries_would_import=summary_stats.would_import,
-            summaries_imported=0,
-            summaries_skipped_existing=summary_stats.skipped_existing,
-            summaries_skipped_unresolved=summary_stats.skipped_unresolved,
-        )
-
-    preflight_summary_stats = SummaryImportStats(scanned=len(summary_candidates))
-    summary_writes_planned = False
-    if include_summaries and not to_import:
-        preflight_summary_stats = _process_summary_candidates(
-            conn=None,
-            import_id=resolved_import_id,
-            candidates=summary_candidates,
-            imported_messages=_target_imported_message_map(target_path, resolved_import_id),
-            imported_summaries=_target_imported_summary_map(target_path, resolved_import_id),
-            dry_run=True,
-        )
-        summary_writes_planned = preflight_summary_stats.would_import > 0
-
-    if not to_import and not summary_writes_planned:
-        return ImportResult(
-            source_db=str(source_path),
-            target_db=str(target_path),
-            import_id=resolved_import_id,
-            scanned=scanned,
-            eligible=len(candidates),
-            would_import=0,
-            imported=0,
-            skipped_existing=skipped_existing,
-            skipped_empty=skipped_empty,
-            conversations=conversations,
-            backup_path=None,
-            summaries_scanned=preflight_summary_stats.scanned,
-            summaries_would_import=0,
-            summaries_imported=0,
-            summaries_skipped_existing=preflight_summary_stats.skipped_existing,
-            summaries_skipped_unresolved=preflight_summary_stats.skipped_unresolved,
-        )
-
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    backup_path = _backup_target(target_path)
-    protection_config = LCMConfig.from_env()
-    protection_config.database_path = str(target_path)
-    store = MessageStore(
-        target_path,
-        ingest_protection_config=protection_config,
-        hermes_home=str(target_path.parent),
-    )
-    conn = store._conn
-    _ensure_import_table(conn)
-    imported_message_map = _imported_message_map_from_conn(conn, resolved_import_id)
-    summary_stats = SummaryImportStats(scanned=len(summary_candidates))
-    if include_summaries:
-        _ensure_summary_nodes_schema(conn)
-        _ensure_summary_import_table(conn)
-
-    imported = 0
-    try:
-        for candidate in to_import:
-            msg: dict[str, Any] = {
-                "role": candidate.role,
-                "content": candidate.content,
-            }
-            if candidate.tool_call_id:
-                msg["tool_call_id"] = candidate.tool_call_id
-            if candidate.tool_calls:
-                msg["tool_calls"] = candidate.tool_calls
-            if candidate.tool_name:
-                msg["tool_name"] = candidate.tool_name
-            protected_msg = protect_message_for_ingest(
-                msg,
-                config=protection_config,
-                hermes_home=str(target_path.parent),
-                session_id=candidate.target_session_id,
-            )
-            tool_calls_json = json.dumps(protected_msg.get("tool_calls")) if protected_msg.get("tool_calls") else None
-            cur = conn.execute(
-                """INSERT INTO messages
-                   (session_id, source, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
-                (
-                    candidate.target_session_id,
-                    _normalize_source_value(candidate.source),
-                    protected_msg.get("role", candidate.role),
-                    normalize_content_value(protected_msg.get("content")),
-                    protected_msg.get("tool_call_id"),
-                    tool_calls_json,
-                    protected_msg.get("tool_name"),
-                    candidate.timestamp,
-                    count_message_tokens(protected_msg),
-                ),
-            )
-            conn.execute(
-                """INSERT INTO lcm_imported_messages
-                   (import_id, source_message_id, source_conversation_id, source_session,
-                    target_store_id, imported_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    resolved_import_id,
-                    candidate.source_message_id,
-                    candidate.source_conversation_id,
-                    candidate.source_session,
-                    int(cur.lastrowid),
-                    time.time(),
-                ),
-            )
-            imported_message_map[candidate.source_message_id] = int(cur.lastrowid)
-            imported += 1
-        if include_summaries:
-            summary_stats = _process_summary_candidates(
-                conn=conn,
-                import_id=resolved_import_id,
-                candidates=summary_candidates,
-                imported_messages=imported_message_map,
-                imported_summaries=_imported_summary_map_from_conn(conn, resolved_import_id),
-                dry_run=False,
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        store.close()
-
-    return ImportResult(
-        source_db=str(source_path),
-        target_db=str(target_path),
+    return _process_import_candidates(
+        source_label=str(source_path),
+        target_path=target_path,
         import_id=resolved_import_id,
+        candidates=candidates,
         scanned=scanned,
-        eligible=len(candidates),
-        would_import=0,
-        imported=imported,
-        skipped_existing=skipped_existing,
         skipped_empty=skipped_empty,
         conversations=conversations,
-        backup_path=backup_path,
-        summaries_scanned=summary_stats.scanned,
-        summaries_would_import=0,
-        summaries_imported=summary_stats.imported,
-        summaries_skipped_existing=summary_stats.skipped_existing,
-        summaries_skipped_unresolved=summary_stats.skipped_unresolved,
+        apply=apply,
+        summary_candidates=summary_candidates,
+        include_summaries=include_summaries,
+    )
+
+
+def _jsonl_compact_json(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def _jsonl_string_type(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _jsonl_row_type(row: dict[str, Any]) -> str | None:
+    return _jsonl_string_type(row.get("type"))
+
+
+def _jsonl_has_malformed_type(row: dict[str, Any]) -> bool:
+    return row.get("type") is not None and _jsonl_row_type(row) is None
+
+
+def _jsonl_tool_call_shaped_content_item(item: dict[str, Any]) -> bool:
+    has_tool_specific_field = (
+        _jsonl_message_field(
+            item,
+            "tool_call_id",
+            "toolCallId",
+            "tool_use_id",
+            "toolUseId",
+            "tool_name",
+            "toolName",
+            "tool_use_name",
+            "toolUseName",
+            "tool_input",
+            "toolInput",
+            "tool_use_input",
+            "toolUseInput",
+        )
+        is not None
+    )
+    has_responses_function_shape = (
+        _jsonl_message_field(item, "call_id", "callId") is not None
+        or (
+            _jsonl_message_field(item, "name") is not None
+            and _jsonl_message_field(item, "arguments", "input", "parameters") is not None
+        )
+    )
+    return "toolCall" in item or has_tool_specific_field or has_responses_function_shape
+
+
+def _jsonl_content_item_has_malformed_tool_call_type(item: dict[str, Any]) -> bool:
+    return (
+        item.get("type") is not None
+        and _jsonl_string_type(item.get("type")) is None
+        and _jsonl_tool_call_shaped_content_item(item)
+    )
+
+
+def _jsonl_openai_tool_call(value: dict[str, Any]) -> dict[str, Any] | None:
+    nested = value.get("toolCall")
+    raw = nested if isinstance(nested, dict) else value
+    raw_type = _jsonl_string_type(raw.get("type"))
+    call_id = _jsonl_message_field(
+        raw,
+        "call_id",
+        "callId",
+        "tool_call_id",
+        "toolCallId",
+        "tool_use_id",
+        "toolUseId",
+        "id",
+    )
+    function_value = raw.get("function")
+    if isinstance(function_value, dict):
+        name = _jsonl_message_field(function_value, "name") or _jsonl_message_field(
+            raw,
+            "name",
+            "tool_name",
+            "toolName",
+            "tool_use_name",
+            "toolUseName",
+        )
+        arguments = _jsonl_message_field(function_value, "arguments")
+    else:
+        name = _jsonl_message_field(raw, "name", "tool_name", "toolName", "tool_use_name", "toolUseName")
+        arguments = None
+    if arguments is None:
+        arguments = _jsonl_message_field(
+            raw,
+            "arguments",
+            "tool_input",
+            "toolInput",
+            "tool_use_input",
+            "toolUseInput",
+            "input",
+            "parameters",
+        )
+    if call_id is None or name is None:
+        return None
+    return {
+        "id": str(call_id),
+        "type": raw_type if raw_type and raw_type not in JSONL_OPENCLAW_TOOL_CALL_TYPES else "function",
+        "function": {
+            "name": str(name),
+            "arguments": _jsonl_compact_json(arguments if arguments is not None else {}),
+        },
+    }
+
+
+def _jsonl_tool_calls_from_content(content: Any) -> list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = _jsonl_string_type(item.get("type")) or ""
+        if item_type not in JSONL_TOOL_CALL_TYPES and "toolCall" not in item:
+            continue
+        call = _jsonl_openai_tool_call(item)
+        if call is not None:
+            calls.append(call)
+    return calls
+
+
+def _jsonl_malformed_tool_call_content_types(content: Any) -> list[str]:
+    if not isinstance(content, list):
+        return []
+    malformed: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        if _jsonl_content_item_has_malformed_tool_call_type(item):
+            malformed.append("non-string tool call type")
+            continue
+        item_type = _jsonl_string_type(item.get("type")) or ""
+        if item_type not in JSONL_TOOL_CALL_TYPES and "toolCall" not in item:
+            continue
+        if _jsonl_openai_tool_call(item) is None:
+            malformed.append(item_type or "toolCall")
+    return malformed
+
+
+def _jsonl_has_malformed_tool_call_content(message: dict[str, Any]) -> bool:
+    return bool(_jsonl_malformed_tool_call_content_types(message.get("content")))
+
+
+def _jsonl_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]] | None:
+    value = message.get("tool_calls", message.get("toolCalls"))
+    calls: list[dict[str, Any]] = []
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            calls.append(_jsonl_openai_tool_call(item) or item)
+    message_type = _jsonl_string_type(message.get("type")) or ""
+    if message_type in JSONL_TOOL_CALL_TYPES or "toolCall" in message:
+        call = _jsonl_openai_tool_call(message)
+        if call is not None:
+            calls.append(call)
+    calls.extend(_jsonl_tool_calls_from_content(message.get("content")))
+    return calls or None
+
+
+def _jsonl_message_field(message: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = message.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _jsonl_role(message: dict[str, Any], row_type: Any) -> str:
+    row_type = _jsonl_string_type(row_type)
+    role = message.get("role")
+    if role in (None, "") and row_type in (
+        {"toolResult", "tool_result"} | JSONL_RESPONSES_FUNCTION_OUTPUT_TYPES
+    ):
+        role = "toolResult"
+    if role in (None, "") and row_type in JSONL_TOOL_CALL_TYPES:
+        role = "assistant"
+    if role in (None, "") and row_type == "custom_message":
+        role = "custom"
+    normalized = str(role or "unknown")
+    if normalized in {"toolResult", "tool_result"}:
+        return "tool"
+    return normalized
+
+
+def _jsonl_content(message: dict[str, Any], role: str) -> Any:
+    content = message.get("content")
+    if role == "tool" and content in (None, ""):
+        content = _jsonl_message_field(message, "tool_output", "toolOutput", "output", "result")
+    return content
+
+
+def _jsonl_row_id(row: dict[str, Any]) -> str | None:
+    value = _jsonl_message_field(_jsonl_row_message(row), "id")
+    if value is None:
+        value = _jsonl_message_field(row, "id")
+    return str(value) if value is not None else None
+
+
+def _jsonl_parent_id(row: dict[str, Any]) -> str | None:
+    value = _jsonl_message_field(_jsonl_row_message(row), "parent_id", "parentId")
+    if value is None:
+        value = _jsonl_message_field(row, "parent_id", "parentId")
+    return str(value) if value is not None else None
+
+
+def _jsonl_importable_row(row: dict[str, Any]) -> bool:
+    if _jsonl_has_malformed_type(row):
+        return False
+    row_type = _jsonl_row_type(row)
+    if row_type in (
+        {"message", "custom_message", "toolResult", "tool_result"}
+        | JSONL_RESPONSES_NATIVE_TYPES
+        | JSONL_OPENCLAW_TOOL_CALL_TYPES
+    ):
+        return True
+    return row_type is None and ("role" in row or "content" in row)
+
+
+def _jsonl_valid_importable_row(row: dict[str, Any]) -> bool:
+    if _jsonl_has_malformed_type(row):
+        return False
+    row_type = _jsonl_row_type(row)
+    if row_type in JSONL_TOOL_CALL_TYPES:
+        return _jsonl_openai_tool_call(row) is not None
+    if row_type == "message":
+        if not (isinstance(row.get("message"), dict) or "role" in row or "content" in row):
+            return False
+        return not _jsonl_has_malformed_tool_call_content(_jsonl_row_message(row))
+    if row_type == "custom_message":
+        if not (isinstance(row.get("message"), dict) or "role" in row or "content" in row):
+            return False
+        return not _jsonl_has_malformed_tool_call_content(_jsonl_row_message(row))
+    if row_type is None and ("role" in row or "content" in row):
+        return not _jsonl_has_malformed_tool_call_content(row)
+    return _jsonl_importable_row(row)
+
+
+def _jsonl_row_message(row: dict[str, Any]) -> dict[str, Any]:
+    raw_message = row.get("message")
+    return raw_message if isinstance(raw_message, dict) else row
+
+
+def _jsonl_row_role(row: dict[str, Any]) -> str:
+    return _jsonl_role(_jsonl_row_message(row), _jsonl_row_type(row))
+
+
+def _jsonl_valid_tool_call_row(row: dict[str, Any]) -> bool:
+    return _jsonl_row_type(row) in JSONL_TOOL_CALL_TYPES and _jsonl_valid_importable_row(row)
+
+
+def _jsonl_responses_function_call_message(row: dict[str, Any]) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": None}
+    tool_call = _jsonl_openai_tool_call(row)
+    if tool_call is not None:
+        message["tool_calls"] = [tool_call]
+    return message
+
+
+def _jsonl_responses_function_output_message(row: dict[str, Any]) -> dict[str, Any]:
+    message: dict[str, Any] = {
+        "role": "tool",
+        "content": _jsonl_content(row, "tool"),
+    }
+    tool_call_id = _jsonl_message_field(
+        row,
+        "tool_call_id",
+        "toolCallId",
+        "tool_use_id",
+        "toolUseId",
+        "call_id",
+        "callId",
+    )
+    if tool_call_id is not None:
+        message["tool_call_id"] = tool_call_id
+    tool_name = _jsonl_message_field(row, "tool_name", "toolName", "name")
+    if tool_name is not None:
+        message["tool_name"] = tool_name
+    return message
+
+
+def _jsonl_active_leaf_lines(rows: list[tuple[int, dict[str, Any]]]) -> set[int] | None:
+    row_by_line = dict(rows)
+    line_by_id: dict[str, int] = {}
+    parent_by_id: dict[str, str | None] = {}
+    last_message_id: str | None = None
+    idless_importable_lines: set[int] = set()
+    has_parent_edges = False
+    for line_no, row in rows:
+        if _jsonl_row_type(row) == "session":
+            continue
+        row_id = _jsonl_row_id(row)
+        valid_importable = _jsonl_valid_importable_row(row)
+        if row_id is None:
+            if valid_importable:
+                role = _jsonl_row_role(row)
+                message = _jsonl_row_message(row)
+                tool_call_id = _jsonl_message_field(
+                    message,
+                    "tool_call_id",
+                    "toolCallId",
+                    "tool_use_id",
+                    "toolUseId",
+                    "call_id",
+                    "callId",
+                )
+                if role != "tool" or tool_call_id is None:
+                    idless_importable_lines.add(line_no)
+            continue
+        if _jsonl_importable_row(row) and not valid_importable:
+            if row_id not in line_by_id:
+                line_by_id[row_id] = line_no
+                parent_by_id[row_id] = _jsonl_parent_id(row)
+            continue
+        line_by_id[row_id] = line_no
+        parent_id = _jsonl_parent_id(row)
+        parent_by_id[row_id] = parent_id
+        if not valid_importable:
+            continue
+        if parent_id is not None and _jsonl_row_role(row) != "tool":
+            has_parent_edges = True
+        if _jsonl_row_role(row) != "tool":
+            last_message_id = row_id
+    if not has_parent_edges or last_message_id is None:
+        return None
+
+    active_lines: set[int] = set()
+    seen_ids: set[str] = set()
+    current: str | None = last_message_id
+    while current is not None and current not in seen_ids:
+        seen_ids.add(current)
+        line_no = line_by_id.get(current)
+        if line_no is None:
+            break
+        active_lines.add(line_no)
+        current = parent_by_id.get(current)
+
+    active_importable_lines = {
+        line_no for line_no in active_lines if _jsonl_valid_importable_row(row_by_line.get(line_no, {}))
+    }
+    active_importable_lines.update(idless_importable_lines)
+
+    active_tool_call_run: list[int] = []
+    active_tool_call_parent: str | None = None
+
+    def flush_active_tool_call_run() -> None:
+        if active_importable_lines.intersection(active_tool_call_run):
+            active_importable_lines.update(active_tool_call_run)
+
+    for line_no, row in rows:
+        if not _jsonl_valid_tool_call_row(row):
+            flush_active_tool_call_run()
+            active_tool_call_run = []
+            active_tool_call_parent = None
+            continue
+        parent_id = _jsonl_parent_id(row)
+        if active_tool_call_run and parent_id != active_tool_call_parent:
+            flush_active_tool_call_run()
+            active_tool_call_run = []
+        active_tool_call_run.append(line_no)
+        active_tool_call_parent = parent_id
+    flush_active_tool_call_run()
+
+    active_tool_call_ids: set[str] = set()
+    for line_no in active_importable_lines:
+        row = row_by_line.get(line_no)
+        if row is None:
+            continue
+        message = _jsonl_row_message(row)
+        tool_calls = _jsonl_tool_calls(message)
+        if not tool_calls:
+            continue
+        for tool_call in tool_calls:
+            call_id = _jsonl_message_field(tool_call, "id", "tool_call_id", "toolCallId")
+            if call_id is not None:
+                active_tool_call_ids.add(str(call_id))
+
+    for line_no, row in rows:
+        if line_no in active_lines or not _jsonl_importable_row(row):
+            continue
+        role = _jsonl_row_role(row)
+        message = _jsonl_row_message(row)
+        tool_call_id = _jsonl_message_field(
+            message,
+            "tool_call_id",
+            "toolCallId",
+            "tool_use_id",
+            "toolUseId",
+            "call_id",
+            "callId",
+        )
+        if role == "tool" and tool_call_id is not None and str(tool_call_id) in active_tool_call_ids:
+            active_importable_lines.add(line_no)
+    return active_importable_lines
+
+
+def _jsonl_active_leaf_lines_by_session(
+    rows: list[tuple[int, dict[str, Any]]],
+    *,
+    fallback_session: str,
+) -> set[int] | None:
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    current_session = fallback_session
+    for line_no, row in rows:
+        if _jsonl_row_type(row) == "session":
+            session_id = _safe_segment(row.get("id"), current_session)
+            if session_id:
+                current_session = session_id
+            continue
+        session = _jsonl_session_value(row, _jsonl_row_message(row), current_session)
+        grouped.setdefault(session, []).append((line_no, row))
+
+    active_lines: set[int] = set()
+    pruning_enabled = False
+    for session_rows in grouped.values():
+        session_active = _jsonl_active_leaf_lines(session_rows)
+        if session_active is None:
+            active_lines.update(line_no for line_no, row in session_rows if _jsonl_importable_row(row))
+        else:
+            pruning_enabled = True
+            active_lines.update(session_active)
+    return active_lines if pruning_enabled else None
+
+
+def _jsonl_session_value(row: dict[str, Any], message: dict[str, Any], fallback: str) -> str:
+    value = _jsonl_message_field(
+        row,
+        "session_id",
+        "sessionId",
+        "session_key",
+        "sessionKey",
+        "conversation_id",
+        "conversationId",
+    )
+    if value is None:
+        value = _jsonl_message_field(
+            message,
+            "session_id",
+            "sessionId",
+            "session_key",
+            "sessionKey",
+            "conversation_id",
+            "conversationId",
+        )
+    return _safe_segment(value, fallback)
+
+
+def _jsonl_warning(path: Path, line_no: int, message: str) -> str:
+    return f"{path.name}:{line_no}: {message}"
+
+
+def _jsonl_source_message_key(source_session: str, source_row_id: str) -> str:
+    return json.dumps([source_session, source_row_id], separators=(",", ":"), ensure_ascii=False)
+
+
+def _collect_jsonl_candidates(
+    files: Iterable[Path],
+    *,
+    namespace: str,
+    agent: str,
+) -> tuple[list[ImportCandidate], int, int, int, int, list[str]]:
+    candidates: list[ImportCandidate] = []
+    warnings: list[str] = []
+    scanned = 0
+    skipped_empty = 0
+    invalid_rows = 0
+    source_sessions: set[str] = set()
+    seen_keys: set[str] = set()
+    now = time.time()
+
+    for path in files:
+        current_session = _jsonl_file_session_fallback(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"{path}: source JSONL file not found")
+        try:
+            handle = path.open("r", encoding="utf-8")
+        except OSError as exc:
+            raise OSError(f"{path}: could not read source JSONL file: {exc}") from exc
+        parsed_rows: list[tuple[int, dict[str, Any] | None, str | None]] = []
+        valid_rows: list[tuple[int, dict[str, Any]]] = []
+        with handle:
+            for line_no, line in enumerate(handle, start=1):
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    decoded = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    parsed_rows.append((line_no, None, f"invalid JSON: {exc.msg}"))
+                    continue
+                if not isinstance(decoded, dict):
+                    parsed_rows.append((line_no, None, "row is not an object"))
+                    continue
+                parsed_rows.append((line_no, decoded, None))
+                valid_rows.append((line_no, decoded))
+
+        active_leaf_lines = _jsonl_active_leaf_lines_by_session(
+            valid_rows,
+            fallback_session=_jsonl_file_session_fallback(path),
+        )
+        pending_native_function_calls: list[JsonlPendingFunctionCall] = []
+
+        def append_jsonl_candidate(
+            *,
+            line_no: int,
+            row: dict[str, Any],
+            message: dict[str, Any],
+            row_id: str | None,
+            timestamp_value: Any,
+            source_row_id_override: str | None = None,
+            source_session_override: str | None = None,
+        ) -> None:
+            nonlocal invalid_rows, skipped_empty
+
+            role = _jsonl_role(message, row.get("type"))
+            content = _jsonl_content(message, role)
+            if _jsonl_malformed_tool_call_content_types(content):
+                invalid_rows += 1
+                warnings.append(
+                    _jsonl_warning(
+                        path,
+                        line_no,
+                        "message content tool call item missing tool call id or name, or has non-string type",
+                    )
+                )
+                return
+
+            tool_calls = _jsonl_tool_calls(message)
+            normalized_content = normalize_content_value(content)
+            if not normalized_content and not tool_calls:
+                skipped_empty += 1
+                return
+
+            source_session = source_session_override or _jsonl_session_value(row, message, current_session)
+            source = _target_source(namespace, agent, source_session)
+            source_row_id = source_row_id_override or _safe_segment(row_id, f"line:{line_no}")
+            source_message_key = _jsonl_source_message_key(source_session, source_row_id)
+            if source_message_key in seen_keys:
+                invalid_rows += 1
+                warnings.append(
+                    _jsonl_warning(
+                        path,
+                        line_no,
+                        f"duplicate source message key {source_message_key!r}",
+                    )
+                )
+                return
+            seen_keys.add(source_message_key)
+            source_sessions.add(source_session)
+
+            msg_for_tokens: dict[str, Any] = {"role": role, "content": content}
+            if tool_calls:
+                msg_for_tokens["tool_calls"] = tool_calls
+            tool_call_id = _jsonl_message_field(
+                message,
+                "tool_call_id",
+                "toolCallId",
+                "tool_use_id",
+                "toolUseId",
+                "call_id",
+                "callId",
+            )
+            tool_name = _jsonl_message_field(message, "tool_name", "toolName", "name")
+            candidates.append(
+                ImportCandidate(
+                    source_message_id=_stable_positive_int(source_message_key),
+                    source_message_key=source_message_key,
+                    source_conversation_id=_stable_positive_int(source_session),
+                    source_session=source_session,
+                    target_session_id=source,
+                    source=source,
+                    role=role,
+                    content=content,
+                    tool_call_id=str(tool_call_id) if tool_call_id is not None else None,
+                    tool_calls=tool_calls,
+                    tool_name=str(tool_name) if tool_name is not None else None,
+                    timestamp=_parse_timestamp(timestamp_value, now),
+                    token_estimate=count_message_tokens(msg_for_tokens),
+                )
+            )
+
+        def flush_pending_native_function_calls() -> None:
+            if not pending_native_function_calls:
+                return
+            first = pending_native_function_calls[0]
+            row_ids = [
+                _safe_segment(pending.row_id, f"line:{pending.line_no}")
+                for pending in pending_native_function_calls
+            ]
+            source_row_id = (
+                row_ids[0]
+                if len(row_ids) == 1
+                else "function_calls:" + _jsonl_compact_json(row_ids)
+            )
+            append_jsonl_candidate(
+                line_no=first.line_no,
+                row=first.row,
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [pending.tool_call for pending in pending_native_function_calls],
+                },
+                row_id=first.row_id,
+                timestamp_value=first.timestamp_value,
+                source_row_id_override=source_row_id,
+                source_session_override=first.source_session,
+            )
+            pending_native_function_calls.clear()
+
+        for line_no, row, row_error in parsed_rows:
+            if row_error is not None:
+                flush_pending_native_function_calls()
+                scanned += 1
+                invalid_rows += 1
+                warnings.append(_jsonl_warning(path, line_no, row_error))
+                continue
+            assert row is not None
+            if active_leaf_lines is not None and _jsonl_valid_importable_row(row) and line_no not in active_leaf_lines:
+                flush_pending_native_function_calls()
+                scanned += 1
+                continue
+
+            row_type = _jsonl_row_type(row)
+            if row_type == "session":
+                flush_pending_native_function_calls()
+                session_id = _safe_segment(row.get("id"), current_session)
+                if session_id:
+                    current_session = session_id
+                else:
+                    warnings.append(_jsonl_warning(path, line_no, "session header missing id"))
+                continue
+            if row_type is not None and not _jsonl_importable_row(row):
+                flush_pending_native_function_calls()
+                scanned += 1
+                continue
+
+            if row_type in {"message", "custom_message"}:
+                flush_pending_native_function_calls()
+                scanned += 1
+                raw_message = row.get("message")
+                if isinstance(raw_message, dict):
+                    message = raw_message
+                elif "role" in row or "content" in row:
+                    message = row
+                else:
+                    invalid_rows += 1
+                    warnings.append(_jsonl_warning(path, line_no, "message row missing message object"))
+                    continue
+                row_id = _jsonl_row_id(row)
+                timestamp_value = row.get("timestamp", message.get("timestamp"))
+            elif row_type in JSONL_RESPONSES_FUNCTION_CALL_TYPES:
+                scanned += 1
+                if not _jsonl_valid_importable_row(row):
+                    flush_pending_native_function_calls()
+                    invalid_rows += 1
+                    warnings.append(_jsonl_warning(path, line_no, f"{row_type} row missing tool call id or name"))
+                    continue
+                message = _jsonl_responses_function_call_message(row)
+                row_id = _jsonl_row_id(row)
+                timestamp_value = row.get("timestamp")
+                tool_calls = _jsonl_tool_calls(message)
+                if not tool_calls:
+                    flush_pending_native_function_calls()
+                    skipped_empty += 1
+                    continue
+                source_session = _jsonl_session_value(row, message, current_session)
+                if (
+                    pending_native_function_calls
+                    and pending_native_function_calls[-1].source_session != source_session
+                ):
+                    flush_pending_native_function_calls()
+                pending_native_function_calls.append(
+                    JsonlPendingFunctionCall(
+                        line_no=line_no,
+                        row=row,
+                        row_id=row_id,
+                        timestamp_value=timestamp_value,
+                        source_session=source_session,
+                        tool_call=tool_calls[0],
+                    )
+                )
+                continue
+            elif row_type in JSONL_OPENCLAW_TOOL_CALL_TYPES:
+                flush_pending_native_function_calls()
+                scanned += 1
+                if not _jsonl_valid_importable_row(row):
+                    invalid_rows += 1
+                    warnings.append(_jsonl_warning(path, line_no, f"{row_type} row missing tool call id or name"))
+                    continue
+                message = _jsonl_responses_function_call_message(row)
+                row_id = _jsonl_row_id(row)
+                timestamp_value = row.get("timestamp")
+            elif row_type in JSONL_RESPONSES_FUNCTION_OUTPUT_TYPES:
+                flush_pending_native_function_calls()
+                scanned += 1
+                message = _jsonl_responses_function_output_message(row)
+                row_id = _jsonl_row_id(row)
+                timestamp_value = row.get("timestamp")
+            elif row_type in {"toolResult", "tool_result"}:
+                flush_pending_native_function_calls()
+                scanned += 1
+                message = row
+                row_id = _jsonl_row_id(row)
+                timestamp_value = row.get("timestamp")
+            elif row.get("type") is None and ("role" in row or "content" in row):
+                flush_pending_native_function_calls()
+                scanned += 1
+                message = row
+                row_id = _jsonl_row_id(row)
+                timestamp_value = row.get("timestamp")
+            else:
+                flush_pending_native_function_calls()
+                scanned += 1
+                invalid_rows += 1
+                warnings.append(_jsonl_warning(path, line_no, "unsupported row shape"))
+                continue
+
+            append_jsonl_candidate(
+                line_no=line_no,
+                row=row,
+                message=message,
+                row_id=row_id,
+                timestamp_value=timestamp_value,
+            )
+        flush_pending_native_function_calls()
+
+    return candidates, scanned, skipped_empty, len(source_sessions), invalid_rows, warnings
+
+
+def import_jsonl_sessions(
+    *,
+    files: Iterable[str | Path],
+    target_db: str | Path,
+    namespace: str = "openclaw-jsonl",
+    agent: str = "unknown",
+    import_id: str | None = None,
+    apply: bool = False,
+) -> ImportResult:
+    source_files = [Path(path) for path in files]
+    target_path = Path(target_db)
+    resolved_import_id = import_id or _default_jsonl_import_id(source_files)
+    candidates, scanned, skipped_empty, conversations, invalid_rows, warnings = _collect_jsonl_candidates(
+        source_files,
+        namespace=namespace,
+        agent=agent,
+    )
+    return _process_import_candidates(
+        source_label=",".join(str(path) for path in source_files),
+        target_path=target_path,
+        import_id=resolved_import_id,
+        candidates=candidates,
+        scanned=scanned,
+        skipped_empty=skipped_empty,
+        conversations=conversations,
+        apply=apply,
+        invalid_rows=invalid_rows,
+        warnings=warnings,
     )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Import raw messages from a lossless-claw/OpenClaw LCM SQLite DB into hermes-lcm.",
+        description="Import raw messages from lossless-claw/OpenClaw sources into hermes-lcm.",
     )
-    parser.add_argument("--source-db", required=True, help="Path to the source lossless-claw/OpenClaw LCM SQLite DB")
+    parser.add_argument("--source-db", help="Path to the source lossless-claw/OpenClaw LCM SQLite DB")
+    parser.add_argument(
+        "--source-jsonl",
+        action="append",
+        default=[],
+        help="Path to an OpenClaw session JSONL export. May be repeated.",
+    )
+    parser.add_argument(
+        "--source-jsonl-dir",
+        action="append",
+        default=[],
+        help="Directory containing OpenClaw session JSONL exports. May be repeated.",
+    )
     parser.add_argument("--target-db", required=True, help="Path to the target hermes-lcm SQLite DB")
-    parser.add_argument("--namespace", default="openclaw-lcm", help="Provenance namespace for imported rows")
+    parser.add_argument(
+        "--namespace",
+        help=(
+            "Provenance namespace for imported rows. Defaults to openclaw-lcm for "
+            "SQLite and openclaw-jsonl for JSONL."
+        ),
+    )
     parser.add_argument("--agent", default="unknown", help="Source OpenClaw agent/profile label for provenance")
-    parser.add_argument("--import-id", help="Stable idempotency key. Defaults to a hash of the source DB path")
+    parser.add_argument("--import-id", help="Stable idempotency key. Defaults to a hash of the selected source path(s)")
     parser.add_argument(
         "--session-identity",
         choices=sorted(VALID_SESSION_IDENTITIES),
@@ -1161,21 +2086,52 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    result = import_lossless_claw(
-        source_db=args.source_db,
-        target_db=args.target_db,
-        namespace=args.namespace,
-        agent=args.agent,
-        import_id=args.import_id,
-        session_identity=args.session_identity,
-        include_summaries=args.include_summaries,
-        apply=args.apply,
-    )
+    jsonl_requested = bool(args.source_jsonl or args.source_jsonl_dir)
+    jsonl_sources = [Path(path) for path in args.source_jsonl]
+    jsonl_sources.extend(Path(directory) for directory in args.source_jsonl_dir)
+    jsonl_files = [Path(path) for path in args.source_jsonl]
+    for directory in args.source_jsonl_dir:
+        directory_path = Path(directory)
+        if directory_path.is_dir():
+            jsonl_files.extend(sorted(directory_path.rglob("*.jsonl")))
+        else:
+            jsonl_files.append(directory_path)
+
+    if args.source_db and jsonl_requested:
+        parser.error("--source-db cannot be combined with --source-jsonl or --source-jsonl-dir")
+    if not args.source_db and not jsonl_requested:
+        parser.error("one of --source-db, --source-jsonl, or --source-jsonl-dir is required")
+    if jsonl_requested and args.include_summaries:
+        parser.error("--include-summaries is only supported with --source-db")
+    if jsonl_requested and args.session_identity != "session_id":
+        parser.error("--session-identity is only supported with --source-db")
+
+    if jsonl_requested:
+        result = import_jsonl_sessions(
+            files=jsonl_files,
+            target_db=args.target_db,
+            namespace=args.namespace or "openclaw-jsonl",
+            agent=args.agent,
+            import_id=args.import_id or _default_jsonl_import_id(jsonl_sources),
+            apply=args.apply,
+        )
+    else:
+        result = import_lossless_claw(
+            source_db=args.source_db,
+            target_db=args.target_db,
+            namespace=args.namespace or "openclaw-lcm",
+            agent=args.agent,
+            import_id=args.import_id,
+            session_identity=args.session_identity,
+            include_summaries=args.include_summaries,
+            apply=args.apply,
+        )
     if args.json:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     else:
         mode = "apply" if args.apply else "dry-run"
-        print(f"lossless-claw import {mode}")
+        source_kind = "jsonl" if jsonl_requested else "lossless-claw"
+        print(f"{source_kind} import {mode}")
         print(f"  source_db: {result.source_db}")
         print(f"  target_db: {result.target_db}")
         print(f"  import_id: {result.import_id}")
@@ -1186,6 +2142,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  imported: {result.imported}")
         print(f"  skipped_existing: {result.skipped_existing}")
         print(f"  skipped_empty: {result.skipped_empty}")
+        if result.invalid_rows:
+            print(f"  invalid_rows: {result.invalid_rows}")
+        for warning in result.warnings:
+            print(f"  warning: {warning}")
         if args.include_summaries:
             print(f"  summaries_scanned: {result.summaries_scanned}")
             print(f"  summaries_would_import: {result.summaries_would_import}")
