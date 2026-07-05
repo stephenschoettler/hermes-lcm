@@ -1099,7 +1099,7 @@ def test_jsonl_import_reports_non_string_type_rows_without_aborting(tmp_path: Pa
     )
 
     assert result.scanned == 3
-    assert result.eligible == 2
+    assert result.eligible == 1
     assert result.imported == 2
     assert result.invalid_rows == 1
     assert result.skipped_empty == 0
@@ -1137,6 +1137,25 @@ def test_jsonl_import_wrapped_metadata_message_does_not_drive_leaf_pruning(tmp_p
     rows = conn.execute("SELECT role, content FROM messages ORDER BY store_id").fetchall()
     conn.close()
     assert rows == [("user", "root"), ("assistant", "current")]
+
+
+def test_jsonl_parser_prefers_top_level_bare_content_over_nested_message_metadata(tmp_path: Path):
+    importer = load_importer_module()
+    row = {
+        "id": "bare",
+        "parentId": "root",
+        "role": "assistant",
+        "content": "visible top-level transcript",
+        "message": {"summary": "auxiliary metadata only"},
+    }
+
+    message = importer._jsonl_row_message(row)
+
+    assert message is row
+    assert importer._jsonl_message_field(message, "role") == "assistant"
+    assert importer._jsonl_message_field(message, "content") == "visible top-level transcript"
+    assert not importer._jsonl_wrapped_metadata_message(row, message)
+    assert importer._jsonl_valid_importable_row(row)
 
 
 def test_jsonl_import_untyped_envelope_metadata_without_content_does_not_drive_leaf_pruning(tmp_path: Path):
@@ -5011,9 +5030,9 @@ def test_jsonl_import_preserves_bare_generic_tool_role_without_call_id(tmp_path:
         files=[session_file], target_db=target_db, import_id="bare-legacy-tool-role", apply=True
     )
 
-    assert result.scanned == 1
-    assert result.eligible == 1
-    assert result.imported == 1
+    assert result.scanned == 2
+    assert result.eligible == 2
+    assert result.imported == 2
     assert result.invalid_rows == 0
     conn = sqlite3.connect(target_db)
     rows = conn.execute(
@@ -5046,9 +5065,9 @@ def test_jsonl_import_preserves_wrapped_generic_tool_role_without_call_id(tmp_pa
         files=[session_file], target_db=target_db, import_id="wrapped-legacy-tool-role", apply=True
     )
 
-    assert result.scanned == 1
-    assert result.eligible == 1
-    assert result.imported == 1
+    assert result.scanned == 2
+    assert result.eligible == 2
+    assert result.imported == 2
     assert result.invalid_rows == 0
     conn = sqlite3.connect(target_db)
     rows = conn.execute(

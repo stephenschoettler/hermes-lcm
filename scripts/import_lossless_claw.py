@@ -1908,6 +1908,8 @@ def _jsonl_valid_importable_row(row: dict[str, Any]) -> bool:
 
 
 def _jsonl_row_message(row: dict[str, Any]) -> dict[str, Any]:
+    if "role" in row or "content" in row:
+        return row
     raw_message = row.get("message")
     return raw_message if isinstance(raw_message, dict) else row
 
@@ -2823,7 +2825,10 @@ def _collect_jsonl_candidates(
                 elif "role" in row or "content" in row:
                     wrapped_message = row
             elif row_type is None and isinstance(row.get("message"), dict):
-                wrapped_message = row["message"]
+                if "role" in row or "content" in row:
+                    wrapped_message = row
+                else:
+                    wrapped_message = row["message"]
 
             wrapped_effective_row_type = (
                 _jsonl_effective_row_type(row, wrapped_message)
