@@ -34,6 +34,7 @@ from .escalation import (
 )
 from .externalize import (
     build_transcript_gc_placeholder,
+    externalized_tool_result_has_persisted_output_marker,
     extract_externalized_ref,
     find_externalized_payload_for_message,
     find_externalized_tool_result_content_for_call,
@@ -48,9 +49,16 @@ from .extraction import (
     strip_injected_context_blocks,
 )
 from .ingest_protection import (
+    _add_inline_persisted_output_generation_metadata,
+    _add_inline_persisted_output_identity_metadata,
     _expected_persisted_output_chars,
+    _has_inline_persisted_output_generation_metadata,
+    _has_lossy_sensitive_redaction,
+    _inline_persisted_output_generation_metadata,
     _is_hermes_persisted_output_marker,
     _json_has_duplicate_object_keys,
+    _persisted_output_inline_preview_sha256,
+    _persisted_output_marker_identity_digest,
     _persisted_output_preview_prefix_digest,
     _persisted_output_saved_path,
     assistant_output_quarantine_reason,
@@ -60,6 +68,7 @@ from .ingest_protection import (
     protect_messages_for_ingest,
     quarantine_suspicious_assistant_messages,
     recover_hermes_persisted_output,
+    recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_text,
     redact_sensitive_value,
     restore_ingest_payload_placeholders,
@@ -476,6 +485,13 @@ class LCMEngine(ContextEngine):
             self._config.ignore_message_patterns
         )
         self._ignored_message_count: int = 0
+        # Raw messages permanently dropped because they matched
+        # ignore_message_patterns. These are NOT persisted anywhere, so an
+        # over-broad operator pattern silently discards substantive turns from
+        # the "lossless" store. Count + log them so the loss is at least
+        # visible; full lossless retention (store with ignored=1) is a larger
+        # follow-up that touches cursor reconciliation and FTS.
+        self._ignore_pattern_dropped_count: int = 0
 
         # Track which store_ids have been ingested into the DAG
         self._last_compacted_store_id: int = 0
@@ -554,6 +570,16 @@ class LCMEngine(ContextEngine):
         self._last_condensation_suppressed_reason = ""
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        # Ingest-failure tracking. The core promise is that nothing is ever
+        # lost, but a swallowed persistence error (disk full, DB locked,
+        # corruption) silently breaks it: the turn continues while messages
+        # exist only in the volatile host list. Surface it instead of hiding
+        # it in a debug log so get_status()/doctor can escalate. Store-scoped,
+        # not session-scoped, so it is not cleared on session reset.
+        self._ingest_failure_count = 0
+        self._consecutive_ingest_failures = 0
+        self._last_ingest_error = ""
+        self._last_ingest_error_time: float = 0
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
@@ -1008,6 +1034,31 @@ class LCMEngine(ContextEngine):
         self._last_boundary_skip_time = 0
         return False
 
+    def _record_ingest_success(self) -> None:
+        self._consecutive_ingest_failures = 0
+
+    def _record_ingest_failure(self, where: str, error: Exception) -> None:
+        """Track a swallowed ingest error so it is operator-visible.
+
+        Escalates to error level once failures are consecutive: a single
+        transient lock is a warning, but a sustained inability to persist
+        means the lossless guarantee is broken and must not stay hidden.
+        """
+        self._ingest_failure_count += 1
+        self._consecutive_ingest_failures += 1
+        self._last_ingest_error = f"{type(error).__name__}: {error}"
+        self._last_ingest_error_time = time.time()
+        message = "LCM ingest failed (%s): %s [consecutive=%d, total=%d]"
+        args = (
+            where,
+            error,
+            self._consecutive_ingest_failures,
+            self._ingest_failure_count,
+        )
+        if self._consecutive_ingest_failures >= 3:
+            logger.error(message, *args)
+        else:
+            logger.warning(message, *args)
     def _bypasses_lcm_context_management(self) -> bool:
         """Return True when this binding must not write/manage LCM state.
 
@@ -1508,12 +1559,13 @@ class LCMEngine(ContextEngine):
                     conversation_id=self._conversation_id,
                 )
                 self._ingest_messages(messages)
+                self._record_ingest_success()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
                 )
             except Exception as e:
-                logger.warning("Ingest during per-turn ingest(): %s", e)
+                self._record_ingest_failure("per-turn ingest()", e)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._bypasses_lcm_context_management():
@@ -1566,8 +1618,18 @@ class LCMEngine(ContextEngine):
         if self._session_id and messages:
             try:
                 replay_messages = self._ingest_messages(messages)
+                self._record_ingest_success()
             except Exception as e:
-                logger.warning("Ingest during preflight: %s", e)
+                # Fail closed for NORMAL threshold compaction: the store did not
+                # accept this turn, so do not compact against a store missing the
+                # latest messages - that could rebuild active context without
+                # them. But still honor emergency overflow recovery, whose whole
+                # job is to keep the prompt under the provider limit; it converges
+                # via deterministic L3 truncation without needing the store write.
+                self._record_ingest_failure("preflight", e)
+                if self._should_force_overflow_recovery(observed_tokens=rough):
+                    return True
+                return False
         if replay_messages is not None and replay_messages != messages:
             if self._compression_boundary_cooldown_active():
                 return False
@@ -4248,8 +4310,9 @@ class LCMEngine(ContextEngine):
         ):
             try:
                 self._ingest_messages(messages)
+                self._record_ingest_success()
             except Exception as e:
-                logger.warning("Ingest during tool call failed: %s", e)
+                self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
@@ -4345,6 +4408,10 @@ class LCMEngine(ContextEngine):
             "threshold_tokens": self.threshold_tokens,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
+            "ingest_failure_count": self._ingest_failure_count,
+            "consecutive_ingest_failures": self._consecutive_ingest_failures,
+            "last_ingest_error": self._last_ingest_error,
+            "last_ingest_error_time": self._last_ingest_error_time,
             "model": self.model,
             "provider": self.provider,
             "context_length_source": self._context_length_source,
@@ -4405,6 +4472,7 @@ class LCMEngine(ContextEngine):
             status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
             status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
             status["ignored_message_count"] = self._ignored_message_count
+            status["ignore_pattern_dropped_count"] = self._ignore_pattern_dropped_count
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
             status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
@@ -5449,6 +5517,40 @@ class LCMEngine(ContextEngine):
             session_id=session_id,
         )
 
+    def _recovered_content_matches_durable_identity(self, recovered_content: str, durable_content: str) -> bool:
+        recovered_identity_content = normalize_content_value(
+            redact_sensitive_value(
+                recovered_content,
+                self._config,
+                parse_json_strings=False,
+            )
+        )
+        if recovered_identity_content == durable_content:
+            return True
+        redaction_names = sorted(set(re.findall(r"\[LCM sensitive redaction: name=([^;\]]+)", durable_content)))
+        if not redaction_names or bool(getattr(self._config, "sensitive_patterns_enabled", False)):
+            return False
+        compat_config = copy.copy(self._config)
+        compat_config.sensitive_patterns_enabled = True
+        compat_config.sensitive_patterns = redaction_names
+        compat_identity_content = normalize_content_value(
+            redact_sensitive_value(
+                recovered_content,
+                compat_config,
+                parse_json_strings=False,
+            )
+        )
+        return compat_identity_content == durable_content
+
+    @staticmethod
+    def _persisted_output_marker_replay_proof(content: str) -> tuple[str | None, bool]:
+        inline_preview_sha256 = _persisted_output_inline_preview_sha256(content)
+        preview_sha256 = inline_preview_sha256 or _persisted_output_preview_prefix_digest(content)
+        if not preview_sha256:
+            return None, False
+        allow_redacted_preview_match = inline_preview_sha256 is None and not _has_lossy_sensitive_redaction(content)
+        return preview_sha256, allow_redacted_preview_match
+
     def _has_durable_persisted_output_replay_identity(self, msg: Dict[str, Any]) -> bool:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
@@ -5456,12 +5558,47 @@ class LCMEngine(ContextEngine):
             return False
         expected_chars = _expected_persisted_output_chars(content)
         persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
+        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
         if (
             expected_chars is None
             or not persisted_output_source_path
             or not persisted_output_preview_sha256
         ):
+            return False
+        recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content)
+        if recovered_with_stat is None:
+            return False
+        require_live_file_freshness = True
+        durable_content = find_externalized_tool_result_content_for_call(
+            tool_call_id=str(msg.get("tool_call_id") or ""),
+            session_id=str(msg.get("session_id") or self._session_id or ""),
+            expected_chars=expected_chars,
+            persisted_output_source_path=persisted_output_source_path,
+            persisted_output_preview_sha256=persisted_output_preview_sha256,
+            require_persisted_output_file_not_newer=require_live_file_freshness,
+            allow_redacted_preview_match=allow_redacted_preview_match,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+        if durable_content is None:
+            return False
+        if recovered_with_stat is not None:
+            recovered_content, _file_stat = recovered_with_stat
+            if not self._recovered_content_matches_durable_identity(recovered_content, durable_content):
+                return False
+        return True
+
+    def _has_any_durable_persisted_output_payload_for_marker(self, msg: Dict[str, Any]) -> bool:
+        role = str(msg.get("role") or "unknown")
+        content = normalize_content_value(msg.get("content")) or ""
+        if role != "tool" or not _is_hermes_persisted_output_marker(content):
+            return False
+        expected_chars = _expected_persisted_output_chars(content)
+        persisted_output_source_path = _persisted_output_saved_path(content)
+        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
+        if expected_chars is None or not persisted_output_source_path or not persisted_output_preview_sha256:
+            return False
+        if recover_hermes_persisted_output_with_file_stat(content) is None:
             return False
         durable_content = find_externalized_tool_result_content_for_call(
             tool_call_id=str(msg.get("tool_call_id") or ""),
@@ -5469,6 +5606,7 @@ class LCMEngine(ContextEngine):
             expected_chars=expected_chars,
             persisted_output_source_path=persisted_output_source_path,
             persisted_output_preview_sha256=persisted_output_preview_sha256,
+            allow_redacted_preview_match=allow_redacted_preview_match,
             config=self._config,
             hermes_home=self._hermes_home,
         )
@@ -5477,16 +5615,50 @@ class LCMEngine(ContextEngine):
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
-        if role == "tool" and _is_hermes_persisted_output_marker(content):
+        if (
+            role == "tool"
+            and _is_hermes_persisted_output_marker(content)
+            and bool(getattr(self._config, "large_output_externalization_enabled", True))
+        ):
             expected_chars = _expected_persisted_output_chars(content)
             persisted_output_source_path = _persisted_output_saved_path(content)
-            persisted_output_preview_sha256 = _persisted_output_preview_prefix_digest(content)
+            persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
             durable_content = None
+            recovered_with_stat = recover_hermes_persisted_output_with_file_stat(content) if not stored_row else None
+            recovered_content = recovered_with_stat[0] if recovered_with_stat is not None else None
+            recovered_identity_content = None
+            if recovered_content is not None:
+                recovered_identity_content = normalize_content_value(
+                    redact_sensitive_value(
+                        recovered_content,
+                        self._config,
+                        parse_json_strings=False,
+                    )
+                )
+            require_live_file_freshness = recovered_with_stat is not None
+
+            def live_file_generation_identity() -> str:
+                try:
+                    live_stat = Path(str(persisted_output_source_path)).stat()
+                    return (
+                        "[LCM persisted-output live file: "
+                        f"path={persisted_output_source_path}; "
+                        f"mtime_ns={live_stat.st_mtime_ns}; "
+                        f"chars={expected_chars}]"
+                    )
+                except OSError:
+                    return (
+                        "[LCM persisted-output live file: "
+                        f"path={persisted_output_source_path}; "
+                        f"chars={expected_chars}]"
+                    )
+
             if (
                 not stored_row
                 and expected_chars is not None
                 and persisted_output_source_path
                 and persisted_output_preview_sha256
+                and recovered_with_stat is not None
             ):
                 durable_content = find_externalized_tool_result_content_for_call(
                     tool_call_id=str(msg.get("tool_call_id") or ""),
@@ -5494,21 +5666,45 @@ class LCMEngine(ContextEngine):
                     expected_chars=expected_chars,
                     persisted_output_source_path=persisted_output_source_path,
                     persisted_output_preview_sha256=persisted_output_preview_sha256,
+                    require_persisted_output_file_not_newer=require_live_file_freshness,
+                    allow_redacted_preview_match=allow_redacted_preview_match,
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
-            if durable_content is not None:
+            if durable_content is not None and (
+                recovered_content is None or self._recovered_content_matches_durable_identity(recovered_content, durable_content)
+            ):
                 content = durable_content
-            else:
-                recovered_content = recover_hermes_persisted_output(content)
-                if recovered_content is not None:
-                    content = normalize_content_value(
-                        redact_sensitive_value(
-                            recovered_content,
-                            self._config,
-                            parse_json_strings=False,
-                        )
-                    ) or ""
+            elif recovered_content is not None:
+                stale_durable_content = find_externalized_tool_result_content_for_call(
+                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    session_id=str(msg.get("session_id") or self._session_id or ""),
+                    expected_chars=expected_chars,
+                    persisted_output_source_path=persisted_output_source_path,
+                    persisted_output_preview_sha256=persisted_output_preview_sha256,
+                    allow_redacted_preview_match=allow_redacted_preview_match,
+                    config=self._config,
+                    hermes_home=self._hermes_home,
+                )
+                if (
+                    stale_durable_content is not None
+                    and self._recovered_content_matches_durable_identity(recovered_content, stale_durable_content)
+                    and not _has_lossy_sensitive_redaction(stale_durable_content)
+                    and not _has_lossy_sensitive_redaction(recovered_identity_content)
+                ):
+                    content = stale_durable_content
+                elif stale_durable_content is not None:
+                    content = live_file_generation_identity()
+                elif recovered_with_stat is not None:
+                    content = _add_inline_persisted_output_generation_metadata(
+                        _add_inline_persisted_output_identity_metadata(
+                            content,
+                            _persisted_output_marker_identity_digest(content),
+                        ),
+                        recovered_with_stat[1],
+                    )
+                elif recovered_identity_content is not None:
+                    content = recovered_identity_content
         tool_calls = msg.get("tool_calls")
         if stored_row:
             session_id = str(msg.get("session_id") or self._session_id or "")
@@ -5544,6 +5740,80 @@ class LCMEngine(ContextEngine):
         if len(candidate_prefix) > len(stored_tail):
             return False
         return stored_tail[-len(candidate_prefix) :] == candidate_prefix
+
+    @staticmethod
+    def _strip_inline_persisted_output_generation_identity(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        role, content, tool_call_id, tool_calls = identity
+        if role != "tool" or not isinstance(content, str):
+            return identity
+        stripped = re.sub(
+            r"\n?\[LCM persisted-output file generation: "
+            r"size=\d+; mtime_ns=\d+; ctime_ns=\d+\]\n?(?=</persisted-output>)",
+            "\n",
+            content,
+        )
+        return (role, stripped, tool_call_id, tool_calls)
+
+    def _stored_row_has_durable_persisted_output_marker(self, row: Dict[str, Any]) -> bool:
+        if str(row.get("role") or "") != "tool":
+            return False
+        content = normalize_content_value(row.get("content")) or ""
+        ref = extract_externalized_ref(content)
+        if not ref:
+            return False
+        return externalized_tool_result_has_persisted_output_marker(
+            ref,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
+    @staticmethod
+    def _persisted_output_durable_wildcard_identity(
+        identity: tuple[str, str, str, str],
+    ) -> tuple[str, str, str, str]:
+        role, _content, tool_call_id, tool_calls = identity
+        return (role, "[LCM persisted-output durable replay]", tool_call_id, tool_calls)
+
+    def _matches_persisted_output_durable_full_replay(
+        self,
+        candidate_messages: list[Dict[str, Any]],
+        candidate_prefix: list[tuple[str, str, str, str]],
+        stored_tail: list[tuple[str, str, str, str]],
+        stored_tail_rows: list[Dict[str, Any]] | None,
+    ) -> bool:
+        if not stored_tail_rows or len(candidate_prefix) != len(stored_tail) or len(candidate_messages) != len(candidate_prefix):
+            return False
+        transformed_candidate: list[tuple[str, str, str, str]] = []
+        transformed_stored: list[tuple[str, str, str, str]] = []
+        saw_persisted_output = False
+        for candidate_msg, candidate_identity, stored_identity, stored_row in zip(
+            candidate_messages,
+            candidate_prefix,
+            stored_tail,
+            stored_tail_rows,
+        ):
+            candidate_content = normalize_content_value(candidate_msg.get("content")) or ""
+            candidate_is_persisted_marker = (
+                str(candidate_msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(candidate_content)
+            )
+            stored_is_persisted_output = self._stored_row_has_durable_persisted_output_marker(stored_row)
+            if candidate_is_persisted_marker or stored_is_persisted_output:
+                if (
+                    not candidate_is_persisted_marker
+                    or not stored_is_persisted_output
+                    or not self._has_durable_persisted_output_replay_identity(candidate_msg)
+                ):
+                    return False
+                saw_persisted_output = True
+                transformed_candidate.append(self._persisted_output_durable_wildcard_identity(candidate_identity))
+                transformed_stored.append(self._persisted_output_durable_wildcard_identity(stored_identity))
+                continue
+            transformed_candidate.append(candidate_identity)
+            transformed_stored.append(stored_identity)
+        return saw_persisted_output and transformed_candidate == transformed_stored
 
     @classmethod
     def _identity_content_for_active_cleanup(cls, content: str) -> Any:
@@ -5668,6 +5938,7 @@ class LCMEngine(ContextEngine):
         messages: List[Dict[str, Any]],
         stored_tail: list[tuple[str, str, str, str]],
         *,
+        stored_tail_rows: list[Dict[str, Any]] | None = None,
         allow_empty_prefix: bool,
         session_count: int,
         raw_session_count: int,
@@ -5750,14 +6021,62 @@ class LCMEngine(ContextEngine):
                 and bool(candidate_visible_prefix)
                 and self._matches_store_tail_suffix(stored_tail, candidate_visible_prefix)
             )
-            if matches_visible_sanitized_tail or matches_visible_raw_tail:
+            early_candidate_has_unrecoverable_persisted_marker = any(
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                and recover_hermes_persisted_output_with_file_stat(
+                    normalize_content_value(msg.get("content")) or ""
+                )
+                is None
+                for msg in candidate_identity_messages
+            )
+            if (matches_visible_sanitized_tail or matches_visible_raw_tail) and not early_candidate_has_unrecoverable_persisted_marker:
                 return cursor
+            candidate_has_persisted_marker = any(
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                for msg in candidate_identity_messages
+            )
+            matches_durable_persisted_output_full_replay = self._matches_persisted_output_durable_full_replay(
+                candidate_identity_messages,
+                candidate_prefix,
+                stored_tail,
+                stored_tail_rows,
+            )
+            candidate_has_unrecoverable_persisted_marker = any(
+                str(msg.get("role") or "") == "tool"
+                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                and recover_hermes_persisted_output_with_file_stat(
+                    normalize_content_value(msg.get("content")) or ""
+                )
+                is None
+                for msg in candidate_identity_messages
+            )
+            matches_inline_generation_cleanup_tail = False
+            if candidate_has_unrecoverable_persisted_marker:
+                generationless_sanitized_tail = [
+                    self._strip_inline_persisted_output_generation_identity(identity)
+                    for identity in sanitized_replay_tail
+                ]
+                generationless_candidate_prefix = [
+                    self._strip_inline_persisted_output_generation_identity(identity)
+                    for identity in candidate_prefix
+                ]
+                matches_inline_generation_cleanup_tail = self._matches_store_tail_suffix(
+                    generationless_sanitized_tail,
+                    generationless_candidate_prefix,
+                )
             raw_tail_suffix = stored_tail[-len(candidate_prefix) :] if matches_raw_tail else []
             raw_suffix_needs_cleanup_equivalence = any(
                 self._active_cleanup_replay_identity(identity) != identity
                 for identity in raw_tail_suffix
             )
-            if not matches_sanitized_tail and not matches_raw_tail:
+            if (
+                not matches_sanitized_tail
+                and not matches_raw_tail
+                and not matches_inline_generation_cleanup_tail
+                and not matches_durable_persisted_output_full_replay
+            ):
                 continue
 
             # Matching a stored suffix is not enough evidence by itself.  A
@@ -5810,11 +6129,21 @@ class LCMEngine(ContextEngine):
             )
             has_persisted_marker_singleton_replay = (
                 matches_raw_tail
+                and not candidate_has_unrecoverable_persisted_marker
                 and len(candidate_prefix) == 1
                 and raw_session_count == 1
                 and candidate_prefix == stored_tail
                 and candidate_prefix[0][0] == "tool"
                 and _is_hermes_persisted_output_marker(candidate_singleton_original_content)
+            )
+            has_durable_persisted_marker_suffix_replay = (
+                (matches_sanitized_tail or matches_raw_tail)
+                and any(
+                    str(msg.get("role") or "") == "tool"
+                    and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                    and self._has_durable_persisted_output_replay_identity(msg)
+                    for msg in candidate_messages
+                )
             )
             has_filtered_full_replay = (
                 matches_sanitized_tail
@@ -5822,17 +6151,56 @@ class LCMEngine(ContextEngine):
                 and len(candidate_prefix) >= effective_session_count
                 and effective_session_count > 0
             )
-            has_effective_full_replay = matches_sanitized_tail and len(candidate_prefix) >= effective_session_count and (
-                candidate_has_system
-                or (effective_session_count > 1 and not sanitized_tail_collapsed)
-                or has_quarantined_singleton_replay
-                or has_filtered_full_replay
+            has_inline_generation_cleanup_replay = (
+                matches_inline_generation_cleanup_tail
+                and candidate_has_unrecoverable_persisted_marker
+                and len(candidate_prefix) >= effective_session_count
+                and effective_session_count > 0
             )
+            has_inline_persisted_generation_suffix_replay = (
+                matches_sanitized_tail
+                and any(
+                    str(msg.get("role") or "") == "tool"
+                    and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+                    and _has_inline_persisted_output_generation_metadata(normalize_content_value(msg.get("content")) or "")
+                    for msg in candidate_identity_messages
+                )
+            )
+            if candidate_has_unrecoverable_persisted_marker:
+                continue
+            has_raw_persisted_marker_exact_replay = (
+                candidate_has_persisted_marker
+                and not candidate_has_unrecoverable_persisted_marker
+                and matches_raw_tail
+                and candidate_prefix == stored_tail[-len(candidate_prefix) :]
+            )
+            has_persisted_marker_specific_replay_evidence = (
+                not candidate_has_persisted_marker
+                or has_durable_persisted_marker_suffix_replay
+                or matches_durable_persisted_output_full_replay
+                or has_inline_generation_cleanup_replay
+                or has_inline_persisted_generation_suffix_replay
+                or has_persisted_marker_singleton_replay
+                or has_raw_persisted_marker_exact_replay
+            )
+            has_effective_full_replay = (
+                has_persisted_marker_specific_replay_evidence
+                and matches_sanitized_tail
+                and len(candidate_prefix) >= effective_session_count
+                and (
+                    candidate_has_system
+                    or (effective_session_count > 1 and not sanitized_tail_collapsed)
+                    or has_quarantined_singleton_replay
+                    or has_filtered_full_replay
+                )
+            )
+
             has_scaffold_evidence = any(
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
             has_raw_full_replay = (
-                matches_raw_tail
+                has_persisted_marker_specific_replay_evidence
+                and matches_raw_tail
                 and not has_scaffold_evidence
                 and len(candidate_messages) >= raw_session_count
                 and raw_session_count > 1
@@ -5846,12 +6214,14 @@ class LCMEngine(ContextEngine):
             )
             candidate_suffix_has_user_turn = any(identity[0] == "user" for identity in candidate_prefix)
             has_scaffold_suffix_replay = (
-                matches_sanitized_tail
+                has_persisted_marker_specific_replay_evidence
+                and matches_sanitized_tail
                 and has_preserved_objective_scaffold
                 and not candidate_suffix_has_user_turn
             )
             has_raw_cleanup_replay = (
-                matches_raw_tail
+                has_persisted_marker_specific_replay_evidence
+                and matches_raw_tail
                 and has_scaffold_evidence
                 and cursor < len(messages)
                 and len(candidate_prefix) >= max(1, self._config.fresh_tail_count)
@@ -5861,6 +6231,10 @@ class LCMEngine(ContextEngine):
                 has_effective_full_replay
                 or has_externalized_singleton_replay
                 or has_persisted_marker_singleton_replay
+                or has_durable_persisted_marker_suffix_replay
+                or matches_durable_persisted_output_full_replay
+                or has_inline_generation_cleanup_replay
+                or has_inline_persisted_generation_suffix_replay
                 or has_raw_full_replay
                 or has_scaffold_suffix_replay
                 or has_raw_cleanup_replay
@@ -5972,14 +6346,19 @@ class LCMEngine(ContextEngine):
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
             return 0
-        stored_tail = [
-            self._message_replay_identity(row, stored_row=True)
+        stored_tail_rows = [
+            row
             for row in stored_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
+        ]
+        stored_tail = [
+            self._message_replay_identity(row, stored_row=True)
+            for row in stored_tail_rows
         ]
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
+            stored_tail_rows=stored_tail_rows,
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
@@ -6019,10 +6398,22 @@ class LCMEngine(ContextEngine):
         # Stale-snapshot proof uses the raw durable prefix.  Ignore-message
         # filters may suppress noisy rows for tail reconciliation, but filtered
         # history alone must not create replay evidence for skipping a batch.
-        if self._is_suspicious_stale_no_overlap_snapshot(
-            incoming_identities,
-            stored_tail,
-            stored_head,
+        incoming_has_unproofed_raw_persisted_marker = any(
+            str(msg.get("role") or "") == "tool"
+            and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
+            and recover_hermes_persisted_output_with_file_stat(
+                normalize_content_value(msg.get("content")) or ""
+            )
+            is None
+            for msg in messages
+        )
+        if (
+            not incoming_has_unproofed_raw_persisted_marker
+            and self._is_suspicious_stale_no_overlap_snapshot(
+                incoming_identities,
+                stored_tail,
+                stored_head,
+            )
         ):
             self._record_ingest_reconciliation(
                 action="skipped batch",
@@ -6064,11 +6455,14 @@ class LCMEngine(ContextEngine):
         for message in messages:
             redacted_message = dict(message)
             if "content" in redacted_message:
-                redacted_message["content"] = redact_sensitive_value(
+                original_content = normalize_content_value(redacted_message.get("content")) or ""
+                redacted_content = redact_sensitive_value(
                     redacted_message.get("content"),
                     self._config,
                     parse_json_strings=False,
                 )
+                redacted_message["content"] = redacted_content
+
             if "tool_calls" in redacted_message:
                 redacted_message["tool_calls"] = redact_sensitive_value(
                     redacted_message.get("tool_calls"),
@@ -6148,7 +6542,10 @@ class LCMEngine(ContextEngine):
                 if (
                     (
                         str(original_msg.get("role") or "") == "tool"
-                        and self._has_durable_persisted_output_replay_identity(original_msg)
+                        and _is_hermes_persisted_output_marker(
+                            normalize_content_value(original_msg.get("content")) or ""
+                        )
+                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
                     )
                     or (
                         self._compiled_ignore_message_patterns
@@ -6387,11 +6784,25 @@ class LCMEngine(ContextEngine):
                         active_message["content"] = self._ignored_active_replay_placeholder(original_text)
                         active_replay_messages[absolute_idx] = active_message
                     excerpt = original_text[:80].replace("\n", " ")
-                    logger.debug(
-                        "LCM ignore_message_patterns dropped %s message: %r",
-                        original_msg.get("role", "unknown"),
-                        excerpt,
-                    )
+                    if ignored_original_messages[absolute_idx]:
+                        # A raw message matched ignore_message_patterns and is
+                        # discarded here - never persisted anywhere. Count and
+                        # log it (INFO) so an over-broad pattern silently eating
+                        # substantive turns is at least visible to the operator.
+                        self._ignore_pattern_dropped_count += 1
+                        logger.info(
+                            "LCM ignore_message_patterns dropped %s message "
+                            "(not persisted; total dropped=%d): %r",
+                            original_msg.get("role", "unknown"),
+                            self._ignore_pattern_dropped_count,
+                            excerpt,
+                        )
+                    else:
+                        logger.debug(
+                            "LCM ignore_message_patterns dropped %s message: %r",
+                            original_msg.get("role", "unknown"),
+                            excerpt,
+                        )
                     continue
                 store_msg = replay_msg
                 if (
@@ -6734,7 +7145,13 @@ class LCMEngine(ContextEngine):
             if not content:
                 continue
 
-            ref = extract_externalized_ref(content)
+            # Only take the fast ref-branch when the ENTIRE row is the
+            # externalized placeholder. A ref merely embedded in surrounding
+            # text (e.g. a recall-tool result that quotes a placeholder) must
+            # fall through to the content-equality lookup below, which tombstones
+            # only when the full row content matches the stored payload -
+            # otherwise the surrounding, never-externalized text is lost.
+            ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
             if ref:
                 externalized = load_externalized_payload(
                     ref,

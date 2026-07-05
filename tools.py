@@ -2473,6 +2473,41 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "detail": str(e),
         })
 
+    # Ingest health: a swallowed persistence error means turns were not
+    # durably stored, silently breaking the lossless guarantee. Surface it.
+    ingest_failures = int(getattr(engine, "_ingest_failure_count", 0) or 0)
+    consecutive_failures = int(getattr(engine, "_consecutive_ingest_failures", 0) or 0)
+    if consecutive_failures > 0:
+        ingest_status = "fail"
+    elif ingest_failures > 0:
+        ingest_status = "warn"
+    else:
+        ingest_status = "pass"
+    checks.append({
+        "check": "ingest_health",
+        "status": ingest_status,
+        "detail": {
+            "total_failures": ingest_failures,
+            "consecutive_failures": consecutive_failures,
+            "last_error": getattr(engine, "_last_ingest_error", "") or "",
+            "last_error_time": getattr(engine, "_last_ingest_error_time", 0) or 0,
+        } if ingest_failures else "no ingest failures recorded",
+    })
+
+    # ignore_message_patterns drops discard raw content that is never persisted.
+    # A non-zero count is worth surfacing so an over-broad pattern is noticed.
+    dropped = int(getattr(engine, "_ignore_pattern_dropped_count", 0) or 0)
+    checks.append({
+        "check": "ignore_pattern_drops",
+        "status": "warn" if dropped else "pass",
+        "detail": (
+            f"{dropped} message(s) dropped by ignore_message_patterns and not "
+            "persisted; verify the pattern is not matching substantive turns"
+            if dropped
+            else "no messages dropped by ignore_message_patterns"
+        ),
+    })
+
     try:
         conn = engine._store._conn
         if conn is None:

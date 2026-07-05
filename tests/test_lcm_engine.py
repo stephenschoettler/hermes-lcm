@@ -4505,6 +4505,64 @@ class TestEngineABC:
         assert "store_messages" in status
         assert "dag_nodes" in status
 
+    def test_ingest_failure_is_surfaced_in_status_and_not_swallowed(self, engine):
+        def boom(_messages):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        engine._ingest_messages = boom
+        msgs = [{"role": "user", "content": "turn that cannot be persisted"}]
+
+        engine.ingest(msgs)
+        status = engine.get_status()
+        assert status["ingest_failure_count"] == 1
+        assert status["consecutive_ingest_failures"] == 1
+        assert "OperationalError" in status["last_ingest_error"]
+
+        engine.threshold_tokens = 1
+        assert engine.should_compress_preflight(msgs) is False
+        status = engine.get_status()
+        assert status["ingest_failure_count"] == 2
+        assert status["consecutive_ingest_failures"] == 2
+
+        del engine._ingest_messages
+        engine.ingest(msgs)
+        status = engine.get_status()
+        assert status["consecutive_ingest_failures"] == 0
+        assert status["ingest_failure_count"] == 2
+
+    def test_preflight_ingest_failure_still_allows_emergency_overflow_recovery(self, engine):
+        # Fail-closed defers NORMAL compaction on ingest failure, but emergency
+        # overflow recovery (which keeps the prompt under the provider limit and
+        # converges via deterministic L3) must still be requested.
+        def boom(_messages):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        engine._ingest_messages = boom
+        engine._should_force_overflow_recovery = lambda **kwargs: True
+
+        assert engine.should_compress_preflight(
+            [{"role": "user", "content": "over-limit turn"}]
+        ) is True
+
+    def test_tool_call_ingest_failure_is_surfaced_in_status(self, engine):
+        engine.on_session_start("live-search-failure", platform="telegram", context_length=200000)
+
+        def boom(_messages):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        engine._ingest_messages = boom
+
+        engine.handle_tool_call(
+            "lcm_status",
+            {},
+            messages=[{"role": "user", "content": "turn that cannot be persisted"}],
+        )
+
+        status = engine.get_status()
+        assert status["ingest_failure_count"] == 1
+        assert status["consecutive_ingest_failures"] == 1
+        assert "OperationalError" in status["last_ingest_error"]
+
     def test_placeholder_metadata_write_skips_when_unchanged(self, engine):
         conn = engine._store._conn
         if not engine._ignored_placeholder_count_metadata_keys():
@@ -21309,6 +21367,45 @@ class TestEngineTools:
         )
 
         assert engine._store.get(tool_store_id)["content"].startswith("[GC'd externalized tool output:")
+
+    def test_gc_does_not_tombstone_row_with_only_embedded_externalized_ref(self, tmp_path):
+        # Regression: a tool row that merely QUOTES an externalized placeholder
+        # inside surrounding text (e.g. a recall-tool result) must not have its
+        # whole content tombstoned - that would discard the surrounding text,
+        # which was never externalized and is unrecoverable.
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_gc_embed.db"),
+            large_output_externalization_enabled=True,
+            large_output_externalization_threshold_chars=200,
+            large_output_transcript_gc_enabled=True,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        big = "RESULT:\n" + ("abcdef" * 2000)
+        engine._ingest_messages([
+            {"role": "tool", "tool_call_id": "call_ext", "content": big},
+        ])
+        placeholder = next(
+            row for row in engine._store.get_range("test-session") if row["role"] == "tool"
+        )["content"]
+        assert placeholder.startswith("[Externalized tool output:")
+        assert "ref=" in placeholder
+
+        embedded = f"Here are the search results:\n{placeholder}\nEnd of results."
+        embed_store_id = engine._store.append(
+            "test-session",
+            {"role": "tool", "tool_call_id": "call_recall", "content": embedded},
+        )
+
+        engine._maybe_gc_compacted_tool_results(
+            [{"role": "tool", "tool_call_id": "call_recall", "content": embedded}],
+            [embed_store_id],
+        )
+
+        preserved = engine._store.get(embed_store_id)["content"]
+        assert preserved == embedded
+        assert not preserved.startswith("[GC'd externalized")
 
     def test_handle_expand_does_not_inline_full_externalized_payload_for_gc_rows(self, tmp_path, monkeypatch):
         config = LCMConfig(
