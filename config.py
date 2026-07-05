@@ -345,6 +345,13 @@ class LCMConfig:
     summary_circuit_breaker_failure_threshold: int = 2
     # Seconds to skip an open summary route before allowing a retry.
     summary_circuit_breaker_cooldown_seconds: int = 300
+    # Sliding-window cap for paid/auxiliary summarizer calls before falling
+    # back to deterministic L3 truncation. 0 disables the spend guard.
+    summary_spend_max_calls: int = 24
+    # Window, in seconds, over which summary spend calls are counted.
+    summary_spend_window_seconds: float = 600.0
+    # Backoff, in seconds, after the spend window is exhausted.
+    summary_spend_backoff_seconds: float = 1800.0
     expansion_model: str = ""     # empty = fall back to summary_model / Hermes auxiliary model
     # Serialized summary/raw/child-source/externalized context budget fed to lcm_expand_query's auxiliary LLM before it returns a bounded answer.
     expansion_context_tokens: int = 32_000
@@ -490,6 +497,21 @@ class LCMConfig:
             "LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS",
             c.summary_circuit_breaker_cooldown_seconds,
         )
+        c.summary_spend_max_calls, source, warning = _parse_int_env_with_source(
+            "LCM_SUMMARY_SPEND_MAX_CALLS",
+            c.summary_spend_max_calls,
+        )
+        _record("summary_spend_max_calls", source, warning)
+        c.summary_spend_window_seconds, source, warning = _parse_float_env_with_source(
+            "LCM_SUMMARY_SPEND_WINDOW_SECONDS",
+            c.summary_spend_window_seconds,
+        )
+        _record("summary_spend_window_seconds", source, warning)
+        c.summary_spend_backoff_seconds, source, warning = _parse_float_env_with_source(
+            "LCM_SUMMARY_SPEND_BACKOFF_SECONDS",
+            c.summary_spend_backoff_seconds,
+        )
+        _record("summary_spend_backoff_seconds", source, warning)
         c.expansion_model = _str("LCM_EXPANSION_MODEL", c.expansion_model)
         c.expansion_context_tokens = _int("LCM_EXPANSION_CONTEXT_TOKENS", c.expansion_context_tokens)
         summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(

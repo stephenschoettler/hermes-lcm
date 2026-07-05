@@ -86,20 +86,21 @@ Expected signals:
 
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
-- tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, and `lcm_doctor`
+- tool list includes `lcm_grep`, `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`, and `lcm_doctor`
 
 Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.18.1 (7 tools)
+  ✓ hermes-lcm v0.18.1 (8 tools)
 
 Provider Plugins:
   Context Engine: lcm
 ```
 
-For source checkouts, `lcm_status`, `/lcm status`, `lcm_doctor`, and
-`/lcm doctor` also report the loaded plugin path and best-effort git identity:
+For source checkouts, `lcm_status`, `/lcm status`, `lcm_inspect`,
+`lcm_doctor`, and `/lcm doctor` also report the loaded plugin path and
+best-effort git identity:
 `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`.
 
 ## Troubleshooting
@@ -119,8 +120,8 @@ LCM tools are still available through the context-engine schema/dispatch path
 registration (Path A) on those hosts because Path A would shadow Path B and lose
 current-turn ingest.
 
-Healthy signals are the same as above: selected context engine `lcm`, the seven
-`lcm_*` tools in the live tool list, and `lcm_status` / `lcm_doctor` responding
+Healthy signals are the same as above: selected context engine `lcm`, the eight
+`lcm_*` tools in the live tool list, and `lcm_status` / `lcm_inspect` / `lcm_doctor` responding
 after one normal message initializes the session.
 
 ### `/lcm status` looks unbound after restart
@@ -191,7 +192,7 @@ FTS shadow tables, DAG summaries, or externalized payload JSON that were written
 before the setting was enabled. Non-password placeholders include a short
 truncated SHA-256 digest for correlation. `password_assignment` placeholders omit
 the digest to avoid making password-like values easier to dictionary-check.
-`lcm_status` and `lcm_doctor` expose the enabled state, configured pattern names,
+`lcm_status`, `lcm_inspect`, and `lcm_doctor` expose the enabled state, configured pattern names,
 unknown names, source, and placeholder format without exposing raw secret values.
 
 ### Cache policy boundary
@@ -551,6 +552,60 @@ Re-running `/lcm rotate apply` on a session whose frontier is already at or
 ahead of the target boundary reports `status: noop` and is safe to retry.
 A no-op apply does not write a new rolling backup, so the previous
 known-good `*-rotate-latest.sqlite3` snapshot survives idempotent retries.
+
+## Import and backfill
+
+`scripts/import_lossless_claw.py` is the local, dry-run-by-default operator path
+for moving OpenClaw history into a Hermes-LCM `lcm.db`. It supports two source
+families:
+
+- `--source-db <path>`: import from an existing lossless-claw/OpenClaw SQLite
+  `lcm.db`. Use `--include-summaries` when you also want compatible source
+  summaries imported into Hermes `summary_nodes`.
+- `--source-jsonl <path>` / `--source-jsonl-dir <path>`: import OpenClaw JSONL
+  session exports when there is no source SQLite database, for example fresh
+  installs, plugin-off catch-up, or one-off session migrations. JSONL import is
+  raw-message-only because the session files do not contain a summary DAG.
+
+Examples:
+
+```bash
+# SQLite source, dry-run
+python scripts/import_lossless_claw.py \
+  --source-db ~/.openclaw/path/to/lcm.db \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --json
+
+# JSONL source directory, dry-run
+python scripts/import_lossless_claw.py \
+  --source-jsonl-dir ~/.openclaw/agents/sammy/sessions \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --json
+
+# Apply only after reviewing the report
+python scripts/import_lossless_claw.py \
+  --source-jsonl-dir ~/.openclaw/agents/sammy/sessions \
+  --target-db ~/.hermes/lcm.db \
+  --agent sammy \
+  --import-id sammy-jsonl-2026-07 \
+  --apply
+```
+
+Safety and reconciliation behavior:
+
+- dry-run is default; writes require `--apply`
+- apply mode backs up an existing target DB before writing
+- `--json` reports `scanned`, `eligible`, `would_import`, `imported`,
+  `skipped_existing`, `skipped_empty`, `invalid_rows`, `warnings`, and summary
+  counters
+- reruns are idempotent for the same `--import-id`; pass a stable explicit
+  import id if the same source files may be copied to different paths
+- JSONL imports preserve session id, role, content, timestamp, tool call/result
+  metadata, and provenance in target `session_id` / `source`
+- no OpenClaw config or separate secret tables are imported; raw transcripts,
+  summaries, and tool payloads may still contain sensitive user data
 
 ## Related references
 

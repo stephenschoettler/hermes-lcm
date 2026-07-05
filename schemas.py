@@ -266,6 +266,28 @@ LCM_STATUS = {
     },
 }
 
+LCM_INSPECT = {
+    "name": "lcm_inspect",
+    "description": (
+        "Inspect read-only LCM metadata for the current session: session/conversation "
+        "lineage, message frontier and fresh tail, DAG compaction frontier, latest "
+        "compaction skip/no-op reason, externalized payload refs and readability, "
+        "and matched ignore/stateless patterns. This is an operator inventory tool; "
+        "use lcm_grep/lcm_load_session/lcm_expand when you need actual content."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of rows/items to return for bounded sections. Defaults to 20 and is capped at 200.",
+                "default": 20,
+            },
+        },
+        "required": [],
+    },
+}
+
 LCM_DOCTOR = {
     "name": "lcm_doctor",
     "description": (

@@ -17,6 +17,16 @@ from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
+
+class SchemaVersionTooNewError(RuntimeError):
+    """Raised when a database was written by a newer LCM schema than this build.
+
+    Opening and migrating such a database with older code risks silently
+    corrupting data written under semantics this build does not understand, so
+    we refuse rather than degrade.
+    """
+
+
 SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
@@ -111,6 +121,37 @@ def get_schema_version(conn: sqlite3.Connection) -> int:
     except (TypeError, ValueError):
         return 0
 
+
+
+
+def read_existing_schema_version(conn: sqlite3.Connection) -> int:
+    """Return schema_version without creating or modifying schema objects."""
+    metadata_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
+    ).fetchone()
+    if not metadata_exists:
+        return 0
+    row = conn.execute(
+        "SELECT value FROM metadata WHERE key = 'schema_version'"
+    ).fetchone()
+    if not row or row[0] is None:
+        return 0
+    try:
+        return int(str(row[0]))
+    except (TypeError, ValueError):
+        return 0
+
+
+def refuse_schema_version_too_new(conn: sqlite3.Connection) -> None:
+    """Raise before any startup DDL when a newer build owns the DB."""
+    current_version = read_existing_schema_version(conn)
+    if current_version > SCHEMA_VERSION:
+        raise SchemaVersionTooNewError(
+            f"LCM database schema version {current_version} is newer than this "
+            f"build supports (v{SCHEMA_VERSION}). Refusing to open to avoid "
+            f"corrupting data written by a newer hermes-lcm. Upgrade the plugin "
+            f"or restore a pre-upgrade backup (.db/-wal/-shm)."
+        )
 
 def ensure_migration_state_table(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -594,9 +635,12 @@ def ensure_external_content_fts(
 
 
 def run_versioned_migrations(conn: sqlite3.Connection) -> None:
+    refuse_schema_version_too_new(conn)
+
     ensure_metadata_table(conn)
     ensure_migration_state_table(conn)
 
+    refuse_schema_version_too_new(conn)
     current_version = get_schema_version(conn)
     if current_version < 2:
         mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
