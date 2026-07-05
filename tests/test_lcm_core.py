@@ -1274,6 +1274,20 @@ class TestMessageStore:
         assert results, "expected LIKE-fallback matches"
         assert results[0]["store_id"] == needle_id
 
+    @pytest.mark.parametrize("sort", ["relevance", "hybrid"])
+    def test_like_fallback_relevance_sort_binds_order_args_before_exact_match(self, store, monkeypatch, sort):
+        import hermes_lcm.store as store_module
+
+        monkeypatch.setattr(store_module, "compute_search_candidate_cap", lambda _limit: 10)
+        needle_id = store.append("sess1", {"role": "user", "content": "alpha beta older best"})
+        for i in range(20):
+            store.append("sess1", {"role": "user", "content": f"alpha recent filler {i}"})
+
+        results = store.search("alpha-beta", session_id="sess1", limit=5, sort=sort)
+
+        assert [result["store_id"] for result in results][:1] == [needle_id]
+        assert any(result["store_id"] == needle_id for result in results)
+
     def test_like_fallback_relevance_sort_finds_recent_match_beyond_first_page(self, store):
         # Regression: with more matching rows than the candidate fetch limit,
         # the relevance/hybrid LIKE fallback fetched an arbitrary storage-order

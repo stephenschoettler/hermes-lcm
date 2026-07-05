@@ -1084,7 +1084,7 @@ class MessageStore:
                         WHERE {' AND '.join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
-                    [*base_args, *exact_args, *order_args, batch_limit, offset],
+                    [*base_args, *order_args, *exact_args, batch_limit, offset],
                 ).fetchall()
                 if not rows:
                     break
