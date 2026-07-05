@@ -219,6 +219,17 @@ def _measure_case(
     return samples
 
 
+def _ignore_message_filtering_active(case: SteadyStateCase) -> bool:
+    """Return whether an ignore-message benchmark case can exercise filtering."""
+
+    if not case.ignore_message_patterns:
+        return True
+    _ensure_hermes_lcm_package()
+    from hermes_lcm.message_patterns import compile_message_patterns
+
+    return bool(compile_message_patterns(case.ignore_message_patterns))
+
+
 def run_steady_state(
     run_dir: Path,
     *,
@@ -232,6 +243,13 @@ def run_steady_state(
     run_dir.mkdir(parents=True, exist_ok=True)
     report = SteadyStateReport(history_sizes=tuple(sorted(history_sizes)), iterations=iterations)
     for case in cases:
+        if not _ignore_message_filtering_active(case):
+            if progress is not None:
+                progress(
+                    f"skipping inactive case: {case.name} "
+                    "(ignore message regex filtering unavailable)"
+                )
+            continue
         if progress is not None:
             progress(f"measuring case: {case.name}")
         report.samples.extend(_measure_case(case, run_dir, history_sizes, iterations))
