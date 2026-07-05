@@ -24,6 +24,7 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     configure_connection,
     ensure_external_content_fts,
+    refuse_schema_version_too_new,
     run_versioned_migrations,
 )
 from .search_query import (
@@ -161,6 +162,7 @@ class SummaryDAG:
 
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS summary_nodes (
@@ -239,23 +241,25 @@ class SummaryDAG:
         Returns the number of deleted nodes. Used during session reset
         to retain only high-level summaries across sessions.
         """
-        cur = self._conn.execute(
-            """DELETE FROM summary_nodes
-               WHERE session_id = ? AND depth < ?""",
-            (session_id, min_depth),
-        )
-        deleted = cur.rowcount
-        self._conn.commit()
+        with self._db_lock:
+            cur = self._conn.execute(
+                """DELETE FROM summary_nodes
+                   WHERE session_id = ? AND depth < ?""",
+                (session_id, min_depth),
+            )
+            deleted = cur.rowcount
+            self._conn.commit()
         return deleted
 
     def delete_session_nodes(self, session_id: str) -> int:
         """Delete all nodes for a session. Returns count deleted."""
-        cur = self._conn.execute(
-            "DELETE FROM summary_nodes WHERE session_id = ?",
-            (session_id,),
-        )
-        deleted = cur.rowcount
-        self._conn.commit()
+        with self._db_lock:
+            cur = self._conn.execute(
+                "DELETE FROM summary_nodes WHERE session_id = ?",
+                (session_id,),
+            )
+            deleted = cur.rowcount
+            self._conn.commit()
         return deleted
 
     def reassign_session_nodes(self, old_session_id: str, new_session_id: str) -> int:
@@ -264,12 +268,13 @@ class SummaryDAG:
         Used for /new carry-over where retained summaries should become part of
         the fresh session while preserving node IDs and node-to-node links.
         """
-        cur = self._conn.execute(
-            "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
-            (new_session_id, old_session_id),
-        )
-        moved = cur.rowcount
-        self._conn.commit()
+        with self._db_lock:
+            cur = self._conn.execute(
+                "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            moved = cur.rowcount
+            self._conn.commit()
         return moved
 
     # -- Read ---------------------------------------------------------------
