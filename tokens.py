@@ -76,7 +76,7 @@ def _count_tokens_cached(text: str) -> int:
 # least likely to recur identically, and caching them would still let the
 # bounded LRU pin unnecessary memory; count those uncached (cost is
 # proportional to size either way).
-_MAX_CACHEABLE_TOKEN_TEXT_CHARS=4096_768
+_MAX_CACHEABLE_TOKEN_TEXT_CHARS = 32_768
 
 
 def count_tokens(text) -> int:

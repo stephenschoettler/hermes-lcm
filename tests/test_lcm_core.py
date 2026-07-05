@@ -1040,18 +1040,31 @@ class TestTokens:
         assert _fallback_token_estimate(latin) == len(latin) // 4 + 1
         assert _fallback_token_estimate(cjk) > len(cjk) // 4 + 1
 
-    def test_count_tokens_does_not_cache_large_strings(self):
+    def test_count_tokens_cache_boundary_is_literal_32_kib(self, monkeypatch):
         from hermes_lcm import tokens as token_module
 
-        token_module._count_tokens_cached.cache_clear()
-        oversized = "x" * (token_module._MAX_CACHEABLE_TOKEN_TEXT_CHARS + 1)
-        first = token_module.count_tokens(oversized)
-        before = token_module._count_tokens_cached.cache_info()
-        assert token_module.count_tokens(oversized) == first
-        after = token_module._count_tokens_cached.cache_info()
+        assert token_module._MAX_CACHEABLE_TOKEN_TEXT_CHARS == 32_768
 
-        assert after.currsize == before.currsize == 0
-        assert after.hits == before.hits == 0
+        monkeypatch.setattr(token_module, "_get_encoder", lambda: None)
+        token_module._count_tokens_cached.cache_clear()
+
+        boundary = "x" * 32_768
+        first = token_module.count_tokens(boundary)
+        before = token_module._count_tokens_cached.cache_info()
+        assert before.currsize == 1
+        assert token_module.count_tokens(boundary) == first
+        after_boundary = token_module._count_tokens_cached.cache_info()
+        assert after_boundary.currsize == 1
+        assert after_boundary.hits == before.hits + 1
+
+        oversized = "x" * 32_769
+        assert token_module.count_tokens(oversized) > 0
+        before_oversized_repeat = token_module._count_tokens_cached.cache_info()
+        assert token_module.count_tokens(oversized) > 0
+        after_oversized_repeat = token_module._count_tokens_cached.cache_info()
+
+        assert after_oversized_repeat.currsize == before_oversized_repeat.currsize == 1
+        assert after_oversized_repeat.hits == before_oversized_repeat.hits
 
     def test_count_tokens_tolerates_non_string_unhashable_input(self):
         assert count_tokens({"api_key": 1}) >= 0
@@ -5171,9 +5184,11 @@ class TestLCMEngineCloning:
 def test_count_tokens_skips_lru_for_large_strings(monkeypatch):
     import hermes_lcm.tokens as tokens
 
+    assert tokens._MAX_CACHEABLE_TOKEN_TEXT_CHARS == 32_768
+
     tokens._count_tokens_cached.cache_clear()
     monkeypatch.setattr(tokens, "_get_encoder", lambda: None)
-    large = "x" * (tokens._MAX_CACHEABLE_TOKEN_TEXT_CHARS + 1)
+    large = "x" * 32_769
 
     first = tokens.count_tokens(large)
     second = tokens.count_tokens(large)
