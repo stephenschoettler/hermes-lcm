@@ -1479,6 +1479,45 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),
+            fresh_tail_count=4,
+            leaf_chunk_tokens=100,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.context_length = 1000
+        instance.threshold_tokens = 100
+        noop_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "tiny old backlog"},
+            {"role": "assistant", "content": "tiny old answer"},
+            {"role": "user", "content": "fresh " + "x" * 500},
+            {"role": "assistant", "content": "fresh " + "y" * 500},
+            {"role": "user", "content": "fresh " + "z" * 500},
+        ]
+        eligible_messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old backlog " + "x" * 600},
+            {"role": "assistant", "content": "old answer " + "y" * 600},
+            {"role": "user", "content": "fresh " + "a" * 200},
+            {"role": "assistant", "content": "fresh " + "b" * 200},
+            {"role": "user", "content": "fresh " + "c" * 200},
+        ]
+
+        try:
+            assert instance.should_compress_preflight(noop_messages) is False
+            assert instance.last_compression_was_noop is True
+            assert instance.last_compression_noop_reason
+
+            assert instance.should_compress_preflight(eligible_messages) is True
+            assert instance.last_compression_status == "pending"
+            assert instance.last_compression_was_noop is False
+            assert instance.last_compression_noop_reason == ""
+        finally:
+            instance.shutdown()
+
     def test_preflight_requests_compaction_for_deferred_maintenance_under_critical_pressure(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_deferred_critical.db"),
