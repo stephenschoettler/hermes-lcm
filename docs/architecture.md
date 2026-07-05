@@ -13,7 +13,7 @@ This page keeps the implementation model and product-positioning nuance outside 
 - **Large payload controls** - optional ingest-time externalization for oversized tool/media/raw payloads, plus transcript GC for already-externalized tool results
 - **Sensitive-pattern controls** - optional named redaction of API keys, bearer tokens, passwords, and private keys before LCM stores or summarizes them
 - **Storage-boundary payload guard** - media-ish `data:*;base64` and long base64-looking strings are externalized before LCM writes them to SQLite
-- **Diagnostics** - `lcm_status`, `lcm_doctor`, and optional `/lcm` slash commands
+- **Diagnostics** - `lcm_status`, `lcm_inspect`, `lcm_doctor`, and optional `/lcm` slash commands
 
 ## LCM vs built-in compression
 

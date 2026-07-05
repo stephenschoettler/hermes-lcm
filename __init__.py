@@ -58,6 +58,7 @@ def register(ctx):
         LCM_EXPAND,
         LCM_EXPAND_QUERY,
         LCM_STATUS,
+        LCM_INSPECT,
         LCM_DOCTOR,
     )
 
@@ -91,6 +92,7 @@ def register(ctx):
         ("lcm_expand", LCM_EXPAND, "🔎"),
         ("lcm_expand_query", LCM_EXPAND_QUERY, "❓"),
         ("lcm_status", LCM_STATUS, "💚"),
+        ("lcm_inspect", LCM_INSPECT, "🧭"),
         ("lcm_doctor", LCM_DOCTOR, "🏥"),
     ]
     register_tool = getattr(ctx, "register_tool", None)
