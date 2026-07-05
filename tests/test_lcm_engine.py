@@ -2109,6 +2109,25 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_thread_context_stateless_stale_generationless_end_does_not_clear_replacement(self, tmp_path, monkeypatch):
+        config = LCMConfig(database_path=str(tmp_path / "thread-stateless-stale-end-generation.db"))
+        instance = LCMEngine(config=config)
+        try:
+            monkeypatch.setattr(
+                instance,
+                "_in_process_auxiliary_caller_generation",
+                lambda session_id: 123 if session_id == "auxiliary:session" else 0,
+            )
+            instance._mark_thread_context_stateless("auxiliary:session")
+            instance._auxiliary_last_prompt_tokens["auxiliary:session"] = 77
+
+            assert not instance._deactivate_auxiliary_session("auxiliary:session", generation=0)
+            assert instance._thread_context_has_auxiliary_session("auxiliary:session")
+            assert instance._auxiliary_session_generations == {"auxiliary:session": 123}
+            assert instance._auxiliary_last_prompt_tokens["auxiliary:session"] == 77
+        finally:
+            instance.shutdown()
+
     def test_thread_context_stateless_generationless_reregister_clears_usage(self, tmp_path):
         config = LCMConfig(database_path=str(tmp_path / "thread-stateless-reregister-clears-usage.db"))
         instance = LCMEngine(config=config)

@@ -2598,7 +2598,7 @@ class LCMEngine(ContextEngine):
             return False
         with self._auxiliary_session_lock:
             active_generation = self._auxiliary_session_generations.get(session_id)
-            if generation and active_generation and generation != active_generation:
+            if active_generation and generation != active_generation:
                 return False
             self._auxiliary_session_ids.discard(session_id)
             self._auxiliary_last_prompt_tokens.pop(session_id, None)
