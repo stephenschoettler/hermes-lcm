@@ -172,3 +172,18 @@ def test_schema_module_exports_only_declared_public_lcm_tool_schemas():
         assert schema["parameters"]["type"] == "object"
         assert isinstance(schema["parameters"].get("properties"), dict)
         assert isinstance(schema["parameters"].get("required"), list)
+
+
+def test_public_tools_are_documented_in_readme_and_retrieval_reference():
+    manifest_tools = _manifest_tool_names()
+    root = Path(__file__).resolve().parents[1]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    retrieval_reference = (root / "docs" / "retrieval-tools.md").read_text(encoding="utf-8")
+
+    for tool_name in manifest_tools:
+        assert f"`{tool_name}`" in readme
+        assert f"`{tool_name}`" in retrieval_reference
+
+    assert "lcm_inspect" in retrieval_reference
+    assert "metadata only" in retrieval_reference
+    assert "use `lcm_load_session`/`lcm_expand` when you need content" in retrieval_reference

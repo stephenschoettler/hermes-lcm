@@ -87,6 +87,62 @@ class SummaryCircuitBreaker:
             )
 
 
+@dataclass
+class SummarySpendGuard:
+    """In-process sliding-window rate limiter for summarizer calls.
+
+    The circuit breaker reacts to *failures*. This guards the orthogonal case:
+    a pathologically looping compaction that succeeds every time but burns
+    auxiliary-model spend without bound. When the call budget for the window is
+    exhausted it opens a backoff during which the escalation path falls back to
+    deterministic L3 truncation (no spend, still converges). A forced/manual
+    compaction calls clear() so operator-driven repair is never blocked.
+    """
+
+    max_calls: int = 24
+    window_seconds: float = 600.0
+    backoff_seconds: float = 1800.0
+    _calls: list[float] = field(default_factory=list)
+    _backoff_until: float = 0.0
+
+    def _prune(self, current_time: float) -> None:
+        cutoff = current_time - self.window_seconds
+        if self._calls and self._calls[0] < cutoff:
+            self._calls = [t for t in self._calls if t >= cutoff]
+
+    def allows(self, *, now: float | None = None) -> bool:
+        if self.max_calls <= 0:
+            return True
+        current_time = time.monotonic() if now is None else now
+        if current_time < self._backoff_until:
+            return False
+        self._prune(current_time)
+        return len(self._calls) < self.max_calls
+
+    def record_call(self, *, now: float | None = None) -> None:
+        if self.max_calls <= 0:
+            return
+        current_time = time.monotonic() if now is None else now
+        self._prune(current_time)
+        self._calls.append(current_time)
+        if len(self._calls) >= self.max_calls and self._backoff_until <= current_time:
+            self._backoff_until = current_time + max(0.0, self.backoff_seconds)
+            # Backoff is the penalty; start the window fresh so the guard allows
+            # again once it elapses rather than double-blocking on the old count.
+            self._calls.clear()
+            logger.warning(
+                "LCM summary spend guard tripped: %d calls within %ss; "
+                "backing off summarizer for %ss (deterministic fallback active)",
+                self.max_calls,
+                self.window_seconds,
+                self.backoff_seconds,
+            )
+
+    def clear(self) -> None:
+        self._calls.clear()
+        self._backoff_until = 0.0
+
+
 def _strip_reasoning_blocks(text: str) -> str:
     """Remove <think>/<thinking>/<reasoning>/<thought>/<REASONING_SCRATCHPAD>
     blocks from ``text``. Idempotent and safe on text without any tags."""
@@ -232,6 +288,7 @@ def _invoke_summary_llm_chain(
     fallback_models: list[str] | tuple[str, ...] | None = None,
     timeout: float | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
+    spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
@@ -244,6 +301,16 @@ def _invoke_summary_llm_chain(
                 candidate_model or _DEFAULT_ROUTE_KEY,
             )
             continue
+        # Check the spend guard per-route so a mid-chain trip stops the
+        # remaining fallbacks instead of over-spending by up to len(chain)-1.
+        if spend_guard is not None and not spend_guard.allows():
+            logger.warning(
+                "LCM summary spend guard active; skipping LLM summarization and "
+                "deferring to deterministic fallback"
+            )
+            break
+        if spend_guard is not None:
+            spend_guard.record_call()
         try:
             result = _invoke_summary_llm(
                 prompt,
@@ -345,6 +412,7 @@ def summarize_with_escalation(
     custom_instructions: str = "",
     fallback_models: list[str] | tuple[str, ...] | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
+    spend_guard: "SummarySpendGuard | None" = None,
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
@@ -362,6 +430,7 @@ def summarize_with_escalation(
         fallback_models=fallback_models,
         timeout=timeout,
         circuit_breaker=circuit_breaker,
+        spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
     )
 
@@ -381,6 +450,7 @@ def summarize_with_escalation(
         fallback_models=fallback_models,
         timeout=timeout,
         circuit_breaker=circuit_breaker,
+        spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
     )
 

@@ -230,6 +230,9 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
     monkeypatch.delenv("LCM_SUMMARY_TIMEOUT_MS", raising=False)
+    monkeypatch.setenv("LCM_SUMMARY_SPEND_MAX_CALLS", "0")
+    monkeypatch.setenv("LCM_SUMMARY_SPEND_WINDOW_SECONDS", "123.5")
+    monkeypatch.setenv("LCM_SUMMARY_SPEND_BACKOFF_SECONDS", "456.5")
     monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "17")
 
     config = LCMConfig.from_env()
@@ -242,9 +245,16 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     assert payload["config"]["fresh_tail_count"] == 17
     assert payload["config"]["context_threshold"] == 0.61
     assert payload["config"]["summary_timeout_ms"] == 42000
+    assert payload["config"]["summary_spend_max_calls"] == 0
+    assert payload["config"]["summary_spend_window_seconds"] == 123.5
+    assert payload["config"]["summary_spend_backoff_seconds"] == 456.5
     assert payload["config_sources"]["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
     assert payload["config_sources"]["context_threshold"] == "config_yaml:lcm.context_threshold"
     assert payload["config_sources"]["summary_timeout_ms"] == "config_yaml:auxiliary.compression.timeout"
+    assert payload["config_sources"]["summary_spend_max_calls"] == "env:LCM_SUMMARY_SPEND_MAX_CALLS"
+    assert payload["config_sources"]["summary_spend_window_seconds"] == "env:LCM_SUMMARY_SPEND_WINDOW_SECONDS"
+    assert payload["config_sources"]["summary_spend_backoff_seconds"] == "env:LCM_SUMMARY_SPEND_BACKOFF_SECONDS"
+    assert engine._summary_spend_guard.max_calls == 0
     assert "fresh_tail_count" in payload["ignored_config_yaml_lcm_keys"]
 
 
