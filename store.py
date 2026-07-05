@@ -729,6 +729,70 @@ class MessageStore:
             return None, None
         return row[0], row[1]
 
+    # -- Metadata key/value JSON --------------------------------------------
+
+    def read_metadata_json(self, key: str) -> Any:
+        """Return the JSON-decoded value stored under ``key`` in the metadata table.
+
+        Returns ``None`` when the connection is closed, the key is absent, or the
+        stored value is empty. JSON decoding is deliberately *not* wrapped: a
+        malformed value raises, so callers keep the ``try``/``except`` scoping
+        that decides whether one bad key aborts a multi-key load or is skipped.
+        Reads are unlocked, matching the store's other read paths (``_write_lock``
+        guards writes only).
+        """
+        conn = self._conn
+        if conn is None:
+            return None
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return json.loads(str(row[0]))
+
+    def write_metadata_json(
+        self,
+        keys: list[str],
+        serialized: str,
+        *,
+        skip_unchanged: bool = False,
+    ) -> bool:
+        """Write the pre-serialized JSON string ``serialized`` to every key in ``keys``.
+
+        Serialization stays with the caller so it keeps control of ``sort_keys``
+        and payload shape. Runs under the store write lock and issues at most one
+        commit. With ``skip_unchanged=True`` a key already holding ``serialized``
+        is left untouched and the commit is skipped entirely when nothing changed
+        -- the ingest-hot-path optimization used by the placeholder count/ordinal
+        writers. Returns ``True`` if any key was written.
+        """
+        conn = self._conn
+        if conn is None:
+            return False
+        wrote = False
+        with self._write_lock:
+            for key in keys:
+                if skip_unchanged:
+                    existing = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?", (key,)
+                    ).fetchone()
+                    if existing is not None and existing[0] == serialized:
+                        continue
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, serialized),
+                )
+                wrote = True
+            if wrote:
+                conn.commit()
+        return wrote
+
     # -- Search -------------------------------------------------------------
 
     def search(self, query: str, session_id: str | None = None,

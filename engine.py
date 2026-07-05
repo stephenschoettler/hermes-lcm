@@ -4714,19 +4714,10 @@ class LCMEngine(ContextEngine):
         if not keys:
             return []
         try:
-            conn = self._store._conn
-            if conn is None:
-                return []
             ordered: list[str] = []
             seen: set[str] = set()
             for key in keys:
-                row = conn.execute(
-                    "SELECT value FROM metadata WHERE key = ?",
-                    (key,),
-                ).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if isinstance(data, list):
                     for item in data:
                         digest = str(item)
@@ -4749,20 +4740,7 @@ class LCMEngine(ContextEngine):
             return ordered_hashes
         try:
             payload = json.dumps(ordered_hashes)
-            conn = self._store._conn
-            if conn is None:
-                return ordered_hashes
-            with self._store._write_lock:
-                for key in keys:
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, payload),
-                    )
-                conn.commit()
+            self._store.write_metadata_json(keys, payload)
         except Exception:
             logger.debug("LCM scoped hash metadata write failed", exc_info=True)
         return ordered_hashes
@@ -4782,14 +4760,8 @@ class LCMEngine(ContextEngine):
         if not count_keys:
             return counts
         try:
-            conn = self._store._conn
-            if conn is None:
-                return counts
             for key in count_keys:
-                row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if not isinstance(data, dict):
                     continue
                 for digest, count in data.items():
@@ -4825,32 +4797,10 @@ class LCMEngine(ContextEngine):
             if parsed_count > 0:
                 payload[digest] = parsed_count
         try:
-            conn = self._store._conn
-            if conn is None:
-                return
             serialized = json.dumps(payload, sort_keys=True)
-            with self._store._write_lock:
-                wrote = False
-                for key in count_keys:
-                    # Skip the write (and its fsync commit under synchronous=FULL)
-                    # when the stored value already matches. This runs on every
-                    # ingest and was previously an unconditional UPSERT+commit.
-                    existing = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
-                    if existing is not None and existing[0] == serialized:
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, serialized),
-                    )
-                    wrote = True
-                if wrote:
-                    conn.commit()
+            # skip_unchanged avoids the fsync commit (under synchronous=FULL) when
+            # the stored value already matches; this runs on every ingest.
+            self._store.write_metadata_json(count_keys, serialized, skip_unchanged=True)
         except Exception:
             logger.debug("LCM ignored placeholder count metadata write failed", exc_info=True)
 
@@ -4863,14 +4813,8 @@ class LCMEngine(ContextEngine):
         if not ordinal_keys:
             return ordinals
         try:
-            conn = self._store._conn
-            if conn is None:
-                return ordinals
             for key in ordinal_keys:
-                row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if not isinstance(data, dict):
                     continue
                 for digest, values in data.items():
@@ -4914,31 +4858,10 @@ class LCMEngine(ContextEngine):
             if clean:
                 payload[digest] = clean
         try:
-            conn = self._store._conn
-            if conn is None:
-                return
             serialized = json.dumps(payload, sort_keys=True)
-            with self._store._write_lock:
-                wrote = False
-                for key in ordinal_keys:
-                    # Skip the write (and its fsync commit) when unchanged; see
-                    # the counts writer above for rationale.
-                    existing = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
-                    if existing is not None and existing[0] == serialized:
-                        continue
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, serialized),
-                    )
-                    wrote = True
-                if wrote:
-                    conn.commit()
+            # Skip the write (and its fsync commit) when unchanged; see the counts
+            # writer above for rationale.
+            self._store.write_metadata_json(ordinal_keys, serialized, skip_unchanged=True)
         except Exception:
             logger.debug("LCM ignored placeholder ordinal metadata write failed", exc_info=True)
 
@@ -5070,19 +4993,10 @@ class LCMEngine(ContextEngine):
         if not keys:
             return []
         try:
-            conn = self._store._conn
-            if conn is None:
-                return []
             records: list[dict[str, str]] = []
             seen: set[tuple[str, str]] = set()
             for key in keys:
-                row = conn.execute(
-                    "SELECT value FROM metadata WHERE key = ?",
-                    (key,),
-                ).fetchone()
-                if not row or not row[0]:
-                    continue
-                data = json.loads(str(row[0]))
+                data = self._store.read_metadata_json(key)
                 if not isinstance(data, list):
                     continue
                 for item in data:
@@ -5137,21 +5051,8 @@ class LCMEngine(ContextEngine):
             normalized.append(clean)
         normalized = normalized[-512:]
         try:
-            conn = self._store._conn
-            if conn is None:
-                return
             payload = json.dumps(normalized)
-            with self._store._write_lock:
-                for key in keys:
-                    conn.execute(
-                        """
-                        INSERT INTO metadata(key, value)
-                        VALUES(?, ?)
-                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                        """,
-                        (key, payload),
-                    )
-                conn.commit()
+            self._store.write_metadata_json(keys, payload)
         except Exception:
             logger.debug("LCM ignored-dependent reply metadata write failed", exc_info=True)
 
