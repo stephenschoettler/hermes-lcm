@@ -42,20 +42,89 @@ claim that Hermes core has no persisted record of pre-compression history.
 
 ## Development
 
-Important files:
+Important files, grouped by concern:
 
 ```text
-plugin.yaml      manifest
-__init__.py      plugin registration and optional slash-command registration
-engine.py        LCMEngine main orchestrator
-store.py         SQLite message store and FTS
-dag.py           summary DAG and FTS
-config.py        env var defaults and overrides
-command.py       /lcm command handlers
-tools.py         lcm_grep, lcm_load_session, lcm_describe, lcm_expand, lcm_expand_query
-schemas.py       tool schemas shown to the model
-tests/           standalone pytest coverage
+Plugin surface
+  plugin.yaml            manifest
+  __init__.py            plugin registration and optional slash-command registration
+  schemas.py             tool schemas shown to the model
+  tools.py               lcm_grep, lcm_load_session, lcm_describe, lcm_expand, lcm_expand_query
+  command.py             /lcm command handlers
+  config.py              env var defaults and overrides
+  presets.py             operator config presets
+
+Engine
+  engine.py              LCMEngine orchestrator (composes the mixins below)
+  compaction.py          CompactionMixin — should_compress / compress leaf pipeline
+  reconcile.py           ReconcileMixin — post-restart ingest-cursor reconciliation and replay identity
+  placeholder_ledger.py  PlaceholderLedgerMixin — ignored-active-replay placeholder bookkeeping
+  engine_registry.py     process-wide active-clone registry (resolve_active_lcm_engine)
+  runtime_identity.py    plugin/git identity for status and doctor
+  codex_routing.py       Codex OAuth route detection and effective context caps
+  sqlite_util.py         SQLite lock-contention / busy-timeout helpers
+  message_analysis.py    tool-call-id pairing and synthetic-noise detection
+  sanitize.py            active-context sanitizers
+  maintenance.py         backup / rotate maintenance ops
+
+Storage and lifecycle
+  store.py               SQLite message store and FTS
+  dag.py                 summary DAG and FTS
+  lifecycle_state.py     lifecycle/frontier state store
+  db_bootstrap.py        schema bootstrap and migrations
+  diagnostics.py         state-db path containment and doctor helpers
+
+Ingest, content and retrieval
+  ingest_protection.py   redaction, externalized-payload and persisted-output protection
+  externalize.py         large-payload externalization
+  extraction.py          pre-compaction content extraction
+  escalation.py          summarize-with-escalation auxiliary routing
+  model_routing.py       LCM auxiliary model-override routing
+  tokens.py              token counting
+  message_content.py     content normalization helpers
+  message_patterns.py    message-pattern matching
+  session_patterns.py    session-pattern matching
+  search_query.py        retrieval query parsing
+
+tests/                   standalone pytest coverage
 ```
+
+### Engine decomposition
+
+`engine.py` is being decomposed into cohesive, behaviour-preserving modules.
+Cohesive groups of stateful `LCMEngine` methods are lifted verbatim into
+`*Mixin` classes in their own files (`compaction.py`, `reconcile.py`,
+`placeholder_ledger.py`, …) and mixed back into `LCMEngine`. Because the methods
+still run bound to the engine instance (`self` is the `LCMEngine`), they read and
+write the same runtime state and call the same sibling helpers through normal
+attribute lookup — so the split changes file layout only, not behaviour or the
+public surface. Pure, stateless helper groups are extracted as plain module
+functions instead of mixins (`codex_routing.py`, `sqlite_util.py`,
+`runtime_identity.py`, `message_analysis.py`).
+
+**Mixin ordering (MRO).** LCM decomposition mixins are listed *before*
+`ContextEngine` in the bases — `class LCMEngine(SomeMixin, …, ContextEngine)`.
+`ContextEngine` defines the protocol methods `compress`, `should_compress`, and
+`should_compress_preflight`; `CompactionMixin` overrides them, so it must precede
+`ContextEngine` to win the MRO. The other mixins hold only private methods with no
+`ContextEngine` counterpart, so their position is not load-bearing, but the same
+"mixins first" convention is kept for all of them so the bases line stays correct
+under any merge order.
+
+**Test note.** Some engine tests patch a module-level function on
+`hermes_lcm.engine` (for example `summarize_with_escalation` or the `count_*`
+token helpers) to intercept a call. When a method that calls such a function is
+moved to a mixin module, the test must patch that name on the mixin's module
+instead — the moved method resolves the name from its own module. Methods whose
+tests rely on this (notably `_summarize_leaf_chunk_with_rescue`) are deliberately
+kept on `LCMEngine` and reached from the mixin via `self`.
+
+**Status.** The decomposition is partial and ongoing: the compaction, reconcile,
+placeholder-ledger, auxiliary-session and active-engine-registry concerns have
+been extracted; larger clusters that remain on `LCMEngine` — session lifecycle
+(`on_session_start` / `on_session_end` / rollover), context assembly, the ingest
+pipeline, and the LCM-bypass host-fallback path — are candidates for later,
+equally behaviour-preserving extraction.
 
 Run tests:
 
