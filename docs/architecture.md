@@ -58,6 +58,7 @@ Engine
   engine.py              LCMEngine orchestrator (composes the mixins below)
   compaction.py          CompactionMixin — should_compress / compress leaf pipeline
   reconcile.py           ReconcileMixin — post-restart ingest-cursor reconciliation and replay identity
+  aux_session.py         AuxiliarySessionMixin — auxiliary session id / context metadata helpers
   placeholder_ledger.py  PlaceholderLedgerMixin — ignored-active-replay placeholder bookkeeping
   engine_registry.py     process-wide active-clone registry (resolve_active_lcm_engine)
   runtime_identity.py    plugin/git identity for status and doctor
@@ -94,13 +95,14 @@ tests/                   standalone pytest coverage
 `engine.py` is being decomposed into cohesive, behaviour-preserving modules.
 Cohesive groups of stateful `LCMEngine` methods are lifted verbatim into
 `*Mixin` classes in their own files (`compaction.py`, `reconcile.py`,
-`placeholder_ledger.py`, …) and mixed back into `LCMEngine`. Because the methods
-still run bound to the engine instance (`self` is the `LCMEngine`), they read and
-write the same runtime state and call the same sibling helpers through normal
-attribute lookup — so the split changes file layout only, not behaviour or the
-public surface. Pure, stateless helper groups are extracted as plain module
-functions instead of mixins (`codex_routing.py`, `sqlite_util.py`,
-`runtime_identity.py`, `message_analysis.py`).
+`aux_session.py`, `placeholder_ledger.py`, …) and mixed back into `LCMEngine`.
+Because the methods still run bound to the engine instance (`self` is the
+`LCMEngine`), they read and write the same runtime state and call the same
+sibling helpers through normal attribute lookup — so the split changes file
+layout only, not behaviour or the public surface. Pure/helper groups are
+extracted as plain module functions instead of mixins (`engine_registry.py`,
+`codex_routing.py`, `sqlite_util.py`, `runtime_identity.py`,
+`message_analysis.py`).
 
 **Mixin ordering (MRO).** LCM decomposition mixins are listed *before*
 `ContextEngine` in the bases — `class LCMEngine(SomeMixin, …, ContextEngine)`.

@@ -4,7 +4,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-- Began a behaviour-preserving decomposition of the ~9k-line `engine.py` into cohesive modules: stateful method clusters became `*Mixin` classes (`compaction.py`, `reconcile.py`, `placeholder_ledger.py`, `engine_registry.py`) mixed back into `LCMEngine`, and pure helper groups became plain modules (`codex_routing.py`, `sqlite_util.py`, `runtime_identity.py`, `message_analysis.py`). No behaviour or public-surface change; documented in `docs/architecture.md`.
+- Began a behaviour-preserving decomposition of the ~9k-line `engine.py` into cohesive modules: stateful method clusters became `*Mixin` classes (`compaction.py`, `reconcile.py`, `aux_session.py`, `placeholder_ledger.py`) mixed back into `LCMEngine`, and pure/helper groups became plain modules (`engine_registry.py`, `codex_routing.py`, `sqlite_util.py`, `runtime_identity.py`, `message_analysis.py`). No behaviour or public-surface change; documented in `docs/architecture.md`.
 
 ## v0.18.1 - 2026-06-30
 
