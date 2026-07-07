@@ -160,6 +160,18 @@ class SummaryDAG:
         self._db_lock = threading.RLock()
         self._init_db()
 
+    @property
+    def connection(self) -> Optional[sqlite3.Connection]:
+        """The live SQLite connection, or ``None`` once :meth:`close` has run.
+
+        Exposed for read-oriented diagnostics and inspection -- FTS sync counts,
+        integrity checks, latest-node lookups -- that need ad-hoc queries the DAG
+        does not wrap in a purpose-built method. Callers must treat it as
+        read-only and tolerate ``None``; writes still go through the DAG's own
+        methods so the ``_db_lock`` contract stays in one place.
+        """
+        return self._conn
+
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)

@@ -78,6 +78,24 @@ def register(ctx):
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
 
+    # Subscribe to the host's explicit subagent lifecycle events when available.
+    # These carry the child_session_id/parent_session_id linkage directly, so LCM
+    # can identify a subagent session from the host's own signal instead of
+    # walking the call stack and reading private agent attributes. Hosts without
+    # a plugin hook bus simply skip this and fall back to the legacy frame walk.
+    register_hook = getattr(ctx, "register_hook", None)
+    if callable(register_hook):
+        from .aux_session import record_subagent_start, record_subagent_stop
+        try:
+            register_hook("subagent_start", lambda **payload: record_subagent_start(payload))
+            register_hook("subagent_stop", lambda **payload: record_subagent_stop(payload))
+        except Exception as exc:
+            logger.info(
+                "LCM explicit subagent-lineage hooks unavailable on this Hermes "
+                "host; auxiliary detection uses the legacy frame-walk fallback: %s",
+                exc,
+            )
+
     # Register tools via the plugin registry only on hosts that preserve the
     # active messages=... contract for registered context-engine tools.
     # Older/current Hermes hosts already expose lcm_* correctly through the

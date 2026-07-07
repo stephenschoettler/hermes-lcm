@@ -1772,7 +1772,7 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
 
 def _summary_quality_stats(engine: "LCMEngine", session_id: str) -> dict[str, Any]:
     """Return read-only summary compression quality diagnostics for one session."""
-    conn = engine._dag._conn
+    conn = engine._dag.connection
     if conn is None:
         raise RuntimeError("LCM DAG connection is not initialized")
     rows = conn.execute(
@@ -1941,7 +1941,7 @@ def _inspect_lifecycle_state(engine: "LCMEngine", session_id: str, conversation_
 
 def _inspect_highest_compacted_source_store_id(engine: "LCMEngine", session_id: str) -> int:
     highest = 0
-    rows = engine._dag._conn.execute(
+    rows = engine._dag.connection.execute(
         """
         SELECT source_ids
         FROM summary_nodes
@@ -2205,7 +2205,7 @@ def lcm_inspect(args: Dict[str, Any], **kwargs) -> str:
     total_dag_nodes = sum(info["count"] for info in depth_stats.values())
     total_dag_tokens = sum(info["tokens"] for info in depth_stats.values())
     total_dag_source_tokens = sum(info["source_tokens"] for info in depth_stats.values())
-    latest_node_rows = engine._dag._conn.execute(
+    latest_node_rows = engine._dag.connection.execute(
         """
         SELECT node_id, session_id, depth, token_count, source_token_count,
                source_type, created_at, earliest_at, latest_at, expand_hint
@@ -2534,7 +2534,7 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     # inverted indexes point at the exact table and repair path.
     for check_name, conn, spec in (
         ("messages_fts_integrity", engine._store.connection, build_message_fts_spec()),
-        ("nodes_fts_integrity", engine._dag._conn, build_nodes_fts_spec()),
+        ("nodes_fts_integrity", engine._dag.connection, build_nodes_fts_spec()),
     ):
         try:
             fts_integrity = check_external_content_fts_integrity(conn, spec)

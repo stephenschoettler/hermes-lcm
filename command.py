@@ -720,7 +720,7 @@ def _doctor_text(engine) -> str:
     db_path = Path(engine._store.db_path)
     runtime_identity = engine.get_runtime_identity()
     store_conn = engine._store.connection
-    dag_conn = engine._dag._conn
+    dag_conn = engine._dag.connection
 
     issues: list[str] = []
     recommended_actions: list[str] = []
@@ -849,7 +849,7 @@ def _doctor_text(engine) -> str:
     clean_scan = _scan_clean_candidates(engine)
 
     debt_rows = []
-    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
+    lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "connection", None)
     if lifecycle_conn is not None:
         try:
             debt_rows = lifecycle_conn.execute(
@@ -1383,7 +1383,7 @@ def _doctor_clean_lifecycle_text(engine) -> str:
     protected = {str(getattr(engine, "_session_id", "") or "")}
     protected = {s for s in protected if s}
 
-    conn = engine._lifecycle._conn
+    conn = engine._lifecycle.connection
     sessions_with_data: set[str] = set()
     for row in conn.execute("SELECT DISTINCT session_id FROM messages").fetchall():
         sessions_with_data.add(str(row[0]))

@@ -453,7 +453,7 @@ def test_registered_tool_handlers_route_through_engine_handle_tool_call(monkeypa
 def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails(tmp_path, monkeypatch):
     module_name = "hermes_lcm_packaging_entrypoint_git_probe_failure"
     _register_plugin_engine(module_name)
-    engine_module = sys.modules[f"{module_name}.engine"]
+    identity_module = sys.modules[f"{module_name}.runtime_identity"]
 
     checkout = tmp_path / "checkout"
     (checkout / ".git").mkdir(parents=True)
@@ -461,9 +461,9 @@ def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails
     def fail_git(*args, **kwargs):
         raise OSError("git unavailable")
 
-    monkeypatch.setattr(engine_module.subprocess, "run", fail_git)
+    monkeypatch.setattr(identity_module.subprocess, "run", fail_git)
 
-    identity = engine_module._git_runtime_identity(checkout)
+    identity = identity_module._git_runtime_identity(checkout)
     assert identity["plugin_git_commit"] == ""
     assert identity["plugin_git_branch"] == ""
     assert identity["plugin_git_dirty"] is None
@@ -473,7 +473,7 @@ def test_git_runtime_identity_preserves_unknown_dirty_state_when_git_probe_fails
 def test_git_runtime_identity_reports_untracked_files_as_dirty(tmp_path, monkeypatch):
     module_name = "hermes_lcm_packaging_entrypoint_git_untracked"
     _register_plugin_engine(module_name)
-    engine_module = sys.modules[f"{module_name}.engine"]
+    identity_module = sys.modules[f"{module_name}.runtime_identity"]
 
     checkout = tmp_path / "checkout"
     (checkout / ".git").mkdir(parents=True)
@@ -491,9 +491,9 @@ def test_git_runtime_identity_reports_untracked_files_as_dirty(tmp_path, monkeyp
             return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/example/repo.git\n", stderr="")
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unexpected")
 
-    monkeypatch.setattr(engine_module.subprocess, "run", fake_git)
+    monkeypatch.setattr(identity_module.subprocess, "run", fake_git)
 
-    identity = engine_module._git_runtime_identity(checkout)
+    identity = identity_module._git_runtime_identity(checkout)
 
     assert identity["plugin_git_dirty"] is True
 

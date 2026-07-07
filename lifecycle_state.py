@@ -94,6 +94,17 @@ class LifecycleStateStore:
         except Exception:
             pass
 
+    @property
+    def connection(self) -> sqlite3.Connection | None:
+        """The live SQLite connection, or ``None`` once :meth:`close` has run.
+
+        Exposed for read-oriented diagnostics -- for example the doctor's
+        maintenance-debt scan -- that need ad-hoc queries the store does not wrap
+        in a purpose-built method. Callers must treat it as read-only; writes go
+        through the store's own methods.
+        """
+        return getattr(self, "_conn", None)
+
     def row_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()
         return int(row["count"] if row else 0)
