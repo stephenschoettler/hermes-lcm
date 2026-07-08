@@ -283,12 +283,12 @@ def _build_l1_focus_brief(focus_topic: str) -> str:
         "\n"
         "Demote old / completed topics:\n"
         "If the summary contains tasks, questions, or remaining work that are no longer active in the latest turns,\n"
-        "mark them under one of these historical headings: {markers}.\n"
+        f"mark them under one of these historical headings: {markers}.\n"
         "Frame them as STALE context — the agent must NOT resume that work unless the latest user message\n"
         "explicitly asks for it. If fully resolved, reduce to a one-line bullet or omit.\n"
         "Exception: active blockers or handoff state should NOT be demoted even if they are absent from the\n"
         "latest turns. Keep blockers and pending handoffs outside historical headings so the agent can still act on them.\n"
-    ).format(markers=markers)
+    )
 
 
 def _build_l2_focus_brief(focus_topic: str) -> str:
@@ -308,12 +308,12 @@ def _build_l2_focus_brief(focus_topic: str) -> str:
         "Keep other active tasks only when they are current blockers or handoff state.\n"
         "\n"
         "Demote old / completed topics:\n"
-        "Place non-current work under: {markers}.\n"
+        f"Place non-current work under: {markers}.\n"
         "These sections are STALE — the agent must not act on them unless the latest user message explicitly\n"
         "requests it. Reduce resolved topics to one-liners or drop.\n"
         "Exception: active blockers and pending handoff state should NOT be demoted even when absent from recent\n"
         "turns. Keep them outside historical headings so the agent retains awareness of unresolved constraints.\n"
-    ).format(markers=markers)
+    )
 
 
 def _summary_model_chain(primary_model: str = "", fallback_models: list[str] | tuple[str, ...] | None = None) -> list[str]:
