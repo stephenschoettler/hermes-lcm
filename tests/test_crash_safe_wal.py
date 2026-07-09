@@ -233,10 +233,14 @@ class TestConcurrentStartupMigration:
             conn = sqlite3.connect(str(db_path), timeout=30.0)
             try:
                 configure_connection(conn)
-                barrier.wait()  # maximise overlap on the migration DDL
+                # Timeout + abort-on-error: a thread that fails before the
+                # barrier must break it, or the surviving threads wait forever
+                # and the deadlock hides the original error from the assert.
+                barrier.wait(timeout=60.0)  # maximise overlap on the migration DDL
                 ensure_message_origin_columns(conn)
                 conn.commit()
             except BaseException as exc:  # noqa: BLE001 - re-asserted below
+                barrier.abort()
                 with lock:
                     errors.append(exc)
             finally:
@@ -246,9 +250,15 @@ class TestConcurrentStartupMigration:
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            t.join(timeout=120.0)
+        stuck = [t for t in threads if t.is_alive()]
+        assert not stuck, f"{len(stuck)} migration threads still running after join timeout"
 
-        assert not errors, f"concurrent column migration raised: {errors!r}"
+        real_errors = [
+            exc for exc in errors if not isinstance(exc, threading.BrokenBarrierError)
+        ]
+        assert not real_errors, f"concurrent column migration raised: {real_errors!r}"
+        assert not errors, "barrier broke without a recorded root-cause error"
         conn = sqlite3.connect(str(db_path))
         columns = [
             row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()

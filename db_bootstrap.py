@@ -99,12 +99,41 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
                                               readers cache WAL pages in RAM.
     """
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    _execute_wal_conversion_with_lock_retry(conn)
+    conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
+
+
+def _execute_wal_conversion_with_lock_retry(
+    conn: sqlite3.Connection,
+    *,
+    budget_ms: int = SQLITE_BUSY_TIMEOUT_MS,
+) -> None:
+    """Run ``PRAGMA journal_mode=WAL`` with a bounded lock-contention retry.
+
+    Converting a rollback-journal database to WAL needs the exclusive lock,
+    and SQLite can return ``SQLITE_BUSY`` for that upgrade without consulting
+    the busy handler when other connections are mid-setup on the same file.
+    Concurrent process startup (gateway + CLI + sub-agents) on a not-yet-WAL
+    database therefore crashed sporadically with ``database is locked``.
+    Once the database is in WAL mode the pragma is a plain read and never
+    takes this path, so the retry only matters on first boot after an
+    install/upgrade or on a rollback-journal restore.
+    """
+    deadline = time.monotonic() + budget_ms / 1000.0
+    delay_seconds = 0.005
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                raise
+        time.sleep(delay_seconds)
+        delay_seconds = min(delay_seconds * 2, 0.25)
 
 
 def add_column_if_missing(
