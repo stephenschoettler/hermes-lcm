@@ -26,6 +26,7 @@ _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
+    "gpt-5.6": 372_000,
     "gpt-5": 272_000,
 }
 
