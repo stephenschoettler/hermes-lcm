@@ -4,6 +4,7 @@ Uses tiktoken when available, falls back to char-based estimate.
 """
 
 import logging
+import threading
 from functools import lru_cache
 from typing import Any, Dict, List
 
@@ -13,21 +14,67 @@ logger = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN = 4
 _encoder = None
-_encoder_checked = False
+_encoder_ready = False
+_encoder_lock = threading.Lock()
+_encoder_thread = None
+
+# Bound on how long a count_tokens() caller will wait for the FIRST encoder
+# load. tiktoken.get_encoding() downloads the BPE file over the network when
+# it is not already cached on disk; on restricted-egress hosts that request
+# can hang for minutes before failing (measured: ~127s per fresh process in a
+# production deployment), and _get_encoder() sits on the host's post-turn
+# hook path -- so the hang blocked reply delivery. Callers that hit the bound
+# use the char-based estimate; the real encoder is adopted (and the count
+# cache cleared) whenever the background load completes.
+_ENCODER_FIRST_WAIT_S = 2.0
+
+
+def _load_encoder():
+    """The (possibly network-backed) tiktoken load. Patchable in tests."""
+    import tiktoken
+    return tiktoken.get_encoding("cl100k_base")
+
+
+def _encoder_loader() -> None:
+    global _encoder, _encoder_ready
+    enc = None
+    try:
+        enc = _load_encoder()
+    except Exception:
+        logger.debug("tiktoken not available, using char-based estimates")
+    with _encoder_lock:
+        _encoder = enc
+        _encoder_ready = True
+    if enc is not None:
+        # Counts for identical text change estimator -> encoder on adoption;
+        # drop memoized estimates so the cache stays consistent.
+        _count_tokens_cached.cache_clear()
 
 
 def _get_encoder():
-    """Lazily load tiktoken cl100k_base encoder."""
-    global _encoder, _encoder_checked
-    if _encoder_checked:
+    """Return the tiktoken encoder, never blocking on unbounded network I/O.
+
+    The load runs in a daemon thread. The first caller waits briefly
+    (_ENCODER_FIRST_WAIT_S) so the common already-cached-on-disk case still
+    gets exact counts immediately; after that, callers never wait -- they use
+    the estimator until the loader finishes.
+    """
+    global _encoder_thread
+    if _encoder_ready:
         return _encoder
-    _encoder_checked = True
-    try:
-        import tiktoken
-        _encoder = tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        logger.debug("tiktoken not available, using char-based estimates")
-    return _encoder
+    first = False
+    with _encoder_lock:
+        if _encoder_ready:
+            return _encoder
+        if _encoder_thread is None:
+            _encoder_thread = threading.Thread(
+                target=_encoder_loader, name="lcm-tiktoken-load", daemon=True
+            )
+            _encoder_thread.start()
+            first = True
+    if first:
+        _encoder_thread.join(timeout=_ENCODER_FIRST_WAIT_S)
+    return _encoder if _encoder_ready else None
 
 
 def _fallback_token_estimate(text: str) -> int:
