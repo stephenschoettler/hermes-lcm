@@ -17,6 +17,13 @@ _encoder = None
 _encoder_ready = False
 _encoder_lock = threading.Lock()
 _encoder_thread = None
+# Cache-key generation, bumped (under _encoder_lock) when the real encoder is
+# adopted. The memoized count is keyed on (text, generation), so an estimator
+# result computed before adoption can only ever be inserted under the old
+# generation: a cache_clear() alone cannot stop an in-flight LRU miss from
+# repopulating the cache with a stale estimate *after* the clear, but a stale
+# insert under a dead key is unreachable by post-adoption lookups.
+_encoder_generation = 0
 
 # Bound on how long a count_tokens() caller will wait for the FIRST encoder
 # load. tiktoken.get_encoding() downloads the BPE file over the network when
@@ -36,7 +43,7 @@ def _load_encoder():
 
 
 def _encoder_loader() -> None:
-    global _encoder, _encoder_ready
+    global _encoder, _encoder_ready, _encoder_generation
     enc = None
     try:
         enc = _load_encoder()
@@ -45,9 +52,14 @@ def _encoder_loader() -> None:
     with _encoder_lock:
         _encoder = enc
         _encoder_ready = True
+        if enc is not None:
+            # Counts for identical text change estimator -> encoder on
+            # adoption; bumping the generation retires every pre-adoption
+            # cache key, including ones an in-flight miss has yet to insert.
+            _encoder_generation += 1
     if enc is not None:
-        # Counts for identical text change estimator -> encoder on adoption;
-        # drop memoized estimates so the cache stays consistent.
+        # Memory hygiene only (correctness comes from the generation key):
+        # evict the now-unreachable old-generation entries.
         _count_tokens_cached.cache_clear()
 
 
@@ -112,10 +124,11 @@ def _count_tokens_core(text) -> int:
 
 
 @lru_cache(maxsize=2048)
-def _count_tokens_cached(text: str) -> int:
+def _count_tokens_cached(text: str, generation: int) -> int:
     # tiktoken encoding is the dominant per-turn cost: assembly and preflight
-    # re-count the same content many times per turn. The encoder is decided
-    # once per process (see _get_encoder), so a content-keyed cache is stable.
+    # re-count the same content many times per turn. The counting function is
+    # stable within one encoder generation (see _encoder_generation), so a
+    # (content, generation) key is stable.
     return _count_tokens_core(text)
 
 
@@ -134,7 +147,7 @@ def count_tokens(text) -> int:
     # (e.g. tool_call arguments as a dict); preserve the legacy tolerance by
     # counting those uncached rather than feeding them to the LRU.
     if isinstance(text, str) and len(text) <= _MAX_CACHEABLE_TOKEN_TEXT_CHARS:
-        return _count_tokens_cached(text)
+        return _count_tokens_cached(text, _encoder_generation)
     return _count_tokens_core(text)
 
 
