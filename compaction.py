@@ -408,10 +408,9 @@ class CompactionMixin:
             n = len(working_messages)
             fresh_tail_start = max(0, n - self._config.fresh_tail_count)
 
-            # Keep only a real system prompt anchored. Gateway sessions may
-            # pass only conversation messages, so index 0 can be an old user
-            # turn; that must remain eligible for compaction instead of being
-            # replayed forever as fresh-looking intent.
+            # Keep a real system prompt and, while it is the only real user
+            # turn, its immediately following prompt. Gateway sessions may pass
+            # only conversation messages, so index 0 remains compactable.
             leading_anchor_count = self._leading_anchor_count(working_messages)
             if fresh_tail_start <= leading_anchor_count:
                 noop_reason = "no eligible raw backlog outside fresh tail"
@@ -664,8 +663,9 @@ class CompactionMixin:
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 compressed = self._assemble_overflow_recovery_context(
                     working_messages[0] if leading_anchor_count else None,
-                    working_messages[leading_anchor_count:],
+                    working_messages[1 if leading_anchor_count else 0:],
                     assembly_cap_override=recovery_assembly_cap,
+                    preserve_leading_user=leading_anchor_count == 2,
                 )
                 return self._finalize_forced_overflow_result(
                     working_messages,
@@ -683,8 +683,9 @@ class CompactionMixin:
                 try:
                     sanitized_messages = self._assemble_context(
                         active_context_messages[0] if leading_anchor_count else None,
-                        active_context_messages[leading_anchor_count:],
+                        active_context_messages[1 if leading_anchor_count else 0:],
                         assembly_cap_override=recovery_assembly_cap,
+                        preserve_leading_user=anchor_leading_count == 2,
                     )
                 finally:
                     self._pending_context_anchor_messages = None
@@ -738,8 +739,9 @@ class CompactionMixin:
         try:
             compressed = self._assemble_context(
                 working_messages[0] if leading_anchor_count else None,
-                working_messages[leading_anchor_count:],
+                working_messages[1 if leading_anchor_count else 0:],
                 assembly_cap_override=recovery_assembly_cap,
+                preserve_leading_user=anchor_leading_count == 2,
             )
         finally:
             self._pending_context_anchor_messages = None

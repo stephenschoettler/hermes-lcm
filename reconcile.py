@@ -18,6 +18,7 @@ avoid an import cycle (staticmethod resolution is identical).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -53,6 +54,61 @@ _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from co
 
 
 class ReconcileMixin:
+    def _assembled_active_context_metadata_key(self) -> str:
+        return f"assembled_active_context_fingerprints:{self._session_id}"  # type: ignore[attr-defined]
+
+    def _active_context_message_fingerprint(self, message: Dict[str, Any]) -> str:
+        identity = self._message_replay_identity(message)
+        serialized = json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _remember_assembled_active_context(self, messages: List[Dict[str, Any]]) -> None:
+        """Persist exact active-context occurrence identity for restart replay."""
+        if not self._session_id or not messages:  # type: ignore[attr-defined]
+            return
+        payload = {
+            "version": 1,
+            "fingerprints": [
+                self._active_context_message_fingerprint(message)
+                for message in messages
+            ],
+        }
+        try:
+            self._store.write_metadata_json(  # type: ignore[attr-defined]
+                [self._assembled_active_context_metadata_key()],
+                json.dumps(payload, sort_keys=True),
+                skip_unchanged=True,
+            )
+        except Exception:
+            logger.debug("LCM assembled active-context provenance write failed", exc_info=True)
+
+    def _reconciled_cursor_from_assembled_active_context(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> int:
+        """Return the exact durable assembled-context prefix length, if replayed."""
+        if not self._session_id or not messages:  # type: ignore[attr-defined]
+            return 0
+        try:
+            payload = self._store.read_metadata_json(  # type: ignore[attr-defined]
+                self._assembled_active_context_metadata_key()
+            )
+        except Exception:
+            logger.debug("LCM assembled active-context provenance read failed", exc_info=True)
+            return 0
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return 0
+        fingerprints = payload.get("fingerprints")
+        if not isinstance(fingerprints, list) or not fingerprints or len(fingerprints) > len(messages):
+            return 0
+        if any(not isinstance(fingerprint, str) for fingerprint in fingerprints):
+            return 0
+        incoming_prefix = [
+            self._active_context_message_fingerprint(message)
+            for message in messages[: len(fingerprints)]
+        ]
+        return len(fingerprints) if incoming_prefix == fingerprints else 0
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -827,6 +883,19 @@ class ReconcileMixin:
                     return cursor
             return 0
 
+        assembled_context_cursor = self._reconciled_cursor_from_assembled_active_context(messages)
+        if assembled_context_cursor == len(messages):
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed durable assembled active context",
+                cursor=assembled_context_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=0,
+                effective_incoming=assembled_context_cursor,
+            )
+            return assembled_context_cursor
+
         tail_limit = min(max(len(messages) * 4, 64), session_count)
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
@@ -840,6 +909,34 @@ class ReconcileMixin:
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
         ]
+        if assembled_context_cursor > 0:
+            incoming_suffix = messages[assembled_context_cursor:]
+            suffix_identities = [
+                self._message_replay_identity(message)
+                for message in incoming_suffix
+            ]
+            durable_suffix_overlap = 0
+            for overlap in range(min(len(suffix_identities), len(stored_tail)), 0, -1):
+                if suffix_identities[:overlap] == stored_tail[-overlap:]:
+                    durable_suffix_overlap = overlap
+                    break
+            cursor = assembled_context_cursor + durable_suffix_overlap
+            reason = (
+                "replayed durable assembled active context and stored suffix"
+                if durable_suffix_overlap
+                else "replayed durable assembled active context"
+            )
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason=reason,
+                cursor=cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=cursor,
+            )
+            return cursor
+
         cursor = self._find_reconciled_cursor_for_store_tail(
             messages,
             stored_tail,
