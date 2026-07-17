@@ -309,6 +309,18 @@ known-good rolling backup.
 
 Most installs only need `plugins.enabled` and `context.engine: lcm`.
 
+Scalar `LCM_*` settings can also be set under the `lcm:` section in
+`~/.hermes/config.yaml` using the lower-case field name, for example
+`LCM_DYNAMIC_LEAF_CHUNK_ENABLED=true` becomes:
+
+```yaml
+lcm:
+  dynamic_leaf_chunk_enabled: true
+```
+
+Environment variables still take precedence over YAML, and
+`lcm_status.config_sources` reports which source won.
+
 ### Common settings
 
 | Variable | Default | Use |

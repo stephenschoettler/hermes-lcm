@@ -255,7 +255,7 @@ def test_lcm_status_json_reports_effective_config_sources(tmp_path, monkeypatch)
     assert payload["config_sources"]["summary_spend_window_seconds"] == "env:LCM_SUMMARY_SPEND_WINDOW_SECONDS"
     assert payload["config_sources"]["summary_spend_backoff_seconds"] == "env:LCM_SUMMARY_SPEND_BACKOFF_SECONDS"
     assert engine._summary_spend_guard.max_calls == 0
-    assert "fresh_tail_count" in payload["ignored_config_yaml_lcm_keys"]
+    assert payload["ignored_config_yaml_lcm_keys"] == []
 
 
 def test_lcm_status_does_not_report_invalid_env_as_effective_source(tmp_path, monkeypatch):
@@ -301,7 +301,7 @@ def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypat
     (hermes_home / "config.yaml").write_text(
         "lcm:\n"
         "  context_threshold: 0.52\n"
-        "  leaf_chunk_tokens: 12345\n"
+        "  leaf_chunk_tokenz: 12345\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
@@ -316,7 +316,7 @@ def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypat
 
     assert payload["overall"] == "warnings"
     assert config_check["status"] == "warn"
-    assert any("lcm.leaf_chunk_tokens" in warning for warning in config_check["detail"])
+    assert any("lcm.leaf_chunk_tokenz" in warning for warning in config_check["detail"])
 
 
 def test_lcm_status_reports_last_compression_noop_reason(engine):
