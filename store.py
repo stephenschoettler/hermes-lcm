@@ -11,6 +11,7 @@ row identity (`store_id`) for DAG/source lookup.
 
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -49,6 +50,31 @@ from .message_content import normalize_content_value as _normalize_content_value
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_ingest_timestamp(value: Any) -> float:
+    """Resolve a message's stored timestamp at ingest.
+
+    A caller that is re-ingesting messages it has already seen — restoring a
+    durable transcript, importing a prior session, replaying after a restart —
+    knows each message's real arrival time and passes it as ``timestamp``.
+    Preserve it, so re-ingest does not collapse the whole history onto the
+    instant of the import.
+
+    A genuinely new live message carries no usable ``timestamp`` and falls back
+    to now. Anything unusable (absent, ``None``, non-numeric, non-positive,
+    NaN/inf) is treated as absent rather than raising or writing a 1970 epoch —
+    ingest must never fail on a malformed optional field.
+    """
+    if value is None:
+        return time.time()
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return time.time()
+    if ts > 0 and math.isfinite(ts):
+        return ts
+    return time.time()
 
 
 _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1 WHEN 'tool' THEN 2 ELSE 1 END"
@@ -336,7 +362,7 @@ class MessageStore:
                     msg.get("tool_call_id"),
                     tc_json,
                     msg.get("tool_name"),
-                    time.time(),
+                    _resolve_ingest_timestamp(msg.get("timestamp")),
                     token_estimate,
                     0,
                 ),
@@ -384,7 +410,7 @@ class MessageStore:
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
+                ts = _resolve_ingest_timestamp(msg.get("timestamp"))
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
