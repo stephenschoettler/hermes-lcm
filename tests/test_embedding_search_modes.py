@@ -16,6 +16,7 @@ import hermes_lcm.tools as lcm_tools
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.embedding_provider import VoyageError
+from hermes_lcm.project_scope import ProjectMetadata
 from hermes_lcm.store import MessageStore
 from hermes_lcm.vector_store import KNNResult, VectorStore
 
@@ -58,10 +59,17 @@ def semantic_engine(tmp_path):
         store.close()
 
 
-def _add_summary(engine, summary: str, *, created_at: float, source_ids=None) -> int:
+def _add_summary(
+    engine,
+    summary: str,
+    *,
+    created_at: float,
+    source_ids=None,
+    session_id="session-a",
+) -> int:
     return engine._dag.add_node(
         SummaryNode(
-            session_id="session-a",
+            session_id=session_id,
             depth=0,
             summary=summary,
             token_count=20,
@@ -114,7 +122,9 @@ def test_semantic_happy_path_orders_by_cosine_and_surfaces_confidence_coverage(
         ],
     )
     provider = MockProvider()
-    monkeypatch.setattr(embedding_provider, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(
+        embedding_provider, "resolve_provider", lambda _config: provider
+    )
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: provider)
 
     payload = json.loads(
@@ -141,6 +151,38 @@ def test_semantic_happy_path_orders_by_cosine_and_surfaces_confidence_coverage(
     assert payload["coverage"] in {"full", "bounded"}
     assert payload["degraded_to_fts"] is False
     assert provider.queries == ["meaning-preserving query"]
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_semantic_modes_fail_closed_for_empty_project_scope(
+    semantic_engine, monkeypatch, mode
+):
+    node_id = _add_summary(
+        semantic_engine,
+        "project scoped semantic result",
+        created_at=1.0,
+    )
+    _seed_vectors(semantic_engine, [(node_id, [1.0, 0.0])])
+    semantic_engine._store.set_session_project_metadata(
+        "session-a",
+        ProjectMetadata("project-a", "/projects/a", "/projects/a"),
+    )
+    provider = MockProvider()
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: provider)
+
+    payload = json.loads(
+        lcm_tools.lcm_grep(
+            {
+                "query": "project scoped semantic result",
+                "mode": mode,
+                "project_id": "missing-project",
+            },
+            engine=semantic_engine,
+        )
+    )
+
+    assert payload["project_id"] == "missing-project"
+    assert payload["results"] == []
 
 
 def test_semantic_timeout_returns_explicit_deadline_without_starting_fallback(
@@ -235,7 +277,9 @@ def test_timeout_worker_is_daemon_and_provider_call_is_bounded(
             release.wait(1.0)
             return list(self.vector)
 
-    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: BlockingProvider())
+    monkeypatch.setattr(
+        lcm_tools, "resolve_provider", lambda _config: BlockingProvider()
+    )
     try:
         payload = json.loads(
             lcm_tools.lcm_grep(
@@ -252,7 +296,9 @@ def test_timeout_worker_is_daemon_and_provider_call_is_bounded(
         assert payload["timeout"] is True
         # The interactive timeout is the remaining absolute budget (~0.02s),
         # computed from a monotonic clock so a few microseconds may have elapsed.
-        assert observed_timeouts and observed_timeouts[0] == pytest.approx(0.02, abs=0.01)
+        assert observed_timeouts and observed_timeouts[0] == pytest.approx(
+            0.02, abs=0.01
+        )
         assert live_workers
         assert all(thread.daemon for thread in live_workers)
     finally:
@@ -490,7 +536,9 @@ def test_hybrid_rrf_deduplicates_nodes_and_rewards_both_arms(
     node_hits = [hit for hit in payload["results"] if hit.get("node_id") == both_node]
     assert len(node_hits) == 1
     both_hit = node_hits[0]
-    raw_hit = next(hit for hit in payload["results"] if hit.get("store_id") == message_id)
+    raw_hit = next(
+        hit for hit in payload["results"] if hit.get("store_id") == message_id
+    )
     assert both_hit["fts_rank"] >= 1 and both_hit["semantic_rank"] == 1
     assert both_hit["rrf_score"] == pytest.approx(
         1 / (60 + both_hit["fts_rank"]) + 1 / 61
@@ -500,7 +548,9 @@ def test_hybrid_rrf_deduplicates_nodes_and_rewards_both_arms(
     assert payload["rrf_k"] == 60
 
 
-@pytest.mark.parametrize(("limit", "expected_candidates"), [(1, 50), (40, 120), (200, 500)])
+@pytest.mark.parametrize(
+    ("limit", "expected_candidates"), [(1, 50), (40, 120), (200, 500)]
+)
 def test_hybrid_limit_controls_bounded_candidate_overfetch(
     semantic_engine,
     monkeypatch,
@@ -550,7 +600,9 @@ def test_semantic_snippets_are_bounded(semantic_engine, monkeypatch):
     assert len(payload["results"][0]["snippet"]) == 300
 
 
-def test_full_text_modes_remain_byte_identical_with_embeddings_on_or_off(semantic_engine):
+def test_full_text_modes_remain_byte_identical_with_embeddings_on_or_off(
+    semantic_engine,
+):
     semantic_engine._store.append(
         "session-a",
         {"role": "user", "content": "byte stable history result"},
@@ -560,7 +612,9 @@ def test_full_text_modes_remain_byte_identical_with_embeddings_on_or_off(semanti
         args = {"query": "stable", "sort": sort}
         semantic_engine._config.embeddings_enabled = False
         disabled = lcm_tools.lcm_grep(args, engine=semantic_engine)
-        explicit = lcm_tools.lcm_grep({**args, "mode": "full_text"}, engine=semantic_engine)
+        explicit = lcm_tools.lcm_grep(
+            {**args, "mode": "full_text"}, engine=semantic_engine
+        )
         semantic_engine._config.embeddings_enabled = True
         enabled = lcm_tools.lcm_grep(args, engine=semantic_engine)
         assert disabled == explicit == enabled
@@ -585,7 +639,9 @@ def _add_summary_in(engine, summary, *, session_id, created_at, source_ids=None)
 
 
 def test_semantic_role_filter_degrades_to_full_text(semantic_engine, monkeypatch):
-    semantic_engine._store.append("session-a", {"role": "user", "content": "role marker"})
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "role marker"}
+    )
     node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
     _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
@@ -604,7 +660,9 @@ def test_semantic_role_filter_degrades_to_full_text(semantic_engine, monkeypatch
     assert all(hit.get("type") == "message" for hit in payload["results"])
 
 
-def test_semantic_time_scoped_query_degrades_to_raw_full_text(semantic_engine, monkeypatch):
+def test_semantic_time_scoped_query_degrades_to_raw_full_text(
+    semantic_engine, monkeypatch
+):
     newer = _add_summary(semantic_engine, "newer high score", created_at=100.0)
     older = _add_summary(semantic_engine, "older lower score", created_at=1.0)
     _seed_vectors(semantic_engine, [(newer, [1.0, 0.0]), (older, [0.0, 1.0])])
@@ -626,15 +684,21 @@ def test_semantic_time_scoped_query_degrades_to_raw_full_text(semantic_engine, m
     assert all(hit.get("type") != "summary" for hit in payload.get("results", []))
 
 
-def test_semantic_source_filter_excludes_ineligible_before_top_k(semantic_engine, monkeypatch):
+def test_semantic_source_filter_excludes_ineligible_before_top_k(
+    semantic_engine, monkeypatch
+):
     keep_msg = semantic_engine._store.append(
         "session-a", {"role": "user", "content": "k"}, source="keep-src"
     )
     drop_msg = semantic_engine._store.append(
         "session-a", {"role": "user", "content": "d"}, source="drop-src"
     )
-    keep = _add_summary(semantic_engine, "keep summary", created_at=1.0, source_ids=[keep_msg])
-    drop = _add_summary(semantic_engine, "drop summary", created_at=2.0, source_ids=[drop_msg])
+    keep = _add_summary(
+        semantic_engine, "keep summary", created_at=1.0, source_ids=[keep_msg]
+    )
+    drop = _add_summary(
+        semantic_engine, "drop summary", created_at=2.0, source_ids=[drop_msg]
+    )
     # drop scores highest but its source is excluded, so it must not take the slot.
     _seed_vectors(semantic_engine, [(keep, [0.0, 1.0]), (drop, [1.0, 0.0])])
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
@@ -681,7 +745,9 @@ def test_semantic_broad_scope_degrades_to_raw_full_text(semantic_engine, monkeyp
     assert all(hit.get("type") != "summary" for hit in payload.get("results", []))
 
 
-def test_semantic_conversation_filter_degrades_to_raw_full_text(semantic_engine, monkeypatch):
+def test_semantic_conversation_filter_degrades_to_raw_full_text(
+    semantic_engine, monkeypatch
+):
     semantic_engine._store.append(
         "session-a", {"role": "user", "content": "c"}, conversation_id="conv-1"
     )
@@ -732,7 +798,9 @@ def test_slow_knn_degrades_within_total_budget(semantic_engine, monkeypatch):
 
     started = time.monotonic()
     payload = json.loads(
-        lcm_tools.lcm_grep({"query": "needle", "mode": "semantic"}, engine=semantic_engine)
+        lcm_tools.lcm_grep(
+            {"query": "needle", "mode": "semantic"}, engine=semantic_engine
+        )
     )
     elapsed = time.monotonic() - started
 
@@ -957,11 +1025,19 @@ def test_recall_eval_is_deterministic_and_hybrid_beats_fts_on_paraphrases():
 
     assert first == second
     metrics = json.loads(first)
-    assert metrics["hybrid"]["paraphrase"]["recall@5"] >= metrics["full_text"]["paraphrase"]["recall@5"]
-    assert metrics["hybrid"]["paraphrase"]["recall@10"] >= metrics["full_text"]["paraphrase"]["recall@10"]
+    assert (
+        metrics["hybrid"]["paraphrase"]["recall@5"]
+        >= metrics["full_text"]["paraphrase"]["recall@5"]
+    )
+    assert (
+        metrics["hybrid"]["paraphrase"]["recall@10"]
+        >= metrics["full_text"]["paraphrase"]["recall@10"]
+    )
 
 
-def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypatch, tmp_path):
+def test_semantic_content_scope_degrades_to_full_text(
+    semantic_engine, monkeypatch, tmp_path
+):
     """content_scope beyond 'history' is a payload-search dimension owned by
     the full-text arm; payloads are never embedded, so the semantic arm must
     degrade rather than silently return history-only semantic hits (combined
@@ -977,7 +1053,9 @@ def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypat
     # lightweight fixture engine needs one on combined heads (real engines
     # always have it).
     monkeypatch.setattr(semantic_engine, "_hermes_home", tmp_path, raising=False)
-    semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "payload marker"}
+    )
     node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
     _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
@@ -995,7 +1073,9 @@ def test_semantic_content_scope_degrades_to_full_text(semantic_engine, monkeypat
         assert all(hit.get("type") != "summary" for hit in payload["results"]), scope
 
 
-def test_hybrid_content_scope_degrades_to_full_text_arm(semantic_engine, monkeypatch, tmp_path):
+def test_hybrid_content_scope_degrades_to_full_text_arm(
+    semantic_engine, monkeypatch, tmp_path
+):
     """In hybrid mode the semantic arm's content_scope degrade must surface as
     the full-text-arm result (which owns payload scanning) plus the explicit
     degraded marker — never fused history-only semantic hits."""
@@ -1006,7 +1086,9 @@ def test_hybrid_content_scope_degrades_to_full_text_arm(semantic_engine, monkeyp
     # lightweight fixture engine needs one on combined heads (real engines
     # always have it).
     monkeypatch.setattr(semantic_engine, "_hermes_home", tmp_path, raising=False)
-    semantic_engine._store.append("session-a", {"role": "user", "content": "payload marker"})
+    semantic_engine._store.append(
+        "session-a", {"role": "user", "content": "payload marker"}
+    )
     node = _add_summary(semantic_engine, "an embedded summary", created_at=1.0)
     _seed_vectors(semantic_engine, [(node, [1.0, 0.0])])
     monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())

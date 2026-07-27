@@ -82,19 +82,17 @@ def _record_embedding(
 
 
 def test_core_migrations_omit_embedding_tables(tmp_path):
-    """A disabled install stays at schema_version 5 with no embedding tables.
+    """A disabled install stays at the core version with no embedding tables.
 
     Embedding tables are opt-in and never created by the core migration path,
-    so a base build can open the DB and the numeric counter stays free for the
-    temporal train (no v6 collision).
+    so a base build can open the DB without optional-schema collisions.
     """
     conn = sqlite3.connect(tmp_path / "core_only.db")
     try:
         db_bootstrap.run_versioned_migrations(conn)
         conn.commit()
 
-        assert db_bootstrap.SCHEMA_VERSION == 5
-        assert db_bootstrap.get_schema_version(conn) == 5
+        assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
         assert not (EMBEDDING_TABLES & _table_names(conn))
         marker = conn.execute(
             "SELECT step_name FROM lcm_migration_state WHERE step_name = ?",
@@ -106,7 +104,7 @@ def test_core_migrations_omit_embedding_tables(tmp_path):
 
 
 def test_vector_store_creates_embedding_tables_lazily_and_idempotently(tmp_path):
-    """VectorStore materializes the opt-in tables on first use, still at v5."""
+    """VectorStore materializes opt-in tables without changing the core version."""
     db_path = tmp_path / "idempotent.db"
     first = VectorStore(db_path)
     first.close()
@@ -114,7 +112,7 @@ def test_vector_store_creates_embedding_tables_lazily_and_idempotently(tmp_path)
     store = VectorStore(db_path)
     try:
         assert EMBEDDING_TABLES <= _table_names(store.connection)
-        assert db_bootstrap.get_schema_version(store.connection) == 5
+        assert db_bootstrap.get_schema_version(store.connection) == db_bootstrap.SCHEMA_VERSION
         steps = store.connection.execute(
             "SELECT step_name FROM lcm_migration_state WHERE step_name = ?",
             (MIGRATION_STEP,),
@@ -147,6 +145,7 @@ def test_vector_store_upgrades_previous_schema_version(tmp_path):
     store = VectorStore(db_path)
     try:
         assert EMBEDDING_TABLES <= _table_names(store.connection)
+        assert "session_project_metadata" in _table_names(store.connection)
         assert db_bootstrap.get_schema_version(store.connection) == db_bootstrap.SCHEMA_VERSION
         completed = store.connection.execute(
             "SELECT completed_at FROM lcm_migration_state WHERE step_name = ?",

@@ -245,6 +245,7 @@ def _parse_strict_int(value: Any, name: str) -> tuple[int | None, str | None]:
 
 
 _LCM_GREP_VALID_SCOPES = frozenset({"current", "all", "session"})
+_LCM_PROJECT_SCOPES = frozenset({"all", "current"})
 _LCM_GREP_VALID_CONTENT_SCOPES = frozenset({"history", "externalized", "both"})
 _LCM_GREP_HARD_LIMIT_CAP = 200
 _LCM_GREP_EXTERNALIZED_FILE_CAP = 256
@@ -271,6 +272,45 @@ _LCM_RECALL_VALID_INCLUDE = frozenset({"all", "summaries", "verbatim"})
 # strong hit — it only nudges toward newer memories.
 _LCM_RECALL_RECENCY_HALF_LIFE_S = 30 * 24 * 3600.0
 _LCM_RECALL_RECENCY_FLOOR = 0.5
+
+
+def _resolve_project_scope(
+    args: Dict[str, Any],
+    engine: "LCMEngine",
+) -> tuple[str, str | None, list[str] | None, str | None]:
+    raw_project_scope = args.get("project_scope", "all")
+    if not isinstance(raw_project_scope, str):
+        return "", None, None, "project_scope must be a string"
+    project_scope = raw_project_scope.strip().lower()
+    if project_scope not in _LCM_PROJECT_SCOPES:
+        return project_scope, None, None, "project_scope must be one of: all, current"
+
+    if "project_id" in args:
+        raw_project_id = args["project_id"]
+        if not isinstance(raw_project_id, str):
+            return project_scope, None, None, "project_id must be a string"
+        if not raw_project_id.strip():
+            return project_scope, None, None, "project_id must not be empty"
+        project_id: str | None = raw_project_id
+    elif project_scope == "current":
+        metadata = engine._store.get_session_project_metadata(engine.current_session_id)
+        if metadata is None:
+            return (
+                project_scope,
+                None,
+                None,
+                "project_scope=current requires project metadata for the active session",
+            )
+        project_id = metadata.project_id
+    else:
+        project_id = None
+
+    session_ids = (
+        engine._store.get_project_session_ids(project_id)
+        if project_id is not None
+        else None
+    )
+    return project_scope, project_id, session_ids, None
 _LCM_RECALL_RRF_K = 60
 _LCM_LOAD_SESSION_DEFAULT_LIMIT = 100
 _LCM_LOAD_SESSION_HARD_LIMIT_CAP = 200
@@ -1708,6 +1748,12 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     if not query:
         return json.dumps({"error": "No query provided"})
 
+    project_scope, project_id, project_session_ids, project_error = _resolve_project_scope(
+        args, engine
+    )
+    if project_error:
+        return json.dumps({"error": project_error})
+
     raw_limit_arg = args.get("limit", 10)
     parsed_limit = _parse_int_value(raw_limit_arg, 10)
     if parsed_limit <= 0:
@@ -1819,6 +1865,9 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
 
     current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
+    current_project_allowed = (
+        project_session_ids is None or current_session_id in project_session_ids
+    )
     results: list[Dict[str, Any]] = []
 
     if content_scope in {"history", "both"}:
@@ -1833,6 +1882,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
+                project_id=project_id,
             )
             for hit in msg_hits:
                 results.append(
@@ -1850,7 +1900,12 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     # contract would push this tool toward a memory-system shape rather than
     # a plugin-local archive search. Raw-message hits remain expandable across
     # sessions via lcm_expand(store_id=...).
-    if content_scope in {"history", "both"} and session_scope == "current" and not raw_message_filter_active:
+    if (
+        content_scope in {"history", "both"}
+        and session_scope == "current"
+        and not raw_message_filter_active
+        and current_project_allowed
+    ):
         try:
             node_hits = engine._dag.search(
                 query,
@@ -1866,7 +1921,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
 
     externalized_scan: dict[str, Any] | None = None
     externalized_results_omitted = False
-    if searches_externalized and externalized_filter_active:
+    if searches_externalized and (externalized_filter_active or not current_project_allowed):
         # Externalized sidecars are tool/ingest payloads, not raw messages, and
         # carry no role/timestamp/source/conversation lane comparable to history
         # rows. Suppress sidecar search whenever one of those filters is active
@@ -2071,6 +2126,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
         "query": query,
         "sort": sort,
         "session_scope": session_scope,
+        "project_scope": project_scope,
         "content_scope": content_scope,
         "source": source,
         "conversation_id": conversation_id,
@@ -2078,6 +2134,8 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
         "total_results": len(results),
         "results": results[:limit],
     }
+    if project_id is not None:
+        response["project_id"] = project_id
     if role is not None:
         response["role"] = role
     if time_from is not None:
@@ -2383,6 +2441,12 @@ def _lcm_grep_semantic(
     if not query:
         return {"error": "No query provided"}
 
+    project_scope, project_id, project_session_ids, project_error = _resolve_project_scope(
+        args, engine
+    )
+    if project_error:
+        return {"error": project_error}
+
     raw_limit_arg = args.get("limit", 10)
     parsed_limit = _parse_int_value(raw_limit_arg, 10)
     if parsed_limit <= 0:
@@ -2499,6 +2563,13 @@ def _lcm_grep_semantic(
     knn_conversation_ids = _resolve_semantic_conversation_scope(
         engine, search_session_id=search_session_id, conversation_id=conversation_id
     )
+    if project_session_ids is not None:
+        project_sessions = set(project_session_ids)
+        knn_conversation_ids = (
+            sorted(project_sessions)
+            if knn_conversation_ids is None
+            else sorted(project_sessions.intersection(knn_conversation_ids))
+        )
     if time.monotonic() >= deadline:
         return _lcm_grep_deadline_error(mode, "scope_resolution")
 
@@ -2625,6 +2696,7 @@ def _lcm_grep_semantic(
         "mode": "semantic",
         "sort": normalize_search_sort(args.get("sort")),
         "session_scope": session_scope,
+        "project_scope": project_scope,
         "source": source,
         "conversation_id": conversation_id,
         "limit": limit,
@@ -2633,6 +2705,8 @@ def _lcm_grep_semantic(
         "coverage": coverage,
         "degraded_to_fts": False,
     }
+    if project_id is not None:
+        response["project_id"] = project_id
     if role is not None:
         response["role"] = role
     if time_from is not None:
@@ -2866,15 +2940,21 @@ def _lcm_recall_approx_reason(arm: str) -> str:
 
 
 def _lcm_recall_fts_arm(
-    engine: "LCMEngine", query: str, *, candidate_limit: int, deadline: float
+    engine: "LCMEngine",
+    query: str,
+    *,
+    candidate_limit: int,
+    deadline: float,
+    project_id: str | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    """FTS arm: raw messages across ALL sessions (no conversation filter)."""
+    """FTS arm: raw messages across eligible project sessions."""
     payload = _lcm_grep_full_text_with_deadline(
         {
             "query": query,
             "mode": "recall",
             "session_scope": "all",
             "limit": candidate_limit,
+            **({"project_id": project_id} if project_id is not None else {}),
         },
         engine=engine,
         deadline=deadline,
@@ -2910,8 +2990,9 @@ def _lcm_recall_summary_arm(
     provider: Any,
     candidate_limit: int,
     deadline: float,
-) -> tuple[list[dict[str, Any]], str]:
-    """Summary KNN arm: embedded summaries across ALL sessions (no filter)."""
+    session_ids: list[str] | None,
+) -> tuple[list[dict[str, Any]], str, int | None, int | None]:
+    """Summary KNN arm: embedded summaries across eligible project sessions."""
     knn_results = _run_within_deadline(
         lambda: run_knn(
             engine,
@@ -2921,7 +3002,7 @@ def _lcm_recall_summary_arm(
             deadline=deadline,
             since=None,
             until=None,
-            conversation_ids=None,
+            conversation_ids=session_ids,
             source=None,
             vector_store_cls=VectorStore,
             scan_rows=max(1, int(getattr(engine._config, "recall_scan_rows", 25_000))),
@@ -2966,8 +3047,9 @@ def _lcm_recall_chunk_arm(
     provider: Any,
     candidate_limit: int,
     deadline: float,
-) -> tuple[list[dict[str, Any]], str]:
-    """Chunk KNN arm: verbatim chunk vectors across ALL sessions (no filter)."""
+    session_ids: list[str] | None,
+) -> tuple[list[dict[str, Any]], str, int | None, int | None]:
+    """Chunk KNN arm: verbatim chunks across eligible project sessions."""
     knn_results = _run_within_deadline(
         lambda: run_chunk_knn(
             engine,
@@ -2977,7 +3059,7 @@ def _lcm_recall_chunk_arm(
             deadline=deadline,
             since=None,
             until=None,
-            conversation_ids=None,
+            conversation_ids=session_ids,
             source=None,
             vector_store_cls=VectorStore,
             scan_rows=max(1, int(getattr(engine._config, "recall_scan_rows", 25_000))),
@@ -3088,6 +3170,12 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if not query:
         return json.dumps({"error": "No query provided"})
 
+    project_scope, project_id, project_session_ids, project_error = _resolve_project_scope(
+        args, engine
+    )
+    if project_error:
+        return json.dumps({"error": project_error})
+
     parsed_limit = _parse_int_value(args.get("limit", _LCM_RECALL_DEFAULT_LIMIT), _LCM_RECALL_DEFAULT_LIMIT)
     if parsed_limit <= 0:
         return json.dumps({"error": "limit must be a positive integer"})
@@ -3132,7 +3220,11 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if run_fts:
         try:
             hits, fts_error = _lcm_recall_fts_arm(
-                engine, query, candidate_limit=candidate_limit, deadline=deadline
+                engine,
+                query,
+                candidate_limit=candidate_limit,
+                deadline=deadline,
+                project_id=project_id,
             )
         except (_WorkerCapacityError, TimeoutError) as exc:
             hits, fts_error = [], {"error": str(exc)}
@@ -3229,6 +3321,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                             provider=provider,
                             candidate_limit=candidate_limit,
                             deadline=deadline,
+                            session_ids=project_session_ids,
                         )
                         arm_hits["summary"] = hits
                         coverage["summary"] = cov
@@ -3257,6 +3350,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                             provider=chunk_provider,
                             candidate_limit=candidate_limit,
                             deadline=deadline,
+                            session_ids=project_session_ids,
                         )
                         arm_hits["chunk"] = hits
                         coverage["chunk"] = cov
@@ -3387,6 +3481,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     degraded = bool(degraded_reasons)
     response: dict[str, Any] = {
         "query": query,
+        "project_scope": project_scope,
         "limit": limit,
         "scope_bias": scope_bias,
         "include": include,
@@ -3406,6 +3501,8 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         },
         "degraded": degraded,
     }
+    if project_id is not None:
+        response["project_id"] = project_id
     if degraded:
         response["degraded_reason"] = "; ".join(dict.fromkeys(degraded_reasons))
     if timed_out:

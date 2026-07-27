@@ -1,9 +1,9 @@
 """Tests for interim-build schema-stamp detection and guided remediation (fix #7).
 
 A database touched by an interim development build can carry a numeric
-``schema_version`` ahead of this build's ladder while its actual schema is the
-v5 shape plus named feature markers. These tests cover classification of that
-condition, the refusal-message guidance, and the explicit backup-first repair.
+``schema_version`` ahead of this build's ladder while its actual schema has a
+compatible core plus named feature markers. These tests cover classification,
+refusal-message guidance, and the explicit backup-first repair.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from hermes_lcm.vector_store import VectorStore
 
 
 def _build_v5_db(path: Path, *, with_features: bool = False) -> None:
-    """Materialize a genuine v5-shaped DB (core tables + both FTS indexes)."""
+    """Materialize the current core tables and both FTS indexes."""
     store = MessageStore(path)
     store.close()
     dag = SummaryDAG(path)
@@ -159,7 +159,62 @@ def test_classify_interim_stamp_on_v5_shape(tmp_path):
     _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
     conn = sqlite3.connect(db_path)
     try:
-        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        )
+    finally:
+        conn.close()
+
+
+def test_classify_interim_stamp_on_previous_core_shape(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP TABLE session_project_metadata")
+        db_bootstrap.set_schema_version(conn, db_bootstrap.SCHEMA_VERSION + 1)
+        conn.commit()
+
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing_constraints", "missing_index", "wrong_index"],
+)
+def test_classify_genuinely_newer_on_malformed_present_project_table(
+    tmp_path, malformation
+):
+    db_path = tmp_path / "lcm.db"
+    _build_v5_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        if malformation == "missing_constraints":
+            conn.execute("DROP TABLE session_project_metadata")
+            conn.execute(
+                "CREATE TABLE session_project_metadata("
+                "session_id TEXT, project_id TEXT, project_root TEXT, cwd TEXT)"
+            )
+        else:
+            conn.execute("DROP INDEX idx_session_project_metadata_project")
+            if malformation == "wrong_index":
+                conn.execute(
+                    "CREATE INDEX idx_session_project_metadata_project "
+                    "ON session_project_metadata(cwd, session_id)"
+                )
+        db_bootstrap.set_schema_version(conn, db_bootstrap.SCHEMA_VERSION + 1)
+        conn.commit()
+
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+        )
     finally:
         conn.close()
 
@@ -172,7 +227,10 @@ def test_classify_interim_stamp_with_feature_marker_tables(tmp_path):
     try:
         # temporal-rollup + embedding tables are known feature markers, so the
         # DB is still classified as an interim stamp, not a genuinely newer DB.
-        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        )
     finally:
         conn.close()
 
@@ -189,7 +247,10 @@ def test_classify_genuinely_newer_on_unknown_table(tmp_path):
     _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
     conn = sqlite3.connect(db_path)
     try:
-        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+        )
     finally:
         conn.close()
 
@@ -286,7 +347,10 @@ def test_classify_genuinely_newer_on_unknown_core_column(tmp_path):
     _stamp(db_path, db_bootstrap.SCHEMA_VERSION + 1)
     conn = sqlite3.connect(db_path)
     try:
-        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_GENUINELY_NEWER
+        )
     finally:
         conn.close()
 
@@ -395,7 +459,10 @@ def test_early_variant_feature_tables_remediate_end_to_end(tmp_path):
     # Classification ignores feature-table internal shape → interim_stamp.
     conn = sqlite3.connect(db_path)
     try:
-        assert classify_version_mismatch(conn) == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        assert (
+            classify_version_mismatch(conn)
+            == db_bootstrap.VERSION_MISMATCH_INTERIM_STAMP
+        )
         dry = remediate_interim_schema_stamp(conn, apply=False)
     finally:
         conn.close()
@@ -414,7 +481,11 @@ def test_early_variant_feature_tables_remediate_end_to_end(tmp_path):
     assert result["status"] == "ok"
     dropped = set(result["dropped_tables"])
     assert {"lcm_rollups", "lcm_rollup_sources", "lcm_rollup_state"} <= dropped
-    assert {"lcm_embedding_profile", "lcm_embedding_meta", "lcm_embedding_vectors"} <= dropped
+    assert {
+        "lcm_embedding_profile",
+        "lcm_embedding_meta",
+        "lcm_embedding_vectors",
+    } <= dropped
     assert _stored_version(db_path) == db_bootstrap.SCHEMA_VERSION
     # Early feature tables are gone; core tables remain untouched.
     remaining = _table_names(db_path)

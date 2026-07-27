@@ -17,6 +17,7 @@ import pytest
 import hermes_lcm.tools as lcm_tools
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
+from hermes_lcm.project_scope import ProjectMetadata
 from hermes_lcm.store import MessageStore
 from hermes_lcm.vector_store import EmbeddingIdentity, VectorStore
 
@@ -180,6 +181,86 @@ def test_recall_returns_cross_session_summaries_without_a_filter(recall_engine, 
     assert sessions == {"session-a", "session-b"}
     assert all(hit["kind"] == "summary" for hit in payload["hits"])
     assert payload["provenance"]["arms_run"] == ["summary"]
+
+
+def test_recall_project_scope_current_filters_all_retrieval_arms(recall_engine, monkeypatch):
+    project_a = ProjectMetadata("project-a", "/projects/a", "/projects/a")
+    project_b = ProjectMetadata("project-b", "/projects/b", "/projects/b")
+    recall_engine._store.set_session_project_metadata(CURRENT, project_a)
+    recall_engine._store.set_session_project_metadata("session-a", project_a)
+    recall_engine._store.set_session_project_metadata("session-b", project_b)
+
+    summary_a = _add_summary(
+        recall_engine,
+        "kanban dashboard sprint summary in project a",
+        session_id="session-a",
+        created_at=10.0,
+    )
+    summary_b = _add_summary(
+        recall_engine,
+        "kanban dashboard sprint summary in project b",
+        session_id="session-b",
+        created_at=11.0,
+    )
+    _seed_summary_vectors(
+        recall_engine,
+        [(summary_a, [1.0, 0.0]), (summary_b, [0.99, 0.141])],
+    )
+    raw_a = recall_engine._store.append(
+        "session-a", {"role": "user", "content": "kanban dashboard sprint raw project a"}
+    )
+    raw_b = recall_engine._store.append(
+        "session-b", {"role": "user", "content": "kanban dashboard sprint raw project b"}
+    )
+    _seed_chunk_vectors(
+        recall_engine,
+        [(raw_a, 0, 0, 34, [1.0, 0.0]), (raw_b, 0, 0, 34, [0.99, 0.141])],
+    )
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="all",
+        project_scope="current",
+        scope_bias=0.0,
+        limit=20,
+    )
+
+    assert payload["project_scope"] == "current"
+    assert payload["project_id"] == "project-a"
+    assert payload["hits"]
+    assert {hit["session_id"] for hit in payload["hits"]} == {"session-a"}
+    assert {hit["kind"] for hit in payload["hits"]} == {"summary", "message_excerpt"}
+    assert set(payload["provenance"]["arms_run"]) == {"fts", "summary", "chunk"}
+
+
+def test_recall_defaults_to_all_projects_and_accepts_explicit_project_id(recall_engine, monkeypatch):
+    recall_engine._config.embeddings_enabled = False
+    project_a = ProjectMetadata("project-a", "/projects/a", "/projects/a")
+    project_b = ProjectMetadata("project-b", "/projects/b", "/projects/b")
+    recall_engine._store.set_session_project_metadata(CURRENT, project_a)
+    recall_engine._store.set_session_project_metadata("session-b", project_b)
+    recall_engine._store.append(
+        CURRENT, {"role": "user", "content": "kanban dashboard sprint raw project a"}
+    )
+    recall_engine._store.append(
+        "session-b", {"role": "user", "content": "kanban dashboard sprint raw project b"}
+    )
+
+    default_payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=10)
+    explicit_payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        project_id="project-b",
+        limit=10,
+    )
+
+    assert default_payload["project_scope"] == "all"
+    assert {hit["session_id"] for hit in default_payload["hits"]} == {CURRENT, "session-b"}
+    assert explicit_payload["project_scope"] == "all"
+    assert explicit_payload["project_id"] == "project-b"
+    assert {hit["session_id"] for hit in explicit_payload["hits"]} == {"session-b"}
 
 
 def test_scope_bias_boosts_current_conversation_without_filtering(recall_engine, monkeypatch):

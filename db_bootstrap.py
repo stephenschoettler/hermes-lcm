@@ -29,20 +29,21 @@ class SchemaVersionTooNewError(RuntimeError):
     """
 
 
-# The core schema ladder stops at 5. Optional embedding tables are NOT part of
+# The core schema ladder stops at 6. Optional embedding tables are NOT part of
 # this counter: they are created lazily+idempotently by VectorStore on first use
 # (see ``ensure_embedding_tables`` / ``VectorStore._ensure_embedding_schema``) and
 # recorded via the named ``embeddings_v1`` migration-state marker instead of a
-# numeric bump. This keeps a disabled install at schema_version 5 with no
+# numeric bump. This keeps a disabled install at the core schema version with no
 # embedding tables, fully openable by a base build, and leaves the numeric
-# counter free for the temporal train so neither collides on a v6.
-SCHEMA_VERSION = 5
+# counter free from optional-feature collisions.
+SCHEMA_VERSION = 6
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
     "messages",
     "metadata",
     "summary_nodes",
+    "session_project_metadata",
     "lcm_lifecycle_state",
     "lcm_migration_state",
     "messages_fts",
@@ -187,8 +188,6 @@ def get_schema_version(conn: sqlite3.Connection) -> int:
         return 0
 
 
-
-
 def read_existing_schema_version(conn: sqlite3.Connection) -> int:
     """Return schema_version without creating or modifying schema objects."""
     metadata_exists = conn.execute(
@@ -234,41 +233,80 @@ def refuse_schema_version_too_new(conn: sqlite3.Connection) -> None:
 #
 # Some databases touched by interim development builds carry a numeric
 # ``schema_version`` ahead of this build's ladder even though their actual shape
-# is the v5 core plus the named opt-in feature markers (the trains reverted the
-# numeric bump in favour of markers). Such a DB is safe to re-stamp back to
+# is a compatible core plus the named opt-in feature markers (the trains reverted
+# the numeric bump in favour of markers). Such a DB is safe to re-stamp back to
 # ``SCHEMA_VERSION``; a genuinely newer DB is not. Classification is read-only
 # and errs toward ``genuinely_newer`` so an ambiguous shape is never downgraded.
 
 VERSION_MISMATCH_INTERIM_STAMP = "interim_stamp"
 VERSION_MISMATCH_GENUINELY_NEWER = "genuinely_newer"
 
-# The exact v5 column contract for every core table that carries one. A missing
-# OR an unexpected column both disqualify a DB from the interim-stamp path.
-_V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
-    "messages": frozenset({
-        "store_id", "session_id", "source", "conversation_id", "role",
-        "content", "tool_call_id", "tool_calls", "tool_name", "timestamp",
-        "token_estimate", "pinned",
-    }),
-    "summary_nodes": frozenset({
-        "node_id", "session_id", "depth", "summary", "token_count",
-        "source_token_count", "source_ids", "source_type", "created_at",
-        "earliest_at", "latest_at", "expand_hint",
-    }),
+# The exact column contract shared by the previous and current core schemas.
+# Missing or unexpected columns disqualify a DB from the interim-stamp path.
+_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "messages": frozenset(
+        {
+            "store_id",
+            "session_id",
+            "source",
+            "conversation_id",
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "timestamp",
+            "token_estimate",
+            "pinned",
+        }
+    ),
+    "summary_nodes": frozenset(
+        {
+            "node_id",
+            "session_id",
+            "depth",
+            "summary",
+            "token_count",
+            "source_token_count",
+            "source_ids",
+            "source_type",
+            "created_at",
+            "earliest_at",
+            "latest_at",
+            "expand_hint",
+        }
+    ),
     "metadata": frozenset({"key", "value"}),
     "lcm_migration_state": frozenset({"step_name", "completed_at"}),
-    "lcm_lifecycle_state": frozenset({
-        "conversation_id", "current_session_id", "last_finalized_session_id",
-        "current_frontier_store_id", "last_finalized_frontier_store_id",
-        "debt_kind", "debt_size_estimate", "current_bound_at",
-        "last_finalized_at", "debt_updated_at", "last_maintenance_attempt_at",
-        "last_rollover_at", "last_reset_at", "updated_at",
-    }),
+    "lcm_lifecycle_state": frozenset(
+        {
+            "conversation_id",
+            "current_session_id",
+            "last_finalized_session_id",
+            "current_frontier_store_id",
+            "last_finalized_frontier_store_id",
+            "debt_kind",
+            "debt_size_estimate",
+            "current_bound_at",
+            "last_finalized_at",
+            "debt_updated_at",
+            "last_maintenance_attempt_at",
+            "last_rollover_at",
+            "last_reset_at",
+            "updated_at",
+        }
+    ),
+}
+_SESSION_PROJECT_METADATA_COLUMNS = {
+    "session_id": ("TEXT", 0, None, 1),
+    "project_id": ("TEXT", 1, None, 0),
+    "project_root": ("TEXT", 1, None, 0),
+    "cwd": ("TEXT", 1, None, 0),
 }
 
 # Core FTS5 virtual tables: presence is enough — their column layout is owned by
 # the FTS5 module, not by this schema contract.
-_V5_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
+_CORE_PRESENCE_ONLY = ("messages_fts", "nodes_fts")
 
 # Extra tables are tolerated only when they belong to a known opt-in feature
 # family (temporal-rollup / embedding / chunk) or are FTS5 shadow tables of the
@@ -327,7 +365,9 @@ _NEWER_BUILD_FINDING_PREFIXES = ("unexpected-column:",)
 
 def _family_reports_newer_shape(findings: Iterable[str]) -> bool:
     """True when any verifier finding is an extra/unknown-piece (newer) signature."""
-    return any(str(finding).startswith(_NEWER_BUILD_FINDING_PREFIXES) for finding in findings)
+    return any(
+        str(finding).startswith(_NEWER_BUILD_FINDING_PREFIXES) for finding in findings
+    )
 
 
 def _user_table_names(conn: sqlite3.Connection) -> set[str]:
@@ -349,11 +389,11 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
     not by the numeric counter. So classification only inspects the core tables
     and the *names* of the extras:
 
-    * :data:`VERSION_MISMATCH_INTERIM_STAMP` — the core v5 shape matches exactly
-      AND every extra table matches a known feature-family prefix (or is an FTS5
-      shadow table). This is the signature of an interim development build that
-      stamped a numeric version it never migrated to; the feature tables may be
-      early variants and are remediated separately (see
+    * :data:`VERSION_MISMATCH_INTERIM_STAMP` — the previous or current core shape
+      matches exactly AND every extra table matches a known feature-family prefix
+      (or is an FTS5 shadow table). This is the signature of an interim
+      development build that stamped a numeric version it never migrated to; the
+      feature tables may be early variants and are remediated separately (see
       :func:`remediate_interim_schema_stamp`).
     * :data:`VERSION_MISMATCH_GENUINELY_NEWER` — any core table/column is missing
       or unexpected, OR any extra table is not a known feature family. A newer
@@ -367,14 +407,14 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
     except sqlite3.DatabaseError:
         return VERSION_MISMATCH_GENUINELY_NEWER
 
-    # Every v5 core table must be present.
-    for table in (*_V5_CORE_TABLE_COLUMNS, *_V5_CORE_PRESENCE_ONLY):
+    # Every table shared by the previous and current core must be present.
+    for table in (*_CORE_TABLE_COLUMNS, *_CORE_PRESENCE_ONLY):
         if table not in tables:
             return VERSION_MISMATCH_GENUINELY_NEWER
 
-    # Core tables must match the v5 column contract exactly — a missing or an
-    # unexpected column both mean this is not a v5-shaped DB.
-    for table, expected in _V5_CORE_TABLE_COLUMNS.items():
+    # Shared core tables must match exactly. The v6 project table is optional
+    # here so an interim-stamped v5 DB can be repaired, then migrated normally.
+    for table, expected in _CORE_TABLE_COLUMNS.items():
         try:
             actual = {
                 str(row[1])
@@ -385,11 +425,66 @@ def classify_version_mismatch(conn: sqlite3.Connection) -> str:
         if actual != set(expected):
             return VERSION_MISMATCH_GENUINELY_NEWER
 
+    if "session_project_metadata" in tables:
+        try:
+            actual = {
+                str(row[1]): (
+                    str(row[2]).upper(),
+                    int(row[3] or 0),
+                    None if row[4] is None else str(row[4]),
+                    int(row[5] or 0),
+                )
+                for row in conn.execute(
+                    "PRAGMA table_info(session_project_metadata)"
+                ).fetchall()
+            }
+            index = next(
+                (
+                    row
+                    for row in conn.execute(
+                        "PRAGMA index_list(session_project_metadata)"
+                    ).fetchall()
+                    if str(row[1]) == "idx_session_project_metadata_project"
+                ),
+                None,
+            )
+            index_columns = tuple(
+                (
+                    None if row[2] is None else str(row[2]),
+                    int(row[3] or 0),
+                    str(row[4]).upper(),
+                    int(row[5] or 0),
+                )
+                for row in conn.execute(
+                    "PRAGMA index_xinfo(idx_session_project_metadata_project)"
+                ).fetchall()
+            )
+        except sqlite3.DatabaseError:
+            return VERSION_MISMATCH_GENUINELY_NEWER
+        if actual != _SESSION_PROJECT_METADATA_COLUMNS:
+            return VERSION_MISMATCH_GENUINELY_NEWER
+        if index is None or (int(index[2]), str(index[3]), int(index[4])) != (
+            0,
+            "c",
+            0,
+        ):
+            return VERSION_MISMATCH_GENUINELY_NEWER
+        if index_columns != (
+            ("project_id", 0, "BINARY", 1),
+            ("session_id", 0, "BINARY", 1),
+            (None, 0, "BINARY", 0),
+        ):
+            return VERSION_MISMATCH_GENUINELY_NEWER
+
     # Any extra table must belong to a known feature family or be an FTS5 shadow.
     # The feature table's *internal* shape is intentionally NOT checked here — an
     # early-variant feature table is still an interim stamp, repaired on apply.
-    allowed = set(_V5_CORE_TABLE_COLUMNS) | set(_V5_CORE_PRESENCE_ONLY)
-    for fts in _V5_CORE_PRESENCE_ONLY:
+    allowed = (
+        set(_CORE_TABLE_COLUMNS)
+        | set(_CORE_PRESENCE_ONLY)
+        | {"session_project_metadata"}
+    )
+    for fts in _CORE_PRESENCE_ONLY:
         allowed.update(get_fts_shadow_table_names(fts))
     for table in tables:
         if table in allowed:
@@ -459,12 +554,14 @@ def _interim_family_drops(conn: sqlite3.Connection) -> list[dict[str, object]]:
                 (prefix + "%",),
             ).fetchall()
         )
-        plans.append({
-            "family": family["name"],
-            "tables": present,
-            "triggers": triggers,
-            "rebuild_hint": family["rebuild_hint"],
-        })
+        plans.append(
+            {
+                "family": family["name"],
+                "tables": present,
+                "triggers": triggers,
+                "rebuild_hint": family["rebuild_hint"],
+            }
+        )
     return plans
 
 
@@ -568,33 +665,61 @@ def ensure_lifecycle_state_table(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_session_project_metadata_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS session_project_metadata (
+            session_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            project_root TEXT NOT NULL,
+            cwd TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_project_metadata_project
+            ON session_project_metadata(project_id, session_id);
+        """
+    )
+
+
 def ensure_lifecycle_state_columns(conn: sqlite3.Connection) -> None:
     ensure_lifecycle_state_table(conn)
     columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
+        row[1]
+        for row in conn.execute("PRAGMA table_info(lcm_lifecycle_state)").fetchall()
     }
     add_column_if_missing(
-        conn, columns, "debt_kind",
+        conn,
+        columns,
+        "debt_kind",
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_kind TEXT",
     )
     add_column_if_missing(
-        conn, columns, "debt_size_estimate",
+        conn,
+        columns,
+        "debt_size_estimate",
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_size_estimate INTEGER NOT NULL DEFAULT 0",
     )
     add_column_if_missing(
-        conn, columns, "debt_updated_at",
+        conn,
+        columns,
+        "debt_updated_at",
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN debt_updated_at REAL",
     )
     add_column_if_missing(
-        conn, columns, "last_maintenance_attempt_at",
+        conn,
+        columns,
+        "last_maintenance_attempt_at",
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_maintenance_attempt_at REAL",
     )
     add_column_if_missing(
-        conn, columns, "last_rollover_at",
+        conn,
+        columns,
+        "last_rollover_at",
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_rollover_at REAL",
     )
     add_column_if_missing(
-        conn, columns, "last_reset_at",
+        conn,
+        columns,
+        "last_reset_at",
         "ALTER TABLE lcm_lifecycle_state ADD COLUMN last_reset_at REAL",
     )
 
@@ -605,11 +730,11 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if not table_row:
         return
-    columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
-    }
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
     add_column_if_missing(
-        conn, columns, "conversation_id",
+        conn,
+        columns,
+        "conversation_id",
         "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
     )
     conn.execute(
@@ -690,26 +815,37 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
         row[1] for row in conn.execute("PRAGMA table_info(lcm_rollups)").fetchall()
     }
     add_column_if_missing(
-        conn, rollup_columns, "generation",
+        conn,
+        rollup_columns,
+        "generation",
         "ALTER TABLE lcm_rollups ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
     )
     add_column_if_missing(
-        conn, rollup_columns, "lease_expires_at",
+        conn,
+        rollup_columns,
+        "lease_expires_at",
         "ALTER TABLE lcm_rollups ADD COLUMN lease_expires_at TEXT",
     )
     add_column_if_missing(
-        conn, rollup_columns, "lease_nonce",
+        conn,
+        rollup_columns,
+        "lease_nonce",
         "ALTER TABLE lcm_rollups ADD COLUMN lease_nonce TEXT NOT NULL DEFAULT ''",
     )
     add_column_if_missing(
-        conn, rollup_columns, "failed_at",
+        conn,
+        rollup_columns,
+        "failed_at",
         "ALTER TABLE lcm_rollups ADD COLUMN failed_at TEXT",
     )
     for column, ddl in (
         ("summary", "ALTER TABLE lcm_rollups ADD COLUMN summary TEXT"),
         ("token_count", "ALTER TABLE lcm_rollups ADD COLUMN token_count INTEGER"),
         ("built_at", "ALTER TABLE lcm_rollups ADD COLUMN built_at TEXT"),
-        ("source_fingerprint", "ALTER TABLE lcm_rollups ADD COLUMN source_fingerprint TEXT"),
+        (
+            "source_fingerprint",
+            "ALTER TABLE lcm_rollups ADD COLUMN source_fingerprint TEXT",
+        ),
         ("error", "ALTER TABLE lcm_rollups ADD COLUMN error TEXT"),
     ):
         add_column_if_missing(conn, rollup_columns, column, ddl)
@@ -740,8 +876,10 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
             "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
             (name,),
         ).fetchone()
+
         def normalize(value: object) -> str:
             return " ".join(str(value or "").lower().split())
+
         if existing is not None and normalize(existing[0]) == normalize(create_sql):
             return
         if existing is not None:
@@ -814,7 +952,8 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     ).fetchone()
     if state_exists:
         state_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(lcm_rollup_state)").fetchall()
+            row[1]
+            for row in conn.execute("PRAGMA table_info(lcm_rollup_state)").fetchall()
         }
         if "scope" not in state_columns:
             conn.execute("DROP TABLE lcm_rollup_state")
@@ -834,9 +973,12 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
 
 def ensure_temporal_rollup_invalidation_triggers(conn: sqlite3.Connection) -> None:
     """Install transaction-coupled summary mutation outbox triggers when possible."""
-    if conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
-    ).fetchone() is None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+        ).fetchone()
+        is None
+    ):
         return
     trigger_sql = {
         "lcm_rollup_node_insert": """
@@ -999,8 +1141,10 @@ def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
             continue
         actual = {
             str(row[1]): (
-                str(row[2]).upper(), int(row[3] or 0),
-                None if row[4] is None else str(row[4]), int(row[5] or 0),
+                str(row[2]).upper(),
+                int(row[3] or 0),
+                None if row[4] is None else str(row[4]),
+                int(row[5] or 0),
             )
             for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
         }
@@ -1049,9 +1193,7 @@ def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
             "check(period_kindin('day','week','month'))",
             "check(statusin('building','ready','stale','failed'))",
         ),
-        "lcm_rollup_invalidations": (
-            "check(operationin('insert','delete','update'))",
-        ),
+        "lcm_rollup_invalidations": ("check(operationin('insert','delete','update'))",),
     }
     for table, snippets in table_checks.items():
         row = conn.execute(
@@ -1097,29 +1239,36 @@ def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
         "idx_lcm_rollups_failed_aggregate": (
             "lcm_rollups",
             [
-                ("scope", 0), ("failed_at", 0), ("period_start", 0),
+                ("scope", 0),
+                ("failed_at", 0),
+                ("period_start", 0),
                 ("period_kind", 0),
             ],
             "where status = 'failed' and period_kind in ('week', 'month')",
         ),
-        "idx_lcm_rollup_sources_node": (
-            "lcm_rollup_sources", [("node_id", 0)], ""
-        ),
+        "idx_lcm_rollup_sources_node": ("lcm_rollup_sources", [("node_id", 0)], ""),
         "idx_lcm_rollup_invalidations_pending": (
-            "lcm_rollup_invalidations", [("event_id", 0)], ""
+            "lcm_rollup_invalidations",
+            [("event_id", 0)],
+            "",
         ),
         "idx_lcm_rollup_invalidations_scope_event": (
             "lcm_rollup_invalidations",
-            [("scope", 0), ("event_id", 0)], ""
+            [("scope", 0), ("event_id", 0)],
+            "",
         ),
         "idx_lcm_rollup_invalidations_scope_coverage": (
             "lcm_rollup_invalidations",
             [
-                ("scope", 0), ("covered_start", 0), ("covered_end", 0),
+                ("scope", 0),
+                ("covered_start", 0),
+                ("covered_end", 0),
                 ("event_id", 0),
-            ], ""
+            ],
+            "",
         ),
     }
+
     def normalized_predicate(sql: object) -> str:
         match = re.search(r"\bwhere\b(.+)$", str(sql or ""), re.IGNORECASE | re.DOTALL)
         if match is None:
@@ -1160,9 +1309,12 @@ def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
         ):
             missing.append(f"index-shape:{name}")
 
-    if conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
-    ).fetchone() is not None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+        ).fetchone()
+        is not None
+    ):
         temp = sqlite3.connect(":memory:")
         try:
             temp.executescript(
@@ -1192,19 +1344,19 @@ def verify_temporal_rollup_schema(conn: sqlite3.Connection) -> list[str]:
             row = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
             ).fetchone()
-            actual = re.sub(
-                r"\s+", "", str(row[0] if row else "").lower()
-            ).rstrip(";")
+            actual = re.sub(r"\s+", "", str(row[0] if row else "").lower()).rstrip(";")
             if actual != expected:
                 missing.append(f"trigger-shape:{name}")
     return missing
+
+
 def ensure_embedding_tables(conn: sqlite3.Connection) -> None:
     """Create the opt-in embedding tables idempotently.
 
     These tables are NOT part of the core ``schema_version`` ladder. They are
     created only when embeddings are actually used (VectorStore construction),
-    so an install with embeddings disabled never materializes them and stays at
-    schema_version 5, openable by a base build.
+    so an install with embeddings disabled never materializes them or advances
+    beyond the core schema version.
 
     Profiles and vectors are keyed on a canonical *identity* — the sha256 of
     ``(provider, model_name, revision, dim, dtype, byteorder, task)`` — rather
@@ -1364,7 +1516,7 @@ def _sql_check_expressions(sql: str) -> set[str]:
             cursor += 1
         if depth:
             return {"<malformed>"}
-        expressions.add(re.sub(r"\s+", "", lowered[body_start:cursor - 1]))
+        expressions.add(re.sub(r"\s+", "", lowered[body_start : cursor - 1]))
         offset = cursor
 
 
@@ -1394,7 +1546,9 @@ def verify_embedding_schema(conn: sqlite3.Connection) -> list[str]:
     ``ensure_embedding_tables``; incompatible same-name objects are rejected
     before the named migration marker is published.
     """
-    errors = [f"missing object: {name}" for name in sorted(embedding_schema_missing(conn))]
+    errors = [
+        f"missing object: {name}" for name in sorted(embedding_schema_missing(conn))
+    ]
     if errors:
         return errors
 
@@ -1471,8 +1625,8 @@ def ensure_chunk_tables(conn: sqlite3.Connection) -> None:
     Like the embedding tables, these are NOT part of the core
     ``schema_version`` ladder — they are materialized only when the chunk
     corpus is actually used (a chunk-corpus VectorStore is constructed), so an
-    install that never runs ``embed backfill --corpus chunks`` stays at
-    schema_version 5 with none of them and remains openable by a base build.
+    install that never runs ``embed backfill --corpus chunks`` creates none of
+    them and remains at the core schema version.
 
     Chunk profiles live in the SHARED ``lcm_embedding_profile`` table under
     ``task='chunk'`` (coexisting with summary profiles), so ``ensure_embedding_tables``
@@ -1535,9 +1689,7 @@ _REQUIRED_CHUNK_INDEXES = (
     "idx_lcm_chunk_meta_store",
 )
 
-_CHUNK_TABLE_SHAPES: dict[
-    str, tuple[tuple[str, str, int, int, str | None], ...]
-] = {
+_CHUNK_TABLE_SHAPES: dict[str, tuple[tuple[str, str, int, int, str | None], ...]] = {
     "lcm_chunk_meta": (
         ("chunk_id", "TEXT", 0, 1, None),
         ("identity_hash", "TEXT", 0, 2, None),
@@ -1561,9 +1713,7 @@ _CHUNK_TABLE_SHAPES: dict[
     ),
 }
 
-_CHUNK_INDEX_SHAPES: dict[
-    str, tuple[str, tuple[tuple[str, int], ...], str | None]
-] = {
+_CHUNK_INDEX_SHAPES: dict[str, tuple[str, tuple[tuple[str, int], ...], str | None]] = {
     "idx_lcm_chunk_meta_identity_embedded_at": (
         "lcm_chunk_meta",
         (("identity_hash", 0), ("embedded_at", 1)),
@@ -1679,7 +1829,9 @@ def set_schema_version(conn: sqlite3.Connection, version: int = SCHEMA_VERSION) 
     )
 
 
-def get_existing_table_names(conn: sqlite3.Connection, names: Iterable[str]) -> set[str]:
+def get_existing_table_names(
+    conn: sqlite3.Connection, names: Iterable[str]
+) -> set[str]:
     existing: set[str] = set()
     for name in names:
         row = conn.execute(
@@ -1691,7 +1843,9 @@ def get_existing_table_names(conn: sqlite3.Connection, names: Iterable[str]) -> 
     return existing
 
 
-def _database_path_for_connection(conn: sqlite3.Connection | None, fallback: str = "") -> str:
+def _database_path_for_connection(
+    conn: sqlite3.Connection | None, fallback: str = ""
+) -> str:
     if conn is None:
         return fallback
     try:
@@ -1754,12 +1908,18 @@ def get_fts_shadow_table_names(table_name: str) -> list[str]:
 
 
 def quote_sql_identifier(identifier: str) -> str:
-    if not identifier or not identifier.replace("_", "a").isalnum() or identifier[0].isdigit():
+    if (
+        not identifier
+        or not identifier.replace("_", "a").isalnum()
+        or identifier[0].isdigit()
+    ):
         raise ValueError(f"invalid SQL identifier: {identifier}")
     return f'"{identifier}"'
 
 
-def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+def _fts_needs_rebuild_structural(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec
+) -> bool:
     shadow_tables = get_fts_shadow_table_names(spec.table_name)
     existing_tables = get_existing_table_names(conn, [spec.table_name, *shadow_tables])
     if spec.table_name not in existing_tables:
@@ -1940,7 +2100,9 @@ def _record_integrity_failed(
     )
 
 
-def _clear_integrity_failed(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
+def _clear_integrity_failed(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec
+) -> None:
     ensure_metadata_table(conn)
     conn.execute("DELETE FROM metadata WHERE key = ?", (_integrity_failed_key(spec),))
 
@@ -1960,7 +2122,10 @@ def load_integrity_failed(
     try:
         data = json.loads(row[0])
         if isinstance(data, dict):
-            return {"at": float(data.get("at") or 0.0), "detail": str(data.get("detail") or "")}
+            return {
+                "at": float(data.get("at") or 0.0),
+                "detail": str(data.get("detail") or ""),
+            }
     except (TypeError, ValueError):
         pass
     return {"at": 0.0, "detail": str(row[0])}
@@ -2285,7 +2450,9 @@ def _check_disk_space(db_path: str) -> bool:
         return True
 
 
-def _fts_missing_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+def _fts_missing_triggers(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec
+) -> bool:
     expected = {
         trigger_name
         for trigger_name in (_extract_trigger_name(sql) for sql in spec.trigger_sqls)
@@ -2302,8 +2469,12 @@ def _fts_missing_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec
     return bool(expected - existing)
 
 
-def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
-    return _fts_needs_rebuild_structural(conn, spec) or _fts_missing_triggers(conn, spec)
+def external_content_fts_needs_repair(
+    conn: sqlite3.Connection, spec: ExternalContentFtsSpec
+) -> bool:
+    return _fts_needs_rebuild_structural(conn, spec) or _fts_missing_triggers(
+        conn, spec
+    )
 
 
 def repair_external_content_fts(
@@ -2360,7 +2531,11 @@ def repair_external_content_fts(
     # full interval). Without this an explicit `repair apply` left the flag stuck.
     _clear_integrity_failed(conn, spec)
     conn.commit()
-    return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
+    return {
+        "rebuilt": rebuilt,
+        "degraded": degraded,
+        "triggers_recreated": triggers_were_missing,
+    }
 
 
 def ensure_external_content_fts(
@@ -2400,6 +2575,11 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
         mark_migration_step_complete(conn, "v5_message_conversation_id")
         current_version = 5
 
+    ensure_session_project_metadata_table(conn)
+    if current_version < 6:
+        mark_migration_step_complete(conn, "v6_session_project_metadata")
+        current_version = 6
+
     # NOTE: the opt-in temporal-rollup tables are deliberately NOT created here.
     # Creating them would advance the core schema for every install (even with
     # the feature off) and make the DB unreadable by a base build. They are
@@ -2407,6 +2587,6 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     # step (``temporal_rollups_v1``), independent of this numeric counter.
     # Embedding tables are intentionally NOT created here: they are an opt-in
     # feature materialized lazily by VectorStore (recorded via the named
-    # ``embeddings_v1`` marker), so a disabled install stays at v5 with no
-    # embedding tables and the numeric counter is free for the temporal train.
+    # ``embeddings_v1`` marker), so a disabled install creates no embedding
+    # tables and does not spend another numeric schema version.
     set_schema_version(conn, current_version)

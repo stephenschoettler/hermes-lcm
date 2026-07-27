@@ -90,6 +90,23 @@ LCM_GREP = {
                     "Must not be supplied with session_scope='current' or session_scope='all'."
                 ),
             },
+            "project_scope": {
+                "type": "string",
+                "enum": ["all", "current"],
+                "description": (
+                    "Project filter over eligible sessions. 'all' (default) preserves existing behavior. "
+                    "'current' restricts results to sessions with the active session's persisted project identity."
+                ),
+                "default": "all",
+            },
+            "project_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Optional exact persisted project identity. When supplied, only sessions for this project are eligible, "
+                    "and it takes precedence over project_scope."
+                ),
+            },
             "source": {
                 "type": "string",
                 "description": (
@@ -175,6 +192,23 @@ LCM_RECALL = {
                     "excerpts only."
                 ),
                 "default": "all",
+            },
+            "project_scope": {
+                "type": "string",
+                "enum": ["all", "current"],
+                "description": (
+                    "Project filter over memory sessions. 'all' (default) preserves global recall. "
+                    "'current' restricts recall to the active session's persisted project identity."
+                ),
+                "default": "all",
+            },
+            "project_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Optional exact persisted project identity. When supplied, only sessions for this project are eligible, "
+                    "and it takes precedence over project_scope."
+                ),
             },
         },
         "required": ["query"],

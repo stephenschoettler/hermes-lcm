@@ -65,11 +65,12 @@ def test_core_migrations_do_not_create_rollup_tables_or_bump_schema(tmp_path):
         conn.commit()
 
         assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
-        assert db_bootstrap.SCHEMA_VERSION == 5
+        assert db_bootstrap.SCHEMA_VERSION == 6
         assert ROLLUP_TABLES.isdisjoint(_table_names(conn))
-        # No numeric v6 step is recorded; the rollup tables use a named step.
+        # Core project migrations may be recorded; the optional rollup step is not.
         steps = conn.execute(
-            "SELECT step_name FROM lcm_migration_state WHERE step_name LIKE 'v6%' OR step_name = 'temporal_rollups_v1'"
+            "SELECT step_name FROM lcm_migration_state "
+            "WHERE step_name = 'temporal_rollups_v1'"
         ).fetchall()
         assert steps == []
     finally:

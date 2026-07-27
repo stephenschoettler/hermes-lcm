@@ -363,7 +363,7 @@ class VectorStore:
 
         Constructing a VectorStore means embeddings are in use; the core
         migration path leaves these tables uncreated so a disabled install
-        stays at schema_version 5 with none of them. Creation is idempotent
+        stays at the core schema version with none of them. Creation is idempotent
         (CREATE TABLE/INDEX IF NOT EXISTS).
 
         The ``embeddings_v1`` marker is NOT trusted on its own: it can be set

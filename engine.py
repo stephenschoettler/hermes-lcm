@@ -122,6 +122,7 @@ from .message_content import (
     stored_text_content_for_pattern_matching,
     text_content_for_pattern_matching,
 )
+from .project_scope import resolve_project_metadata
 from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
@@ -142,11 +143,21 @@ _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
 
-_PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
+_PRESERVED_TODO_CONTEXT_PREFIX = (
+    "[Your active task list was preserved across context compression]"
+)
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
+class LCMEngine(
+    CompactionMixin,
+    ResetStateMixin,
+    ReconcileMixin,
+    AuxiliarySessionMixin,
+    PlaceholderLedgerMixin,
+    BypassMixin,
+    ContextEngine,
+):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -164,8 +175,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
-    def __init__(self, config: LCMConfig | None = None,
-                 hermes_home: str = ""):
+    def __init__(self, config: LCMConfig | None = None, hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
 
@@ -336,7 +346,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # keep anchoring opt-in rather than changing its public behavior.
         self._pending_context_anchor_messages: Optional[List[Dict[str, Any]]] = None
         self._current_compress_store_ids_by_message_id: dict[int, int] = {}
-        self._current_compress_placeholder_identity_counts: dict[tuple[str, str, str, str], int] = {}
+        self._current_compress_placeholder_identity_counts: dict[
+            tuple[str, str, str, str], int
+        ] = {}
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
@@ -346,7 +358,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._pending_reset_frontier_store_id: int = 0
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget: dict[str, int] = {}
-        self._compression_boundary_active_placeholder_digest_ordinals: dict[str, set[int]] = {}
+        self._compression_boundary_active_placeholder_digest_ordinals: dict[
+            str, set[int]
+        ] = {}
         self._compression_boundary_stored_placeholder_digest_counts: dict[str, int] = {}
         self._thread_context = threading.local()
         self._auxiliary_session_ids: set[str] = set()
@@ -370,7 +384,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lcm_bypass_message_prefix_fingerprints: dict[
             str, list[tuple[list[str], bool]]
         ] = {}
-        self._lcm_normal_message_prefix_fingerprints: dict[tuple[str, str], list[str]] = {}
+        self._lcm_normal_message_prefix_fingerprints: dict[
+            tuple[str, str], list[str]
+        ] = {}
         self._lcm_current_start_allows_bypass_lineage = False
         self._auxiliary_session_lock = threading.RLock()
         self._host_fallback_compressor: Any = None
@@ -468,7 +484,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 try:
                     close()
                 except Exception:
-                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+                    logger.debug(
+                        "LCM failed closing %s during profile rebind",
+                        attr,
+                        exc_info=True,
+                    )
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
@@ -528,15 +548,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return False
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
-            current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
-            if current_home == str(hermes_home) and current_store_home == str(hermes_home):
+            current_store_home = str(
+                getattr(getattr(self, "_store", None), "_hermes_home", "") or ""
+            )
+            if current_home == str(hermes_home) and current_store_home == str(
+                hermes_home
+            ):
                 return False
             self._hermes_home = hermes_home
             store = getattr(self, "_store", None)
             if store is not None:
                 store._hermes_home = hermes_home
             self._reset_profile_runtime_state()
-            logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
+            logger.info(
+                "LCM rebound Hermes home for configured database path %s", hermes_home
+            )
             return True
 
         db_path = self._resolve_db_path(hermes_home)
@@ -627,7 +653,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         try:
             parsed_context_length = int(context_length)
         except (TypeError, ValueError):
-            logger.debug("LCM ignored invalid %s context_length: %r", source, context_length)
+            logger.debug(
+                "LCM ignored invalid %s context_length: %r", source, context_length
+            )
             return False
         if parsed_context_length <= 0:
             logger.debug(
@@ -641,9 +669,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self.effective_context_length_reason = ""
             self._context_length_source = source
             self.threshold_tokens = 0
-            self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-                self._runtime_context_threshold(model=model, provider=provider)
-            )
+            (
+                self.context_threshold,
+                self._context_threshold_source,
+                self._context_threshold_autoraised,
+            ) = self._runtime_context_threshold(model=model, provider=provider)
             self.threshold_percent = self.context_threshold
             return True
         self.raw_context_length = parsed_context_length
@@ -656,9 +686,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.effective_context_length_cap = cap
         self.effective_context_length_reason = reason
         self._context_length_source = source
-        self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-            self._runtime_context_threshold(model=model, provider=provider)
-        )
+        (
+            self.context_threshold,
+            self._context_threshold_source,
+            self._context_threshold_autoraised,
+        ) = self._runtime_context_threshold(model=model, provider=provider)
         self.threshold_percent = self.context_threshold
         context_threshold_tokens = int(
             effective_context_length * self.context_threshold
@@ -770,7 +802,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         lets diagnostic surfaces (lcm_status, /lcm command) make the
         divergence explicit without recomputing the underlying invariant.
         """
-        return bool(self._foreground_session_id) and self._foreground_session_id != self._session_id
+        return (
+            bool(self._foreground_session_id)
+            and self._foreground_session_id != self._session_id
+        )
 
     @property
     def current_session_ignored(self) -> bool:
@@ -816,29 +851,37 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         auxiliary_session_id
                     )
                     if active_generation is None and caller_generation:
-                        expected_parent = self._auxiliary_handoff_parent_session_ids.get(
-                            auxiliary_session_id
+                        expected_parent = (
+                            self._auxiliary_handoff_parent_session_ids.get(
+                                auxiliary_session_id
+                            )
                         )
-                        if expected_parent and self._in_process_parent_session_id(
-                            {},
-                            session_id=auxiliary_session_id,
-                            include_explicit=False,
-                        ) != expected_parent:
+                        if (
+                            expected_parent
+                            and self._in_process_parent_session_id(
+                                {},
+                                session_id=auxiliary_session_id,
+                                include_explicit=False,
+                            )
+                            != expected_parent
+                        ):
                             return
                         if auxiliary_session_id in self._auxiliary_last_prompt_tokens:
                             self._auxiliary_direct_end_guard_session_ids.add(
                                 auxiliary_session_id
                             )
-                        self._auxiliary_last_prompt_tokens.pop(auxiliary_session_id, None)
+                        self._auxiliary_last_prompt_tokens.pop(
+                            auxiliary_session_id, None
+                        )
                         if self._host_fallback_session_id == auxiliary_session_id:
                             self._end_host_fallback_compressor_for_session(
                                 auxiliary_session_id,
                                 [],
                                 current_session_bypasses=True,
                             )
-                        self._auxiliary_session_generations[
-                            auxiliary_session_id
-                        ] = caller_generation
+                        self._auxiliary_session_generations[auxiliary_session_id] = (
+                            caller_generation
+                        )
                         active_generation = caller_generation
                     stack = self._thread_context_auxiliary_stack()
                     stack_marks_current_session = bool(
@@ -850,10 +893,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     generation_matches = (
                         caller_generation == 0
                         if active_generation is None
-                        else caller_generation == active_generation or stack_marks_current_session
+                        else caller_generation == active_generation
+                        or stack_marks_current_session
                     )
                     if generation_matches:
-                        self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
+                        self._auxiliary_last_prompt_tokens[auxiliary_session_id] = (
+                            prompt_tokens
+                        )
             return
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
@@ -861,7 +907,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         cache_keys = {"cache_read_tokens", "cache_write_tokens"}
         self.cache_metrics_available = any(key in usage for key in cache_keys)
-        self.last_input_tokens = int(usage.get("input_tokens", self.last_prompt_tokens) or 0)
+        self.last_input_tokens = int(
+            usage.get("input_tokens", self.last_prompt_tokens) or 0
+        )
         self.last_output_tokens = int(
             usage.get("output_tokens", self.last_completion_tokens) or 0
         )
@@ -915,45 +963,57 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
             prev_count = int(existing.get("compression_count_at_record", 0) or 0)
             compacted = self.compression_count > prev_count
-            rebaselined = self.compression_count != prev_count  # compaction or session reset
+            rebaselined = (
+                self.compression_count != prev_count
+            )  # compaction or session reset
             if rebaselined:
                 turns_since = 0
                 peak_tokens_since = prompt_tokens
             else:
-                turns_since = int(existing.get("turns_since_leaf_compaction", 0) or 0) + 1
+                turns_since = (
+                    int(existing.get("turns_since_leaf_compaction", 0) or 0) + 1
+                )
                 peak_tokens_since = max(
-                    int(existing.get("peak_prompt_tokens_since_leaf_compaction", 0) or 0),
+                    int(
+                        existing.get("peak_prompt_tokens_since_leaf_compaction", 0) or 0
+                    ),
                     prompt_tokens,
                 )
             total_compactions = int(existing.get("total_compactions", 0) or 0)
             if compacted:
                 total_compactions += self.compression_count - prev_count
                 last_leaf_compaction_at = time.time()
-                last_compaction_duration_ms = round(self._last_compaction_duration_ms, 3)
+                last_compaction_duration_ms = round(
+                    self._last_compaction_duration_ms, 3
+                )
             else:
                 last_leaf_compaction_at = existing.get("last_leaf_compaction_at")
-                last_compaction_duration_ms = existing.get("last_compaction_duration_ms")
+                last_compaction_duration_ms = existing.get(
+                    "last_compaction_duration_ms"
+                )
 
             record = dict(existing)
-            record.update({
-                "conversation_id": conversation_id,
-                "last_observed_prompt_tokens": prompt_tokens,
-                "last_observed_cache_read": cache_read,
-                "last_observed_cache_write": cache_write,
-                "cache_state": cache_state,
-                "consecutive_cold_observations": cold_streak,
-                "turns_since_leaf_compaction": turns_since,
-                "peak_prompt_tokens_since_leaf_compaction": peak_tokens_since,
-                # Reserved carry-forward field; no live 'medium'/'high' computation yet.
-                "activity_band": existing.get("activity_band", "low"),
-                "provider": self.provider or existing.get("provider"),
-                "model": self.model or existing.get("model"),
-                "last_api_call_at": time.time(),
-                "last_leaf_compaction_at": last_leaf_compaction_at,
-                "last_compaction_duration_ms": last_compaction_duration_ms,
-                "total_compactions": total_compactions,
-                "compression_count_at_record": self.compression_count,
-            })
+            record.update(
+                {
+                    "conversation_id": conversation_id,
+                    "last_observed_prompt_tokens": prompt_tokens,
+                    "last_observed_cache_read": cache_read,
+                    "last_observed_cache_write": cache_write,
+                    "cache_state": cache_state,
+                    "consecutive_cold_observations": cold_streak,
+                    "turns_since_leaf_compaction": turns_since,
+                    "peak_prompt_tokens_since_leaf_compaction": peak_tokens_since,
+                    # Reserved carry-forward field; no live 'medium'/'high' computation yet.
+                    "activity_band": existing.get("activity_band", "low"),
+                    "provider": self.provider or existing.get("provider"),
+                    "model": self.model or existing.get("model"),
+                    "last_api_call_at": time.time(),
+                    "last_leaf_compaction_at": last_leaf_compaction_at,
+                    "last_compaction_duration_ms": last_compaction_duration_ms,
+                    "total_compactions": total_compactions,
+                    "compression_count_at_record": self.compression_count,
+                }
+            )
             if cache_state == "hot":
                 record["last_cache_hit_at"] = time.time()
             self._store.write_compaction_telemetry(conversation_id, record)
@@ -1111,9 +1171,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     and rebind_candidate_is_foreground_branch
                 )
             ):
-                self._foreground_rebind_previous_session_id = self._foreground_session_id
-                self._foreground_rebind_previous_platform = self._foreground_session_platform
-                self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
+                self._foreground_rebind_previous_session_id = (
+                    self._foreground_session_id
+                )
+                self._foreground_rebind_previous_platform = (
+                    self._foreground_session_platform
+                )
+                self._foreground_rebind_previous_conversation_id = (
+                    self._foreground_conversation_id
+                )
             self._foreground_rebind_session_id = session_id
             self._foreground_rebind_parent_session_id = parent_session_id
             return
@@ -1126,13 +1192,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             self._foreground_rebind_session_id = session_id
             self._foreground_rebind_previous_session_id = self._foreground_session_id
-            self._foreground_rebind_previous_platform = self._foreground_session_platform
-            self._foreground_rebind_previous_conversation_id = self._foreground_conversation_id
+            self._foreground_rebind_previous_platform = (
+                self._foreground_session_platform
+            )
+            self._foreground_rebind_previous_conversation_id = (
+                self._foreground_conversation_id
+            )
             self._foreground_rebind_parent_session_id = parent_session_id
             return
         self._clear_foreground_rebind_candidate()
 
-    def _restore_foreground_after_late_auxiliary_reclassification(self, session_id: str) -> None:
+    def _restore_foreground_after_late_auxiliary_reclassification(
+        self, session_id: str
+    ) -> None:
         if self._foreground_session_id != session_id:
             if self._foreground_rebind_session_id == session_id:
                 self._clear_foreground_rebind_candidate()
@@ -1153,24 +1225,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and self._lcm_session_last_normal_conversation_id.get(parent_session_id)
             ):
                 self._foreground_session_id = parent_session_id
-                self._foreground_session_platform = self._lcm_session_last_normal_platform.get(
-                    parent_session_id,
-                    self._foreground_rebind_previous_platform,
+                self._foreground_session_platform = (
+                    self._lcm_session_last_normal_platform.get(
+                        parent_session_id,
+                        self._foreground_rebind_previous_platform,
+                    )
                 )
-                self._foreground_conversation_id = self._lcm_session_last_normal_conversation_id[
-                    parent_session_id
-                ]
+                self._foreground_conversation_id = (
+                    self._lcm_session_last_normal_conversation_id[parent_session_id]
+                )
             else:
-                self._foreground_session_id = self._foreground_rebind_previous_session_id
-                self._foreground_session_platform = self._foreground_rebind_previous_platform
-                self._foreground_conversation_id = self._foreground_rebind_previous_conversation_id
+                self._foreground_session_id = (
+                    self._foreground_rebind_previous_session_id
+                )
+                self._foreground_session_platform = (
+                    self._foreground_rebind_previous_platform
+                )
+                self._foreground_conversation_id = (
+                    self._foreground_rebind_previous_conversation_id
+                )
         else:
             self._foreground_session_id = ""
             self._foreground_session_platform = ""
             self._foreground_conversation_id = ""
         self._clear_foreground_rebind_candidate()
 
-    def _maybe_reclassify_current_session_as_auxiliary_before_message_ingest(self) -> bool:
+    def _maybe_reclassify_current_session_as_auxiliary_before_message_ingest(
+        self,
+    ) -> bool:
         """Defense-in-depth for host markers that arrive after session binding.
 
         Older Hermes Agent background-review forks seed ``_memory_write_origin``
@@ -1183,20 +1265,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id = str(self._session_id or "")
         if not session_id:
             return False
-        if self._session_ignored or self._session_stateless or self._thread_context_stateless():
+        if (
+            self._session_ignored
+            or self._session_stateless
+            or self._thread_context_stateless()
+        ):
             return False
         if self._ingest_cursor > 0:
             return False
         try:
             stored_count = self._store.get_session_count(session_id)
         except Exception:
-            logger.debug("LCM first-ingest auxiliary recheck count probe failed", exc_info=True)
+            logger.debug(
+                "LCM first-ingest auxiliary recheck count probe failed", exc_info=True
+            )
             return False
         if stored_count != 0:
             return False
         if not self._in_process_auxiliary_caller_generation(session_id):
             return False
 
+        self._store.delete_session_project_metadata(session_id)
         self._mark_thread_context_stateless(session_id)
         self._restore_foreground_after_late_auxiliary_reclassification(session_id)
         logger.info(
@@ -1219,10 +1308,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         are skipped (no duplicates).
         """
         if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+            self._remember_lcm_bypass_message_prefix(
+                self._bypass_lcm_session_id(), messages
+            )
             return
         if self._bypasses_lcm_context_management():
-            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+            self._remember_lcm_bypass_message_prefix(
+                self._bypass_lcm_session_id(), messages
+            )
             return
         if self._session_id and messages:
             try:
@@ -1236,7 +1329,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
+                    self._session_id,
+                    len(messages),
+                    self._ingest_cursor,
                 )
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
@@ -1323,9 +1418,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
-                if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
+                if (
+                    attempt_number >= max_attempts
+                    or not self._is_retry_worthy_leaf_summary_error(exc)
+                ):
                     raise
-                smaller_chunk = self._next_leaf_rescue_chunk(attempt_chunk, source_tokens)
+                smaller_chunk = self._next_leaf_rescue_chunk(
+                    attempt_chunk, source_tokens
+                )
                 if not smaller_chunk or len(smaller_chunk) >= len(attempt_chunk):
                     raise
                 logger.warning(
@@ -1348,14 +1448,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         conversation_id: str | None = None,
     ) -> None:
-        state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
+        state = self._lifecycle.bind_session(
+            session_id, conversation_id=conversation_id
+        )
         self._conversation_id = state.conversation_id
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
         self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)
-            self._lcm_session_last_normal_conversation_id[session_id] = state.conversation_id
+            self._lcm_session_last_normal_conversation_id[session_id] = (
+                state.conversation_id
+            )
             self._foreground_session_id = session_id
             self._foreground_session_platform = self._session_platform
             self._foreground_conversation_id = state.conversation_id
@@ -1394,7 +1498,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and not self._session_stateless
         ):
             run_rollup_maintenance(
-                self._dag, self._config, session_id,
+                self._dag,
+                self._config,
+                session_id,
                 circuit_breaker=self._summary_circuit_breaker,
                 spend_guard=self._summary_spend_guard,
             )
@@ -1448,7 +1554,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._last_compacted_store_id,
         )
 
-    def _has_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> bool:
+    def _has_lcm_bypass_lineage_session(
+        self, session_id: str, *, platform: Optional[str] = None
+    ) -> bool:
         with self._auxiliary_session_lock:
             if session_id not in self._lcm_bypass_lineage_session_ids:
                 return False
@@ -1457,13 +1565,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             platforms = self._lcm_bypass_lineage_platforms.get(session_id) or set()
             return not platforms or platform in platforms
 
-    def _mark_lcm_bypass_lineage_session(self, session_id: str, *, platform: Optional[str] = None) -> None:
+    def _mark_lcm_bypass_lineage_session(
+        self, session_id: str, *, platform: Optional[str] = None
+    ) -> None:
         if not session_id:
             return
         platform = self._session_platform if platform is None else str(platform or "")
         with self._auxiliary_session_lock:
             self._lcm_bypass_lineage_session_ids.add(session_id)
-            self._lcm_bypass_lineage_platforms.setdefault(session_id, set()).add(platform)
+            self._lcm_bypass_lineage_platforms.setdefault(session_id, set()).add(
+                platform
+            )
             self._lcm_session_last_platform[session_id] = platform
             self._lcm_session_last_bypassed[session_id] = True
 
@@ -1487,11 +1599,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if new_session_id:
                 new_platform = str(new_platform or "")
                 self._lcm_bypass_lineage_session_ids.add(new_session_id)
-                self._lcm_bypass_lineage_platforms.setdefault(new_session_id, set()).add(new_platform)
+                self._lcm_bypass_lineage_platforms.setdefault(
+                    new_session_id, set()
+                ).add(new_platform)
                 self._lcm_session_last_platform[new_session_id] = new_platform
                 self._lcm_session_last_bypassed[new_session_id] = True
 
-    def _compression_boundary_from_lcm_bypassed_session(self, old_session_id: str) -> bool:
+    def _compression_boundary_from_lcm_bypassed_session(
+        self, old_session_id: str
+    ) -> bool:
         if not old_session_id:
             return False
         if old_session_id in self._lcm_session_last_bypassed:
@@ -1558,7 +1674,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         self._clear_pending_reset_boundary()
 
-    def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _raw_backlog_messages(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         fresh_tail_start = self._fresh_tail_start(messages)
         leading_anchor_count = self._leading_anchor_count(messages)
         if fresh_tail_start <= leading_anchor_count:
@@ -1601,7 +1719,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 fresh_tail_count=configured_count,
                 fresh_tail_max_tokens=self._config.fresh_tail_max_tokens,
             )
-            selected = rows[boundary.start:]
+            selected = rows[boundary.start :]
             unresolved_tool_boundary = bool(
                 selected
                 and selected[0].get("role") == "tool"
@@ -1621,7 +1739,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         history without a system prompt; preserving that first user turn as raw
         active context lets stale requests look current after later compaction.
         """
-        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        if (
+            messages
+            and isinstance(messages[0], dict)
+            and messages[0].get("role") == "system"
+        ):
             return 1
         return 0
 
@@ -1640,7 +1762,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
             return False
         state = self._lifecycle.get_by_conversation(self._conversation_id)
-        return bool(state and state.debt_kind == "raw_backlog" and state.debt_size_estimate > 0)
+        return bool(
+            state and state.debt_kind == "raw_backlog" and state.debt_size_estimate > 0
+        )
 
     def _budget_pressure_ratio(
         self,
@@ -1722,10 +1846,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if self._has_raw_backlog_debt():
             self._lifecycle.clear_debt(self._conversation_id)
 
-    def _apply_session_start_metadata(self, session_id: str, kwargs: Dict[str, Any]) -> None:
+    def _apply_session_start_metadata(
+        self,
+        session_id: str,
+        kwargs: Dict[str, Any],
+        *,
+        project_source_session_id: str = "",
+    ) -> None:
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._refresh_session_filters()
+        if not self._bypasses_lcm_context_management():
+            inherited = self._store.copy_session_project_metadata(
+                project_source_session_id,
+                session_id,
+            )
+            if not inherited:
+                cwd = str(kwargs.get("cwd") or os.environ.get("TERMINAL_CWD") or "")
+                self._store.set_session_project_metadata(
+                    session_id,
+                    resolve_project_metadata(cwd),
+                )
         # Hold the foreground view stable when the new binding is a side
         # channel (cron tick inside the gateway process, debug probe, etc.).
         # Tools that report "current session" to operators must keep pointing
@@ -1786,10 +1927,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._set_context_length(parsed_context_length, source="session_start")
                 update_model_is_authoritative = False
             else:
-                if (
-                    update_model_is_authoritative
-                    and parsed_context_length not in {self.context_length, self.raw_context_length}
-                ):
+                if update_model_is_authoritative and parsed_context_length not in {
+                    self.context_length,
+                    self.raw_context_length,
+                }:
                     logger.warning(
                         "LCM ignored stale session-start context_length=%s for model=%s; active update_model raw_context_length=%s effective_context_length=%s",
                         parsed_context_length,
@@ -1867,12 +2008,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
 
         def _has_summary_nodes(candidate_session_id: str | None) -> bool:
-            return bool(candidate_session_id and self._dag.get_session_nodes(candidate_session_id))
+            return bool(
+                candidate_session_id
+                and self._dag.get_session_nodes(candidate_session_id)
+            )
 
         def _host_source_from_conversation_state(state: Any) -> tuple[str, Any]:
             if not _state_conversation_matches(state):
                 return "", None
-            if state.current_session_id == old_session_id and _has_summary_nodes(old_session_id):
+            if state.current_session_id == old_session_id and _has_summary_nodes(
+                old_session_id
+            ):
                 return old_session_id, state
             if (
                 state.conversation_id == old_session_id
@@ -1891,7 +2037,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         def _host_source_from_session_state(state: Any) -> tuple[str, Any]:
             if not _state_conversation_matches(state):
                 return "", None
-            if state.current_session_id == old_session_id and _has_summary_nodes(old_session_id):
+            if state.current_session_id == old_session_id and _has_summary_nodes(
+                old_session_id
+            ):
                 return old_session_id, state
             if (
                 state.current_session_id is None
@@ -1901,8 +2049,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 return old_session_id, state
             return "", None
 
-        host_source_session_id, host_source_state = _host_source_from_conversation_state(
-            conversation_state
+        host_source_session_id, host_source_state = (
+            _host_source_from_conversation_state(conversation_state)
         )
         if not host_source_session_id:
             host_source_session_id, host_source_state = _host_source_from_session_state(
@@ -1933,21 +2081,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 bound_state = self._lifecycle.get_by_session(previous_session_id)
                 bound_conversation_matches = bool(
                     bound_state
-                    and (not self._conversation_id or bound_state.conversation_id == self._conversation_id)
+                    and (
+                        not self._conversation_id
+                        or bound_state.conversation_id == self._conversation_id
+                    )
                     and (
                         not requested_conversation_id
                         or bound_state.conversation_id == requested_conversation_id
                     )
                 )
                 bound_is_active_source = bool(
-                    bound_state and bound_state.current_session_id == previous_session_id
+                    bound_state
+                    and bound_state.current_session_id == previous_session_id
                 )
                 bound_is_finalized_source = bool(
                     bound_state
                     and bound_state.current_session_id is None
                     and bound_state.last_finalized_session_id == previous_session_id
                 )
-                bound_has_summary_nodes = bool(self._dag.get_session_nodes(previous_session_id))
+                bound_has_summary_nodes = bool(
+                    self._dag.get_session_nodes(previous_session_id)
+                )
                 if (
                     bound_conversation_matches
                     and (bound_is_active_source or bound_is_finalized_source)
@@ -2020,30 +2174,36 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             pending_reset_frontier,
         )
         can_reassign = bool(
-            source_session_id
-            and session_id
-            and source_session_id != session_id
+            source_session_id and session_id and source_session_id != session_id
         )
         boundary_placeholder_budget = {}
         boundary_placeholder_ordinals: dict[str, set[int]] = {}
         if can_reassign:
             if previous_session_id == source_session_id:
-                boundary_placeholder_budget = self._active_replay_generated_placeholder_digest_budget()
-                boundary_placeholder_ordinals = self._generated_placeholder_digest_ordinals_for_active_replay(
-                    self._last_active_replay_messages
+                boundary_placeholder_budget = (
+                    self._active_replay_generated_placeholder_digest_budget()
+                )
+                boundary_placeholder_ordinals = (
+                    self._generated_placeholder_digest_ordinals_for_active_replay(
+                        self._last_active_replay_messages
+                    )
                 )
             if not boundary_placeholder_budget:
-                boundary_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts(
-                    self._session_scoped_hash_metadata_keys(
-                        "ignored_active_replay_placeholder_hash_counts",
-                        source_session_id,
+                boundary_placeholder_budget = (
+                    self._load_generated_ignored_placeholder_hash_counts(
+                        self._session_scoped_hash_metadata_keys(
+                            "ignored_active_replay_placeholder_hash_counts",
+                            source_session_id,
+                        )
                     )
                 )
             if not boundary_placeholder_ordinals:
-                boundary_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals(
-                    self._session_scoped_hash_metadata_keys(
-                        "ignored_active_replay_placeholder_hash_ordinals",
-                        source_session_id,
+                boundary_placeholder_ordinals = (
+                    self._load_generated_ignored_placeholder_hash_ordinals(
+                        self._session_scoped_hash_metadata_keys(
+                            "ignored_active_replay_placeholder_hash_ordinals",
+                            source_session_id,
+                        )
                     )
                 )
             for digest, ordinals in boundary_placeholder_ordinals.items():
@@ -2089,7 +2249,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # raw rows here makes session-scoped transcript recovery report the
             # old/child session as missing even though its payload was only
             # reassigned to the next compression segment.
-            moved_nodes = self._dag.reassign_session_nodes(source_session_id, session_id)
+            moved_nodes = self._dag.reassign_session_nodes(
+                source_session_id, session_id
+            )
             logger.debug(
                 "LCM compression boundary continued %s -> %s: carried %d DAG nodes; preserved raw message ownership",
                 source_session_id,
@@ -2116,7 +2278,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._log_session_filter_diagnostics()
             return
 
-        self._apply_session_start_metadata(session_id, kwargs)
+        self._apply_session_start_metadata(
+            session_id,
+            kwargs,
+            project_source_session_id=source_session_id,
+        )
         self._bind_lifecycle_state(session_id, conversation_id=conversation_id)
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         if frontier > 0:
@@ -2129,8 +2295,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._last_compacted_store_id = state.current_frontier_store_id
         self._clear_pending_reset_boundary()
         self._compression_boundary_ingest_pending = can_reassign
-        self._compression_boundary_active_placeholder_digest_budget = boundary_placeholder_budget
-        self._compression_boundary_active_placeholder_digest_ordinals = boundary_placeholder_ordinals
+        self._compression_boundary_active_placeholder_digest_budget = (
+            boundary_placeholder_budget
+        )
+        self._compression_boundary_active_placeholder_digest_ordinals = (
+            boundary_placeholder_ordinals
+        )
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
@@ -2143,19 +2313,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._lcm_current_start_allows_bypass_lineage = False
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
         pre_reset_preserve_ambiguous_no_frame_old_session = False
-        if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
-            old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
-                old_session_id
+        if (
+            boundary_reason == "compression"
+            and old_session_id
+            and old_session_id != session_id
+        ):
+            old_session_auxiliary_generation = (
+                self._in_process_auxiliary_caller_generation(old_session_id)
             )
             new_session_auxiliary_parent = self._in_process_parent_session_id(
                 {},
                 session_id=session_id,
                 include_explicit=False,
             )
-            new_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(session_id)
+            new_session_auxiliary_generation = (
+                self._in_process_auxiliary_caller_generation(session_id)
+            )
             with self._auxiliary_session_lock:
-                active_old_auxiliary_generation = self._auxiliary_session_generations.get(
-                    old_session_id
+                active_old_auxiliary_generation = (
+                    self._auxiliary_session_generations.get(old_session_id)
                 )
                 old_session_auxiliary_generation_is_stale = bool(
                     (
@@ -2175,10 +2351,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     or (
                         active_old_auxiliary_generation is not None
                         and (
-                            (
-                                old_session_auxiliary_generation
-                                and active_old_auxiliary_generation != old_session_auxiliary_generation
-                            )
+                            old_session_auxiliary_generation
+                            and active_old_auxiliary_generation
+                            != old_session_auxiliary_generation
                         )
                     )
                 )
@@ -2200,11 +2375,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and old_session_id not in self._auxiliary_direct_end_guard_session_ids
                 and new_session_auxiliary_parent != old_session_id
             )
-        if self._host_fallback_compressor is not None and (
-            self._host_fallback_session_id != session_id or requested_platform != self._session_platform
-        ) and not (
-            pre_reset_preserve_ambiguous_no_frame_old_session
-            and self._host_fallback_session_id == old_session_id
+        if (
+            self._host_fallback_compressor is not None
+            and (
+                self._host_fallback_session_id != session_id
+                or requested_platform != self._session_platform
+            )
+            and not (
+                pre_reset_preserve_ambiguous_no_frame_old_session
+                and self._host_fallback_session_id == old_session_id
+            )
         ):
             compressor = self._host_fallback_compressor
             fallback_session_id = self._host_fallback_session_id or previous_session_id
@@ -2213,31 +2393,42 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 try:
                     on_session_end(fallback_session_id, [])
                 except Exception:
-                    logger.debug("LCM host fallback compressor session-start reset failed", exc_info=True)
+                    logger.debug(
+                        "LCM host fallback compressor session-start reset failed",
+                        exc_info=True,
+                    )
             on_session_reset = getattr(compressor, "on_session_reset", None)
             if callable(on_session_reset):
                 try:
                     on_session_reset()
                 except Exception:
-                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
+                    logger.debug(
+                        "LCM host fallback compressor reset failed", exc_info=True
+                    )
             self._host_fallback_compressor = None
             self._host_fallback_session_id = ""
-        if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
-            old_session_is_suppressed_foreground = self._auxiliary_lineage_suppressed_as_foreground(
-                old_session_id
+        if (
+            boundary_reason == "compression"
+            and old_session_id
+            and old_session_id != session_id
+        ):
+            old_session_is_suppressed_foreground = (
+                self._auxiliary_lineage_suppressed_as_foreground(old_session_id)
             )
-            old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(
-                old_session_id
+            old_session_auxiliary_generation = (
+                self._in_process_auxiliary_caller_generation(old_session_id)
             )
             new_session_auxiliary_parent = self._in_process_parent_session_id(
                 {},
                 session_id=session_id,
                 include_explicit=False,
             )
-            new_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(session_id)
+            new_session_auxiliary_generation = (
+                self._in_process_auxiliary_caller_generation(session_id)
+            )
             with self._auxiliary_session_lock:
-                active_old_auxiliary_generation = self._auxiliary_session_generations.get(
-                    old_session_id
+                active_old_auxiliary_generation = (
+                    self._auxiliary_session_generations.get(old_session_id)
                 )
                 old_session_auxiliary_generation_is_stale = bool(
                     (
@@ -2257,10 +2448,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     or (
                         active_old_auxiliary_generation is not None
                         and (
-                            (
-                                old_session_auxiliary_generation
-                                and active_old_auxiliary_generation != old_session_auxiliary_generation
-                            )
+                            old_session_auxiliary_generation
+                            and active_old_auxiliary_generation
+                            != old_session_auxiliary_generation
                         )
                     )
                 )
@@ -2272,7 +2462,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 session_id=session_id,
                 include_explicit=False,
             )
-            new_session_is_auxiliary_continuation = new_session_auxiliary_parent == old_session_id
+            new_session_is_auxiliary_continuation = (
+                new_session_auxiliary_parent == old_session_id
+            )
             preserve_ambiguous_no_frame_old_session = bool(
                 active_old_auxiliary_generation is not None
                 and not old_session_auxiliary_generation
@@ -2351,7 +2543,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
-        if self._is_live_auxiliary_child_session(session_id, previous_session_id, kwargs):
+        if self._is_live_auxiliary_child_session(
+            session_id, previous_session_id, kwargs
+        ):
             explicit_parent_id = str(kwargs.get("parent_session_id") or "")
             preserve_foreground_reuse_marker = bool(
                 (
@@ -2414,7 +2608,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _session_end_prefix_compare_value(self, value: Any, *, session_id: str) -> Any:
         if isinstance(value, dict):
             return {
-                key: self._session_end_prefix_compare_value(child, session_id=session_id)
+                key: self._session_end_prefix_compare_value(
+                    child, session_id=session_id
+                )
                 for key, child in value.items()
             }
         if isinstance(value, list):
@@ -2445,7 +2641,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             if payload is not None:
                 payload_session_id = str(payload.get("session_id") or "")
-                if not session_id or not payload_session_id or payload_session_id == session_id:
+                if (
+                    not session_id
+                    or not payload_session_id
+                    or payload_session_id == session_id
+                ):
                     content = payload.get("content")
                     if isinstance(content, str):
                         return content
@@ -2459,7 +2659,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             if payload is not None:
                 payload_session_id = str(payload.get("session_id") or "")
-                if not session_id or not payload_session_id or payload_session_id == session_id:
+                if (
+                    not session_id
+                    or not payload_session_id
+                    or payload_session_id == session_id
+                ):
                     content = payload.get("content")
                     if isinstance(content, str):
                         return content
@@ -2553,7 +2757,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     session_id=session_id,
                 )
             except Exception:
-                logger.debug("LCM session-end prefix compare normalization failed", exc_info=True)
+                logger.debug(
+                    "LCM session-end prefix compare normalization failed", exc_info=True
+                )
                 return None
             if message_identity != stored_identity:
                 return None
@@ -2585,7 +2791,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             for msg in messages[:_LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT]
         ]
         if fingerprints:
-            remembered = self._lcm_bypass_message_prefix_fingerprints.setdefault(session_id, [])
+            remembered = self._lcm_bypass_message_prefix_fingerprints.setdefault(
+                session_id, []
+            )
             truncated = len(messages) > _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT
             retained: list[tuple[list[str], bool]] = []
             for existing_fingerprints, existing_truncated in remembered:
@@ -2646,7 +2854,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         compare_count = min(len(fingerprints), len(messages))
         if compare_count <= 0:
             return 0
-        candidate = [self._lcm_bypass_message_fingerprint(msg) for msg in messages[:compare_count]]
+        candidate = [
+            self._lcm_bypass_message_fingerprint(msg)
+            for msg in messages[:compare_count]
+        ]
         if candidate == fingerprints[:compare_count]:
             return compare_count
         return 0
@@ -2663,7 +2874,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         session_id: str,
         messages: List[Dict[str, Any]],
     ) -> int:
-        count, _truncated = self._matching_lcm_bypass_prefix_evidence(session_id, messages)
+        count, _truncated = self._matching_lcm_bypass_prefix_evidence(
+            session_id, messages
+        )
         return count
 
     def _matching_lcm_bypass_prefix_evidence(
@@ -2673,9 +2886,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> tuple[int, bool]:
         best_count = 0
         best_truncated = False
-        for fingerprints, truncated in self._lcm_bypass_message_prefix_fingerprints.get(session_id, []):
+        for fingerprints, truncated in self._lcm_bypass_message_prefix_fingerprints.get(
+            session_id, []
+        ):
             count = self._matching_fingerprint_prefix_count(fingerprints, messages)
-            count_truncated = bool(truncated and count > 0 and count == len(fingerprints))
+            count_truncated = bool(
+                truncated and count > 0 and count == len(fingerprints)
+            )
             if count > best_count:
                 best_count = count
                 best_truncated = count_truncated
@@ -2690,11 +2907,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         conversation_id: str | None = None,
     ) -> bool:
-        return self._matching_lcm_normal_prefix_count(
-            session_id,
-            messages,
-            conversation_id=conversation_id,
-        ) > 0
+        return (
+            self._matching_lcm_normal_prefix_count(
+                session_id,
+                messages,
+                conversation_id=conversation_id,
+            )
+            > 0
+        )
 
     def _matching_lcm_normal_prefix_count(
         self,
@@ -2706,7 +2926,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return self._matching_fingerprint_prefix_count(
             self._lcm_normal_message_prefix_fingerprints.get(
                 self._lcm_normal_prefix_key(session_id, conversation_id=conversation_id)
-            ) or [],
+            )
+            or [],
             messages,
         )
 
@@ -2724,7 +2945,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         for msg in suffix:
             if self._matches_ignore_message_patterns(msg):
                 self._ignored_message_count += 1
-                excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[:80].replace("\n", " ")
+                excerpt = (text_content_for_pattern_matching(msg.get("content")) or "")[
+                    :80
+                ].replace("\n", " ")
                 logger.debug(
                     "LCM ignore_message_patterns dropped late session-end %s message: %r",
                     msg.get("role", "unknown"),
@@ -2780,9 +3003,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if current_thread_session_id == session_id:
                     self._clear_thread_context_stateless(session_id)
             return
-        current_session_bypasses = session_id == self._session_id and self._bypasses_lcm_context_management()
-        ended_session_directly_bypasses = self._ended_session_directly_bypasses_lcm(session_id)
-        direct_bypass_normal_conversation_id = self._lcm_session_last_normal_conversation_id.get(session_id)
+        current_session_bypasses = (
+            session_id == self._session_id and self._bypasses_lcm_context_management()
+        )
+        ended_session_directly_bypasses = self._ended_session_directly_bypasses_lcm(
+            session_id
+        )
+        direct_bypass_normal_conversation_id = (
+            self._lcm_session_last_normal_conversation_id.get(session_id)
+        )
         direct_bypass_normal_prefix_count = None
         if (
             session_id != self._session_id
@@ -2804,7 +3033,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and direct_bypass_normal_prefix_count is not None
             and direct_bypass_normal_prefix_count > 0
         )
-        if ended_session_directly_bypasses and not direct_bypass_is_suppressed_reused_normal:
+        if (
+            ended_session_directly_bypasses
+            and not direct_bypass_is_suppressed_reused_normal
+        ):
             self._remember_lcm_bypass_message_prefix(session_id, messages)
             self._end_host_fallback_compressor_for_session(
                 session_id,
@@ -2812,7 +3044,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 current_session_bypasses=current_session_bypasses,
             )
             if session_id == self._thread_context_session_id():
-                self._deactivate_auxiliary_session(session_id, generation=ended_generation)
+                self._deactivate_auxiliary_session(
+                    session_id, generation=ended_generation
+                )
                 self._clear_thread_context_stateless(session_id)
             return
         same_id_has_bypass_lineage = (
@@ -2839,14 +3073,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 messages,
                 conversation_id=same_id_conversation_id,
             )
-            same_id_recorded_normal_prefix_count = self._matching_lcm_normal_prefix_count(
-                session_id,
-                messages,
-                conversation_id=same_id_conversation_id,
+            same_id_recorded_normal_prefix_count = (
+                self._matching_lcm_normal_prefix_count(
+                    session_id,
+                    messages,
+                    conversation_id=same_id_conversation_id,
+                )
             )
         same_id_store_prefix_positive = (
-            same_id_normal_prefix_count is not None
-            and same_id_normal_prefix_count > 0
+            same_id_normal_prefix_count is not None and same_id_normal_prefix_count > 0
         )
         same_id_strongest_normal_prefix_count = max(
             same_id_recorded_normal_prefix_count,
@@ -2872,12 +3107,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and bool(direct_bypass_normal_conversation_id)
             and not ended_generation
         )
-        off_current_lineage = (
-            session_id != self._session_id
-            and (
-                self._has_lcm_bypass_lineage_session(session_id)
-                or off_current_auxiliary_reused_normal
-            )
+        off_current_lineage = session_id != self._session_id and (
+            self._has_lcm_bypass_lineage_session(session_id)
+            or off_current_auxiliary_reused_normal
         )
         off_current_normal_conversation_id = (
             self._lcm_session_last_normal_conversation_id.get(session_id)
@@ -2919,18 +3151,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     conversation_id=off_current_normal_conversation_id,
                 )
             except Exception:
-                logger.debug("LCM off-current recorded-prefix row-count probe failed", exc_info=True)
+                logger.debug(
+                    "LCM off-current recorded-prefix row-count probe failed",
+                    exc_info=True,
+                )
                 stored_normal_rows = []
             if len(stored_normal_rows) == off_current_recorded_prefix_count:
-                off_current_recorded_prefix_for_append = off_current_recorded_prefix_count
+                off_current_recorded_prefix_for_append = (
+                    off_current_recorded_prefix_count
+                )
         off_current_strongest_normal_prefix_count = max(
-            off_current_store_prefix_for_append if off_current_store_prefix_positive else 0,
+            off_current_store_prefix_for_append
+            if off_current_store_prefix_positive
+            else 0,
             off_current_recorded_prefix_for_append,
         )
         off_current_truncated_bypass_prefix_ambiguous = (
             off_current_bypass_prefix_truncated
             and off_current_bypass_prefix_count > 0
-            and off_current_strongest_normal_prefix_count >= off_current_bypass_prefix_count
+            and off_current_strongest_normal_prefix_count
+            >= off_current_bypass_prefix_count
             and len(messages) > off_current_bypass_prefix_count
         )
         if (
@@ -2947,7 +3187,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and not off_current_truncated_bypass_prefix_ambiguous
             and (
                 off_current_bypass_prefix_count <= 0
-                or off_current_recorded_prefix_for_append > off_current_bypass_prefix_count
+                or off_current_recorded_prefix_for_append
+                > off_current_bypass_prefix_count
             )
         ):
             off_current_prefix_count = off_current_recorded_prefix_for_append
@@ -2977,7 +3218,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             and bool(self._lcm_session_last_bypassed.get(session_id))
             and not self._session_end_matches_current_store_prefix(session_id, messages)
         )
-        off_current_should_bypass = off_current_lineage and off_current_prefix_count is None
+        off_current_should_bypass = (
+            off_current_lineage and off_current_prefix_count is None
+        )
         if off_current_prefix_count is not None:
             prefix_count = off_current_prefix_count
             suffix = messages[prefix_count:]
@@ -2987,20 +3230,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     suffix,
                     source=(
                         self._lcm_session_last_normal_platform.get(session_id)
-                        or self._lcm_session_last_platform.get(session_id, self._session_platform)
+                        or self._lcm_session_last_platform.get(
+                            session_id, self._session_platform
+                        )
                     ),
                     conversation_id=off_current_normal_conversation_id,
                 )
             try:
-                state = self._lifecycle.get_by_conversation(off_current_normal_conversation_id)
-                frontier_store_id = state.current_frontier_store_id if state is not None else 0
+                state = self._lifecycle.get_by_conversation(
+                    off_current_normal_conversation_id
+                )
+                frontier_store_id = (
+                    state.current_frontier_store_id if state is not None else 0
+                )
                 self._lifecycle.finalize_session(
                     off_current_normal_conversation_id,
                     session_id,
                     frontier_store_id=frontier_store_id,
                 )
             except Exception:
-                logger.debug("LCM off-current session-end lifecycle finalization failed", exc_info=True)
+                logger.debug(
+                    "LCM off-current session-end lifecycle finalization failed",
+                    exc_info=True,
+                )
             return
         if (
             current_session_bypasses
@@ -3066,7 +3318,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         return
                     raise
         except KeyboardInterrupt:
-            logger.warning("LCM session-end ingest/finalize interrupted before bounded flush completed")
+            logger.warning(
+                "LCM session-end ingest/finalize interrupted before bounded flush completed"
+            )
             return
         except Exception as exc:
             if _is_sqlite_locked_error(exc):
@@ -3085,7 +3339,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 try:
                     on_session_reset()
                 except Exception:
-                    logger.debug("LCM host fallback compressor reset failed", exc_info=True)
+                    logger.debug(
+                        "LCM host fallback compressor reset failed", exc_info=True
+                    )
             self._host_fallback_compressor = None
             self._host_fallback_session_id = ""
         self._pending_reset_session_id = self._session_id
@@ -3142,9 +3398,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             finally:
                 store.close()
         except Exception:  # pragma: no cover - defensive; purge is best-effort
-            logger.debug(
-                "LCM embedding purge for deleted nodes failed", exc_info=True
-            )
+            logger.debug("LCM embedding purge for deleted nodes failed", exc_info=True)
 
     def _archive_chunks_for_messages(
         self,
@@ -3170,7 +3424,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if connection is not None:
                 for offset in range(0, len(store_ids), 256):
                     VectorStore.archive_chunks_for_messages_on_connection(
-                        connection, store_ids[offset:offset + 256]
+                        connection, store_ids[offset : offset + 256]
                     )
                 return
             store = VectorStore(self._store.db_path, config=self._config)
@@ -3179,11 +3433,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             finally:
                 store.close()
         except Exception:  # pragma: no cover - defensive; archive is best-effort
-            logger.debug(
-                "LCM chunk archive for purged messages failed", exc_info=True
-            )
+            logger.debug("LCM chunk archive for purged messages failed", exc_info=True)
 
-    def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> int:
+    def carry_over_new_session_context(
+        self, old_session_id: str, new_session_id: str
+    ) -> int:
         """Move retained summaries from the old session into the new one.
 
         This reassigns session ownership for retained summary nodes, but it does
@@ -3235,8 +3489,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             old_session_id and bound_session_id and old_session_id == bound_session_id
         )
 
-        if carry_over_context and boundary_reason == "compression" and old_session_id and old_session_id != new_session_id:
-            before_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
+        if (
+            carry_over_context
+            and boundary_reason == "compression"
+            and old_session_id
+            and old_session_id != new_session_id
+        ):
+            before_node_ids = {
+                node.node_id for node in self._dag.get_session_nodes(new_session_id)
+            }
             if can_carry_over:
                 self.on_session_end(old_session_id, previous_messages)
             else:
@@ -3250,7 +3511,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 old_session_id=old_session_id,
                 **kwargs,
             )
-            after_node_ids = {node.node_id for node in self._dag.get_session_nodes(new_session_id)}
+            after_node_ids = {
+                node.node_id for node in self._dag.get_session_nodes(new_session_id)
+            }
             return len(after_node_ids - before_node_ids)
 
         if old_session_id and can_carry_over:
@@ -3297,9 +3560,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if name != "lcm_inspect" and messages and self._session_id:
             if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+                self._remember_lcm_bypass_message_prefix(
+                    self._bypass_lcm_session_id(), messages
+                )
             elif not (
-                self._session_ignored or self._session_stateless or self._thread_context_stateless()
+                self._session_ignored
+                or self._session_stateless
+                or self._thread_context_stateless()
             ):
                 try:
                     self._ingest_messages(messages)
@@ -3368,61 +3635,79 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "lifecycle_last_finalized_session_id": "",
         }
         if self.side_channel_active:
-            identity.update({
-                "bound_session_id": self._session_id,
-                "bound_session_platform": self._session_platform,
-                "bound_conversation_id": self._conversation_id,
-            })
+            identity.update(
+                {
+                    "bound_session_id": self._session_id,
+                    "bound_session_platform": self._session_platform,
+                    "bound_conversation_id": self._conversation_id,
+                }
+            )
         identity.update(git_identity)
         if lifecycle_state is not None:
-            identity.update({
-                "lifecycle_current_session_id": lifecycle_state.current_session_id or "",
-                "lifecycle_last_finalized_session_id": lifecycle_state.last_finalized_session_id or "",
-            })
+            identity.update(
+                {
+                    "lifecycle_current_session_id": lifecycle_state.current_session_id
+                    or "",
+                    "lifecycle_last_finalized_session_id": lifecycle_state.last_finalized_session_id
+                    or "",
+                }
+            )
         if lifecycle_error:
             identity["lifecycle_error"] = lifecycle_error
         return identity
 
     def get_status(self) -> Dict[str, Any]:
         status = super().get_status()
-        status.update({
-            "compression_count": self.compression_count,
-            "last_prompt_tokens": self.last_prompt_tokens,
-            "last_completion_tokens": self.last_completion_tokens,
-            "last_total_tokens": self.last_total_tokens,
-            "last_input_tokens": self.last_input_tokens,
-            "last_output_tokens": self.last_output_tokens,
-            "last_cache_read_tokens": self.last_cache_read_tokens,
-            "last_cache_write_tokens": self.last_cache_write_tokens,
-            "last_reasoning_tokens": self.last_reasoning_tokens,
-            "cache_metrics_available": self.cache_metrics_available,
-            "cache_read_ratio": round(self.cache_read_ratio, 4),
-            "raw_context_length": self.raw_context_length,
-            "context_length": self.context_length,
-            "effective_context_length_cap": self.effective_context_length_cap,
-            "effective_context_length_reason": self.effective_context_length_reason,
-            "threshold_tokens": self.threshold_tokens,
-            "last_compression_status": self._last_compression_status,
-            "last_compression_noop_reason": self._last_compression_noop_reason,
-            "threshold_full_sweep": dict(self._last_threshold_full_sweep),
-            "ingest_failure_count": self._ingest_failure_count,
-            "consecutive_ingest_failures": self._consecutive_ingest_failures,
-            "last_ingest_error": self._last_ingest_error,
-            "last_ingest_error_time": self._last_ingest_error_time,
-            "model": self.model,
-            "provider": self.provider,
-            "context_length_source": self._context_length_source,
-            "configured_context_threshold": self._config.context_threshold,
-            "context_threshold": self.context_threshold,
-            "context_threshold_source": self._context_threshold_source,
-            "context_threshold_autoraised": self._context_threshold_autoraised,
-            "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
-            "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
-            "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
-        })
+        status.update(
+            {
+                "compression_count": self.compression_count,
+                "last_prompt_tokens": self.last_prompt_tokens,
+                "last_completion_tokens": self.last_completion_tokens,
+                "last_total_tokens": self.last_total_tokens,
+                "last_input_tokens": self.last_input_tokens,
+                "last_output_tokens": self.last_output_tokens,
+                "last_cache_read_tokens": self.last_cache_read_tokens,
+                "last_cache_write_tokens": self.last_cache_write_tokens,
+                "last_reasoning_tokens": self.last_reasoning_tokens,
+                "cache_metrics_available": self.cache_metrics_available,
+                "cache_read_ratio": round(self.cache_read_ratio, 4),
+                "raw_context_length": self.raw_context_length,
+                "context_length": self.context_length,
+                "effective_context_length_cap": self.effective_context_length_cap,
+                "effective_context_length_reason": self.effective_context_length_reason,
+                "threshold_tokens": self.threshold_tokens,
+                "last_compression_status": self._last_compression_status,
+                "last_compression_noop_reason": self._last_compression_noop_reason,
+                "threshold_full_sweep": dict(self._last_threshold_full_sweep),
+                "ingest_failure_count": self._ingest_failure_count,
+                "consecutive_ingest_failures": self._consecutive_ingest_failures,
+                "last_ingest_error": self._last_ingest_error,
+                "last_ingest_error_time": self._last_ingest_error_time,
+                "model": self.model,
+                "provider": self.provider,
+                "context_length_source": self._context_length_source,
+                "configured_context_threshold": self._config.context_threshold,
+                "context_threshold": self.context_threshold,
+                "context_threshold_source": self._context_threshold_source,
+                "context_threshold_autoraised": self._context_threshold_autoraised,
+                "config_sources": dict(
+                    getattr(self._config, "config_sources", {}) or {}
+                ),
+                "config_source_warnings": list(
+                    getattr(self._config, "config_source_warnings", []) or []
+                ),
+                "ignored_config_yaml_lcm_keys": list(
+                    getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []
+                ),
+            }
+        )
         session_id = self.current_session_id
         conversation_id = self.current_conversation_id
-        lifecycle_state = self._lifecycle.get_by_conversation(conversation_id) if conversation_id else None
+        lifecycle_state = (
+            self._lifecycle.get_by_conversation(conversation_id)
+            if conversation_id
+            else None
+        )
         status["engine"] = "lcm"
         status["runtime_identity"] = self.get_runtime_identity()
         status["ingest_protection"] = sensitive_pattern_status(self._config)
@@ -3462,17 +3747,31 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             status["session_platform"] = self.current_session_platform
             status["session_ignored"] = self.current_session_ignored
             status["session_stateless"] = self.current_session_stateless
-            status["ignore_session_patterns"] = list(self._config.ignore_session_patterns)
-            status["stateless_session_patterns"] = list(self._config.stateless_session_patterns)
-            status["ignore_message_patterns"] = list(self._config.ignore_message_patterns)
-            status["ignore_session_patterns_source"] = self._config.ignore_session_patterns_source
-            status["stateless_session_patterns_source"] = self._config.stateless_session_patterns_source
-            status["ignore_message_patterns_source"] = self._config.ignore_message_patterns_source
+            status["ignore_session_patterns"] = list(
+                self._config.ignore_session_patterns
+            )
+            status["stateless_session_patterns"] = list(
+                self._config.stateless_session_patterns
+            )
+            status["ignore_message_patterns"] = list(
+                self._config.ignore_message_patterns
+            )
+            status["ignore_session_patterns_source"] = (
+                self._config.ignore_session_patterns_source
+            )
+            status["stateless_session_patterns_source"] = (
+                self._config.stateless_session_patterns_source
+            )
+            status["ignore_message_patterns_source"] = (
+                self._config.ignore_message_patterns_source
+            )
             status["ignored_message_count"] = self._ignored_message_count
             status["ignore_pattern_dropped_count"] = self._ignore_pattern_dropped_count
             status["ingest_reconciliation"] = dict(self._last_ingest_reconciliation)
             status["overflow_recovery_failed"] = self._last_overflow_recovery_failed
-            status["condensation_suppressed_reason"] = self._last_condensation_suppressed_reason
+            status["condensation_suppressed_reason"] = (
+                self._last_condensation_suppressed_reason
+            )
             status["conversation_id"] = conversation_id
             if lifecycle_state is not None:
                 status["lifecycle"] = {
@@ -3510,22 +3809,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     "last_observed_prompt_tokens": telemetry.get(
                         "last_observed_prompt_tokens", 0
                     ),
-                    "last_observed_cache_read": telemetry.get("last_observed_cache_read", 0),
-                    "last_observed_cache_write": telemetry.get("last_observed_cache_write", 0),
+                    "last_observed_cache_read": telemetry.get(
+                        "last_observed_cache_read", 0
+                    ),
+                    "last_observed_cache_write": telemetry.get(
+                        "last_observed_cache_write", 0
+                    ),
                     "activity_band": telemetry.get("activity_band", "low"),
                     "total_compactions": telemetry.get("total_compactions", 0),
                     "last_leaf_compaction_at": telemetry.get("last_leaf_compaction_at"),
-                    "last_compaction_duration_ms": telemetry.get("last_compaction_duration_ms"),
+                    "last_compaction_duration_ms": telemetry.get(
+                        "last_compaction_duration_ms"
+                    ),
                     "provider": telemetry.get("provider"),
                     "model": telemetry.get("model"),
                     "last_api_call_at": telemetry.get("last_api_call_at"),
                 }
         return status
 
-    def update_model(self, model: str, context_length: int,
-                     base_url: str = "", api_key: str = "",
-                     provider: str = "",
-                     api_mode: str = "") -> None:
+    def update_model(
+        self,
+        model: str,
+        context_length: int,
+        base_url: str = "",
+        api_key: str = "",
+        provider: str = "",
+        api_mode: str = "",
+    ) -> None:
         parent_session_id = self._in_process_parent_session_id({})
         if parent_session_id:
             logger.debug(
@@ -3550,27 +3860,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._session_match_keys,
             self._compiled_ignore_session_patterns,
         )
-        self._session_stateless = (
-            not self._session_ignored
-            and (
-                (
-                    self._lcm_current_start_allows_bypass_lineage
-                    and self._has_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
+        self._session_stateless = not self._session_ignored and (
+            (
+                self._lcm_current_start_allows_bypass_lineage
+                and self._has_lcm_bypass_lineage_session(
+                    self._session_id, platform=self._session_platform
                 )
-                or matches_session_pattern(
-                    self._session_match_keys,
-                    self._compiled_stateless_session_patterns,
-                )
+            )
+            or matches_session_pattern(
+                self._session_match_keys,
+                self._compiled_stateless_session_patterns,
             )
         )
         if self._session_id:
             self._lcm_session_last_platform[self._session_id] = self._session_platform
-            self._lcm_session_last_bypassed[self._session_id] = bool(self._session_ignored or self._session_stateless)
+            self._lcm_session_last_bypassed[self._session_id] = bool(
+                self._session_ignored or self._session_stateless
+            )
             if not self._session_ignored and not self._session_stateless:
-                self._lcm_non_bypass_platforms.setdefault(self._session_id, set()).add(self._session_platform)
-                self._lcm_session_last_normal_platform[self._session_id] = self._session_platform
+                self._lcm_non_bypass_platforms.setdefault(self._session_id, set()).add(
+                    self._session_platform
+                )
+                self._lcm_session_last_normal_platform[self._session_id] = (
+                    self._session_platform
+                )
         if self._session_ignored or self._session_stateless:
-            self._mark_lcm_bypass_lineage_session(self._session_id, platform=self._session_platform)
+            self._mark_lcm_bypass_lineage_session(
+                self._session_id, platform=self._session_platform
+            )
 
     def _log_session_filter_diagnostics(self) -> None:
         if not self._logged_filter_config:
@@ -3614,12 +3931,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not self._session_id or self._session_ignored or self._session_stateless:
             return
         try:
-            self._ingest_cursor_needs_reconcile = self._store.get_session_count(self._session_id) > 0
+            self._ingest_cursor_needs_reconcile = (
+                self._store.get_session_count(self._session_id) > 0
+            )
         except Exception as exc:  # pragma: no cover - defensive only
             logger.debug("LCM ingest cursor reconciliation probe failed: %s", exc)
             self._ingest_cursor_needs_reconcile = False
 
-    def _stored_row_externalized_text_parts_for_pattern_matching(self, msg: Dict[str, Any]) -> list[str]:
+    def _stored_row_externalized_text_parts_for_pattern_matching(
+        self, msg: Dict[str, Any]
+    ) -> list[str]:
         ref_sources: list[str] = []
         content = msg.get("content")
         if isinstance(content, str):
@@ -3653,17 +3974,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 parts.append(payload_content)
         return parts
 
-    def _stored_row_externalized_text_for_pattern_matching(self, msg: Dict[str, Any]) -> str:
-        return "\n".join(self._stored_row_externalized_text_parts_for_pattern_matching(msg))
+    def _stored_row_externalized_text_for_pattern_matching(
+        self, msg: Dict[str, Any]
+    ) -> str:
+        return "\n".join(
+            self._stored_row_externalized_text_parts_for_pattern_matching(msg)
+        )
 
-    def _is_cached_active_replay_message_at_index(self, idx: int, msg: Dict[str, Any]) -> bool:
+    def _is_cached_active_replay_message_at_index(
+        self, idx: int, msg: Dict[str, Any]
+    ) -> bool:
         if idx < 0 or idx >= len(self._last_active_replay_messages):
             return False
         return self._message_replay_identity(msg) == self._message_replay_identity(
             self._last_active_replay_messages[idx]
         )
 
-    def _matches_ignore_message_patterns(self, msg: Dict[str, Any], *, stored_row: bool = False) -> bool:
+    def _matches_ignore_message_patterns(
+        self, msg: Dict[str, Any], *, stored_row: bool = False
+    ) -> bool:
         if not self._compiled_ignore_message_patterns:
             return False
         content = msg.get("content")
@@ -3675,19 +4004,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if matches_message_pattern(text, self._compiled_ignore_message_patterns):
             return True
         if stored_row:
-            externalized_parts = self._stored_row_externalized_text_parts_for_pattern_matching(msg)
+            externalized_parts = (
+                self._stored_row_externalized_text_parts_for_pattern_matching(msg)
+            )
             for externalized_text in externalized_parts:
-                if externalized_text and matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns):
+                if externalized_text and matches_message_pattern(
+                    externalized_text, self._compiled_ignore_message_patterns
+                ):
                     return True
             externalized_text = "\n".join(externalized_parts)
             if externalized_text and externalized_text != text:
-                return matches_message_pattern(externalized_text, self._compiled_ignore_message_patterns)
+                return matches_message_pattern(
+                    externalized_text, self._compiled_ignore_message_patterns
+                )
         return False
 
     def _content_has_externalized_placeholder_ref(self, content: str) -> bool:
-        return bool(extract_externalized_ref(content) or extract_ingest_externalized_refs(content))
+        return bool(
+            extract_externalized_ref(content)
+            or extract_ingest_externalized_refs(content)
+        )
 
-    def _has_prior_raw_externalized_placeholder_row(self, store_id: int, msg: Dict[str, Any]) -> bool:
+    def _has_prior_raw_externalized_placeholder_row(
+        self, store_id: int, msg: Dict[str, Any]
+    ) -> bool:
         if not self._session_id:
             return False
         raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
@@ -3704,30 +4044,47 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 row_store_id = int(row.get("store_id") or 0)
                 if row_store_id >= store_id:
                     return False
-                if self._raw_externalized_placeholder_replay_identity(row) == raw_identity:
+                if (
+                    self._raw_externalized_placeholder_replay_identity(row)
+                    == raw_identity
+                ):
                     return True
                 after_store_id = max(after_store_id, row_store_id)
 
-    def _mapped_stored_row_matches_ignore_message_patterns(self, msg: Dict[str, Any]) -> bool:
+    def _mapped_stored_row_matches_ignore_message_patterns(
+        self, msg: Dict[str, Any]
+    ) -> bool:
         store_id = msg.get("store_id")
         content = normalize_content_value(msg.get("content")) or ""
-        has_externalized_placeholder = self._content_has_externalized_placeholder_ref(content)
+        has_externalized_placeholder = self._content_has_externalized_placeholder_ref(
+            content
+        )
         mapped_from_active_placeholder = False
         if store_id is None:
             store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
-            mapped_from_active_placeholder = has_externalized_placeholder and store_id is not None
+            mapped_from_active_placeholder = (
+                has_externalized_placeholder and store_id is not None
+            )
         if store_id is None:
             return False
-        if mapped_from_active_placeholder and self._has_prior_raw_externalized_placeholder_row(int(store_id), msg):
+        if (
+            mapped_from_active_placeholder
+            and self._has_prior_raw_externalized_placeholder_row(int(store_id), msg)
+        ):
             raw_identity = self._raw_externalized_placeholder_replay_identity(msg)
-            if self._current_compress_placeholder_identity_counts.get(raw_identity, 0) <= 1:
+            if (
+                self._current_compress_placeholder_identity_counts.get(raw_identity, 0)
+                <= 1
+            ):
                 return False
         try:
             stored = self._store.get(int(store_id))
         except Exception:
             logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
             return False
-        return bool(stored and self._matches_ignore_message_patterns(stored, stored_row=True))
+        return bool(
+            stored and self._matches_ignore_message_patterns(stored, stored_row=True)
+        )
 
     def _copy_active_replay_messages_preserving_generated_ids(
         self,
@@ -3742,7 +4099,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         for message in active_replay_messages:
             copied_message = dict(message)
             if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(copied_message))
+                self._generated_ignored_active_replay_placeholder_message_ids.add(
+                    id(copied_message)
+                )
             copied_replay_messages.append(copied_message)
         return copied_replay_messages
 
@@ -3754,14 +4113,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
-        self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-            active_replay_messages
+        self._last_active_replay_messages = (
+            self._copy_active_replay_messages_preserving_generated_ids(
+                active_replay_messages
+            )
         )
         self._write_generated_ignored_placeholder_hash_counts(
-            self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
+            self._generated_placeholder_digest_budget_for_active_replay(
+                active_replay_messages
+            )
         )
         self._write_generated_ignored_placeholder_hash_ordinals(
-            self._generated_placeholder_digest_ordinals_for_active_replay(active_replay_messages)
+            self._generated_placeholder_digest_ordinals_for_active_replay(
+                active_replay_messages
+            )
         )
         return active_replay_messages
 
@@ -3769,11 +4134,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         original_messages: List[Dict[str, Any]],
     ) -> Optional[List[Dict[str, Any]]]:
-        identities = [self._message_replay_identity(message) for message in original_messages]
+        identities = [
+            self._message_replay_identity(message) for message in original_messages
+        ]
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                return self._copy_active_replay_messages_preserving_generated_ids(
+                    cached
+                )
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -3782,8 +4151,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         content = normalize_content_value(msg.get("content")) or ""
         if role == "system":
             return (
-                "[Note: This conversation uses Lossless Context Management (LCM)." in content
-                and "Earlier turns have been compacted into hierarchical summaries below." in content
+                "[Note: This conversation uses Lossless Context Management (LCM)."
+                in content
+                and "Earlier turns have been compacted into hierarchical summaries below."
+                in content
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
@@ -3796,16 +4167,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         )
 
-    def _restore_ingest_payload_placeholders_in_value(self, value: Any, *, session_id: str) -> Any:
+    def _restore_ingest_payload_placeholders_in_value(
+        self, value: Any, *, session_id: str
+    ) -> Any:
         if isinstance(value, dict):
             return {
-                self._restore_ingest_payload_placeholders_in_value(key, session_id=session_id)
+                self._restore_ingest_payload_placeholders_in_value(
+                    key, session_id=session_id
+                )
                 if isinstance(key, str)
-                else key: self._restore_ingest_payload_placeholders_in_value(val, session_id=session_id)
+                else key: self._restore_ingest_payload_placeholders_in_value(
+                    val, session_id=session_id
+                )
                 for key, val in value.items()
             }
         if isinstance(value, list):
-            return [self._restore_ingest_payload_placeholders_in_value(item, session_id=session_id) for item in value]
+            return [
+                self._restore_ingest_payload_placeholders_in_value(
+                    item, session_id=session_id
+                )
+                for item in value
+            ]
         if isinstance(value, str):
             return restore_ingest_payload_placeholders(
                 value,
@@ -3815,7 +4197,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return value
 
-    def _restore_ingest_payload_placeholders_in_content_identity(self, content: str, *, session_id: str) -> str:
+    def _restore_ingest_payload_placeholders_in_content_identity(
+        self, content: str, *, session_id: str
+    ) -> str:
         if not content:
             return content
         try:
@@ -3828,7 +4212,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 session_id=session_id,
             )
         restore_as_structured = False
-        if isinstance(decoded, (dict, list)) and normalize_content_value(decoded) == content:
+        if (
+            isinstance(decoded, (dict, list))
+            and normalize_content_value(decoded) == content
+        ):
             for ref in extract_ingest_externalized_refs(content):
                 payload = load_externalized_payload(
                     ref,
@@ -3836,14 +4223,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     hermes_home=self._hermes_home,
                 )
                 payload_session_id = (payload or {}).get("session_id") or ""
-                if session_id and payload_session_id and payload_session_id != session_id:
+                if (
+                    session_id
+                    and payload_session_id
+                    and payload_session_id != session_id
+                ):
                     continue
                 field_path = str((payload or {}).get("field_path") or "")
                 if field_path and field_path != "content":
                     restore_as_structured = True
                     break
         if restore_as_structured:
-            restored = self._restore_ingest_payload_placeholders_in_value(decoded, session_id=session_id)
+            restored = self._restore_ingest_payload_placeholders_in_value(
+                decoded, session_id=session_id
+            )
             return normalize_content_value(restored) or ""
         return restore_ingest_payload_placeholders(
             content,
@@ -3852,7 +4245,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             session_id=session_id,
         )
 
-    def _recovered_content_matches_durable_identity(self, recovered_content: str, durable_content: str) -> bool:
+    def _recovered_content_matches_durable_identity(
+        self, recovered_content: str, durable_content: str
+    ) -> bool:
         recovered_identity_content = normalize_content_value(
             redact_sensitive_value(
                 recovered_content,
@@ -3862,8 +4257,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         if recovered_identity_content == durable_content:
             return True
-        redaction_names = sorted(set(re.findall(r"\[LCM sensitive redaction: name=([^;\]]+)", durable_content)))
-        if not redaction_names or bool(getattr(self._config, "sensitive_patterns_enabled", False)):
+        redaction_names = sorted(
+            set(
+                re.findall(
+                    r"\[LCM sensitive redaction: name=([^;\]]+)", durable_content
+                )
+            )
+        )
+        if not redaction_names or bool(
+            getattr(self._config, "sensitive_patterns_enabled", False)
+        ):
             return False
         compat_config = copy.copy(self._config)
         compat_config.sensitive_patterns_enabled = True
@@ -3880,21 +4283,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     @staticmethod
     def _persisted_output_marker_replay_proof(content: str) -> tuple[str | None, bool]:
         inline_preview_sha256 = _persisted_output_inline_preview_sha256(content)
-        preview_sha256 = inline_preview_sha256 or _persisted_output_preview_prefix_digest(content)
+        preview_sha256 = (
+            inline_preview_sha256 or _persisted_output_preview_prefix_digest(content)
+        )
         if not preview_sha256:
             return None, False
-        allow_redacted_preview_match = inline_preview_sha256 is None and not _has_lossy_sensitive_redaction(content)
+        allow_redacted_preview_match = (
+            inline_preview_sha256 is None
+            and not _has_lossy_sensitive_redaction(content)
+        )
         return preview_sha256, allow_redacted_preview_match
 
-    def _has_any_durable_persisted_output_payload_for_marker(self, msg: Dict[str, Any]) -> bool:
+    def _has_any_durable_persisted_output_payload_for_marker(
+        self, msg: Dict[str, Any]
+    ) -> bool:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if role != "tool" or not _is_hermes_persisted_output_marker(content):
             return False
         expected_chars = _expected_persisted_output_chars(content)
         persisted_output_source_path = _persisted_output_saved_path(content)
-        persisted_output_preview_sha256, allow_redacted_preview_match = self._persisted_output_marker_replay_proof(content)
-        if expected_chars is None or not persisted_output_source_path or not persisted_output_preview_sha256:
+        persisted_output_preview_sha256, allow_redacted_preview_match = (
+            self._persisted_output_marker_replay_proof(content)
+        )
+        if (
+            expected_chars is None
+            or not persisted_output_source_path
+            or not persisted_output_preview_sha256
+        ):
             return False
         if recover_hermes_persisted_output_with_file_stat(content) is None:
             return False
@@ -3911,15 +4327,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return durable_content is not None
 
     @classmethod
-    def _is_active_context_droppable_identity(cls, identity: tuple[str, str, str, str]) -> bool:
+    def _is_active_context_droppable_identity(
+        cls, identity: tuple[str, str, str, str]
+    ) -> bool:
         """Return true for durable rows sanitized out of active replay only."""
         role, content, _tool_call_id, tool_calls = identity
         if role != "assistant" or tool_calls:
             return False
-        return _should_drop_active_assistant_message({
-            "role": role,
-            "content": cls._identity_content_for_active_cleanup(content),
-        })
+        return _should_drop_active_assistant_message(
+            {
+                "role": role,
+                "content": cls._identity_content_for_active_cleanup(content),
+            }
+        )
 
     def _ignored_message_is_quarantinable_assistant(self, msg: Dict[str, Any]) -> bool:
         if self._is_volatile_ignored_quarantine_placeholder(
@@ -3937,7 +4357,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         content = normalize_content_value(msg.get("content")) or ""
         return assistant_output_quarantine_reason(content) is not None
 
-    def _redact_active_replay_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _redact_active_replay_messages(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         redacted_replay_messages: list[Dict[str, Any]] = []
         generated_message_ids = getattr(
             self,
@@ -3961,7 +4383,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     parse_json_strings=True,
                 )
             if id(message) in generated_message_ids:
-                self._generated_ignored_active_replay_placeholder_message_ids.add(id(redacted_message))
+                self._generated_ignored_active_replay_placeholder_message_ids.add(
+                    id(redacted_message)
+                )
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
@@ -3996,10 +4420,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
             previous_store_id_map = self._current_compress_store_ids_by_message_id
-            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(messages)
+            self._current_compress_store_ids_by_message_id = (
+                self._get_store_id_map_for_messages(messages)
+            )
             try:
                 for idx in range(scan_start, n):
-                    mapped_ignore = self._mapped_stored_row_matches_ignore_message_patterns(messages[idx])
+                    mapped_ignore = (
+                        self._mapped_stored_row_matches_ignore_message_patterns(
+                            messages[idx]
+                        )
+                    )
                     ignored_original_messages[idx] = (
                         self._matches_ignore_message_patterns(messages[idx])
                         or mapped_ignore
@@ -4036,7 +4466,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         and _is_hermes_persisted_output_marker(
                             normalize_content_value(original_msg.get("content")) or ""
                         )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
+                        and self._has_any_durable_persisted_output_payload_for_marker(
+                            original_msg
+                        )
                     )
                     or (
                         self._compiled_ignore_message_patterns
@@ -4044,14 +4476,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                 )
                 else replay_msg
-                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
+                for idx, (original_msg, replay_msg) in enumerate(
+                    zip(messages, replay_messages)
+                )
             ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(
+                reconcile_messages
+            )
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
-            cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
-            cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
+            cached_source_identities = getattr(
+                self, "_last_active_replay_source_identities", None
+            )
+            cached_active_replay_messages = getattr(
+                self, "_last_active_replay_messages", None
+            )
             if (
                 cached_source_identities is not None
                 and cached_active_replay_messages is not None
@@ -4059,7 +4499,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and len(cached_active_replay_messages) >= cursor
             ):
                 current_prefix_identities = [
-                    self._message_replay_identity(message) for message in messages[:cursor]
+                    self._message_replay_identity(message)
+                    for message in messages[:cursor]
                 ]
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
@@ -4070,7 +4511,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
-            self._session_id, cursor, n,
+            self._session_id,
+            cursor,
+            n,
         )
 
         new_messages = replay_messages[cursor:] if cursor < n else []
@@ -4094,8 +4537,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not compression_boundary_ingest_pending and self._session_id:
             try:
                 if self._store.get_session_count(self._session_id) == 0:
-                    empty_session_placeholder_budget = self._load_generated_ignored_placeholder_hash_counts()
-                    empty_session_placeholder_ordinals = self._load_generated_ignored_placeholder_hash_ordinals()
+                    empty_session_placeholder_budget = (
+                        self._load_generated_ignored_placeholder_hash_counts()
+                    )
+                    empty_session_placeholder_ordinals = (
+                        self._load_generated_ignored_placeholder_hash_ordinals()
+                    )
             except Exception:
                 empty_session_placeholder_budget = {}
                 empty_session_placeholder_ordinals = {}
@@ -4110,10 +4557,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             empty_session_placeholder_seen: dict[str, int] = {}
             if empty_session_placeholder_ordinals and cursor > 0:
                 for replay_msg in replay_messages[:cursor]:
-                    replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
+                    replay_text = (
+                        text_content_for_pattern_matching(replay_msg.get("content"))
+                        or ""
+                    )
                     digest = self._active_replay_placeholder_digest(replay_text)
                     if digest:
-                        empty_session_placeholder_seen[digest] = empty_session_placeholder_seen.get(digest, 0) + 1
+                        empty_session_placeholder_seen[digest] = (
+                            empty_session_placeholder_seen.get(digest, 0) + 1
+                        )
             boundary_all_placeholder_replay_batch = (
                 compression_boundary_ingest_pending
                 and len(new_messages) > 1
@@ -4126,25 +4578,37 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
             )
             if compression_boundary_ingest_pending:
-                boundary_budget = self._compression_boundary_active_placeholder_digest_budget
-                stored_counts = self._compression_boundary_stored_placeholder_digest_counts
+                boundary_budget = (
+                    self._compression_boundary_active_placeholder_digest_budget
+                )
+                stored_counts = (
+                    self._compression_boundary_stored_placeholder_digest_counts
+                )
                 if boundary_budget and stored_counts:
                     incoming_counts: dict[str, int] = {}
                     relevant_digests = set(boundary_budget) | set(stored_counts)
                     for msg in new_messages:
-                        text = text_content_for_pattern_matching(msg.get("content")) or ""
+                        text = (
+                            text_content_for_pattern_matching(msg.get("content")) or ""
+                        )
                         digest = self._active_replay_placeholder_digest(text)
                         if digest in relevant_digests:
                             incoming_counts[digest] = incoming_counts.get(digest, 0) + 1
                     adjusted_budget: dict[str, int] = {}
                     for digest, count in boundary_budget.items():
                         parsed_count = max(0, int(count or 0))
-                        incoming_count = max(0, int(incoming_counts.get(digest, 0) or 0))
+                        incoming_count = max(
+                            0, int(incoming_counts.get(digest, 0) or 0)
+                        )
                         stored_count = max(0, int(stored_counts.get(digest, 0) or 0))
-                        remaining = min(parsed_count, max(0, incoming_count - stored_count))
+                        remaining = min(
+                            parsed_count, max(0, incoming_count - stored_count)
+                        )
                         if remaining > 0:
                             adjusted_budget[digest] = remaining
-                    self._compression_boundary_active_placeholder_digest_budget = adjusted_budget
+                    self._compression_boundary_active_placeholder_digest_budget = (
+                        adjusted_budget
+                    )
             empty_session_all_placeholder_replay_batch = (
                 bool(empty_session_placeholder_ordinals)
                 and len(new_messages) > 1
@@ -4156,10 +4620,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     for msg in new_messages
                 )
             )
-            for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
+            for offset, (original_msg, replay_msg) in enumerate(
+                zip(original_new_messages, new_messages)
+            ):
                 absolute_idx = cursor + offset
-                replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
-                original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+                replay_text = (
+                    text_content_for_pattern_matching(replay_msg.get("content")) or ""
+                )
+                original_text = (
+                    text_content_for_pattern_matching(original_msg.get("content")) or ""
+                )
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
                     replay_msg,
                     replay_text,
@@ -4169,17 +4639,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     original_text != replay_text
                     or (
                         volatile_digest is not None
-                        and volatile_digest in self._load_generated_ignored_placeholder_hashes()
+                        and volatile_digest
+                        in self._load_generated_ignored_placeholder_hashes()
                     )
                 )
-                active_replay_placeholder = self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
-                active_replay_placeholder_digest = self._active_replay_placeholder_digest(replay_text)
+                active_replay_placeholder = self._is_ignored_active_replay_placeholder(
+                    replay_msg, replay_text
+                )
+                active_replay_placeholder_digest = (
+                    self._active_replay_placeholder_digest(replay_text)
+                )
                 if not active_replay_placeholder:
                     replay_text_stripped = replay_text.strip()
                     if (
                         self._is_context_summary_content(replay_text)
-                        or replay_text_stripped.startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
-                        or replay_text_stripped.startswith(_PRESERVED_TODO_CONTEXT_PREFIX)
+                        or replay_text_stripped.startswith(
+                            _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
+                        )
+                        or replay_text_stripped.startswith(
+                            _PRESERVED_TODO_CONTEXT_PREFIX
+                        )
                     ):
                         boundary_seen_synthetic_summary_before = True
                 compression_carried_active_placeholder = False
@@ -4191,13 +4670,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     and active_replay_placeholder_digest is not None
                 ):
                     empty_session_placeholder_seen[active_replay_placeholder_digest] = (
-                        empty_session_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
+                        empty_session_placeholder_seen.get(
+                            active_replay_placeholder_digest, 0
+                        )
+                        + 1
                     )
-                    ordinal = empty_session_placeholder_seen[active_replay_placeholder_digest]
-                    remaining = empty_session_placeholder_budget.get(active_replay_placeholder_digest, 0)
+                    ordinal = empty_session_placeholder_seen[
+                        active_replay_placeholder_digest
+                    ]
+                    remaining = empty_session_placeholder_budget.get(
+                        active_replay_placeholder_digest, 0
+                    )
                     if (
                         remaining > 0
-                        and ordinal in empty_session_placeholder_ordinals.get(
+                        and ordinal
+                        in empty_session_placeholder_ordinals.get(
                             active_replay_placeholder_digest,
                             set(),
                         )
@@ -4205,20 +4692,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     ):
                         metadata_replayed_active_placeholder = True
                         if remaining == 1:
-                            empty_session_placeholder_budget.pop(active_replay_placeholder_digest, None)
+                            empty_session_placeholder_budget.pop(
+                                active_replay_placeholder_digest, None
+                            )
                         else:
-                            empty_session_placeholder_budget[active_replay_placeholder_digest] = remaining - 1
+                            empty_session_placeholder_budget[
+                                active_replay_placeholder_digest
+                            ] = remaining - 1
                 if (
                     compression_boundary_ingest_pending
                     and active_replay_placeholder
                     and active_replay_placeholder_digest is not None
                 ):
                     boundary_placeholder_seen[active_replay_placeholder_digest] = (
-                        boundary_placeholder_seen.get(active_replay_placeholder_digest, 0) + 1
+                        boundary_placeholder_seen.get(
+                            active_replay_placeholder_digest, 0
+                        )
+                        + 1
                     )
-                    current_placeholder_ordinal = boundary_placeholder_seen[active_replay_placeholder_digest]
-                    boundary_budget = self._compression_boundary_active_placeholder_digest_budget
-                    boundary_ordinals = self._compression_boundary_active_placeholder_digest_ordinals
+                    current_placeholder_ordinal = boundary_placeholder_seen[
+                        active_replay_placeholder_digest
+                    ]
+                    boundary_budget = (
+                        self._compression_boundary_active_placeholder_digest_budget
+                    )
+                    boundary_ordinals = (
+                        self._compression_boundary_active_placeholder_digest_ordinals
+                    )
                     generated_message_ids = getattr(
                         self,
                         "_generated_ignored_active_replay_placeholder_message_ids",
@@ -4229,7 +4729,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         or id(original_msg) in generated_message_ids
                     )
                     ordinal_matches_generated = (
-                        current_placeholder_ordinal in boundary_ordinals.get(
+                        current_placeholder_ordinal
+                        in boundary_ordinals.get(
                             active_replay_placeholder_digest,
                             set(),
                         )
@@ -4243,15 +4744,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         has_generated_provenance
                         or (not has_generated_provenance and ordinal_matches_generated)
                     ):
-                        remaining = boundary_budget.get(active_replay_placeholder_digest, 0)
+                        remaining = boundary_budget.get(
+                            active_replay_placeholder_digest, 0
+                        )
                         if remaining > 0:
                             compression_carried_active_placeholder = True
                             if remaining == 1:
-                                boundary_budget.pop(active_replay_placeholder_digest, None)
+                                boundary_budget.pop(
+                                    active_replay_placeholder_digest, None
+                                )
                             else:
-                                boundary_budget[active_replay_placeholder_digest] = remaining - 1
+                                boundary_budget[active_replay_placeholder_digest] = (
+                                    remaining - 1
+                                )
                 replayed_active_placeholder = active_replay_placeholder and (
-                    self._is_cached_active_replay_message_at_index(absolute_idx, replay_msg)
+                    self._is_cached_active_replay_message_at_index(
+                        absolute_idx, replay_msg
+                    )
                     or compression_carried_active_placeholder
                     or metadata_replayed_active_placeholder
                 )
@@ -4262,18 +4771,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 ):
                     self._ignored_message_count += 1
                     if generated_volatile_placeholder and volatile_digest is not None:
-                        self._remember_generated_ignored_placeholder_hash(volatile_digest)
+                        self._remember_generated_ignored_placeholder_hash(
+                            volatile_digest
+                        )
                     replay_preserves_ignore_decision = (
-                        self._is_volatile_ignored_quarantine_placeholder(replay_msg, replay_text)
-                        or self._is_ignored_active_replay_placeholder(replay_msg, replay_text)
+                        self._is_volatile_ignored_quarantine_placeholder(
+                            replay_msg, replay_text
+                        )
+                        or self._is_ignored_active_replay_placeholder(
+                            replay_msg, replay_text
+                        )
                     )
-                    if ignored_original_messages[absolute_idx] and not replay_preserves_ignore_decision:
+                    if (
+                        ignored_original_messages[absolute_idx]
+                        and not replay_preserves_ignore_decision
+                    ):
                         if active_replay_messages is replay_messages:
                             active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
                                 replay_messages
                             )
                         active_message = dict(active_replay_messages[absolute_idx])
-                        active_message["content"] = self._ignored_active_replay_placeholder(original_text)
+                        active_message["content"] = (
+                            self._ignored_active_replay_placeholder(original_text)
+                        )
                         active_replay_messages[absolute_idx] = active_message
                     excerpt = original_text[:80].replace("\n", " ")
                     if ignored_original_messages[absolute_idx]:
@@ -4297,11 +4817,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         )
                     continue
                 store_msg = replay_msg
-                if (
-                    str(original_msg.get("role") or "") == "tool"
-                    and _is_hermes_persisted_output_marker(
-                        normalize_content_value(original_msg.get("content")) or ""
-                    )
+                if str(
+                    original_msg.get("role") or ""
+                ) == "tool" and _is_hermes_persisted_output_marker(
+                    normalize_content_value(original_msg.get("content")) or ""
                 ):
                     store_msg = original_msg
                 kept.append((absolute_idx, store_msg))
@@ -4314,7 +4833,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-            return self._remember_active_replay_messages(messages, active_replay_messages)
+            return self._remember_active_replay_messages(
+                messages, active_replay_messages
+            )
 
         protected_messages = protect_messages_for_ingest(
             [msg for _idx, msg in messages_to_store_with_index],
@@ -4331,8 +4852,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         ):
             if self._protected_message_uses_raw_payload_active_stub(protected_msg):
                 if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
+                    active_replay_messages = (
+                        self._copy_active_replay_messages_preserving_generated_ids(
+                            replay_messages
+                        )
                     )
                 active_message = dict(active_replay_messages[absolute_idx])
                 active_message["content"] = protected_msg["content"]
@@ -4346,8 +4869,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             if stubbed_message is not None:
                 if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
+                    active_replay_messages = (
+                        self._copy_active_replay_messages_preserving_generated_ids(
+                            replay_messages
+                        )
                     )
                 active_replay_messages[absolute_idx] = stubbed_message
 
@@ -4369,7 +4894,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}
         self._compression_boundary_stored_placeholder_digest_counts = {}
-        logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
+        logger.debug(
+            "Ingested %d messages into LCM store", len(messages_to_store_with_index)
+        )
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
         # Most ``protected_messages`` changes are storage-only: inline media and
         # data/base64 substrings stay provider-usable in active replay. The
@@ -4378,7 +4905,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return self._remember_active_replay_messages(messages, active_replay_messages)
 
     @staticmethod
-    def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
+    def _protected_message_uses_raw_payload_active_stub(
+        message: Dict[str, Any],
+    ) -> bool:
         content = message.get("content")
         return isinstance(content, str) and content.startswith(
             "[Externalized payload: kind=raw_payload;"
@@ -4386,7 +4915,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         ids_by_message_id = self._get_store_id_map_for_messages(messages)
-        return [ids_by_message_id[id(msg)] for msg in messages if id(msg) in ids_by_message_id]
+        return [
+            ids_by_message_id[id(msg)]
+            for msg in messages
+            if id(msg) in ids_by_message_id
+        ]
 
     # -- Internal: summarization -------------------------------------------
 
@@ -4403,7 +4936,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if not output_path:
                 base = self._hermes_home or os.path.expanduser("~/.hermes")
                 output_path = os.path.join(base, "lcm-extractions")
-            extraction_model = self._config.extraction_model or self._config.summary_model
+            extraction_model = (
+                self._config.extraction_model or self._config.summary_model
+            )
             extract_before_compaction(
                 serialized_messages=serialized,
                 output_path=output_path,
@@ -4454,14 +4989,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # fall through to the content-equality lookup below, which tombstones
             # only when the full row content matches the stored payload -
             # otherwise the surrounding, never-externalized text is lost.
-            ref = extract_externalized_ref(content) if is_externalized_placeholder(content) else None
+            ref = (
+                extract_externalized_ref(content)
+                if is_externalized_placeholder(content)
+                else None
+            )
             if ref:
                 externalized = load_externalized_payload(
                     ref,
                     config=self._config,
                     hermes_home=self._hermes_home,
                 )
-                if externalized is not None and externalized.get("kind", "tool_result") == "tool_result":
+                if (
+                    externalized is not None
+                    and externalized.get("kind", "tool_result") == "tool_result"
+                ):
                     placeholder = build_transcript_gc_placeholder(externalized)
                     self._store.gc_externalized_tool_result(
                         store_id, placeholder, before_commit=_archive_in_rewrite_txn
@@ -4518,7 +5060,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 else:
                     content = sanitize_pre_compaction_content(content)
                     if len(content) > 3000:
-                        content = content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                        content = (
+                            content[:2000] + "\n...[truncated]...\n" + content[-800:]
+                        )
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
@@ -4527,7 +5071,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if role == "assistant":
                 tool_calls = msg.get("tool_calls", [])
                 matched_tool_calls = [
-                    tc for tc in tool_calls
+                    tc
+                    for tc in tool_calls
                     if not _tool_call_id(tc) or _tool_call_id(tc) in matched_tool_ids
                 ]
                 if _is_synthetic_assistant_noise(content):
@@ -4629,10 +5174,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     continue
                 for nested_key in ("value", "content"):
                     if isinstance(text_value.get(nested_key), str):
-                        return [{
-                            "type": block_type,
-                            value_key: {nested_key: placeholder},
-                        }]
+                        return [
+                            {
+                                "type": block_type,
+                                value_key: {nested_key: placeholder},
+                            }
+                        ]
         # _is_textual_tool_result_content() only admits supported shapes, so
         # this fallback is defensive rather than a normal provider path.
         return [{"type": "text", "text": placeholder}]
@@ -4688,7 +5235,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     continue
                 call_id = _tool_call_id(tool_call)
                 function = tool_call.get("function") or {}
-                tool_name = str(function.get("name") or "") if isinstance(function, dict) else ""
+                tool_name = (
+                    str(function.get("name") or "")
+                    if isinstance(function, dict)
+                    else ""
+                )
                 if call_id and tool_name in {"lcm_describe", "lcm_expand"}:
                     recovery_tool_call_ids.add(call_id)
         return recovery_tool_call_ids
@@ -4699,7 +5250,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         recovery_tool_call_ids: set[str],
     ) -> Dict[str, Any] | None:
-        if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
+        if not getattr(
+            self._config, "large_output_active_replay_stubbing_enabled", False
+        ):
             return None
         if not getattr(self._config, "large_output_externalization_enabled", False):
             return None
@@ -4754,11 +5307,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         SQLite rows, or DAG lineage. The newest ``fresh_tail_count`` messages
         stay inline, matching Lossless Claw's protected-tail contract.
         """
-        if not getattr(self._config, "large_output_active_replay_stubbing_enabled", False):
+        if not getattr(
+            self._config, "large_output_active_replay_stubbing_enabled", False
+        ):
             return messages
         if not getattr(self._config, "large_output_externalization_enabled", False):
             return messages
-        protected_tail_count = max(0, int(getattr(self._config, "fresh_tail_count", 0) or 0))
+        protected_tail_count = max(
+            0, int(getattr(self._config, "fresh_tail_count", 0) or 0)
+        )
         eligible_end = max(0, len(messages) - protected_tail_count)
         if eligible_end <= 0:
             return messages
@@ -4822,13 +5379,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if msg.get("role") == "assistant":
                 expected_ids = [
                     call_id
-                    for call_id in (_tool_call_id(tool_call) for tool_call in (msg.get("tool_calls") or []))
+                    for call_id in (
+                        _tool_call_id(tool_call)
+                        for tool_call in (msg.get("tool_calls") or [])
+                    )
                     if call_id
                 ]
 
                 for expected_id in expected_ids:
                     matched_direct_result = False
-                    while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
+                    while (
+                        i + 1 < len(messages) and messages[i + 1].get("role") == "tool"
+                    ):
                         next_msg = messages[i + 1]
                         next_id = str(next_msg.get("tool_call_id") or "").strip()
                         if next_id == expected_id:
@@ -4840,11 +5402,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         i += 1
 
                     if not matched_direct_result and insert_missing_tool_stubs:
-                        sanitized.append({
-                            "role": "tool",
-                            "content": "[Result from earlier conversation — see context summary above]",
-                            "tool_call_id": expected_id,
-                        })
+                        sanitized.append(
+                            {
+                                "role": "tool",
+                                "content": "[Result from earlier conversation — see context summary above]",
+                                "tool_call_id": expected_id,
+                            }
+                        )
                         inserted_stub_results += 1
 
                 while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
@@ -4922,9 +5486,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
-            uncondensed = self._dag.get_uncondensed_at_depth(
-                self._session_id, depth
-            )
+            uncondensed = self._dag.get_uncondensed_at_depth(self._session_id, depth)
             if len(uncondensed) < fanin:
                 continue
 
@@ -4948,14 +5510,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
             logger.info(
                 "LCM condensation: d%d × %d → d%d (L%d, %d→%d tokens)",
-                depth, len(to_condense), depth + 1, level,
-                source_tokens, summary_tokens,
+                depth,
+                len(to_condense),
+                depth + 1,
+                level,
+                source_tokens,
+                summary_tokens,
             )
 
-            if leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+            if (
+                leaf_compacted_this_turn
+                and self._config.cache_friendly_condensation_enabled
+            ):
                 break
 
-        if not condensed_any and leaf_compacted_this_turn and self._config.cache_friendly_condensation_enabled:
+        if (
+            not condensed_any
+            and leaf_compacted_this_turn
+            and self._config.cache_friendly_condensation_enabled
+        ):
             self._last_condensation_suppressed_reason = suppression_reason
 
     def _condense_summary_nodes(
@@ -5041,7 +5614,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         preferred_max_depth = self._config.incremental_max_depth
         for depth in sorted(by_depth):
             nodes = by_depth[depth]
-            within_preferred_depth = preferred_max_depth < 0 or depth < preferred_max_depth
+            within_preferred_depth = (
+                preferred_max_depth < 0 or depth < preferred_max_depth
+            )
             if within_preferred_depth and len(nodes) >= fanin:
                 return nodes[:fanin]
         # The frontier still exceeds its sweep target but no routine group is
@@ -5119,9 +5694,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     @staticmethod
     def _preserved_objective_context_content(message: Dict[str, Any]) -> str:
         content = text_content_for_pattern_matching(message.get("content")) or ""
-        return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
+        return (
+            content
+            if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
+            else ""
+        )
 
-    def _sanitized_preserved_objective_context_content(self, message: Dict[str, Any]) -> str:
+    def _sanitized_preserved_objective_context_content(
+        self, message: Dict[str, Any]
+    ) -> str:
         preserved_objective = self._preserved_objective_context_content(message)
         if not preserved_objective:
             return ""
@@ -5130,7 +5711,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             role=str(message.get("role") or "user"),
         )
 
-    def _sanitize_active_preserved_objective_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize_active_preserved_objective_message(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
         sanitized_content = self._sanitized_preserved_objective_context_content(message)
         if not sanitized_content or sanitized_content == message.get("content"):
             return message
@@ -5138,7 +5721,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         sanitized["content"] = sanitized_content
         return sanitized
 
-    def _sanitize_preserved_objective_content(self, content: str, role: str = "user") -> str:
+    def _sanitize_preserved_objective_content(
+        self, content: str, role: str = "user"
+    ) -> str:
         content = strip_injected_context_blocks(content)
         content = protect_inline_payloads_in_text(
             content,
@@ -5180,7 +5765,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         for message in reversed(messages):
             if not isinstance(message, dict):
                 continue
-            content_text = text_content_for_pattern_matching(message.get("content")) or ""
+            content_text = (
+                text_content_for_pattern_matching(message.get("content")) or ""
+            )
             if (
                 self._matches_ignore_message_patterns(message)
                 or self._mapped_stored_row_matches_ignore_message_patterns(message)
@@ -5213,7 +5800,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         for message in reversed(messages):
             if not isinstance(message, dict) or message.get("role") != "user":
                 continue
-            text = (text_content_for_pattern_matching(message.get("content")) or "").strip()
+            text = (
+                text_content_for_pattern_matching(message.get("content")) or ""
+            ).strip()
             if text:
                 return text
         return ""
@@ -5269,7 +5858,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             payload = json.loads(raw)
         except Exception:  # noqa: BLE001 - never let recall break assembly
-            logger.debug("LCM proactive recall failed; injecting nothing", exc_info=True)
+            logger.debug(
+                "LCM proactive recall failed; injecting nothing", exc_info=True
+            )
             self._proactive_recall_skipped_count += 1
             return None
 
@@ -5312,7 +5903,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         for hit in surviving[:3]:
             ts = hit.get("timestamp") or 0
             try:
-                when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts))) if ts else "unknown time"
+                when = (
+                    time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(ts)))
+                    if ts
+                    else "unknown time"
+                )
             except (TypeError, ValueError, OSError):
                 when = "unknown time"
             snippet = (hit.get("snippet") or "").strip().replace("\n", " ")
@@ -5322,7 +5917,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 line += f" (expand: {expand})"
             candidate_lines = rendered_lines + [line]
             block = self._wrap_relevant_memories(header, candidate_lines)
-            if count_message_tokens({"role": summary_role, "content": block}) > budget_tokens:
+            if (
+                count_message_tokens({"role": summary_role, "content": block})
+                > budget_tokens
+            ):
                 break
             rendered_lines = candidate_lines
 
@@ -5379,7 +5977,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Stub durably externalized evictable tool payloads before the assembly
         # budget pass so the selector sees their reduced provider-visible cost.
         # The helper protects the configured fresh tail and is fail-open.
-        assembly_tail_messages = self._stub_large_tool_results_for_active_replay(tail_messages)
+        assembly_tail_messages = self._stub_large_tool_results_for_active_replay(
+            tail_messages
+        )
         tail_selected = assembly_tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
@@ -5426,7 +6026,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             summary_role = "assistant" if last_role != "assistant" else "user"
         if anchor_part is not None:
             anchor_msg = {"role": summary_role, "content": anchor_part}
-            if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
+            if (
+                summary_budget is None
+                or count_message_tokens(anchor_msg) <= summary_budget
+            ):
                 summary_parts.append(anchor_part)
 
         # Node ids placed in the summary prefix — used to dedupe proactive-recall
@@ -5502,7 +6105,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     trimmed_result.append(msg)
                     continue
                 parts = [
-                    part for part in content.split("\n\n---\n\n")
+                    part
+                    for part in content.split("\n\n---\n\n")
                     if not part.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
                 ]
                 if parts:
@@ -5562,7 +6166,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if effective_cap is None:
             self._last_overflow_recovery_failed = False
         else:
-            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > effective_cap
+            self._last_overflow_recovery_failed = (
+                count_messages_tokens(compressed) > effective_cap
+            )
             if self._last_overflow_recovery_failed:
                 logger.warning(
                     "LCM overflow recovery could not get under cap=%d; returning best-effort context (%d tokens)",
@@ -5678,7 +6284,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         minimum_candidate_len = 1 if system_msg is not None else 0
         if len(candidate) == minimum_candidate_len and tail_messages:
-            fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
+            fallback = ([system_msg] if system_msg is not None else []) + [
+                tail_messages[-1]
+            ]
             return self._sanitize_active_context_messages(fallback)
         return candidate
 
@@ -5730,10 +6338,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if self._is_context_summary_content(content):
                 continue
             text = (text_content_for_pattern_matching(content) or "").strip()
-            if self._matches_ignore_message_patterns(msg) or self._is_volatile_ignored_quarantine_placeholder(
-                msg,
-                text,
-            ) or self._is_ignored_active_replay_placeholder(msg, text):
+            if (
+                self._matches_ignore_message_patterns(msg)
+                or self._is_volatile_ignored_quarantine_placeholder(
+                    msg,
+                    text,
+                )
+                or self._is_ignored_active_replay_placeholder(msg, text)
+            ):
                 continue
             # Additional redaction safety net: run extracted text through the
             # configured redaction path.  _redact_active_replay_messages uses
@@ -5782,7 +6394,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         marker = "Expand for details about:"
         idx = summary.rfind(marker)
         if idx >= 0:
-            hint = summary[idx + len(marker):].strip()
+            hint = summary[idx + len(marker) :].strip()
             # Take first line only
             return hint.split("\n")[0].strip()
         return ""
@@ -5874,7 +6486,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if self._session_ignored:
             return {"ok": False, "reason": "session_ignored", "session_id": session_id}
         if self._session_stateless:
-            return {"ok": False, "reason": "session_stateless", "session_id": session_id}
+            return {
+                "ok": False,
+                "reason": "session_stateless",
+                "session_id": session_id,
+            }
 
         fresh_tail_count = max(1, int(self._config.fresh_tail_count))
         total_count = int(self._store.get_session_count(session_id))
