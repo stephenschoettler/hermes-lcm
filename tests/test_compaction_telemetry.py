@@ -1,7 +1,12 @@
 """Tests for B2 compaction telemetry (per-conversation snapshot in metadata)."""
 
+import json
+import threading
+
 import pytest
 
+from hermes_lcm import tools as lcm_tools
+from hermes_lcm.command import handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.store import MessageStore
@@ -36,6 +41,28 @@ def _cold_usage(prompt=1000):
 
 def _telemetry(engine):
     return engine.get_status().get("compaction_telemetry")
+
+
+def _slash_status_fields(engine):
+    return {
+        key.strip(): value.strip()
+        for line in handle_lcm_command("status", engine).splitlines()
+        if ":" in line
+        for key, value in [line.split(":", 1)]
+    }
+
+
+def _assert_total_compaction_surfaces(engine, expected):
+    status = engine.get_status()
+    tool_status = json.loads(lcm_tools.lcm_status({}, engine=engine))
+    slash_status = _slash_status_fields(engine)
+
+    assert status["total_compactions"] == expected
+    assert status["total_compactions_scope"] == "current_conversation"
+    assert tool_status["total_compactions"] == expected
+    assert tool_status["total_compactions_scope"] == "current_conversation"
+    assert slash_status["total_compactions"] == str(expected)
+    assert slash_status["total_compactions_scope"] == "current_conversation"
 
 
 def test_records_per_turn_snapshot(engine):
@@ -96,6 +123,355 @@ def test_resets_on_compaction(engine):
     assert t["last_leaf_compaction_at"] is not None
     assert t["last_compaction_duration_ms"] == 12.5
     assert t["peak_prompt_tokens_since_leaf_compaction"] == 400  # reset to current
+
+
+def test_total_compactions_status_includes_pending_compaction(engine):
+    engine.compression_count = 3
+    engine.update_from_response(_hot_usage())
+    _assert_total_compaction_surfaces(engine, 3)
+
+    # Status can be requested after compaction increments the live counter but
+    # before the response hook persists the next telemetry snapshot.
+    engine.compression_count += 1
+
+    _assert_total_compaction_surfaces(engine, 4)
+
+
+def test_total_compactions_status_survives_session_rollover_for_conversation(engine):
+    engine.compression_count = 3
+    engine.update_from_response(_hot_usage())
+    _assert_total_compaction_surfaces(engine, 3)
+
+    engine.on_session_start(
+        "test-session-next",
+        platform="discord",
+        conversation_id="conv-1",
+    )
+
+    assert engine.compression_count == 0
+    _assert_total_compaction_surfaces(engine, 3)
+
+
+@pytest.mark.parametrize("previous_session_count", [1, 3])
+def test_total_compactions_includes_first_compaction_after_session_rollover(
+    engine,
+    previous_session_count,
+):
+    engine.compression_count = previous_session_count
+    engine.update_from_response(_hot_usage())
+
+    engine.on_session_start(
+        "test-session-next",
+        platform="discord",
+        conversation_id="conv-1",
+    )
+    assert engine.compression_count == 0
+
+    # The first response telemetry can arrive after the new session has already
+    # compacted. Count it even when the new session's counter is equal to or
+    # below the persisted baseline from the previous session.
+    engine.compression_count = 1
+    engine.update_from_response(_hot_usage())
+
+    _assert_total_compaction_surfaces(engine, previous_session_count + 1)
+
+
+def test_total_compactions_includes_first_compaction_after_engine_restart(tmp_path):
+    config = LCMConfig()
+    config.database_path = str(tmp_path / "lcm_test.db")
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    first.on_session_start(
+        "test-session",
+        platform="discord",
+        conversation_id="conv-1",
+    )
+    first.compression_count = 3
+    first.update_from_response(_hot_usage())
+    first.shutdown()
+
+    restarted = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    try:
+        restarted.on_session_start(
+            "test-session-next",
+            platform="discord",
+            conversation_id="conv-1",
+        )
+        restarted.compression_count = 1
+        restarted.update_from_response(_hot_usage())
+
+        _assert_total_compaction_surfaces(restarted, 4)
+    finally:
+        restarted.shutdown()
+
+
+def test_total_compactions_rebaseline_when_session_id_binds_new_conversation(engine):
+    engine.compression_count = 3
+    engine.update_from_response(_hot_usage())
+    _assert_total_compaction_surfaces(engine, 3)
+
+    engine.on_session_start(
+        "test-session",
+        platform="discord",
+        conversation_id="conv-2",
+    )
+
+    assert engine.compression_count == 0
+    _assert_total_compaction_surfaces(engine, 0)
+    assert engine._store.read_compaction_telemetry("conv-1")["total_compactions"] == 3
+
+    engine.compression_count = 1
+    engine.update_from_response(_hot_usage())
+    _assert_total_compaction_surfaces(engine, 1)
+
+
+@pytest.mark.parametrize("record_mode", ["successful_compaction", "response_hook"])
+def test_compactions_increment_total_atomically_across_engines(tmp_path, record_mode):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_test.db"))
+    engines = [
+        LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home_a")),
+        LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home_b")),
+    ]
+    barrier = threading.Barrier(2, timeout=5)
+    errors = []
+
+    try:
+        for index, current in enumerate(engines):
+            current.on_session_start(
+                f"test-session-{index}",
+                platform="cli",
+                conversation_id="conv-1",
+            )
+            current.compression_count = 1
+            original_increment = current._store.increment_compaction_telemetry
+
+            def paused_increment(
+                conversation_id,
+                increment,
+                updates,
+                *,
+                _increment=original_increment,
+            ):
+                barrier.wait()
+                return _increment(conversation_id, increment, updates)
+
+            current._store.increment_compaction_telemetry = paused_increment
+
+        def record(current):
+            try:
+                if record_mode == "successful_compaction":
+                    current._record_successful_compaction_telemetry()
+                else:
+                    current.update_from_response(_hot_usage())
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=record, args=(current,)) for current in engines]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not [thread for thread in threads if thread.is_alive()]
+        assert errors == []
+        telemetry = engines[0]._store.read_compaction_telemetry("conv-1")
+        assert telemetry["total_compactions"] == 2
+    finally:
+        for current in engines:
+            current.shutdown()
+
+
+def test_zero_delta_snapshot_cannot_overwrite_concurrent_increment(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "lcm_test.db"))
+    engines = [
+        LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home_a")),
+        LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home_b")),
+    ]
+    barrier = threading.Barrier(2, timeout=5)
+    errors = []
+
+    try:
+        for index, current in enumerate(engines):
+            current.on_session_start(
+                f"test-session-{index}",
+                platform="cli",
+                conversation_id="conv-1",
+            )
+            original_increment = current._store.increment_compaction_telemetry
+
+            def paused_increment(
+                conversation_id,
+                increment,
+                updates,
+                *,
+                _increment=original_increment,
+            ):
+                barrier.wait()
+                return _increment(conversation_id, increment, updates)
+
+            current._store.increment_compaction_telemetry = paused_increment
+
+        engines[1].compression_count = 1
+
+        def record_snapshot():
+            try:
+                engines[0].update_from_response(_hot_usage())
+            except Exception as exc:
+                errors.append(exc)
+
+        def record_increment():
+            try:
+                engines[1]._record_successful_compaction_telemetry()
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=record_snapshot),
+            threading.Thread(target=record_increment),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not [thread for thread in threads if thread.is_alive()]
+        assert errors == []
+        telemetry = engines[0]._store.read_compaction_telemetry("conv-1")
+        assert telemetry["total_compactions"] == 1
+    finally:
+        for current in engines:
+            current.shutdown()
+
+
+def test_successful_compaction_is_durable_before_response_hook(tmp_path, monkeypatch):
+    config = LCMConfig(
+        database_path=str(tmp_path / "lcm_test.db"),
+        fresh_tail_count=2,
+        leaf_chunk_tokens=1,
+    )
+    conversation_id = "conv-1"
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old question one"},
+        {"role": "assistant", "content": "old answer one"},
+        {"role": "user", "content": "old question two"},
+        {"role": "assistant", "content": "old answer two"},
+        {"role": "user", "content": "fresh question"},
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+
+    first = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    first.on_session_start(
+        "test-session",
+        platform="cli",
+        conversation_id=conversation_id,
+        context_length=200_000,
+    )
+
+    def summarize(initial_chunk, **_kwargs):
+        return (
+            list(initial_chunk),
+            100,
+            "Durable summary.\nExpand for details about: old turns",
+            1,
+            1,
+        )
+
+    monkeypatch.setattr(first, "_summarize_leaf_chunk_with_rescue", summarize)
+    first.compress(messages)
+    assert first.compression_count == 1
+    persisted = first._store.read_compaction_telemetry(conversation_id)
+    assert persisted is not None
+    assert persisted["total_compactions"] == 1
+    assert persisted["compression_count_at_record"] == 1
+
+    # Simulate process interruption before update_from_response() can persist
+    # the next per-turn telemetry snapshot.
+    first.shutdown()
+
+    restarted = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    try:
+        restarted.on_session_start(
+            "test-session-next",
+            platform="cli",
+            conversation_id=conversation_id,
+            context_length=200_000,
+        )
+
+        _assert_total_compaction_surfaces(restarted, 1)
+    finally:
+        restarted.shutdown()
+
+
+def test_response_hook_does_not_recount_durably_recorded_compaction(engine):
+    engine.compression_count = 1
+    engine._last_compaction_duration_ms = 12.5
+    engine._record_successful_compaction_telemetry()
+
+    engine.update_from_response(_hot_usage(prompt=400))
+
+    telemetry = _telemetry(engine)
+    assert telemetry["total_compactions"] == 1
+    assert telemetry["turns_since_leaf_compaction"] == 0
+    assert telemetry["peak_prompt_tokens_since_leaf_compaction"] == 400
+    assert telemetry["last_compaction_duration_ms"] == 12.5
+
+
+def test_response_hook_does_not_recount_ambiguous_committed_increment(engine, monkeypatch):
+    real_increment = engine._store.increment_compaction_telemetry
+
+    def commit_then_raise(conversation_id, increment, updates):
+        real_increment(conversation_id, increment, updates)
+        raise RuntimeError("simulated ambiguous commit outcome")
+
+    engine.compression_count = 1
+    engine._last_compaction_duration_ms = 12.5
+    monkeypatch.setattr(engine._store, "increment_compaction_telemetry", commit_then_raise)
+    engine._record_successful_compaction_telemetry()
+
+    committed = engine._store.read_compaction_telemetry("conv-1")
+    assert committed["total_compactions"] == 1
+    assert engine._compaction_telemetry_counter_rebaseline_pending is True
+
+    monkeypatch.setattr(engine._store, "increment_compaction_telemetry", real_increment)
+    engine.update_from_response(_hot_usage(prompt=400))
+
+    telemetry = engine._store.read_compaction_telemetry("conv-1")
+    assert telemetry["total_compactions"] == 1
+    assert telemetry["turns_since_leaf_compaction"] == 0
+    assert telemetry["peak_prompt_tokens_since_leaf_compaction"] == 400
+
+    engine.compression_count = 2
+    engine._record_successful_compaction_telemetry()
+    assert engine._store.read_compaction_telemetry("conv-1")["total_compactions"] == 2
+
+
+def test_total_compactions_status_defaults_to_zero_without_telemetry(engine):
+    _assert_total_compaction_surfaces(engine, 0)
+
+
+def test_total_compactions_status_is_scoped_to_current_conversation(engine):
+    engine._store.write_compaction_telemetry(
+        "conv-1",
+        {"conversation_id": "conv-1", "total_compactions": 2},
+    )
+    engine._store.write_compaction_telemetry(
+        "other-conversation",
+        {"conversation_id": "other-conversation", "total_compactions": 99},
+    )
+
+    _assert_total_compaction_surfaces(engine, 2)
+
+
+@pytest.mark.parametrize("malformed", [-1, "7", 1.5, True, None, [], {}])
+def test_total_compactions_status_fails_closed_for_malformed_telemetry(engine, malformed):
+    engine._store.write_compaction_telemetry(
+        "conv-1",
+        {"conversation_id": "conv-1", "total_compactions": malformed},
+    )
+
+    _assert_total_compaction_surfaces(engine, 0)
+    assert _telemetry(engine)["total_compactions"] == 0
 
 
 def test_no_conversation_records_nothing(engine):

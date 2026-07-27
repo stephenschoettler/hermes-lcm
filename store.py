@@ -915,6 +915,105 @@ class MessageStore:
             return None
         return data if isinstance(data, dict) else None
 
+    def increment_compaction_telemetry(
+        self,
+        conversation_id: str,
+        increment: int,
+        updates: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically increment and update one conversation's telemetry record."""
+        if not conversation_id:
+            return None
+        if isinstance(increment, bool) or not isinstance(increment, int) or increment < 0:
+            raise ValueError("compaction telemetry increment must be a non-negative integer")
+        conn = self._conn
+        if conn is None:
+            return None
+
+        key = self._compaction_telemetry_key(conversation_id)
+        with self._write_lock:
+            try:
+                # Separate MessageStore instances have separate Python locks.
+                # Acquire SQLite's write reservation before reading so this
+                # read-modify-write serializes across every connection.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                try:
+                    existing = json.loads(str(row[0])) if row and row[0] else {}
+                except (ValueError, TypeError):
+                    existing = {}
+                if not isinstance(existing, dict):
+                    existing = {}
+
+                # Per-runtime high-water marks make a committed increment
+                # idempotent when its caller observes an ambiguous exception.
+                # Retain enough recent epochs for overlapping runtimes without
+                # allowing this diagnostic metadata row to grow forever.
+                watermarks = []
+                raw_watermarks = existing.get("counter_epoch_watermarks", [])
+                if isinstance(raw_watermarks, list):
+                    watermarks = [
+                        item
+                        for item in raw_watermarks
+                        if (
+                            isinstance(item, list)
+                            and len(item) == 2
+                            and isinstance(item[0], str)
+                            and item[0]
+                            and isinstance(item[1], int)
+                            and not isinstance(item[1], bool)
+                            and item[1] >= 0
+                        )
+                    ]
+                effective_increment = increment
+                counter_epoch = updates.get("counter_epoch")
+                target_count = updates.get("compression_count_at_record")
+                if (
+                    isinstance(counter_epoch, str)
+                    and counter_epoch
+                    and isinstance(target_count, int)
+                    and not isinstance(target_count, bool)
+                    and target_count >= 0
+                ):
+                    prior_count = next(
+                        (item[1] for item in watermarks if item[0] == counter_epoch),
+                        0,
+                    )
+                    effective_increment = max(0, target_count - prior_count)
+                    watermarks = [item for item in watermarks if item[0] != counter_epoch]
+                    watermarks.append([counter_epoch, max(prior_count, target_count)])
+                    watermarks = watermarks[-64:]
+
+                current_total = existing.get("total_compactions", 0)
+                if (
+                    isinstance(current_total, bool)
+                    or not isinstance(current_total, int)
+                    or current_total < 0
+                ):
+                    current_total = 0
+                record = dict(existing)
+                record.update(updates)
+                record["conversation_id"] = conversation_id
+                record["counter_epoch_watermarks"] = watermarks
+                record["total_compactions"] = current_total + effective_increment
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, json.dumps(record, sort_keys=True)),
+                )
+                conn.commit()
+                return record
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+
     def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:
         """Upsert the per-conversation compaction-telemetry record.
 
