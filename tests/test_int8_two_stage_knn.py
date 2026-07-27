@@ -6,6 +6,7 @@ vector-store suites (which must stay green); here we assert the new int8 identit
 is distinct, the sign-bit prescreen is written and consulted, coverage='full_approx'
 reported, and stage-1 recall@M meets the spec bar on a synthetic 5k set.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -96,24 +97,46 @@ def test_int8_identity_distinct_and_writes_binary(tmp_path):
     _seed_messages(db_path, 3)
     vs = VectorStore(db_path)
     try:
-        f32 = EmbeddingIdentity.canonical(PROVIDER, MODEL, "", 4, "float32", "little", "chunk")
+        f32 = EmbeddingIdentity.canonical(
+            PROVIDER, MODEL, "", 4, "float32", "little", "chunk"
+        )
         i8 = _int8_identity(4)
         assert f32.identity_hash != i8.identity_hash
 
         vs.register_profile(MODEL, PROVIDER, 4, dtype="float32", task="chunk")
         vs.record_chunk_embedding(
-            "0:0", MODEL, [1.0, 0.0, 0.0, 0.0], store_id=0, chunk_index=0,
-            char_start=0, char_end=1, token_estimate=1, identity=f32,
+            "0:0",
+            MODEL,
+            [1.0, 0.0, 0.0, 0.0],
+            store_id=0,
+            chunk_index=0,
+            char_start=0,
+            char_end=1,
+            token_estimate=1,
+            identity=f32,
         )
         # float32 writes NO binary row (byte-identical legacy behavior).
-        assert vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0] == 0
+        assert (
+            vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0]
+            == 0
+        )
 
         vs.register_profile(MODEL, PROVIDER, 4, dtype="int8", task="chunk")
         vs.record_chunk_embedding(
-            "1:0", MODEL, [0.0, 1.0, 0.0, 0.0], store_id=1, chunk_index=0,
-            char_start=0, char_end=1, token_estimate=1, identity=i8,
+            "1:0",
+            MODEL,
+            [0.0, 1.0, 0.0, 0.0],
+            store_id=1,
+            chunk_index=0,
+            char_start=0,
+            char_end=1,
+            token_estimate=1,
+            identity=i8,
         )
-        assert vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0] == 1
+        assert (
+            vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0]
+            == 1
+        )
         # int8 vec blob is dim + 4 bytes, distinct layout from float32 (dim*4).
         blob = vs.connection.execute(
             "SELECT vec FROM lcm_chunk_vectors WHERE identity_hash = ?",
@@ -127,19 +150,71 @@ def test_int8_identity_distinct_and_writes_binary(tmp_path):
 def test_two_stage_reports_full_coverage(tmp_path):
     db_path = tmp_path / "lcm.db"
     _seed_messages(db_path, 3)
-    vs = VectorStore(db_path, bounded_scan_rows=1)  # tiny bound: proves it is NOT bounded
+    vs = VectorStore(
+        db_path, bounded_scan_rows=1
+    )  # tiny bound: proves it is NOT bounded
     try:
         i8 = _int8_identity(4)
         vs.register_profile(MODEL, PROVIDER, 4, dtype="int8", task="chunk")
-        for idx, vec in enumerate([[1.0, 0.0, 0.0, 0.0], [0.9, 0.1, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]):
+        for idx, vec in enumerate(
+            [[1.0, 0.0, 0.0, 0.0], [0.9, 0.1, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+        ):
             vs.record_chunk_embedding(
-                f"{idx}:0", MODEL, vec, store_id=idx, chunk_index=0,
-                char_start=0, char_end=1, token_estimate=1, identity=i8,
+                f"{idx}:0",
+                MODEL,
+                vec,
+                store_id=idx,
+                chunk_index=0,
+                char_start=0,
+                char_end=1,
+                token_estimate=1,
+                identity=i8,
             )
-        result = vs.knn_chunks([1.0, 0.0, 0.0, 0.0], k=2, model=MODEL, provider=PROVIDER)
+        result = vs.knn_chunks(
+            [1.0, 0.0, 0.0, 0.0], k=2, model=MODEL, provider=PROVIDER
+        )
         # Full corpus reached despite bounded_scan_rows=1 -> the two-stage path fired.
         assert result.coverage == "full_approx"
         assert result[0][0] == "0:0"
+    finally:
+        vs.close()
+
+
+def test_two_stage_filters_session_before_binary_prescreen(tmp_path):
+    db_path = tmp_path / "lcm.db"
+    _seed_messages(db_path, 20, session="other")
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE messages SET session_id = 'target' WHERE store_id = 0")
+    conn.commit()
+    conn.close()
+    vs = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        identity = _int8_identity(4)
+        vs.register_profile(MODEL, PROVIDER, 4, dtype="int8", task="chunk")
+        for store_id in range(20):
+            vector = [-1.0, -1.0, -1.0, -1.0] if store_id == 0 else [1.0, 1.0, 1.0, 1.0]
+            vs.record_chunk_embedding(
+                f"{store_id}:0",
+                MODEL,
+                vector,
+                store_id=store_id,
+                chunk_index=0,
+                char_start=0,
+                char_end=1,
+                token_estimate=1,
+                identity=identity,
+            )
+
+        result = vs.knn_chunks(
+            [1.0, 1.0, 1.0, 1.0],
+            k=1,
+            model=MODEL,
+            provider=PROVIDER,
+            conversation_ids=["target"],
+        )
+
+        assert result.coverage == "full_approx"
+        assert [row[0] for row in result] == ["0:0"]
     finally:
         vs.close()
 
@@ -206,8 +281,15 @@ def test_two_stage_recall_vs_exact_float_through_store(tmp_path):
         vs.register_profile(MODEL, PROVIDER, dim, dtype="int8", task="chunk")
         for i in range(n):
             vs.record_chunk_embedding(
-                f"{i}:0", MODEL, vecs[i].tolist(), store_id=i, chunk_index=0,
-                char_start=0, char_end=1, token_estimate=1, identity=i8,
+                f"{i}:0",
+                MODEL,
+                vecs[i].tolist(),
+                store_id=i,
+                chunk_index=0,
+                char_start=0,
+                char_end=1,
+                token_estimate=1,
+                identity=i8,
             )
         query = base
         result = vs.knn_chunks(query.tolist(), k=k, model=MODEL, provider=PROVIDER)
@@ -232,8 +314,15 @@ def test_store_dim_truncates_and_renormalizes(tmp_path):
         vs.register_profile(MODEL, PROVIDER, store_dim, dtype="int8", task="chunk")
         # Feed a full 4-d vector; only the leading 2 dims are stored + renormalized.
         vs.record_chunk_embedding(
-            "0:0", MODEL, [3.0, 4.0, 99.0, 99.0], store_id=0, chunk_index=0,
-            char_start=0, char_end=1, token_estimate=1, identity=i8,
+            "0:0",
+            MODEL,
+            [3.0, 4.0, 99.0, 99.0],
+            store_id=0,
+            chunk_index=0,
+            char_start=0,
+            char_end=1,
+            token_estimate=1,
+            identity=i8,
         )
         blob = vs.connection.execute(
             "SELECT vec FROM lcm_chunk_vectors WHERE chunk_id = '0:0'"
@@ -276,7 +365,7 @@ def test_float32_prescreen_opt_in_writes_binary_and_stays_exact(tmp_path):
     vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
     for j in rng.choice(n, k, replace=False):
         u = rng.standard_normal(dim).astype(np.float32)
-        vecs[j] = (base + 0.4 * u / np.linalg.norm(u))
+        vecs[j] = base + 0.4 * u / np.linalg.norm(u)
         vecs[j] /= np.linalg.norm(vecs[j])
 
     cfg = LCMConfig(embedding_binary_prescreen=True)
@@ -287,18 +376,30 @@ def test_float32_prescreen_opt_in_writes_binary_and_stays_exact(tmp_path):
         ident = EmbeddingIdentity.canonical(
             PROVIDER, MODEL, "prescreen", dim, "float32", "little", "chunk"
         )
-        vs.register_profile(MODEL, PROVIDER, dim, revision="prescreen", dtype="float32", task="chunk")
+        vs.register_profile(
+            MODEL, PROVIDER, dim, revision="prescreen", dtype="float32", task="chunk"
+        )
         for i in range(n):
             vs.record_chunk_embedding(
-                f"{i}:0", MODEL, vecs[i].tolist(), store_id=i, chunk_index=0,
-                char_start=0, char_end=1, token_estimate=1, identity=ident,
+                f"{i}:0",
+                MODEL,
+                vecs[i].tolist(),
+                store_id=i,
+                chunk_index=0,
+                char_start=0,
+                char_end=1,
+                token_estimate=1,
+                identity=ident,
             )
         # float32 layout preserved (dim*4 bytes), and a binary row was written.
         blob = vs.connection.execute(
             "SELECT vec FROM lcm_chunk_vectors WHERE chunk_id='0:0'"
         ).fetchone()[0]
         assert len(blob) == dim * 4
-        assert vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0] == n
+        assert (
+            vs.connection.execute("SELECT COUNT(*) FROM lcm_chunk_binary").fetchone()[0]
+            == n
+        )
 
         result = vs.knn_chunks(base.tolist(), k=k, model=MODEL, provider=PROVIDER)
         assert result.coverage == "full_approx"

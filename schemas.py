@@ -90,6 +90,23 @@ LCM_GREP = {
                     "Must not be supplied with session_scope='current' or session_scope='all'."
                 ),
             },
+            "project_scope": {
+                "type": "string",
+                "enum": ["all", "current"],
+                "description": (
+                    "Project filter over eligible sessions. 'all' (default) preserves existing behavior. "
+                    "'current' restricts results to sessions with the active session's persisted project identity."
+                ),
+                "default": "all",
+            },
+            "project_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Optional exact persisted project identity. When supplied, only sessions for this project are eligible, "
+                    "and it takes precedence over project_scope."
+                ),
+            },
             "source": {
                 "type": "string",
                 "description": (
@@ -176,6 +193,23 @@ LCM_RECALL = {
                 ),
                 "default": "all",
             },
+            "project_scope": {
+                "type": "string",
+                "enum": ["all", "current"],
+                "description": (
+                    "Project filter over memory sessions. 'all' (default) preserves global recall. "
+                    "'current' restricts recall to the active session's persisted project identity."
+                ),
+                "default": "all",
+            },
+            "project_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Optional exact persisted project identity. When supplied, only sessions for this project are eligible, "
+                    "and it takes precedence over project_scope."
+                ),
+            },
         },
         "required": ["query"],
     },
@@ -184,9 +218,9 @@ LCM_RECALL = {
 LCM_RECENT = {
     "name": "lcm_recent",
     "description": (
-        "Retrieve recent conversation summaries by a natural UTC time period. "
-        "Ready temporal rollups are served when available; otherwise the tool "
-        "transparently falls back to existing leaf summaries in the same window."
+        "Retrieve recent summaries by a natural UTC time period. Conversation scope "
+        "uses ready temporal rollups or existing leaf-summary fallback behavior; "
+        "project and all scopes return bounded DAG summaries without generating rollups."
     ),
     "parameters": {
         "type": "object",
@@ -200,9 +234,23 @@ LCM_RECENT = {
             },
             "scope": {
                 "type": "string",
-                "enum": ["conversation"],
-                "description": "Use the active conversation. Cross-session rollups are future work.",
+                "enum": ["conversation", "project", "all"],
+                "description": (
+                    "'conversation' (default) preserves current-conversation rollup behavior. "
+                    "'project' browses sessions with one persisted project identity. "
+                    "'all' browses every session and does not require project metadata."
+                ),
                 "default": "conversation",
+            },
+            "project_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000,
+                "pattern": r"\S",
+                "description": (
+                    "Optional exact persisted project identity for scope='project' (maximum 1000 characters). "
+                    "When omitted, the active session's persisted project identity is used."
+                ),
             },
             "limit": {
                 "type": "integer",

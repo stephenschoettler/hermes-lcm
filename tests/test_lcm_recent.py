@@ -9,9 +9,11 @@ import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryDAG, SummaryNode
+from hermes_lcm.project_scope import ProjectMetadata
 from hermes_lcm.rollup_periods import parse_recent_period
 from hermes_lcm.rollup_store import RollupStore
 from hermes_lcm.schemas import LCM_RECENT
+from hermes_lcm.store import MessageStore
 from hermes_lcm.tokens import count_tokens
 from hermes_lcm import tools as tools_module
 from hermes_lcm.tools import (
@@ -25,8 +27,19 @@ from hermes_lcm.tools import (
 NOW = datetime(2026, 7, 15, 15, 30, tzinfo=timezone.utc)
 
 
-def test_lcm_recent_schema_advertises_conversation_scope_only():
-    assert LCM_RECENT["parameters"]["properties"]["scope"]["enum"] == ["conversation"]
+def test_lcm_recent_schema_advertises_cross_session_scopes():
+    parameters = LCM_RECENT["parameters"]
+    properties = parameters["properties"]
+    assert properties["scope"]["enum"] == ["conversation", "project", "all"]
+    assert properties["project_id"] | {"description": None} == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000,
+        "pattern": r"\S",
+        "description": None,
+    }
+    assert "scope='project'" in properties["project_id"]["description"]
+    assert {"allOf", "anyOf", "oneOf"}.isdisjoint(parameters)
 
 
 @pytest.mark.parametrize(
@@ -89,11 +102,13 @@ def test_parse_recent_period_rejects_unrepresentable_lower_day_bounds():
 @pytest.fixture
 def recent_parts(tmp_path):
     db_path = tmp_path / "recent.db"
+    message_store = MessageStore(db_path)
     dag = SummaryDAG(db_path)
     store = RollupStore(db_path)
     config = LCMConfig(database_path=str(db_path), temporal_rollups_enabled=True)
     engine = SimpleNamespace(
         _dag=dag,
+        _store=message_store,
         _config=config,
         current_session_id="conversation-a",
     )
@@ -102,6 +117,7 @@ def recent_parts(tmp_path):
     finally:
         store.close()
         dag.close()
+        message_store.close()
 
 
 def _timestamp(day: date, hour: int = 12) -> float:
@@ -130,6 +146,226 @@ def _ready(store, kind, period_start, scope, summary="ready rollup", token_count
     token = store.upsert_building(kind, period_start, scope)
     store.mark_ready(token, summary, token_count, [], "fingerprint")
     return token.rollup_id
+
+
+def _set_project(engine, session_id, project_id):
+    engine._store.set_session_project_metadata(
+        session_id,
+        ProjectMetadata(project_id, f"/projects/{project_id}", f"/projects/{project_id}"),
+    )
+
+
+def test_lcm_recent_all_returns_bounded_dag_summaries_without_project_metadata(
+    recent_parts,
+):
+    engine, store = recent_parts
+    day = date(2026, 7, 15)
+    older = _add_leaf(engine._dag, "session-a", day, "older all-session summary", timestamp=_timestamp(day, 8))
+    newer = _add_leaf(engine._dag, "session-b", day, "newer all-session summary", timestamp=_timestamp(day, 20))
+    tied = _add_leaf(engine._dag, "session-c", day, "tied all-session summary", timestamp=_timestamp(day, 20))
+    _add_leaf(engine._dag, "outside-window", date(2026, 7, 14), "outside window")
+    _ready(store, "day", day.isoformat(), engine.current_session_id, summary="must not be served")
+
+    result = json.loads(
+        lcm_recent(
+            {"period": "date:2026-07-15", "scope": "all", "limit": 2},
+            engine=engine,
+        )
+    )
+
+    assert result["mode"] == "dag_summaries"
+    assert result["scope"] == "all"
+    assert [section["node_id"] for section in result["sections"]] == [tied, newer]
+    assert older not in {section["node_id"] for section in result["sections"]}
+    assert result["provenance"] == {
+        "summaries": [
+            {"node_id": tied, "session_id": "session-c"},
+            {"node_id": newer, "session_id": "session-b"},
+        ]
+    }
+    assert "rollups_covered" not in result
+
+
+def test_lcm_recent_project_defaults_to_current_session_project(recent_parts):
+    engine, _store = recent_parts
+    day = date(2026, 7, 15)
+    _set_project(engine, engine.current_session_id, "project-a")
+    _set_project(engine, "same-project", "project-a")
+    _set_project(engine, "other-project", "project-b")
+    current = _add_leaf(engine._dag, engine.current_session_id, day, "current project summary")
+    same = _add_leaf(engine._dag, "same-project", day, "same project summary")
+    _add_leaf(engine._dag, "other-project", day, "other project summary")
+    _add_leaf(engine._dag, "missing-metadata", day, "unscoped summary")
+
+    result = json.loads(
+        lcm_recent(
+            {"period": "date:2026-07-15", "scope": "project"},
+            engine=engine,
+        )
+    )
+
+    assert result["project_id"] == "project-a"
+    assert {section["node_id"] for section in result["sections"]} == {current, same}
+    assert {section["session_id"] for section in result["sections"]} == {
+        engine.current_session_id,
+        "same-project",
+    }
+
+
+def test_lcm_recent_project_accepts_explicit_project_id(recent_parts):
+    engine, _store = recent_parts
+    day = date(2026, 7, 15)
+    _set_project(engine, engine.current_session_id, "project-a")
+    _set_project(engine, "other-project", "project-b")
+    expected = _add_leaf(engine._dag, "other-project", day, "explicit project summary")
+    _add_leaf(engine._dag, engine.current_session_id, day, "current project summary")
+
+    result = json.loads(
+        lcm_recent(
+            {
+                "period": "date:2026-07-15",
+                "scope": "project",
+                "project_id": "project-b",
+            },
+            engine=engine,
+        )
+    )
+
+    assert result["project_id"] == "project-b"
+    assert [section["node_id"] for section in result["sections"]] == [expected]
+
+
+@pytest.mark.parametrize(
+    ("project_id", "error"),
+    [
+        (None, "project_id must be a string"),
+        (123, "project_id must be a string"),
+        ("   ", "project_id must not be empty"),
+        ("p" * 1001, "project_id must be at most 1000 characters"),
+    ],
+)
+def test_lcm_recent_project_rejects_invalid_explicit_id_before_queries(
+    recent_parts, monkeypatch, project_id, error
+):
+    engine, _store = recent_parts
+
+    def fail_query(*_args, **_kwargs):
+        raise AssertionError("invalid project_id must be rejected before queries")
+
+    monkeypatch.setattr(tools_module, "_recent_leaf_sections", fail_query)
+    monkeypatch.setattr(tools_module, "_recent_ready_rollups", fail_query)
+
+    result = json.loads(
+        lcm_recent(
+            {"period": "today", "scope": "project", "project_id": project_id},
+            engine=engine,
+        )
+    )
+
+    assert result == {"error": error}
+
+
+def test_lcm_recent_project_maximum_id_keeps_response_within_char_limit(recent_parts):
+    engine, _store = recent_parts
+    project_id = "p" * 1000
+
+    encoded = lcm_recent(
+        {"period": "today", "scope": "project", "project_id": project_id},
+        engine=engine,
+    )
+
+    assert json.loads(encoded)["project_id"] == project_id
+    assert len(encoded) <= tools_module._LCM_RECENT_MAX_RESPONSE_CHARS
+
+
+@pytest.mark.parametrize(
+    ("scope", "project_id"),
+    [("conversation", "other-project"), ("all", 123)],
+)
+def test_lcm_recent_rejects_project_id_outside_project_scope_before_queries(
+    recent_parts, monkeypatch, scope, project_id
+):
+    engine, _store = recent_parts
+
+    def fail_query(*_args, **_kwargs):
+        raise AssertionError("incompatible project_id must be rejected before queries")
+
+    monkeypatch.setattr(tools_module, "_recent_leaf_sections", fail_query)
+    monkeypatch.setattr(tools_module, "_recent_ready_rollups", fail_query)
+
+    result = json.loads(
+        lcm_recent(
+            {"period": "today", "scope": scope, "project_id": project_id},
+            engine=engine,
+        )
+    )
+
+    assert result == {"error": "project_id is only valid when scope=project"}
+
+
+def test_lcm_recent_project_limit_is_applied_after_stable_lineage_dedup(recent_parts):
+    engine, _store = recent_parts
+    day = date(2026, 7, 15)
+    for session_id in (engine.current_session_id, "parent-session", "independent-session"):
+        _set_project(engine, session_id, "project-a")
+    child = _add_leaf(engine._dag, engine.current_session_id, day, "covered child")
+    independent = _add_leaf(
+        engine._dag,
+        "independent-session",
+        day,
+        "independent summary",
+        timestamp=_timestamp(day, 6),
+    )
+    parent = engine._dag.add_node(
+        SummaryNode(
+            session_id="parent-session",
+            depth=1,
+            summary="cross-session parent",
+            token_count=3,
+            source_token_count=4,
+            source_ids=[child],
+            source_type="nodes",
+            created_at=_timestamp(day),
+            earliest_at=_timestamp(day),
+            latest_at=_timestamp(day),
+        )
+    )
+
+    result = json.loads(
+        lcm_recent(
+            {"period": "date:2026-07-15", "scope": "project", "limit": 2},
+            engine=engine,
+        )
+    )
+
+    assert [section["node_id"] for section in result["sections"]] == [parent, independent]
+    assert child not in {section["node_id"] for section in result["sections"]}
+
+
+def test_lcm_recent_project_without_current_project_metadata_is_an_error(recent_parts):
+    engine, _store = recent_parts
+
+    result = json.loads(
+        lcm_recent({"period": "today", "scope": "project"}, engine=engine)
+    )
+
+    assert result == {
+        "error": "scope=project requires project metadata for the active session"
+    }
+
+
+def test_lcm_recent_omitted_scope_is_byte_identical_to_explicit_conversation(
+    recent_parts,
+):
+    engine, store = recent_parts
+    _ready(store, "day", "2026-07-15", engine.current_session_id)
+
+    omitted = lcm_recent({"period": "date:2026-07-15"}, engine=engine)
+    explicit = lcm_recent(
+        {"period": "date:2026-07-15", "scope": "conversation"}, engine=engine
+    )
+
+    assert omitted == explicit
 
 
 def test_lcm_recent_serves_ready_rollup_with_provenance(recent_parts):
@@ -685,6 +921,25 @@ def test_recent_fallback_candidate_work_is_sql_bounded(recent_parts, monkeypatch
     assert result["mode"] == "leaf_summary_fallback"
     assert result["sections"] == []
     assert frontier_calls == []
+
+
+def test_lcm_recent_all_surfaces_frontier_work_limit(recent_parts, monkeypatch):
+    engine, _store = recent_parts
+    day = date(2026, 7, 15)
+    monkeypatch.setattr(tools_module, "_LCM_RECENT_FRONTIER_WORK_LIMIT", 1)
+    _add_leaf(engine._dag, "session-a", day, "first matching summary")
+    _add_leaf(engine._dag, "session-b", day, "second matching summary")
+
+    result = json.loads(
+        lcm_recent(
+            {"period": "date:2026-07-15", "scope": "all", "limit": 1},
+            engine=engine,
+        )
+    )
+
+    assert result == {
+        "error": "recent summary frontier exceeds bounded work limit (1); narrow period or scope"
+    }
 
 
 def test_recent_fallback_releases_snapshot_before_later_dag_write(recent_parts):

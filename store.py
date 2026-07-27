@@ -46,6 +46,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .project_scope import ProjectMetadata
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,9 @@ def _legacy_blank_source_clause(column: str) -> str:
     # SQLite TRIM() only strips spaces unless given an explicit character set.
     # Match Python's write-time `str.strip()` behavior for common ASCII whitespace
     # so legacy tabs/newlines do not become a fake attributed source bucket.
-    whitespace_chars = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
+    whitespace_chars = (
+        "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
+    )
     return f"({column} IS NULL OR TRIM({column}, {whitespace_chars}) = '')"
 
 
@@ -76,16 +79,22 @@ def _normalize_conversation_id_value(conversation_id: str | None) -> str:
     return (conversation_id or "").strip()
 
 
-def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
+def _source_filter_clause(
+    column: str, source: str | None
+) -> tuple[str | None, list[str]]:
     normalized = _normalize_source_value(source) if source is not None else ""
     if not normalized:
         return None, []
     if normalized == _UNKNOWN_SOURCE:
-        return f"({column} = ? OR {_legacy_blank_source_clause(column)})", [_UNKNOWN_SOURCE]
+        return f"({column} = ? OR {_legacy_blank_source_clause(column)})", [
+            _UNKNOWN_SOURCE
+        ]
     return f"{column} = ?", [normalized]
 
 
-def _conversation_filter_clause(column: str, conversation_id: str | None) -> tuple[str | None, list[str]]:
+def _conversation_filter_clause(
+    column: str, conversation_id: str | None
+) -> tuple[str | None, list[str]]:
     normalized = _normalize_conversation_id_value(conversation_id)
     if not normalized:
         return None, []
@@ -102,7 +111,12 @@ def _message_role_bias(role: str | None) -> float:
     return 1.0
 
 
-def _message_directness_score(role: str | None, content: str | None, terms: List[str], phrases: List[str] | None = None) -> float:
+def _message_directness_score(
+    role: str | None,
+    content: str | None,
+    terms: List[str],
+    phrases: List[str] | None = None,
+) -> float:
     score = compute_directness_score(content or "", terms, phrases)
     if role == "tool":
         stripped = (content or "").lstrip()
@@ -120,14 +134,18 @@ def _build_search_order_by(
     order_parts: list[str] = []
     if normalized == "relevance":
         if role_penalty_expr:
-            order_parts.extend(["rank ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"])
+            order_parts.extend(
+                ["rank ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"]
+            )
         else:
             order_parts.extend(["rank ASC", f"{timestamp_expr} DESC"])
         return ", ".join(order_parts)
     if normalized == "hybrid":
         blended = f"(rank / (1 + (MAX(0.0, ((strftime('%s','now') - {timestamp_expr}) / 3600.0)) * {AGE_DECAY_RATE})))"
         if role_penalty_expr:
-            order_parts.extend([f"{blended} ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"])
+            order_parts.extend(
+                [f"{blended} ASC", f"{role_penalty_expr} ASC", f"{timestamp_expr} DESC"]
+            )
         else:
             order_parts.extend([f"{blended} ASC", f"{timestamp_expr} DESC"])
         return ", ".join(order_parts)
@@ -138,7 +156,9 @@ def _build_search_order_by(
     return ", ".join(order_parts)
 
 
-def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
+def _fallback_result_sort_key(
+    result: Dict[str, Any], sort: str | None
+) -> tuple[float, float, float, float]:
     normalized = normalize_search_sort(sort)
     score = float(result.get("_fallback_score") or 0.0)
     directness = float(result.get("_directness_score") or 0.0)
@@ -154,7 +174,9 @@ def _fallback_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple
     return (-timestamp, role_bias, -score, -directness)
 
 
-def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[float, float, float, float]:
+def _fts_result_sort_key(
+    result: Dict[str, Any], sort: str | None
+) -> tuple[float, float, float, float]:
     normalized = normalize_search_sort(sort)
     rank = result.get("search_rank")
     rank_value = float(rank) if rank is not None else float("inf")
@@ -166,7 +188,11 @@ def _fts_result_sort_key(result: Dict[str, Any], sort: str | None) -> tuple[floa
         return (rank_value, -directness, role_bias, -timestamp)
     if normalized == "hybrid":
         age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
-        blended = rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
+        blended = (
+            rank_value / (1 + (age_hours * AGE_DECAY_RATE))
+            if rank is not None
+            else float("inf")
+        )
         return (blended, -directness, role_bias, -timestamp)
     return (-timestamp, role_bias, rank_value, 0.0)
 
@@ -178,7 +204,11 @@ def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
     if normalized == "hybrid":
         timestamp = float(result.get("timestamp") or 0.0)
         age_hours = max(0.0, (time.time() - timestamp) / 3600.0)
-        return rank_value / (1 + (age_hours * AGE_DECAY_RATE)) if rank is not None else float("inf")
+        return (
+            rank_value / (1 + (age_hours * AGE_DECAY_RATE))
+            if rank is not None
+            else float("inf")
+        )
     return rank_value
 
 
@@ -219,10 +249,18 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        ingest_protection_config=None,
+        hermes_home: str = "",
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
+        self._ingest_protection_config = ingest_protection_config or LCMConfig(
+            database_path=str(self.db_path)
+        )
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
         # ``self._conn`` is shared across threads (the connection is opened with
@@ -245,7 +283,9 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(self.db_path), timeout=5.0, check_same_thread=False
+        )
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
@@ -284,10 +324,13 @@ class MessageStore:
 
     def _ensure_source_column(self) -> None:
         columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
         add_column_if_missing(
-            self._conn, columns, "source",
+            self._conn,
+            columns,
+            "source",
             "ALTER TABLE messages ADD COLUMN source TEXT DEFAULT ''",
         )
         self._conn.execute(
@@ -296,10 +339,13 @@ class MessageStore:
 
     def _ensure_conversation_id_column(self) -> None:
         columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
         }
         add_column_if_missing(
-            self._conn, columns, "conversation_id",
+            self._conn,
+            columns,
+            "conversation_id",
             "ALTER TABLE messages ADD COLUMN conversation_id TEXT DEFAULT ''",
         )
         self._conn.execute(
@@ -308,9 +354,14 @@ class MessageStore:
 
     # -- Write operations ---------------------------------------------------
 
-    def append(self, session_id: str, msg: Dict[str, Any],
-               token_estimate: int = 0, source: str = "",
-               conversation_id: str = "") -> int:
+    def append(
+        self,
+        session_id: str,
+        msg: Dict[str, Any],
+        token_estimate: int = 0,
+        source: str = "",
+        conversation_id: str = "",
+    ) -> int:
         """Persist a message and return its store_id."""
         msg = protect_message_for_ingest(
             msg,
@@ -344,11 +395,14 @@ class MessageStore:
             self._conn.commit()
             return cur.lastrowid
 
-    def append_batch(self, session_id: str,
-                     messages: List[Dict[str, Any]],
-                     token_estimates: List[int] | None = None,
-                     source: str = "",
-                     conversation_id: str = "") -> List[int]:
+    def append_batch(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        token_estimates: List[int] | None = None,
+        source: str = "",
+        conversation_id: str = "",
+    ) -> List[int]:
         """Persist multiple messages in one transaction. Returns store_ids."""
         protected_messages = protect_messages_for_ingest(
             messages,
@@ -364,11 +418,14 @@ class MessageStore:
             conversation_id=conversation_id,
         )
 
-    def _append_protected_batch(self, session_id: str,
-                                messages: List[Dict[str, Any]],
-                                token_estimates: List[int] | None = None,
-                                source: str = "",
-                                conversation_id: str = "") -> List[int]:
+    def _append_protected_batch(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        token_estimates: List[int] | None = None,
+        source: str = "",
+        conversation_id: str = "",
+    ) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -407,7 +464,9 @@ class MessageStore:
                 ids.append(cur.lastrowid)
         return ids
 
-    def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
+    def reassign_session_messages(
+        self, old_session_id: str, new_session_id: str
+    ) -> int:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
@@ -418,6 +477,69 @@ class MessageStore:
             )
             self._conn.commit()
             return cur.rowcount if cur.rowcount is not None else 0
+
+    def set_session_project_metadata(
+        self,
+        session_id: str,
+        metadata: ProjectMetadata,
+    ) -> None:
+        """Persist one project metadata row for a session."""
+        if not session_id or not metadata.project_id:
+            return
+        with self._write_lock:
+            self._conn.execute(
+                """
+                INSERT INTO session_project_metadata(session_id, project_id, project_root, cwd)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    project_root = excluded.project_root,
+                    cwd = excluded.cwd
+                """,
+                (
+                    session_id,
+                    metadata.project_id,
+                    metadata.project_root,
+                    metadata.cwd,
+                ),
+            )
+            self._conn.commit()
+
+    def copy_session_project_metadata(
+        self,
+        source_session_id: str,
+        target_session_id: str,
+    ) -> bool:
+        """Copy project metadata across a compression session boundary."""
+        if not source_session_id or not target_session_id:
+            return False
+        with self._write_lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO session_project_metadata(session_id, project_id, project_root, cwd)
+                SELECT ?, project_id, project_root, cwd
+                FROM session_project_metadata
+                WHERE session_id = ?
+                ON CONFLICT(session_id) DO UPDATE SET
+                    project_id = excluded.project_id,
+                    project_root = excluded.project_root,
+                    cwd = excluded.cwd
+                """,
+                (target_session_id, source_session_id),
+            )
+            self._conn.commit()
+            return bool(cur.rowcount)
+
+    def delete_session_project_metadata(self, session_id: str) -> None:
+        """Remove project metadata when a session is reclassified as non-durable."""
+        if not session_id:
+            return
+        with self._write_lock:
+            self._conn.execute(
+                "DELETE FROM session_project_metadata WHERE session_id = ?",
+                (session_id,),
+            )
+            self._conn.commit()
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
@@ -473,7 +595,6 @@ class MessageStore:
             return True
 
     def pin(self, store_id: int) -> None:
-
         """Mark a message as pinned (protected from pruning)."""
         with self._write_lock:
             self._conn.execute(
@@ -493,9 +614,37 @@ class MessageStore:
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
         row = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
+            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?",
+            (store_id,),
         ).fetchone()
         return self._row_to_dict(row) if row else None
+
+    def get_session_project_metadata(self, session_id: str) -> ProjectMetadata | None:
+        row = self._conn.execute(
+            """
+            SELECT project_id, project_root, cwd
+            FROM session_project_metadata
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        return ProjectMetadata(*row) if row else None
+
+    def get_project_session_ids(self, project_id: str) -> List[str]:
+        if not project_id:
+            return []
+        return [
+            str(row[0])
+            for row in self._conn.execute(
+                """
+                SELECT session_id
+                FROM session_project_metadata
+                WHERE project_id = ?
+                ORDER BY session_id
+                """,
+                (project_id,),
+            ).fetchall()
+        ]
 
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.
@@ -511,14 +660,20 @@ class MessageStore:
         ).fetchall()
         return {row[0]: self._row_to_dict(row) for row in rows}
 
-    def get_range(self, session_id: str, start_id: int = 0,
-                  end_id: int | None = None,
-                  limit: int = 1000,
-                  conversation_id: str | None = None) -> List[Dict[str, Any]]:
+    def get_range(
+        self,
+        session_id: str,
+        start_id: int = 0,
+        end_id: int | None = None,
+        limit: int = 1000,
+        conversation_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Get messages in a store_id range for a session."""
         where = ["session_id = ?", "store_id >= ?"]
         args: list[Any] = [session_id, start_id]
-        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "conversation_id", conversation_id
+        )
         if conversation_clause:
             where.append(conversation_clause)
             args.extend(conversation_args)
@@ -528,7 +683,7 @@ class MessageStore:
         args.append(limit)
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE {' AND '.join(where)}
+               WHERE {" AND ".join(where)}
                ORDER BY store_id LIMIT ?""",
             args,
         ).fetchall()
@@ -603,14 +758,15 @@ class MessageStore:
         args.extend([after_store_id, limit])
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE {' AND '.join(where)}
+               WHERE {" AND ".join(where)}
                ORDER BY store_id LIMIT ?""",
             args,
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_messages(self, session_id: str,
-                             limit: int = 10000) -> List[Dict[str, Any]]:
+    def get_session_messages(
+        self, session_id: str, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
@@ -620,9 +776,9 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_messages_after(self, session_id: str,
-                                   after_store_id: int = 0,
-                                   limit: int = 10000) -> List[Dict[str, Any]]:
+    def get_session_messages_after(
+        self, session_id: str, after_store_id: int = 0, limit: int = 10000
+    ) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
@@ -632,7 +788,9 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
-    def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
+    def get_session_tail(
+        self, session_id: str, limit: int = 1000
+    ) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
@@ -818,7 +976,9 @@ class MessageStore:
             "stats_after": stats_after,
         }
 
-    def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
+    def get_time_bounds(
+        self, store_ids: List[int]
+    ) -> tuple[float | None, float | None]:
         if not store_ids:
             return None, None
         placeholders = ",".join("?" * len(store_ids))
@@ -900,7 +1060,9 @@ class MessageStore:
     def _compaction_telemetry_key(conversation_id: str) -> str:
         return f"compaction_telemetry:{conversation_id}"
 
-    def read_compaction_telemetry(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def read_compaction_telemetry(
+        self, conversation_id: str
+    ) -> Optional[Dict[str, Any]]:
         """Return the persisted per-conversation compaction-telemetry record, or None.
 
         Best-effort: a closed connection, missing/empty row, or malformed JSON all
@@ -910,12 +1072,16 @@ class MessageStore:
         if not conversation_id:
             return None
         try:
-            data = self.read_metadata_json(self._compaction_telemetry_key(conversation_id))
+            data = self.read_metadata_json(
+                self._compaction_telemetry_key(conversation_id)
+            )
         except (ValueError, TypeError):
             return None
         return data if isinstance(data, dict) else None
 
-    def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:
+    def write_compaction_telemetry(
+        self, conversation_id: str, record: Dict[str, Any]
+    ) -> None:
         """Upsert the per-conversation compaction-telemetry record.
 
         Stored as a single JSON row in the existing metadata table (no dedicated
@@ -931,13 +1097,19 @@ class MessageStore:
 
     # -- Search -------------------------------------------------------------
 
-    def search(self, query: str, session_id: str | None = None,
-               limit: int = 20, sort: str | None = None,
-               source: str | None = None,
-               conversation_id: str | None = None,
-               role: str | None = None,
-               time_from: float | None = None,
-               time_to: float | None = None) -> List[Dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        session_id: str | None = None,
+        limit: int = 20,
+        sort: str | None = None,
+        source: str | None = None,
+        conversation_id: str | None = None,
+        role: str | None = None,
+        time_from: float | None = None,
+        time_to: float | None = None,
+        project_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """FTS5 search across raw messages.
 
         Retrieval contract:
@@ -963,6 +1135,7 @@ class MessageStore:
                 role=role,
                 time_from=time_from,
                 time_to=time_to,
+                project_id=project_id,
             )
 
         order_by = _build_search_order_by(
@@ -972,10 +1145,16 @@ class MessageStore:
         )
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
         candidate_cap = compute_search_candidate_cap(limit)
-        apply_directness_adjustment = should_apply_directness_rank_adjustment(terms, phrases)
-        max_rank_bonus = compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
+        apply_directness_adjustment = should_apply_directness_rank_adjustment(
+            terms, phrases
+        )
+        max_rank_bonus = (
+            compute_directness_rank_bonus_upper_bound(terms, phrases) * 3e-7
+        )
         source_clause, source_args = _source_filter_clause("m.source", source)
-        conversation_clause, conversation_args = _conversation_filter_clause("m.conversation_id", conversation_id)
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "m.conversation_id", conversation_id
+        )
         offset = 0
         scanned_rows = 0
         results: list[Dict[str, Any]] = []
@@ -986,6 +1165,12 @@ class MessageStore:
                 if session_id is not None:
                     where.append("m.session_id = ?")
                     args.append(session_id)
+                if project_id is not None:
+                    where.append(
+                        "EXISTS (SELECT 1 FROM session_project_metadata spm "
+                        "WHERE spm.session_id = m.session_id AND spm.project_id = ?)"
+                    )
+                    args.append(project_id)
                 if source_clause:
                     where.append(source_clause)
                     args.extend(source_args)
@@ -1009,13 +1194,15 @@ class MessageStore:
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
                        JOIN messages m ON m.store_id = fts.rowid
-                       WHERE {' AND '.join(where)}
+                       WHERE {" AND ".join(where)}
                        ORDER BY {order_by} LIMIT ? OFFSET ?""",
                     args,
                 ).fetchall()
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
-                logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
+                logger.warning(
+                    "FTS message search failed, falling back to LIKE: %s", exc
+                )
                 return self._search_like(
                     query,
                     session_id=session_id,
@@ -1026,6 +1213,7 @@ class MessageStore:
                     role=role,
                     time_from=time_from,
                     time_to=time_to,
+                    project_id=project_id,
                 )
 
             raw_primary_values: list[float] = []
@@ -1033,19 +1221,31 @@ class MessageStore:
                 d = self._row_to_dict(r)
                 base_columns = 12
                 d["search_rank"] = r[base_columns] if len(r) > base_columns else None
-                d["snippet"] = r[base_columns + 1] if len(r) > (base_columns + 1) else ""
-                d["_directness_score"] = _message_directness_score(d.get("role"), d.get("content"), terms, phrases)
+                d["snippet"] = (
+                    r[base_columns + 1] if len(r) > (base_columns + 1) else ""
+                )
+                d["_directness_score"] = _message_directness_score(
+                    d.get("role"), d.get("content"), terms, phrases
+                )
                 if apply_directness_adjustment and d["search_rank"] is not None:
                     rank_adjustment = max(float(d["_directness_score"]), 0.0)
-                    d["search_rank"] = float(d["search_rank"]) - (rank_adjustment * 3e-7)
+                    d["search_rank"] = float(d["search_rank"]) - (
+                        rank_adjustment * 3e-7
+                    )
                 raw_primary_values.append(_fts_primary_value(d, sort))
                 results.append(d)
             results.sort(key=lambda result: _fts_result_sort_key(result, sort))
 
-            if not apply_directness_adjustment or len(rows) < fetch_limit or len(results) <= limit:
+            if (
+                not apply_directness_adjustment
+                or len(rows) < fetch_limit
+                or len(results) <= limit
+            ):
                 return results[:limit]
 
-            worst_visible_primary = _fts_primary_value(results[min(limit, len(results)) - 1], sort)
+            worst_visible_primary = _fts_primary_value(
+                results[min(limit, len(results)) - 1], sort
+            )
             last_fetched_primary = raw_primary_values[-1]
             best_unseen_primary = last_fetched_primary - max_rank_bonus
             if best_unseen_primary > worst_visible_primary:
@@ -1060,13 +1260,19 @@ class MessageStore:
                 return results[:limit]
             fetch_limit = min(fetch_limit * 2, remaining)
 
-    def _search_like(self, query: str, session_id: str | None = None,
-                     limit: int = 20, sort: str | None = None,
-                     source: str | None = None,
-                     conversation_id: str | None = None,
-                     role: str | None = None,
-                     time_from: float | None = None,
-                     time_to: float | None = None) -> List[Dict[str, Any]]:
+    def _search_like(
+        self,
+        query: str,
+        session_id: str | None = None,
+        limit: int = 20,
+        sort: str | None = None,
+        source: str | None = None,
+        conversation_id: str | None = None,
+        role: str | None = None,
+        time_from: float | None = None,
+        time_to: float | None = None,
+        project_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         safe_query = sanitize_fts5_query(query)
         terms = extract_search_terms(safe_query)
         phrases = extract_quoted_phrases(safe_query)
@@ -1079,11 +1285,19 @@ class MessageStore:
         if session_id is not None:
             where.append("session_id = ?")
             args.append(session_id)
+        if project_id is not None:
+            where.append(
+                "EXISTS (SELECT 1 FROM session_project_metadata spm "
+                "WHERE spm.session_id = messages.session_id AND spm.project_id = ?)"
+            )
+            args.append(project_id)
         source_clause, source_args = _source_filter_clause("source", source)
         if source_clause:
             where.append(source_clause)
             args.extend(source_args)
-        conversation_clause, conversation_args = _conversation_filter_clause("conversation_id", conversation_id)
+        conversation_clause, conversation_args = _conversation_filter_clause(
+            "conversation_id", conversation_id
+        )
         if conversation_clause:
             where.append(conversation_clause)
             args.extend(conversation_args)
@@ -1121,7 +1335,9 @@ class MessageStore:
             score_exprs: list[str] = []
             for term in terms:
                 if collapse_risky_repeats:
-                    score_exprs.append("CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
+                    score_exprs.append(
+                        "CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
+                    )
                     order_args.append(f"%{escape_like(term)}%")
                 else:
                     expr, expr_args = count_expr(term)
@@ -1150,27 +1366,45 @@ class MessageStore:
             directness_args: list[Any] = []
             unique_score_expr, expr_args = build_unique_exprs(terms)
             directness_args.extend(expr_args)
-            normalized_phrases = {(phrase or "").strip().lower() for phrase in phrases if (phrase or "").strip()}
+            normalized_phrases = {
+                (phrase or "").strip().lower()
+                for phrase in phrases
+                if (phrase or "").strip()
+            }
             if phrases:
                 phrase_hit_exprs: list[str] = []
                 for phrase in phrases:
-                    phrase_hit_exprs.append("CASE WHEN INSTR(LOWER(content), LOWER(?)) > 0 THEN 1 ELSE 0 END")
+                    phrase_hit_exprs.append(
+                        "CASE WHEN INSTR(LOWER(content), LOWER(?)) > 0 THEN 1 ELSE 0 END"
+                    )
                     directness_args.append(phrase)
-                phrase_hit_expr = " + ".join(phrase_hit_exprs) if phrase_hit_exprs else "0"
-                non_phrase_terms = [term for term in terms if term.strip().lower() not in normalized_phrases]
+                phrase_hit_expr = (
+                    " + ".join(phrase_hit_exprs) if phrase_hit_exprs else "0"
+                )
+                non_phrase_terms = [
+                    term
+                    for term in terms
+                    if term.strip().lower() not in normalized_phrases
+                ]
                 non_phrase_total_expr, expr_args = build_total_exprs(non_phrase_terms)
                 directness_args.extend(expr_args)
                 non_phrase_unique_expr, expr_args = build_unique_exprs(non_phrase_terms)
                 directness_args.extend(expr_args)
-                repetition_expr = f"MAX(({non_phrase_total_expr}) - ({non_phrase_unique_expr}), 0)"
+                repetition_expr = (
+                    f"MAX(({non_phrase_total_expr}) - ({non_phrase_unique_expr}), 0)"
+                )
                 directness_expr = f"(({unique_score_expr}) * 5.0) + (({phrase_hit_expr}) * 8.0) - MIN(({repetition_expr}), 6)"
             else:
                 total_repetition_expr, expr_args = build_total_exprs(terms)
                 directness_args.extend(expr_args)
                 unique_repetition_expr, expr_args = build_unique_exprs(terms)
                 directness_args.extend(expr_args)
-                repetition_expr = f"MAX(({total_repetition_expr}) - ({unique_repetition_expr}), 0)"
-                directness_expr = f"(({unique_score_expr}) * 5.0) - MIN(({repetition_expr}), 6)"
+                repetition_expr = (
+                    f"MAX(({total_repetition_expr}) - ({unique_repetition_expr}), 0)"
+                )
+                directness_expr = (
+                    f"(({unique_score_expr}) * 5.0) - MIN(({repetition_expr}), 6)"
+                )
             order_args.extend(directness_args)
             order_by = (
                 f"ORDER BY timestamp DESC, {role_bias} ASC, ({score_expr}) DESC, "
@@ -1182,7 +1416,9 @@ class MessageStore:
                 result = self._row_to_dict(row)
                 content = result.get("content") or ""
                 score = sum(
-                    min(count_term_matches(content, term), 1) if collapse_risky_repeats else count_term_matches(content, term)
+                    min(count_term_matches(content, term), 1)
+                    if collapse_risky_repeats
+                    else count_term_matches(content, term)
                     for term in terms
                 )
                 if score <= 0:
@@ -1190,7 +1426,9 @@ class MessageStore:
                 result["search_rank"] = -float(score)
                 result["snippet"] = build_snippet(content, terms)
                 result["_fallback_score"] = float(score)
-                result["_directness_score"] = _message_directness_score(result.get("role"), content, terms, phrases)
+                result["_directness_score"] = _message_directness_score(
+                    result.get("role"), content, terms, phrases
+                )
                 results.append(result)
 
         if normalized_sort == "recency":
@@ -1204,7 +1442,7 @@ class MessageStore:
                 rows = self._conn.execute(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
-                        WHERE {' AND '.join(where)}
+                        WHERE {" AND ".join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
                     [*base_args, *order_args, batch_limit, offset],
@@ -1221,7 +1459,7 @@ class MessageStore:
                         tie_rows = self._conn.execute(
                             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                                 FROM messages
-                                WHERE {' AND '.join(where)}
+                                WHERE {" AND ".join(where)}
                                 {order_by}
                                 LIMIT ? OFFSET ?""",
                             [*base_args, *order_args, fetch_limit, offset],
@@ -1231,7 +1469,10 @@ class MessageStore:
                         matching_tie_rows = []
                         reached_next_primary_group = False
                         for tie_row in tie_rows:
-                            if tie_row[8] == boundary_timestamp and _message_role_bias(tie_row[3]) == boundary_role_bias:
+                            if (
+                                tie_row[8] == boundary_timestamp
+                                and _message_role_bias(tie_row[3]) == boundary_role_bias
+                            ):
                                 matching_tie_rows.append(tie_row)
                             else:
                                 reached_next_primary_group = True
@@ -1250,7 +1491,9 @@ class MessageStore:
             order_args = []
             for term in terms:
                 if collapse_risky_repeats:
-                    score_exprs.append("CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END")
+                    score_exprs.append(
+                        "CASE WHEN content LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END"
+                    )
                     order_args.append(f"%{escape_like(term)}%")
                 else:
                     expr, expr_args = count_expr(term)
@@ -1258,7 +1501,11 @@ class MessageStore:
                     order_args.extend(expr_args)
             score_expr = " + ".join(score_exprs) if score_exprs else "0"
             exact_query = (query or "").strip()
-            exact_expr = "CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END" if exact_query else "0"
+            exact_expr = (
+                "CASE WHEN LOWER(content) = LOWER(?) THEN 1 ELSE 0 END"
+                if exact_query
+                else "0"
+            )
             exact_args: list[Any] = [exact_query] if exact_query else []
             directness_expr = "0.0 + 0"
 
@@ -1281,7 +1528,7 @@ class MessageStore:
                 rows = self._conn.execute(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
-                        WHERE {' AND '.join(where)}
+                        WHERE {" AND ".join(where)}
                         {order_by}
                         LIMIT ? OFFSET ?""",
                     [*base_args, *order_args, *exact_args, batch_limit, offset],
@@ -1305,12 +1552,24 @@ class MessageStore:
         if row is None:
             return {}
         cols = [
-            "store_id", "session_id", "source", "role", "content", "tool_call_id",
-            "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
+            "store_id",
+            "session_id",
+            "source",
+            "role",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "tool_name",
+            "timestamp",
+            "token_estimate",
+            "pinned",
+            "conversation_id",
         ]
-        d = dict(zip(cols, row[:len(cols)]))
+        d = dict(zip(cols, row[: len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))
-        d["conversation_id"] = _normalize_conversation_id_value(d.get("conversation_id"))
+        d["conversation_id"] = _normalize_conversation_id_value(
+            d.get("conversation_id")
+        )
         # Deserialize tool_calls JSON
         if d.get("tool_calls"):
             try:

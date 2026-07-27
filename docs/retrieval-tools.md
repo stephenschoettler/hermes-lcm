@@ -4,14 +4,14 @@ Use this page when you need the exact LCM tool contract or archive-migration not
 
 ## Agent Tools
 
-Use these tools for current-session recall after compaction. Use `session_search`
-for earlier separate sessions or broad cross-session history.
+Use these tools for LCM-backed recall after compaction. Use `session_search` for
+Hermes history that is not present in the plugin-local LCM database.
 
 | Tool | Use |
 |------|-----|
-| `lcm_grep` | Search current-session raw messages and summaries. `mode='full_text'` is the byte-compatible default; `mode='semantic'` searches embedded summaries; `mode='hybrid'` combines full-text and semantic ranks with RRF. Opt into `content_scope='externalized'` or `'both'` for bounded literal search over recoverable payload prefixes owned by the active session. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only in full-text mode and cannot search externalized payloads. Raw-message filters `role`, `time_from`, `time_to`, `source`, and `conversation_id` are pushed into the full-text query; when any is supplied, externalized payload results are omitted, and summary hits are omitted for the role/time filters so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |
-| `lcm_recall` | Search the agent's entire memory across ALL conversations and all time by meaning. Runs three arms over the whole local database — full-text raw messages, embedded summary KNN, and verbatim chunk KNN (all cross-session, no filter) — fuses them with RRF, dedupes chunk hits against FTS by `store_id`, and applies a soft prior `final_score = rank_score × (1 + scope_bias × is_current_conversation) × recency_boost(half_life=30d, floor 0.5)`. `scope_bias` (0..1, default 0.5) and recency are ranking BOOSTS, never filters. `include` selects `all`/`summaries`/`verbatim`. An optional voyage `rerank-2.5-lite` stage (`LCM_RERANK_ENABLED`, default off) reorders the top window of candidates AFTER the scope/recency prior, as a pure rank-reorder (voyage relevance is never spliced onto the RRF scale); any failure skips silently to RRF order. When embeddings are disabled or the vector corpora are empty the tool degrades to the full-text arm — including for `include='summaries'`, whose only vector arm is dead in that state, so a summaries request still returns full-text hits rather than nothing. Each hit carries an `expand_hint`: verbatim/current-session hits get an `lcm_expand(...)` handle, while cross-session summary hits get an `lcm_load_session(...)` handle (`lcm_expand`'s `node_id` mode is current-session only). Use `lcm_grep(mode='full_text')` for exact text in a known range and `lcm_load_session` for full transcripts. |
-| `lcm_recent` | Retrieve recent summaries with natural UTC periods. Ready temporal rollups are preferred; missing, stale, disabled, and sub-day windows transparently use leaf summaries instead. |
+| `lcm_grep` | Search current-session raw messages and summaries. `project_scope='all'` is the default; use `project_scope='current'` or an exact `project_id` to restrict eligible sessions before search limits and ranking. `mode='full_text'` is the byte-compatible default; `mode='semantic'` searches embedded summaries; `mode='hybrid'` combines full-text and semantic ranks with RRF. Opt into `content_scope='externalized'` or `'both'` for bounded literal search over recoverable payload prefixes owned by the active session. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only in full-text mode and cannot search externalized payloads. Raw-message filters `role`, `time_from`, `time_to`, `source`, and `conversation_id` are pushed into the full-text query; when any is supplied, externalized payload results are omitted, and summary hits are omitted for the role/time filters so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |
+| `lcm_recall` | Search the agent's memory by meaning. `project_scope='all'` is the default; use `project_scope='current'` or an exact `project_id` to filter every retrieval arm before candidate caps, fusion, and ranking. Runs three arms over eligible sessions — full-text raw messages, embedded summary KNN, and verbatim chunk KNN — fuses them with RRF, dedupes chunk hits against FTS by `store_id`, and applies a soft prior `final_score = rank_score × (1 + scope_bias × is_current_conversation) × recency_boost(half_life=30d, floor 0.5)`. `scope_bias` (0..1, default 0.5) and recency are ranking BOOSTS, never filters. `include` selects `all`/`summaries`/`verbatim`. An optional voyage `rerank-2.5-lite` stage (`LCM_RERANK_ENABLED`, default off) reorders the top window of candidates AFTER the scope/recency prior, as a pure rank-reorder (voyage relevance is never spliced onto the RRF scale); any failure skips silently to RRF order. When embeddings are disabled or the vector corpora are empty the tool degrades to the full-text arm — including for `include='summaries'`, whose only vector arm is dead in that state, so a summaries request still returns full-text hits rather than nothing. Each hit carries an `expand_hint`: verbatim/current-session hits get an `lcm_expand(...)` handle, while cross-session summary hits get an `lcm_load_session(...)` handle (`lcm_expand`'s `node_id` mode is current-session only). Use `lcm_grep(mode='full_text')` for exact text in a known range and `lcm_load_session` for full transcripts. |
+| `lcm_recent` | Retrieve recent summaries with natural UTC periods. The default `scope='conversation'` preserves ready-rollup and leaf-fallback behavior. Opt into `scope='project'` for sessions with one persisted project identity or `scope='all'` for every LCM session; cross-session modes return bounded real DAG summaries and never generate aggregate rollups. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. This is not search: it returns raw rows in `store_id` order, bounded by `limit`, with per-message content bounded by `max_content_chars`, and continues with `after_store_id` from `next_cursor`. |
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
@@ -28,6 +28,26 @@ bounded archive search over rows already present in `lcm.db` (raw-message hits
 only). Once a session id is known, `lcm_load_session` can enumerate that session's
 raw transcript in chronological `store_id` pages without a search query. Use
 Hermes `session_search` for broad cross-session history outside the LCM database.
+
+Project filtering is independent of session scope. Both `lcm_grep` and
+`lcm_recall` default to `project_scope='all'`, which keeps sessions with and
+without project metadata eligible. `project_scope='current'` uses the active
+session's stored project identity. `lcm_recent(scope='project')` uses that same
+persisted identity when `project_id` is omitted. These requests return an error
+if the active session has no project metadata instead of guessing from the
+plugin process's working directory. A resolved `project_id` (explicit or
+persisted) must be a nonblank string of at most 1,000 characters. An explicit
+value selects that exact stored identity and is valid only with
+`lcm_recent(scope='project')`; supplying it with conversation or all scope is
+rejected by the handler before retrieval. Hermes tool schemas do not support
+cross-field conditionals, so this runtime check is authoritative.
+`lcm_recent(scope='all')` does not consult or require project metadata.
+
+The plugin stores one project row per session. At session start it uses the host
+`cwd`, then `TERMINAL_CWD`. It does not fall back to the ambient process cwd.
+Git linked worktrees share the main checkout's common repository root as their
+project identity; a non-Git cwd uses its normalized path. Compression children
+inherit the parent session's stored project row.
 
 Within the current session, `source` filters raw rows directly and filters
 summary nodes by descendant raw-message source lineage. `unknown` is a real
@@ -204,7 +224,15 @@ the same 20,000-character response ceiling used by the retrieval tools.
 ```
 
 ```json
-{"period": "date:2026-07-15", "scope": "global"}
+{"period": "date:2026-07-15", "scope": "project"}
+```
+
+```json
+{"period": "7d", "scope": "project", "project_id": "/path/to/project"}
+```
+
+```json
+{"period": "month", "scope": "all", "limit": 50}
 ```
 
 When temporal rollups are enabled and `ready` rollups cover the **entire**
@@ -218,6 +246,16 @@ is a successful retrieval, including for an empty window; `provenance.fallback`
 is `true` and no LLM call is made while serving either path. See the
 [operator guide's temporal rollup operations](operator-guide.md#temporal-rollup-operations)
 for enablement, tuning, status inspection, and bounded rebuild commands.
+
+`scope='project'` and `scope='all'` deliberately bypass temporal rollups. They
+query the persisted summary DAG in the requested UTC window, collapse covered
+lineage before applying `limit`, and return a deterministic newest-first list.
+Every returned section includes its real `node_id` and `session_id`, mirrored in
+`provenance.summaries`. Project scope includes only sessions whose stored
+`project_id` matches exactly; sessions without metadata remain eligible only in
+all scope. Explicit project identities are limited to 1,000 characters so fixed
+response metadata remains within the 20,000-character ceiling. These modes do
+not call an LLM or synthesize a cross-session rollup.
 
 ### Lossless raw recovery contract
 
