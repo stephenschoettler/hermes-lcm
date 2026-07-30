@@ -238,6 +238,35 @@ class TestForkSideChannelGuard:
         finally:
             engine.shutdown()
 
+    def test_t6b_small_delta_not_skipped(self, tmp_path):
+        """1-5 message delta against large session → guard not triggered.
+
+        Legitimate restarts often deliver a small delta of new messages.
+        The guard requires incoming > 5 to avoid skipping these.
+        """
+        engine = _make_engine(tmp_path)
+        try:
+            original = _make_messages(49, prefix="orig")
+            engine._ingest_messages(original)
+            assert engine._store.get_session_count("fork-guard") == 50
+
+            replay_engine = _make_engine(tmp_path)
+            try:
+                replay_engine._ingest_cursor_needs_reconcile = True
+                # Single new message — must NOT be skipped
+                delta = [{"role": "user", "content": "brand-new-message"}]
+                replay_engine._ingest_messages(delta)
+
+                count = replay_engine._store.get_session_count("fork-guard")
+                assert count == 51, (
+                    f"Expected 51 (50 + 1 new), got {count}. "
+                    "Guard incorrectly skipped a small delta."
+                )
+            finally:
+                replay_engine.shutdown()
+        finally:
+            engine.shutdown()
+
     def test_t7_empty_session_early_return(self, tmp_path):
         """Empty session → early return, guard never reached."""
         engine = _make_engine(tmp_path)
