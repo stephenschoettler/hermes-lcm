@@ -954,7 +954,7 @@ class ReconcileMixin:
         # AND its tail has zero overlap with the stored tail.
         if (
             len(incoming_identities) < session_count
-            and incoming_identities
+            and len(incoming_identities) > 5
             and not set(
                 incoming_identities[-min(5, len(incoming_identities)):]
             ).intersection(set(stored_tail))
