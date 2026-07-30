@@ -21,8 +21,6 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-import pytest
-
 # engine.py imports agent.context_engine at module level; provide a stub
 # before the conftest partial-import can poison sys.modules.
 if "agent.context_engine" not in sys.modules:
