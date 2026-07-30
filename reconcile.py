@@ -50,6 +50,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 
 
 class ReconcileMixin:
@@ -127,6 +128,15 @@ class ReconcileMixin:
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        # Strip volatile compaction scaffolding suffixes so identity matching
+        # survives compression cycles.  The host appends a task-list annotation
+        # to the last user message during context compression; the annotation
+        # changes on every cycle (task statuses update), so including it in the
+        # replay identity causes reconciliation to fail and triggers full
+        # re-ingest of already-stored messages (duplication bug).
+        _todo_idx = content.find(_PRESERVED_TODO_CONTEXT_PREFIX)
+        if _todo_idx > 0:
+            content = content[:_todo_idx].rstrip()
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)

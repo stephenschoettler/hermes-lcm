@@ -700,6 +700,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         return self._last_compression_status
 
+    @last_compression_status.setter
+    def last_compression_status(self, value: str) -> None:
+        # ponytail: host (conversation_compression.py) resets this via setattr
+        # before each compress() pass; without a setter the property raises
+        # AttributeError.  Backing field is _last_compression_status.
+        self._last_compression_status = value
+
     @property
     def last_compression_noop_reason(self) -> str:
         """Human-readable reason for the latest no-op compression decision."""
@@ -3786,6 +3793,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and "Earlier turns have been compacted into hierarchical summaries below." in content
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
+            return True
+        if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):
             return True
         if "[Expand for details:" not in content:
             return False
