@@ -3796,6 +3796,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return True
         if content.lstrip().startswith(_PRESERVED_TODO_CONTEXT_PREFIX):
             return True
+        if content.lstrip().startswith("[Note: model was just switched from "):
+            return True
         if "[Expand for details:" not in content:
             return False
         return bool(

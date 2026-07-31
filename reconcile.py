@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
+_MODEL_SWITCH_NOTIFICATION_PREFIX = "[Note: model was just switched from "
 
 
 class ReconcileMixin:
@@ -137,6 +138,15 @@ class ReconcileMixin:
         _todo_idx = content.find(_PRESERVED_TODO_CONTEXT_PREFIX)
         if _todo_idx > 0:
             content = content[:_todo_idx].rstrip()
+        # Model-switch notifications are ephemeral host scaffolding: the
+        # host injects "[Note: model was just switched from X to Y...]"
+        # into the active message list, LCM persists it, but the host
+        # removes it after processing.  The next turn's incoming list no
+        # longer contains it, so the stored tail can never match →
+        # cursor=0 → full re-ingest.  Treat the entire message as
+        # identity-empty so it never blocks suffix matching.
+        if content.startswith(_MODEL_SWITCH_NOTIFICATION_PREFIX):
+            content = ""
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)
@@ -859,6 +869,9 @@ class ReconcileMixin:
             row
             for row in stored_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
+            and not (
+                normalize_content_value(row.get("content")) or ""
+            ).lstrip().startswith(_MODEL_SWITCH_NOTIFICATION_PREFIX)
         ]
         stored_tail = [
             self._message_replay_identity(row, stored_row=True)
