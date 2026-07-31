@@ -42,7 +42,6 @@ if _existing is not None and not hasattr(_existing, "LCMEngine"):
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
-from hermes_lcm.reconcile import _MODEL_SWITCH_NOTIFICATION_PREFIX
 
 
 def _make_engine(tmp_path: Path, *, session_id: str = "model-switch") -> LCMEngine:
