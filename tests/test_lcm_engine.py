@@ -1484,6 +1484,7 @@ class TestEngineABC:
         schemas = engine.get_tool_schemas()
         names = [s["name"] for s in schemas]
         assert "lcm_grep" in names
+        assert "lcm_recall" in names
         assert "lcm_describe" in names
         assert "lcm_expand" in names
         assert "lcm_load_session" in names
@@ -1507,6 +1508,12 @@ class TestEngineABC:
         assert "unknown" in grep_props["source"]["description"]
         assert "conversation_id" in grep_props
         assert "Discord" in grep_props["conversation_id"]["description"]
+        assert grep_props["exclude_current_session"]["default"] is False
+        assert grep_props["exclude_session_ids"]["default"] == []
+        recall_schema = next(s for s in schemas if s["name"] == "lcm_recall")
+        recall_props = recall_schema["parameters"]["properties"]
+        assert recall_props["exclude_current_session"]["default"] is False
+        assert recall_props["exclude_session_ids"]["default"] == []
         # The default scope still steers callers to the active session.
         description_lower = grep_schema["description"].lower()
         assert (
@@ -25814,6 +25821,162 @@ class TestHandleGrepCrossSession:
             assert hit["from_current_session"] == (hit["session_id"] == "test-session")
             assert "timestamp" in hit
             assert hit["timestamp"] >= 0
+
+    def test_excludes_explicit_and_current_sessions_from_full_text_candidates(self, engine):
+        self._seed_two_sessions(engine)
+        engine._store.append(
+            "kept-session",
+            {"role": "user", "content": "docker plan retained"},
+        )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "docker",
+                    "session_scope": "all",
+                    "exclude_current_session": True,
+                    "exclude_session_ids": ["old-session"],
+                },
+            )
+        )
+
+        assert [hit["session_id"] for hit in result["results"]] == ["kept-session"]
+
+    def test_excludes_sessions_before_the_full_text_candidate_cap(self, engine):
+        engine._store.append(
+            "kept-session",
+            {"role": "user", "content": "docker"},
+        )
+        for _ in range(20):
+            engine._store.append(
+                "crowding-session",
+                {"role": "user", "content": "docker"},
+            )
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "docker",
+                    "session_scope": "all",
+                    "exclude_session_ids": ["crowding-session"],
+                    "limit": 1,
+                },
+            )
+        )
+
+        assert [hit["session_id"] for hit in result["results"]] == ["kept-session"]
+
+    @pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+    def test_excludes_current_session_from_semantic_candidates(
+        self, engine, monkeypatch, mode
+    ):
+        from hermes_lcm.vector_store import VectorStore
+
+        engine._config.embeddings_enabled = True
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="semantic docker plan",
+                token_count=10,
+                source_token_count=10,
+                source_ids=[],
+                source_type="messages",
+                created_at=1.0,
+            )
+        )
+
+        class Provider:
+            provider_id = "mock"
+            model_id = "mock-model"
+
+            def embed_query(self, _query):
+                return [1.0, 0.0]
+
+        monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: Provider())
+        vector_store = VectorStore(engine._store.db_path, config=engine._config)
+        try:
+            vector_store.register_profile("mock-model", "mock", 2)
+            identity = vector_store.capture_identity("mock-model", provider="mock")
+            vector_store.record_embedding(
+                str(node_id),
+                "summary",
+                "mock-model",
+                [1.0, 0.0],
+                identity=identity,
+            )
+        finally:
+            vector_store.close()
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "docker",
+                    "mode": mode,
+                    "exclude_current_session": True,
+                },
+            )
+        )
+
+        assert result["total_results"] == 0
+        assert result["results"] == []
+        assert result["degraded_to_fts"] is False
+
+    def test_excluding_the_only_explicit_scope_returns_an_empty_bounded_result(self, engine):
+        self._seed_two_sessions(engine)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {
+                    "query": "docker",
+                    "session_scope": "session",
+                    "session_id": "old-session",
+                    "exclude_session_ids": ["old-session"],
+                    "limit": 5,
+                },
+            )
+        )
+
+        assert result["limit"] == 5
+        assert result["total_results"] == 0
+        assert result["results"] == []
+
+    def test_rejects_non_list_session_exclusions(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "exclude_session_ids": "old-session"},
+            )
+        )
+
+        assert result == {"error": "exclude_session_ids must be an array of strings"}
+
+    @pytest.mark.parametrize("invalid_id", ["", "   ", 7, None])
+    def test_rejects_invalid_session_exclusion_entries(self, engine, invalid_id):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "exclude_session_ids": [invalid_id]},
+            )
+        )
+
+        assert result == {
+            "error": "exclude_session_ids must contain only non-empty strings"
+        }
+
+    def test_rejects_non_boolean_current_session_exclusion(self, engine):
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "docker", "exclude_current_session": "false"},
+            )
+        )
+
+        assert result == {"error": "exclude_current_session must be a boolean"}
 
     def test_session_scope_session_restricts_to_explicit_id(self, engine):
         self._seed_two_sessions(engine)

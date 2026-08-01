@@ -182,6 +182,165 @@ def test_recall_returns_cross_session_summaries_without_a_filter(recall_engine, 
     assert payload["provenance"]["arms_run"] == ["summary"]
 
 
+def test_recall_excludes_sessions_from_lexical_summary_and_chunk_candidates(
+    recall_engine, monkeypatch
+):
+    for session_id in (CURRENT, "session-a", "session-b"):
+        store_id = recall_engine._store.append(
+            session_id,
+            {"role": "user", "content": "kanban dashboard sprint retained detail"},
+        )
+        node_id = _add_summary(
+            recall_engine,
+            "kanban dashboard sprint retained summary",
+            session_id=session_id,
+            created_at=5.0,
+        )
+        _seed_summary_vectors(recall_engine, [(node_id, [1.0, 0.0])])
+        _seed_chunk_vectors(recall_engine, [(store_id, 0, 0, 39, [1.0, 0.0])])
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="all",
+        scope_bias=0.0,
+        limit=25,
+        exclude_current_session=True,
+        exclude_session_ids=["session-a"],
+    )
+
+    assert payload["hits"]
+    assert {hit["session_id"] for hit in payload["hits"]} == {"session-b"}
+    assert {arm for hit in payload["hits"] for arm in hit["arms"]} == {
+        "fts",
+        "summary",
+        "chunk",
+    }
+
+
+def test_recall_rejects_non_list_session_exclusions(recall_engine):
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "kanban", "exclude_session_ids": "session-a"},
+            engine=recall_engine,
+        )
+    )
+
+    assert payload == {"error": "exclude_session_ids must be an array of strings"}
+
+
+@pytest.mark.parametrize("invalid_id", ["", "   ", 7, None])
+def test_recall_rejects_invalid_session_exclusion_entries(recall_engine, invalid_id):
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "kanban", "exclude_session_ids": [invalid_id]},
+            engine=recall_engine,
+        )
+    )
+
+    assert payload == {
+        "error": "exclude_session_ids must contain only non-empty strings"
+    }
+
+
+def test_recall_excludes_sessions_before_the_summary_candidate_cap(
+    recall_engine, monkeypatch
+):
+    vectors = []
+    for index in range(50):
+        node_id = _add_summary(
+            recall_engine,
+            f"crowding summary {index}",
+            session_id="crowding-session",
+            created_at=float(index + 2),
+        )
+        vectors.append((node_id, [1.0, 0.0]))
+    kept = _add_summary(
+        recall_engine,
+        "eligible lower-ranked summary",
+        session_id="kept-session",
+        created_at=1.0,
+    )
+    vectors.append((kept, [0.5, 0.8660254]))
+    _seed_summary_vectors(recall_engine, vectors)
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="summaries",
+        scope_bias=0.0,
+        limit=1,
+        exclude_session_ids=["crowding-session"],
+    )
+
+    assert [hit["node_id"] for hit in payload["hits"]] == [kept]
+
+
+def test_recall_excludes_sessions_before_the_chunk_candidate_cap(
+    recall_engine, monkeypatch
+):
+    vectors = []
+    for index in range(50):
+        store_id = recall_engine._store.append(
+            "crowding-session",
+            {"role": "user", "content": f"unrelated crowding chunk {index}"},
+        )
+        vectors.append((store_id, 0, 0, 20, [1.0, 0.0]))
+    kept = recall_engine._store.append(
+        "kept-session",
+        {"role": "user", "content": "eligible lower-ranked chunk"},
+    )
+    vectors.append((kept, 0, 0, 20, [0.5, 0.8660254]))
+    _seed_chunk_vectors(recall_engine, vectors)
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="verbatim",
+        scope_bias=0.0,
+        limit=1,
+        exclude_session_ids=["crowding-session"],
+    )
+
+    assert [hit["store_id"] for hit in payload["hits"]] == [kept]
+
+
+def test_recall_rejects_non_boolean_current_session_exclusion(recall_engine):
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "kanban", "exclude_current_session": "false"},
+            engine=recall_engine,
+        )
+    )
+
+    assert payload == {"error": "exclude_current_session must be a boolean"}
+
+
+def test_recall_all_known_sessions_excluded_is_not_degraded(recall_engine, monkeypatch):
+    store_id = recall_engine._store.append(
+        CURRENT,
+        {"role": "user", "content": "kanban dashboard sprint detail"},
+    )
+    node_id = _add_summary(
+        recall_engine,
+        "kanban dashboard sprint summary",
+        session_id=CURRENT,
+        created_at=5.0,
+    )
+    _seed_summary_vectors(recall_engine, [(node_id, [1.0, 0.0])])
+    _seed_chunk_vectors(recall_engine, [(store_id, 0, 0, 30, [1.0, 0.0])])
+
+    payload = _recall(
+        recall_engine,
+        monkeypatch,
+        include="all",
+        exclude_current_session=True,
+    )
+
+    assert payload["hits"] == []
+    assert payload["degraded"] is False
+
+
 def test_scope_bias_boosts_current_conversation_without_filtering(recall_engine, monkeypatch):
     cross = _add_summary(recall_engine, "cross conversation kanban", session_id="session-a", created_at=5.0)
     here = _add_summary(recall_engine, "current conversation kanban", session_id=CURRENT, created_at=5.0)

@@ -90,6 +90,17 @@ LCM_GREP = {
                     "Must not be supplied with session_scope='current' or session_scope='all'."
                 ),
             },
+            "exclude_current_session": {
+                "type": "boolean",
+                "description": "Exclude results from the active session.",
+                "default": False,
+            },
+            "exclude_session_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Session ids to exclude from retrieval results.",
+                "default": [],
+            },
             "source": {
                 "type": "string",
                 "description": (
@@ -140,7 +151,8 @@ LCM_RECALL = {
         "expand a cross-session summary). Not for retrieving exact/verbatim text within a known time range — "
         "use lcm_grep(mode='full_text') for that. Not for full transcripts — after locating the right "
         "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
-        "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to."
+        "ranking boosts, not filters; explicit session exclusions are hard filters. For hard time bounds use "
+        "lcm_grep time_from/time_to."
     ),
     "parameters": {
         "type": "object",
@@ -161,8 +173,8 @@ LCM_RECALL = {
                 "type": "number",
                 "description": (
                     "Soft preference for the current conversation, 0..1 (default 0.5). 0 = global-neutral, "
-                    "1 = strongly prefer memories from the current conversation. This is a ranking boost, "
-                    "never a hard filter — cross-conversation memories always remain eligible."
+                    "1 = strongly prefer memories from the current conversation. This setting only changes "
+                    "ranking; explicit session exclusions remain hard filters."
                 ),
                 "default": 0.5,
             },
@@ -175,6 +187,17 @@ LCM_RECALL = {
                     "excerpts only."
                 ),
                 "default": "all",
+            },
+            "exclude_current_session": {
+                "type": "boolean",
+                "description": "Exclude results from the active session.",
+                "default": False,
+            },
+            "exclude_session_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Session ids to exclude from retrieval results.",
+                "default": [],
             },
         },
         "required": ["query"],
