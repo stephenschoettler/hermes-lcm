@@ -80,13 +80,13 @@ def _add_summary(engine, summary, *, session_id, created_at, latest_at=None):
     )
 
 
-def _seed_summary_vectors(engine, rows, *, provider="mock"):
+def _seed_summary_vectors(engine, rows, *, provider="mock", model="mock-model"):
     store = VectorStore(engine._store.db_path, config=engine._config)
     try:
-        store.register_profile("mock-model", provider, 2)
-        identity = store.capture_identity("mock-model", provider=provider)
+        store.register_profile(model, provider, 2)
+        identity = store.capture_identity(model, provider=provider)
         for node_id, vector in rows:
-            store.record_embedding(str(node_id), "summary", "mock-model", vector, identity=identity)
+            store.record_embedding(str(node_id), "summary", model, vector, identity=identity)
     finally:
         store.close()
 
@@ -496,6 +496,210 @@ def test_recall_uses_recall_timeout_budget(recall_engine, monkeypatch):
     payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=5)
     assert payload.get("timeout") is not True
     assert payload["hits"]
+
+
+def test_slow_fts_arm_cannot_starve_semantic_recall_and_rerank(recall_engine, monkeypatch):
+    """A slow first arm degrades alone instead of consuming the whole recall budget."""
+    recall_engine._config.recall_query_timeout_s = 8.0
+    recall_engine._config.embedding_provider = "voyage"
+    recall_engine._config.embedding_model = "voyage-4-large"
+    recall_engine._config.rerank_enabled = True
+    node = _add_summary(
+        recall_engine,
+        "semantic result survives slow full-text search",
+        session_id="session-a",
+        created_at=1.0,
+    )
+    _seed_summary_vectors(
+        recall_engine,
+        [(node, [1.0, 0.0])],
+        provider="voyage",
+        model="voyage-4-large",
+    )
+
+    clock = [100.0]
+    captured: dict[str, float] = {}
+
+    class VoyageProvider(MockProvider):
+        provider_id = "voyage"
+        model_id = "voyage-4-large"
+
+        def rerank(self, _query, documents, *, top_k=None, timeout, model="rerank-2.5-lite"):
+            return [(index, 1.0) for index, _document in enumerate(documents)]
+
+    provider = VoyageProvider()
+
+    def slow_fts(_engine, _query, *, candidate_limit, deadline):
+        del candidate_limit
+        captured["fts_deadline"] = deadline
+        clock[0] = deadline
+        return [], {"error": "full-text deadline exhausted", "timeout": True}
+
+    def summary_arm(_engine, **_kwargs):
+        return (
+            [
+                {
+                    "kind": "summary",
+                    "node_id": 1,
+                    "session_id": "session-a",
+                    "timestamp": 1.0,
+                    "snippet": "semantic result survives slow full-text search",
+                    "from_current_session": False,
+                    "expand_hint": "lcm_expand(node_id=1)",
+                }
+            ],
+            "full",
+            1,
+            1,
+        )
+
+    monkeypatch.setattr(lcm_tools.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(lcm_tools, "_resolve_recall_chunk_provider", lambda *_a, **_k: provider)
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", slow_fts)
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_summary_arm", summary_arm)
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_chunk_arm", lambda *_a, **_k: ([], "none", 0, 0))
+
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "semantic deadline fairness", "include": "all", "limit": 5},
+            engine=recall_engine,
+        )
+    )
+
+    assert captured["fts_deadline"] < 108.0
+    assert payload["provenance"]["arms_run"] == ["summary"]
+    assert payload["provenance"]["coverage"] == {
+        "fts": "none",
+        "summary": "full",
+        "chunk": "none",
+    }
+    assert payload["provenance"]["rerank"] == "applied"
+    assert payload["hits"][0]["node_id"] == 1
+    assert payload["degraded"] is True
+    assert payload["timeout"] is True
+
+
+@pytest.mark.parametrize(
+    ("configured_provider", "canonical_provider"),
+    [("voyageai", "voyage"), ("fast-embed", "fastembed")],
+)
+def test_provider_alias_uses_existing_vector_corpus_for_fts_fairness(
+    recall_engine,
+    monkeypatch,
+    configured_provider,
+    canonical_provider,
+):
+    """Supported provider aliases select the same corpus as provider resolution."""
+    recall_engine._config.recall_query_timeout_s = 8.0
+    recall_engine._config.embedding_provider = configured_provider
+    node = _add_summary(
+        recall_engine,
+        "semantic result behind the provider alias",
+        session_id="session-a",
+        created_at=1.0,
+    )
+    _seed_summary_vectors(
+        recall_engine,
+        [(node, [1.0, 0.0])],
+        provider=canonical_provider,
+    )
+
+    provider = MockProvider()
+    provider.provider_id = canonical_provider
+    clock = [100.0]
+    captured: dict[str, float] = {}
+
+    def fts_arm(_engine, _query, *, candidate_limit, deadline):
+        del candidate_limit
+        captured["fts_deadline"] = deadline
+        return [], None
+
+    monkeypatch.setattr(lcm_tools.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: provider)
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", fts_arm)
+
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "provider alias", "include": "all", "limit": 5},
+            engine=recall_engine,
+        )
+    )
+
+    assert captured["fts_deadline"] == 102.0
+    assert payload["provenance"]["coverage"]["summary"] == "full"
+    assert payload["hits"][0]["node_id"] == node
+
+
+@pytest.mark.parametrize(
+    ("embeddings_enabled", "provider_name", "model_name"),
+    [
+        (False, "voyage", "voyage-4-large"),
+        (True, "", ""),
+    ],
+)
+def test_fts_fallback_keeps_full_recall_budget_without_semantic_route(
+    recall_engine,
+    monkeypatch,
+    embeddings_enabled,
+    provider_name,
+    model_name,
+):
+    recall_engine._config.recall_query_timeout_s = 8.0
+    recall_engine._config.embeddings_enabled = embeddings_enabled
+    recall_engine._config.embedding_provider = provider_name
+    recall_engine._config.embedding_model = model_name
+
+    clock = [100.0]
+    captured: dict[str, float] = {}
+
+    def fts_arm(_engine, _query, *, candidate_limit, deadline):
+        del candidate_limit
+        captured["fts_deadline"] = deadline
+        return [], None
+
+    monkeypatch.setattr(lcm_tools.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: None)
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", fts_arm)
+
+    json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "fts fallback budget", "include": "all", "limit": 5},
+            engine=recall_engine,
+        )
+    )
+
+    assert captured["fts_deadline"] == 108.0
+
+
+def test_fts_keeps_full_budget_when_requested_vector_corpus_is_unbackfilled(
+    recall_engine,
+    monkeypatch,
+):
+    """Configured embeddings without requested vectors are still an FTS-only route."""
+    recall_engine._config.recall_query_timeout_s = 8.0
+
+    clock = [100.0]
+    captured: dict[str, float] = {}
+
+    def fts_arm(_engine, _query, *, candidate_limit, deadline):
+        del candidate_limit
+        captured["fts_deadline"] = deadline
+        return [], None
+
+    monkeypatch.setattr(lcm_tools.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", fts_arm)
+
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "fts fallback budget", "include": "verbatim", "limit": 5},
+            engine=recall_engine,
+        )
+    )
+
+    assert captured["fts_deadline"] == 108.0
+    assert payload["provenance"]["coverage"]["chunk"] == "none"
 
 
 def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch):
