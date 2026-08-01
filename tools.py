@@ -3050,6 +3050,10 @@ def _lcm_recall_rerank(
                 documents,
                 top_k=len(documents),
                 timeout=max(0.001, deadline - time.monotonic()),
+                model=(
+                    str(getattr(config, "rerank_model", "") or "").strip()
+                    or "rerank-2.5-lite"
+                ),
             ),
             remaining_s=deadline - time.monotonic(),
             name="lcm-recall-rerank",

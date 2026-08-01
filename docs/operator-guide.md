@@ -181,8 +181,10 @@ environment variables:
 | `LCM_EMBEDDING_STORE_DIM` | `0` | Optional Matryoshka truncation dimension for newly-registered profiles (`0` = full profile dim); truncated vectors are renormalized and are also a distinct profile identity |
 | `LCM_EMBEDDING_BINARY_PRESCREEN` | `false` | Write the sign-bit prescreen for float32 identities too (int8 identities always write it), unlocking the full-corpus two-stage KNN; flipping it on an already-populated identity mints a new, distinct identity rather than mutating the existing one |
 | `LCM_KNN_PRESCREEN_MULTIPLIER` | `4` | Stage-1 prescreen breadth for two-stage KNN: `M = multiplier × k` lowest-Hamming-distance survivors are exact-rescored |
+| `LCM_RERANK_ENABLED` | `false` | Let `lcm_recall` ask Voyage to rerank its bounded fused candidate window. Failures preserve the incoming RRF order; `lcm_grep` is unaffected |
+| `LCM_RERANK_MODEL` | `rerank-2.5-lite` | Voyage reranker model used by `lcm_recall`; set `rerank-2.5` for the quality-oriented model |
 | `LCM_PROACTIVE_RECALL_ENABLED` | `false` | Opt in to proactive memory injection: at assembly, embed the newest user message and inject one budget-capped "relevant memories" block (needs `LCM_EMBEDDINGS_ENABLED`). Default-off keeps assembly byte-identical |
-| `LCM_PROACTIVE_RECALL_MIN_SCORE` | `0.01` | Relevance floor for an injected memory. RRF-scale by default (a top-of-arm hit is ~0.016); with `LCM_RERANK_ENABLED` the score is a `[0,1]` cross-encoder relevance, so raise this (e.g. `0.3`) for a strict semantic gate |
+| `LCM_PROACTIVE_RECALL_MIN_SCORE` | `0.01` | Relevance floor for an injected memory on the RRF/composite scale (a top-of-arm hit is ~0.016). Reranking changes candidate order only and does not replace this score with Voyage's incompatible `0..1` relevance score |
 | `LCM_PROACTIVE_RECALL_BUDGET_TOKENS` | `500` | Hard token budget for the single injected block (1-3 items) |
 | `LCM_PROACTIVE_RECALL_PROVIDER` | empty | Embedding-provider override for the injection query only (e.g. keep a local `fastembed` provider offline even when search uses `voyage`). Empty reuses the main provider. The override provider must have embedded the corpus for its arms to return hits |
 | `LCM_DOCTOR_CLEAN_APPLY_ENABLED` | `false` | Permit destructive `/lcm doctor clean apply` in trusted operator contexts |

@@ -217,6 +217,29 @@ def test_min_score_floor_drops_weak_hits(tmp_path, provider):
     assert engine._proactive_recall_skipped_count == 1
 
 
+def test_rerank_keeps_proactive_floor_on_reported_rrf_score(tmp_path, monkeypatch, provider):
+    """Reranking changes order only; proactive recall still filters the score
+    reported by lcm_recall, which remains on the RRF/composite scale."""
+    engine = _make_engine(
+        tmp_path,
+        rerank_enabled=True,
+        proactive_recall_min_score=0.01,
+    )
+    monkeypatch.setattr(
+        lcm_tools,
+        "lcm_recall",
+        lambda *a, **k: (
+            '{"hits":[{"snippet":"useful older context",'
+            '"score":0.016,"from_current_session":false}]}'
+        ),
+    )
+
+    msg = engine._build_proactive_recall_message(_tail(), "user", set())
+
+    assert msg is not None
+    assert "useful older context" in msg["content"]
+
+
 # ── Budget cap ──
 
 

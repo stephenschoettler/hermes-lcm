@@ -327,6 +327,7 @@ def test_rerank_skips_silently_on_non_voyage_provider(recall_engine, monkeypatch
 
 def test_rerank_applies_and_reorders_with_voyage_provider(recall_engine, monkeypatch):
     recall_engine._config.rerank_enabled = True
+    recall_engine._config.rerank_model = "rerank-2.5"
     a = _add_summary(recall_engine, "kanban alpha", session_id="session-a", created_at=5.0)
     b = _add_summary(recall_engine, "kanban beta", session_id="session-b", created_at=5.0)
     # a is RRF rank 1, b rank 2 (seeded under the voyage identity the rerank
@@ -335,19 +336,23 @@ def test_rerank_applies_and_reorders_with_voyage_provider(recall_engine, monkeyp
 
     class RerankProvider(MockProvider):
         provider_id = "voyage"
+        observed_model = None
 
         def rerank(self, query, documents, *, top_k=None, timeout, model="rerank-2.5-lite"):
+            self.observed_model = model
             # Flip relevance: the LAST document scores highest (index i -> score i),
             # returned in descending-relevance order as the real API does.
             return sorted(
                 ((i, float(i)) for i in range(len(documents))), key=lambda item: -item[1]
             )
 
+    provider = RerankProvider()
     payload = _recall(
-        recall_engine, monkeypatch, provider=RerankProvider(), include="summaries", scope_bias=0.0, limit=5
+        recall_engine, monkeypatch, provider=provider, include="summaries", scope_bias=0.0, limit=5
     )
     assert payload["provenance"]["rerank"] == "applied"
     assert payload["hits"][0]["node_id"] == b
+    assert provider.observed_model == "rerank-2.5"
 
 
 def test_rerank_failure_falls_back_to_rrf_order(recall_engine, monkeypatch):
@@ -458,6 +463,13 @@ def test_recall_query_timeout_has_its_own_budget(monkeypatch, tmp_path):
     cfg = LCMConfig.from_env()
     assert cfg.recall_query_timeout_s == 12.5
     assert cfg.embedding_query_timeout_s == 3.0  # grep's deadline untouched
+
+
+def test_rerank_model_default_and_env_override(monkeypatch):
+    assert LCMConfig().rerank_model == "rerank-2.5-lite"
+
+    monkeypatch.setenv("LCM_RERANK_MODEL", "rerank-2.5")
+    assert LCMConfig.from_env().rerank_model == "rerank-2.5"
 
 
 def test_recall_arm_weights_default_and_env_lenient(monkeypatch, tmp_path):
