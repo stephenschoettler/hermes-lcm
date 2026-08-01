@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import heapq
 import json
 import logging
 import re
@@ -67,7 +68,14 @@ from .retrieval_core import (
     run_knn,
 )
 from .rollup_store import RollupStore
-from .search_query import AGE_DECAY_RATE, normalize_search_sort
+from .search_query import (
+    AGE_DECAY_RATE,
+    compute_directness_score,
+    extract_quoted_phrases,
+    extract_search_terms,
+    normalize_search_sort,
+    requires_like_fallback,
+)
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .sqlite_util import _sqlite_savepoint
 from .store import build_message_fts_spec
@@ -438,6 +446,11 @@ def _query_terms_for_match_window(query: str | None) -> list[str]:
             token = token.rsplit(":", 1)[-1]
         if len(token) >= 2:
             add_term(token)
+    if not terms and requires_like_fallback(query):
+        # LIKE supports exact raw terms that FTS/window tokenization cannot
+        # represent, notably emoji-only queries. Keep that literal intact so
+        # hydration can verify the same match and retain truthful offsets.
+        add_term(query)
     seen: set[str] = set()
     unique: list[str] = []
     for term in sorted(terms, key=len, reverse=True):
@@ -448,13 +461,149 @@ def _query_terms_for_match_window(query: str | None) -> list[str]:
     return unique
 
 
-def _content_offset_for_query_match(content: str, query: str | None) -> int:
-    folded = content.casefold()
+def _query_conjuncts_for_match_window(query: str | None) -> list[str]:
+    """Return lexical requirements for a simple implicit/explicit AND query."""
+    if not query or requires_like_fallback(query):
+        return []
+    quoted_phrases = [
+        phrase.strip() for phrase in re.findall(r'"([^"]+)"', query) if phrase.strip()
+    ]
+    unquoted = re.sub(r'"[^"]+"', " ", query)
+    tokens = re.findall(r"[\w][\w:-]*\*?", unquoted)
+    if any(token.upper() == "OR" for token in tokens):
+        # OR branches are alternatives, not a set of jointly required evidence.
+        return []
+
+    conjuncts = list(quoted_phrases)
+    skip_negated = False
+    for token in tokens:
+        operator = token.upper()
+        if operator == "NOT":
+            skip_negated = True
+            continue
+        if operator in {"AND", "NEAR"}:
+            continue
+        if skip_negated:
+            skip_negated = False
+            continue
+        token = token.rstrip("*").strip()
+        if ":" in token:
+            token = token.rsplit(":", 1)[-1]
+        if len(token) >= 2:
+            conjuncts.append(token)
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for conjunct in conjuncts:
+        key = conjunct.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(conjunct)
+    return unique
+
+
+def _content_offset_for_query_match_or_none(
+    content: str, query: str | None
+) -> int | None:
+    match = _query_match_span_or_none(content, query)
+    return None if match is None else match[0]
+
+
+def _casefold_with_original_offsets(text: str) -> tuple[str, list[int]]:
+    """Casefold text while retaining a map back to Python character offsets."""
+    folded_parts: list[str] = []
+    offsets: list[int] = []
+    for index, char in enumerate(text):
+        folded = char.casefold()
+        folded_parts.append(folded)
+        offsets.extend([index] * len(folded))
+    return "".join(folded_parts), offsets
+
+
+def _query_match_span_or_none(
+    content: str, query: str | None
+) -> tuple[int, int] | None:
+    """Return one verified query-match span in original character offsets."""
+    if not content or not query:
+        return None
+    folded, original_offsets = _casefold_with_original_offsets(content)
+    if not folded or not original_offsets:
+        return None
+    conjuncts = _query_conjuncts_for_match_window(query)
+    if conjuncts:
+        needles = [conjunct.casefold() for conjunct in conjuncts]
+        heap: list[tuple[int, int, int, int]] = []
+        max_end = 0
+        for needle_index, needle in enumerate(needles):
+            if not needle:
+                return None
+            folded_start = folded.find(needle)
+            if folded_start < 0:
+                return None
+            folded_end = folded_start + len(needle)
+            start = original_offsets[folded_start]
+            end = original_offsets[folded_end - 1] + 1
+            heapq.heappush(heap, (start, end, needle_index, folded_start))
+            max_end = max(max_end, end)
+
+        best: tuple[int, int] | None = None
+        while heap:
+            min_start, _end, needle_index, folded_start = heapq.heappop(heap)
+            candidate = (min_start, max_end)
+            if best is None or candidate[1] - candidate[0] < best[1] - best[0]:
+                best = candidate
+            needle = needles[needle_index]
+            next_folded_start = folded.find(needle, folded_start + 1)
+            if next_folded_start < 0:
+                break
+            next_folded_end = next_folded_start + len(needle)
+            next_start = original_offsets[next_folded_start]
+            next_end = original_offsets[next_folded_end - 1] + 1
+            heapq.heappush(
+                heap,
+                (next_start, next_end, needle_index, next_folded_start),
+            )
+            max_end = max(max_end, next_end)
+        return best
+
     for term in _query_terms_for_match_window(query):
-        index = folded.find(term.casefold())
-        if index >= 0:
-            return index
-    return 0
+        needle = term.casefold()
+        if not needle:
+            continue
+        folded_start = folded.find(needle)
+        if folded_start < 0:
+            continue
+        folded_end = folded_start + len(needle)
+        return original_offsets[folded_start], original_offsets[folded_end - 1] + 1
+    return None
+
+
+def _content_window_for_query_match_or_none(
+    content: str,
+    query: str | None,
+    *,
+    max_chars: int = _LCM_RECALL_SNIPPET_CHARS,
+) -> tuple[int, str] | None:
+    """Return a bounded evidence window that fully contains a verified match."""
+    match = _query_match_span_or_none(content, query)
+    if match is None:
+        return None
+    match_start, match_end = match
+    if match_end <= max_chars:
+        # Preserve the historical offset-0 window whenever the complete match
+        # fits; callers already rely on that compatibility behavior.
+        return 0, content[:max_chars]
+    if match_end - match_start > max_chars:
+        return None
+    window_start = match_start
+    window_end = min(len(content), window_start + max_chars)
+    if not (window_start <= match_start and match_end <= window_end):
+        return None
+    return window_start, content[window_start:window_end]
+
+
+def _content_offset_for_query_match(content: str, query: str | None) -> int:
+    return _content_offset_for_query_match_or_none(content, query) or 0
 
 
 def _full_content_slice(content: str, content_offset: int = 0) -> dict[str, Any]:
@@ -1820,6 +1969,8 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     current_session_id = engine.current_session_id
     has_current_session = bool(current_session_id)
     results: list[Dict[str, Any]] = []
+    search_failures: list[str] = []
+    message_search_coverage = "full"
 
     if content_scope in {"history", "both"}:
         try:
@@ -1834,6 +1985,9 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 time_from=time_from,
                 time_to=time_to,
             )
+            message_search_coverage = str(
+                getattr(msg_hits, "coverage", "full") or "full"
+            )
             for hit in msg_hits:
                 results.append(
                     _shape_message_hit(
@@ -1844,6 +1998,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 )
         except Exception as exc:
             logger.warning("Message search failed: %s", exc)
+            search_failures.append(f"message search failed: {exc}")
 
     # Summary-node search is intentionally current-session only. Cross-session
     # DAG expansion is deferred; returning summary hits without an expansion
@@ -1863,6 +2018,7 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 results.append(_shape_summary_hit(node))
         except Exception as exc:
             logger.warning("Node search failed: %s", exc)
+            search_failures.append(f"summary search failed: {exc}")
 
     externalized_scan: dict[str, Any] | None = None
     externalized_results_omitted = False
@@ -2102,6 +2258,12 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
         response["externalized_refs"] = externalized_refs
     if externalized_scan is not None:
         response["externalized_scan"] = externalized_scan
+    if search_failures:
+        response["degraded"] = True
+        response["degraded_reason"] = "; ".join(search_failures)
+        response["search_failures"] = search_failures
+    if str(args.get("mode") or "").lower() == "recall":
+        response["_message_search_coverage"] = message_search_coverage
     return json.dumps(response)
 
 
@@ -2828,20 +2990,264 @@ def _lcm_recall_excerpt_expand_hint(hit: dict[str, Any]) -> str:
     return f"lcm_expand(store_id={hit.get('store_id')}, content_offset={offset})"
 
 
+def _lcm_recall_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    if isinstance(value, str) and not value.strip().isdigit():
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _lcm_recall_require_deadline(deadline: float, stage: str) -> None:
+    if time.monotonic() >= deadline:
+        raise TimeoutError(f"citation hydration deadline exhausted during {stage}")
+
+
+def _lcm_recall_summary_source_ids(
+    engine: "LCMEngine",
+    node_id: Any,
+    *,
+    deadline: float,
+    max_nodes: int = 64,
+    max_sources: int = 64,
+) -> list[int]:
+    """Resolve one summary to bounded raw-source ids without trusting its refs."""
+    root = _lcm_recall_positive_int(node_id)
+    if root is None:
+        return []
+    queue = [root]
+    seen_nodes: set[int] = set()
+    source_ids: list[int] = []
+    while queue and len(seen_nodes) < max_nodes and len(source_ids) < max_sources:
+        _lcm_recall_require_deadline(deadline, "summary lineage lookup")
+        current = queue.pop(0)
+        if current in seen_nodes:
+            continue
+        seen_nodes.add(current)
+        try:
+            node = engine._dag.get_node(current)
+        except TimeoutError:
+            raise
+        except Exception:  # malformed/corrupt lineage is uncitable, not fatal
+            _lcm_recall_require_deadline(deadline, "summary lineage lookup")
+            continue
+        _lcm_recall_require_deadline(deadline, "summary lineage lookup")
+        if node is None or not isinstance(node.source_ids, list):
+            continue
+        if node.source_type == "messages":
+            for value in node.source_ids:
+                source_id = _lcm_recall_positive_int(value)
+                if source_id is not None and source_id not in source_ids:
+                    source_ids.append(source_id)
+                    if len(source_ids) >= max_sources:
+                        break
+        elif node.source_type == "nodes":
+            for value in node.source_ids:
+                child_id = _lcm_recall_positive_int(value)
+                if child_id is not None and child_id not in seen_nodes:
+                    queue.append(child_id)
+    return source_ids
+
+
+def _lcm_recall_relevant_summary_row(
+    rows: dict[int, dict[str, Any]],
+    candidate_ids: list[int],
+    *,
+    query: str,
+    matched_summary: str,
+    deadline: float,
+) -> dict[str, Any] | None:
+    """Choose query-relevant raw evidence; fail closed when none supports it."""
+    query_terms = extract_search_terms(query)
+    query_phrases = extract_quoted_phrases(query)
+    summary_terms = extract_search_terms(matched_summary)
+    summary_phrases = extract_quoted_phrases(matched_summary)
+    best: tuple[tuple[float, float, float, int], dict[str, Any]] | None = None
+    for index, source_id in enumerate(candidate_ids):
+        _lcm_recall_require_deadline(deadline, "summary evidence scoring")
+        row = rows.get(source_id)
+        if row is None:
+            continue
+        content = str(row.get("content") or "")
+        if not content:
+            continue
+        query_score = compute_directness_score(content, query_terms, query_phrases)
+        summary_score = compute_directness_score(
+            content, summary_terms, summary_phrases
+        )
+        if summary_score > 0:
+            rank = (2.0, summary_score, query_score, -index)
+        elif query_score > 0:
+            rank = (1.0, query_score, 0.0, -index)
+        else:
+            continue
+        if best is None or rank > best[0]:
+            best = (rank, row)
+    _lcm_recall_require_deadline(deadline, "summary evidence scoring")
+    return best[1] if best is not None else None
+
+
+def _lcm_recall_summary_evidence_window(
+    content: str,
+    matched_summary: str,
+) -> tuple[int, str] | None:
+    """Locate the tightest bounded window supported by the selected source row."""
+    folded_content = content.casefold()
+    overlapping_terms: list[str] = []
+    seen: set[str] = set()
+    for term in extract_search_terms(matched_summary):
+        cleaned = term.strip().replace('"', " ")
+        key = cleaned.casefold()
+        if not cleaned or key in seen or key not in folded_content:
+            continue
+        seen.add(key)
+        overlapping_terms.append(cleaned)
+    if not overlapping_terms:
+        return None
+    evidence_query = " AND ".join(f'"{term}"' for term in overlapping_terms)
+    return _content_window_for_query_match_or_none(content, evidence_query)
+
+
+def _lcm_recall_citable_hit(
+    engine: "LCMEngine",
+    hit: dict[str, Any],
+    *,
+    query: str,
+    deadline: float,
+) -> dict[str, Any] | None:
+    """Hydrate an untrusted candidate to one exact, expandable raw message."""
+    _lcm_recall_require_deadline(deadline, "candidate hydration")
+    matched_summary = str(
+        hit.get("_matched_summary") or hit.get("snippet") or ""
+    )
+    source_node_id: int | None = None
+    if hit.get("kind") == "summary":
+        source_node_id = _lcm_recall_positive_int(hit.get("node_id"))
+        candidate_ids = _lcm_recall_summary_source_ids(
+            engine, source_node_id, deadline=deadline
+        )
+    else:
+        store_id = _lcm_recall_positive_int(hit.get("store_id"))
+        candidate_ids = [store_id] if store_id is not None else []
+    if not candidate_ids:
+        return None
+    _lcm_recall_require_deadline(deadline, "message batch lookup")
+    try:
+        rows = engine._store.get_batch(candidate_ids)
+    except TimeoutError:
+        raise
+    except Exception:
+        return None
+    _lcm_recall_require_deadline(deadline, "message batch lookup")
+    if source_node_id is not None:
+        row = _lcm_recall_relevant_summary_row(
+            rows,
+            candidate_ids,
+            query=query,
+            matched_summary=matched_summary,
+            deadline=deadline,
+        )
+    else:
+        row = next(
+            (
+                rows[source_id]
+                for source_id in candidate_ids
+                if source_id in rows and str(rows[source_id].get("content") or "")
+            ),
+            None,
+        )
+    if row is None:
+        return None
+    store_id = _lcm_recall_positive_int(row.get("store_id"))
+    if store_id is None:
+        return None
+    content = str(row.get("content") or "")
+    if "chunk_span" in hit:
+        span = hit.get("chunk_span")
+        if not isinstance(span, dict):
+            return None
+        start = span.get("char_start")
+        end = span.get("char_end")
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or not 0 <= start < end <= len(content)
+        ):
+            return None
+        chunk_content = content[start:end]
+        if len(chunk_content) <= _LCM_RECALL_SNIPPET_CHARS:
+            # A valid chunk span is authoritative and can be cited whole.
+            content_offset = start
+            excerpt = chunk_content
+        else:
+            window = _content_window_for_query_match_or_none(chunk_content, query)
+            if window is None:
+                if source_node_id is not None:
+                    window = _lcm_recall_summary_evidence_window(
+                        chunk_content, matched_summary
+                    )
+                else:
+                    window = _content_window_for_query_match_or_none(
+                        chunk_content, str(hit.get("snippet") or "")
+                    )
+            if window is None:
+                return None
+            local_offset, excerpt = window
+            content_offset = start + local_offset
+    else:
+        window = _content_window_for_query_match_or_none(content, query)
+        if window is None and source_node_id is not None:
+            window = _lcm_recall_summary_evidence_window(
+                content, matched_summary
+            )
+        if window is None:
+            return None
+        content_offset, excerpt = window
+    if not excerpt:
+        return None
+    _lcm_recall_require_deadline(deadline, "candidate hydration")
+    citable = {
+        "kind": "message_excerpt",
+        "store_id": store_id,
+        "session_id": row.get("session_id"),
+        "timestamp": row.get("timestamp") or 0,
+        "snippet": excerpt,
+        "content_offset": content_offset,
+        "from_current_session": bool(engine.current_session_id)
+        and row.get("session_id") == engine.current_session_id,
+    }
+    if source_node_id is not None:
+        citable["source_node_id"] = source_node_id
+    citable["expand_hint"] = _lcm_recall_excerpt_expand_hint(citable)
+    citable["citation"] = {
+        "tool": "lcm_expand",
+        "store_id": store_id,
+        "content_offset": content_offset,
+    }
+    return citable
+
+
 def _lcm_recall_bounded_reason(
     arm: str, scanned: int | None, total: int | None
 ) -> str:
     """Degraded-reasons text for a ``coverage='bounded'`` arm (SCAN-1).
 
-    Names the arm and the scanned/total ratio so a caller can see that the arm
-    scored only the most-recent slice of the corpus (older archived vectors were
-    excluded by the recency-bounded candidate scan), rather than the truncation
-    being silent.
+    Names the arm and the scored/total ratio without assuming why coverage was
+    incomplete. Bounded candidate scans can exclude older vectors, while exact
+    scans can skip malformed live rows that cannot be scored.
     """
     if scanned is not None and total is not None:
         return (
-            f"{arm} arm coverage bounded: scored the {scanned} most-recent of "
-            f"{total} vectors (older vectors excluded)"
+            f"{arm} arm coverage bounded: scored {scanned} of {total} vectors; "
+            "some live vectors were excluded or unreadable"
         )
     return (
         f"{arm} arm coverage bounded: scored only the most-recent slice of the "
@@ -2882,6 +3288,14 @@ def _lcm_recall_fts_arm(
     )
     if "error" in payload:
         return [], payload
+    message_coverage = str(
+        payload.get("_message_search_coverage") or "full"
+    )
+    if payload.get("degraded"):
+        return [], {
+            "error": payload.get("degraded_reason") or "full-text search degraded",
+            "timeout": bool(payload.get("timeout")),
+        }
     hits: list[dict[str, Any]] = []
     for row in payload.get("results", []):
         store_id = row.get("store_id")
@@ -2900,6 +3314,8 @@ def _lcm_recall_fts_arm(
         }
         hit["expand_hint"] = _lcm_recall_excerpt_expand_hint(hit)
         hits.append(hit)
+    if message_coverage != "full":
+        return hits, {"coverage": message_coverage}
     return hits, None
 
 
@@ -2925,6 +3341,9 @@ def _lcm_recall_summary_arm(
             source=None,
             vector_store_cls=VectorStore,
             scan_rows=max(1, int(getattr(engine._config, "recall_scan_rows", 25_000))),
+            full_scan=bool(
+                getattr(engine._config, "recall_full_corpus_scan_enabled", True)
+            ),
         ),
         remaining_s=deadline - time.monotonic(),
         name="lcm-recall-summary-knn",
@@ -2951,6 +3370,7 @@ def _lcm_recall_summary_arm(
             "node_id": node.node_id,
             "session_id": node.session_id,
             "timestamp": node.latest_at or node.created_at or 0,
+            "_matched_summary": node.summary or "",
             "snippet": (node.summary or "")[:_LCM_RECALL_SNIPPET_CHARS],
             "from_current_session": bool(current) and node.session_id == current,
         }
@@ -2981,6 +3401,9 @@ def _lcm_recall_chunk_arm(
             source=None,
             vector_store_cls=VectorStore,
             scan_rows=max(1, int(getattr(engine._config, "recall_scan_rows", 25_000))),
+            full_scan=bool(
+                getattr(engine._config, "recall_full_corpus_scan_enabled", True)
+            ),
         ),
         remaining_s=deadline - time.monotonic(),
         name="lcm-recall-chunk-knn",
@@ -3104,6 +3527,17 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     include = str(args.get("include") or "all").strip().lower()
     if include not in _LCM_RECALL_VALID_INCLUDE:
         return json.dumps({"error": "include must be one of: all, summaries, verbatim"})
+    requested_detail = str(args.get("detail") or "snippets").strip().lower()
+    if requested_detail not in {"snippets", "answer_ready"}:
+        return json.dumps({"error": "detail must be one of: snippets, answer_ready"})
+    reference_strict_enabled = bool(
+        getattr(engine._config, "recall_reference_strict", True)
+    )
+    detail = (
+        requested_detail
+        if requested_detail != "answer_ready" or reference_strict_enabled
+        else "snippets"
+    )
 
     # lcm_recall fans out three arms + fusion/hydration/rerank, so it uses its own
     # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
@@ -3131,18 +3565,28 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # -- FTS arm (the default-on value: works with embeddings disabled) --
     if run_fts:
         try:
-            hits, fts_error = _lcm_recall_fts_arm(
+            hits, fts_status = _lcm_recall_fts_arm(
                 engine, query, candidate_limit=candidate_limit, deadline=deadline
             )
         except (_WorkerCapacityError, TimeoutError) as exc:
-            hits, fts_error = [], {"error": str(exc)}
-        if fts_error is not None:
+            hits, fts_status = [], {"error": str(exc)}
+        if fts_status is not None and "error" in fts_status:
             coverage["fts"] = "none"
             degraded_reasons.append("full-text arm unavailable")
-            timed_out = timed_out or bool(fts_error.get("timeout"))
+            timed_out = timed_out or bool(fts_status.get("timeout"))
         else:
             arm_hits["fts"] = hits
-            coverage["fts"] = "ok"
+            fts_coverage = (
+                str(fts_status.get("coverage") or "bounded")
+                if fts_status is not None
+                else "full"
+            )
+            coverage["fts"] = fts_coverage
+            if fts_coverage != "full":
+                degraded_reasons.append(
+                    "full-text arm coverage bounded: LIKE fallback did not scan "
+                    "the complete all-time candidate set"
+                )
 
     # -- Vector arms. Local/same-model corpora share one query embedding;
     # Voyage's context chunk corpus resolves and embeds with its own model. --
@@ -3245,6 +3689,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     except TimeoutError:
                         timed_out = True
                         coverage["summary"] = "none"
+                        degraded_reasons.append("summary arm timed out")
                     except Exception as exc:  # noqa: BLE001
                         coverage["summary"] = "none"
                         degraded_reasons.append(f"summary arm failed: {exc}")
@@ -3273,6 +3718,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                     except TimeoutError:
                         timed_out = True
                         coverage["chunk"] = "none"
+                        degraded_reasons.append("chunk arm timed out")
                     except Exception as exc:  # noqa: BLE001
                         coverage["chunk"] = "none"
                         degraded_reasons.append(f"chunk arm failed: {exc}")
@@ -3357,8 +3803,27 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # -- Response shaping (char-capped) --
     hits_out: list[dict[str, Any]] = []
     response_chars = 0
+    omitted_uncitable = 0
+    delivered_store_ids: set[int] = set()
     for entry in ordered:
         hit = entry["hit"]
+        if detail == "answer_ready":
+            try:
+                citable = _lcm_recall_citable_hit(
+                    engine, hit, query=query, deadline=deadline
+                )
+            except TimeoutError:
+                timed_out = True
+                degraded_reasons.append("citation hydration timed out")
+                break
+            if citable is None:
+                omitted_uncitable += 1
+                continue
+            store_id = int(citable["store_id"])
+            if store_id in delivered_store_ids:
+                continue
+            delivered_store_ids.add(store_id)
+            hit = citable
         arms = sorted({arm_order[index] for index in entry["ranks"].keys()})
         item: dict[str, Any] = {
             "kind": hit.get("kind"),
@@ -3376,6 +3841,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             item["store_id"] = hit.get("store_id")
             if hit.get("chunk_span"):
                 item["chunk_span"] = hit["chunk_span"]
+            if hit.get("source_node_id") is not None:
+                item["source_node_id"] = hit["source_node_id"]
+            if hit.get("citation"):
+                item["citation"] = hit["citation"]
         item_chars = len(json.dumps(item, ensure_ascii=False))
         if hits_out and response_chars + item_chars > _LCM_RECALL_RESPONSE_CHAR_CAP:
             break
@@ -3390,6 +3859,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         "limit": limit,
         "scope_bias": scope_bias,
         "include": include,
+        "detail": detail,
         "total_results": len(hits_out),
         "hits": hits_out,
         "provenance": {
@@ -3397,6 +3867,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             "arm_weights": {name: arm_weights[i] for i, name in enumerate(arm_order)},
             "coverage": coverage,
             "rerank": rerank_status,
+            "reference_strict": {
+                "enabled": reference_strict_enabled,
+                "omitted_uncitable": omitted_uncitable,
+            },
             "ordering": (
                 "rrf-fusion -> scope/recency prior -> rerank reorder (top window); "
                 "the reported score is the scope/recency-adjusted RRF score, and "

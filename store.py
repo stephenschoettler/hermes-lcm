@@ -59,6 +59,14 @@ _MESSAGE_SELECT_COLUMNS = (
 _UNKNOWN_SOURCE = "unknown"
 
 
+class _SearchHits(list[Dict[str, Any]]):
+    """List-compatible search results carrying corpus-coverage metadata."""
+
+    def __init__(self, rows=(), *, coverage: str = "full"):
+        super().__init__(rows)
+        self.coverage = coverage
+
+
 def _legacy_blank_source_clause(column: str) -> str:
     # SQLite TRIM() only strips spaces unless given an explicit character set.
     # Match Python's write-time `str.strip()` behavior for common ASCII whitespace
@@ -1071,7 +1079,7 @@ class MessageStore:
         terms = extract_search_terms(safe_query)
         phrases = extract_quoted_phrases(safe_query)
         if not terms:
-            return []
+            return _SearchHits(coverage="bounded")
         fetch_limit = compute_search_fetch_limit(limit, terms, phrases)
 
         where: list[str] = ["content IS NOT NULL"]
@@ -1296,7 +1304,7 @@ class MessageStore:
         results.sort(key=lambda result: _fallback_result_sort_key(result, sort))
         for result in results:
             result.pop("_fallback_score", None)
-        return results[:limit]
+        return _SearchHits(results[:limit], coverage="bounded")
 
     # -- Helpers ------------------------------------------------------------
 

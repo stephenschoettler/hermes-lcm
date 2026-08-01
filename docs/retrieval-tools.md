@@ -20,6 +20,32 @@ for earlier separate sessions or broad cross-session history.
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, message/frontier metadata, fresh tail, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. It returns metadata only; use `lcm_load_session`/`lcm_expand` when you need content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
 
+`lcm_recall` now scores each live summary/chunk vector exactly through a
+keyset-paginated, deadline-guarded scan. Its working set is capped at 1,024
+vectors per batch even when `LCM_RECALL_SCAN_ROWS` is larger; that setting still
+controls the legacy recency window and can reduce the exact-scan batch size.
+The FTS arm already searches the complete FTS index and reports `coverage='full'`.
+
+Set `detail='answer_ready'` when results will be used as evidence. Every delivered
+hit is then rehydrated from an existing raw `messages.store_id`; summary hits are
+resolved through at most 64 DAG nodes / 64 raw references and are represented by
+the exact raw excerpt rather than uncited summary prose. Missing rows, malformed
+ids/spans, corrupt lineage, and empty sources are omitted without crashing, and
+lower-ranked citable hits backfill the requested limit. Each delivered hit carries
+a structured `citation` for `lcm_expand(store_id=..., content_offset=...)`.
+
+The rollback boundary is explicit and process-local:
+
+```bash
+LCM_RECALL_FULL_CORPUS_SCAN_ENABLED=false
+LCM_RECALL_REFERENCE_STRICT=false
+```
+
+The first flag restores the prior recency-bounded vector scan. The second makes an
+`answer_ready` request fall back to legacy snippet shaping. Neither rollback writes
+the database or migrates stored data, so both changes are reversible by removing
+the variables and restarting the Hermes process.
+
 ### Retrieval contract
 
 LCM retrieval tools default to current-session scope. `lcm_grep` accepts
@@ -150,8 +176,9 @@ erroring the tool. `lcm_grep`'s hybrid RRF is unaffected: it keeps implicit
 actually applied to the arms that ran are echoed back under
 `provenance.arm_weights`.
 
-If the summary or chunk arm ran under `coverage='bounded'` (recency-truncated
-candidate scan) or `coverage='full_approx'` (two-stage binary-prescreen KNN,
+If the rollback configuration makes a summary or chunk arm run under
+`coverage='bounded'` (recency-truncated candidate scan) or `coverage='full_approx'`
+(two-stage binary-prescreen KNN,
 see [vector storage scale options](operator-guide.md#vector-storage-scale-options-v3)),
 `lcm_recall` surfaces that in its response `degraded_reason`, naming the arm and
 the caveat — the same disclosure mechanism as `lcm_grep`'s `degraded_reason` —

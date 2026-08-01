@@ -129,6 +129,40 @@ class TestChunkWriteAndKnn:
         finally:
             vs.close()
 
+    def test_full_scan_reaches_best_chunk_outside_recency_bound(self, tmp_path):
+        db_path = tmp_path / "lcm.db"
+        _seed_messages(
+            db_path,
+            [
+                (1, "s", "history", "user", "old exact match", 1.0),
+                (2, "s", "history", "user", "new distractor", 2.0),
+            ],
+        )
+        vs = VectorStore(db_path, bounded_scan_rows=1)
+        vs.register_profile(MODEL, PROVIDER, DIM, task="chunk")
+        try:
+            _write(vs, "1:0", 1, 0, [1.0, 0.0, 0.0, 0.0])
+            _write(vs, "2:0", 2, 0, [0.0, 1.0, 0.0, 0.0])
+
+            bounded = vs.knn_chunks(
+                [1.0, 0.0, 0.0, 0.0], k=1, model=MODEL, provider=PROVIDER
+            )
+            exhaustive = vs.knn_chunks(
+                [1.0, 0.0, 0.0, 0.0],
+                k=1,
+                model=MODEL,
+                provider=PROVIDER,
+                full_scan=True,
+            )
+
+            assert bounded.coverage == "bounded"
+            assert [row[0] for row in bounded] == ["2:0"]
+            assert exhaustive.coverage == "full"
+            assert exhaustive.scanned == exhaustive.total == 2
+            assert [row[0] for row in exhaustive] == ["1:0"]
+        finally:
+            vs.close()
+
     def test_numpy_absent_reports_full_when_scan_covers_corpus(
         self, store, monkeypatch
     ):

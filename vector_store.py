@@ -13,6 +13,7 @@ import math
 import sqlite3
 import struct
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -234,9 +235,10 @@ class KNNResult(list[tuple[str, float, str]]):
         super().__init__(rows)
         self.coverage = coverage
         self.reason = reason
-        # Bounded-coverage provenance: how many of the corpus's live vectors were
-        # actually scored (``scanned``) out of the total live for the identity
-        # (``total``), so a caller can surface partial-archive coverage (SCAN-1).
+        # Coverage provenance: how many of the corpus's live vectors were actually
+        # scored (``scanned``) out of the total live rows examined (``total``).
+        # This surfaces both recency bounds and malformed rows skipped by an exact
+        # full scan instead of overstating either path as complete.
         self.scanned = scanned
         self.total = total
 
@@ -1459,6 +1461,164 @@ class VectorStore:
             for _, embedded_id, score, kind in ranked[:limit]
         ]
 
+    def _full_scan_exact(
+        self,
+        *,
+        identity_hash: str,
+        dim: int,
+        dtype: str,
+        query: Sequence[float],
+        k: int,
+        chunk: bool,
+        deadline: float | None,
+    ) -> KNNResult:
+        """Score every live vector in bounded batches and retain exact top-k.
+
+        The keyset cursor prevents OFFSET rescans, while the fixed batch ceiling
+        bounds decoded-vector memory even when the legacy recency bound is large.
+        This path is intentionally filter-free: lcm_recall is the all-time,
+        all-conversation caller; filtered lcm_grep keeps its existing bounded
+        candidate contract. A read transaction holds one SQLite snapshot across
+        all batches, so concurrent writers cannot create a partial-corpus view.
+        """
+        try:
+            numpy = _load_numpy()
+        except ImportError:
+            numpy = None
+        query_array = (
+            numpy.asarray(query, dtype=numpy.float32)
+            if numpy is not None
+            else None
+        )
+        batch_size = min(1024, max(1, int(self.bounded_scan_rows or 1)))
+        last_rowid = 0
+        total = 0
+        scored = 0
+        skipped = 0
+        best: list[tuple[int, str, float, str]] = []
+        summary_columns = self._table_columns("summary_nodes")
+        suppression = (
+            " AND sn.suppressed_at IS NULL"
+            if "suppressed_at" in summary_columns
+            else ""
+        )
+        conn = self._conn
+        if conn is None:  # pragma: no cover - guarded by the public methods
+            return KNNResult(coverage="none")
+        started_read_transaction = not conn.in_transaction
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("full-corpus vector scan deadline exhausted")
+        if started_read_transaction:
+            conn.execute("BEGIN")
+        try:
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("full-corpus vector scan deadline exhausted")
+                if chunk:
+                    rows = conn.execute(
+                        """
+                        SELECT v.rowid, v.chunk_id AS embedded_id,
+                               'chunk' AS embedded_kind, v.vec
+                        FROM lcm_chunk_vectors v
+                        JOIN lcm_chunk_meta cm
+                          ON cm.chunk_id = v.chunk_id
+                         AND cm.identity_hash = v.identity_hash
+                        JOIN messages msg ON msg.store_id = cm.store_id
+                        WHERE v.identity_hash = ? AND cm.archived = 0 AND v.rowid > ?
+                        ORDER BY v.rowid ASC
+                        LIMIT ?
+                        """,
+                        (identity_hash, last_rowid, batch_size),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        f"""
+                        SELECT v.rowid, v.embedded_id, m.embedded_kind, v.vec
+                        FROM lcm_embedding_vectors v
+                        JOIN lcm_embedding_meta m
+                          ON m.embedded_id = v.embedded_id
+                         AND m.identity_hash = v.identity_hash
+                        JOIN summary_nodes sn
+                          ON sn.node_id = CAST(v.embedded_id AS INTEGER)
+                        WHERE v.identity_hash = ? AND m.archived = 0 AND v.rowid > ?
+                              {suppression}
+                        ORDER BY v.rowid ASC
+                        LIMIT ?
+                        """,
+                        (identity_hash, last_rowid, batch_size),
+                    ).fetchall()
+                if not rows:
+                    break
+                last_rowid = int(rows[-1]["rowid"])
+                total += len(rows)
+                rowids: list[int] = []
+                embedded_ids: list[str] = []
+                kinds: list[str] = []
+                vectors: list[tuple[float, ...]] = []
+                for index, row in enumerate(rows):
+                    if (
+                        deadline is not None
+                        and index % 64 == 0
+                        and time.monotonic() >= deadline
+                    ):
+                        raise TimeoutError("full-corpus vector scan deadline exhausted")
+                    try:
+                        vector = self._decode_stored_vec(bytes(row["vec"]), dim, dtype)
+                    except (TypeError, ValueError):
+                        skipped += 1
+                        continue
+                    if vector is None:
+                        skipped += 1
+                        continue
+                    rowids.append(int(row["rowid"]))
+                    embedded_ids.append(str(row["embedded_id"]))
+                    kinds.append(str(row["embedded_kind"]))
+                    vectors.append(vector)
+                scored += len(vectors)
+                if vectors:
+                    if numpy is not None:
+                        assert query_array is not None
+                        matrix = numpy.asarray(vectors, dtype=numpy.float32)
+                        batch_scores = matrix @ query_array
+                    else:
+                        batch_scores = [
+                            sum(
+                                value * query_value
+                                for value, query_value in zip(vector, query)
+                            )
+                            for vector in vectors
+                        ]
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("full-corpus vector scan deadline exhausted")
+                    batch_best = sorted(
+                        zip(rowids, embedded_ids, batch_scores, kinds),
+                        key=lambda row: (-float(row[2]), -int(row[0]), str(row[1])),
+                    )[:k]
+                    best = sorted(
+                        [*best, *batch_best],
+                        key=lambda row: (-float(row[2]), -int(row[0]), str(row[1])),
+                    )[:k]
+        finally:
+            # The caller may have installed a deadline progress handler. Once
+            # cleanup starts it must not interrupt ROLLBACK and strand this
+            # pooled connection on the scan's read snapshot.
+            conn.set_progress_handler(None, 0)
+            if conn.in_transaction:
+                conn.rollback()
+
+        candidates = [
+            (str(embedded_id), float(score), str(kind))
+            for _, embedded_id, score, kind in best
+        ]
+        coverage = "none" if not scored else "bounded" if skipped else "full"
+        return KNNResult(
+            candidates,
+            coverage=coverage,
+            reason="malformed_vectors_skipped" if skipped else None,
+            scanned=scored,
+            total=total,
+        )
+
     def _source_allowed_ids(self, table: str, source: str) -> set[str]:
         """Root candidate ids whose source subtree reaches a message with ``source``.
 
@@ -1852,6 +2012,8 @@ class VectorStore:
         conversation_ids: Sequence[str] | None = None,
         source: str | None = None,
         provider: str | None = None,
+        full_scan: bool = False,
+        deadline: float | None = None,
     ) -> KNNResult:
         k = int(k)
         if k <= 0:
@@ -1879,6 +2041,22 @@ class VectorStore:
         dim = int(profile["dim"])
         dtype = str(profile["dtype"])
         query = self._normalized(query_vec, expected_dim=dim)
+        if (
+            full_scan
+            and since is None
+            and until is None
+            and conversation_ids is None
+            and source is None
+        ):
+            return self._full_scan_exact(
+                identity_hash=identity,
+                dim=dim,
+                dtype=dtype,
+                query=query,
+                k=k,
+                chunk=False,
+                deadline=deadline,
+            )
         try:
             numpy = _load_numpy()
         except ImportError:
@@ -2381,6 +2559,8 @@ class VectorStore:
         conversation_ids: Sequence[str] | None = None,
         source: str | None = None,
         provider: str | None = None,
+        full_scan: bool = False,
+        deadline: float | None = None,
     ) -> KNNResult:
         """Bounded-candidate chunk KNN with the summary coverage contract.
 
@@ -2412,6 +2592,22 @@ class VectorStore:
         dim = int(profile["dim"])
         dtype = str(profile["dtype"])
         query = self._normalized(query_vec, expected_dim=dim)
+        if (
+            full_scan
+            and since is None
+            and until is None
+            and conversation_ids is None
+            and source is None
+        ):
+            return self._full_scan_exact(
+                identity_hash=identity,
+                dim=dim,
+                dtype=dtype,
+                query=query,
+                k=k,
+                chunk=True,
+                deadline=deadline,
+            )
         try:
             numpy = _load_numpy()
         except ImportError:

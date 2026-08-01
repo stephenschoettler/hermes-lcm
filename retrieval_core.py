@@ -118,7 +118,14 @@ def _run_pooled_knn(
             try:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("semantic vector search deadline exhausted")
-                return query(store)
+                try:
+                    return query(store)
+                except sqlite3.OperationalError as exc:
+                    if "interrupt" in str(exc).lower() or time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "semantic vector search deadline exhausted"
+                        ) from exc
+                    raise
             finally:
                 if vector_conn is not None:
                     vector_conn.set_progress_handler(None, 1000)
@@ -232,6 +239,7 @@ def run_knn(
     source: str | None,
     vector_store_cls: Any,
     scan_rows: int | None = None,
+    full_scan: bool = False,
 ) -> Any:
     """Run the vector KNN query inside the operation's absolute deadline.
 
@@ -257,6 +265,8 @@ def run_knn(
             until=until,
             conversation_ids=conversation_ids,
             source=source,
+            full_scan=full_scan,
+            deadline=deadline,
         ),
     )
 
@@ -274,6 +284,7 @@ def run_chunk_knn(
     source: str | None,
     vector_store_cls: Any,
     scan_rows: int | None = None,
+    full_scan: bool = False,
 ) -> Any:
     """Run the chunk-corpus KNN query inside the operation's absolute deadline.
 
@@ -299,6 +310,8 @@ def run_chunk_knn(
             until=until,
             conversation_ids=conversation_ids,
             source=source,
+            full_scan=full_scan,
+            deadline=deadline,
         ),
     )
 

@@ -176,6 +176,18 @@ LCM_RECALL = {
                 ),
                 "default": "all",
             },
+            "detail": {
+                "type": "string",
+                "enum": ["snippets", "answer_ready"],
+                "description": (
+                    "Delivery mode. 'snippets' (default) preserves ranked previews. "
+                    "'answer_ready' returns only excerpts rehydrated from existing raw "
+                    "message rows, with exact lcm_expand citations; malformed, stale, "
+                    "or otherwise uncitable candidates are omitted and lower-ranked "
+                    "citable candidates backfill the requested limit."
+                ),
+                "default": "snippets",
+            },
         },
         "required": ["query"],
     },

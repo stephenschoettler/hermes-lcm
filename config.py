@@ -353,6 +353,12 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
+    _EnvFieldSpec(
+        "recall_full_corpus_scan_enabled",
+        "LCM_RECALL_FULL_CORPUS_SCAN_ENABLED",
+        bool,
+    ),
+    _EnvFieldSpec("recall_reference_strict", "LCM_RECALL_REFERENCE_STRICT", bool),
     _EnvFieldSpec("proactive_recall_enabled", "LCM_PROACTIVE_RECALL_ENABLED", bool),
     _EnvFieldSpec("proactive_recall_min_score", "LCM_PROACTIVE_RECALL_MIN_SCORE", float),
     _EnvFieldSpec("proactive_recall_budget_tokens", "LCM_PROACTIVE_RECALL_BUDGET_TOKENS", int),
@@ -589,6 +595,12 @@ class LCMConfig:
     # (still deadline-guarded) lets recall cover a realistic forever-memory
     # corpus while capping worst-case cost on a very large one.
     recall_scan_rows: int = 25_000
+    # Exact, keyset-paginated whole-corpus scoring for lcm_recall vector arms.
+    # Disable to restore the previous recency-bounded scan immediately.
+    recall_full_corpus_scan_enabled: bool = True
+    # answer_ready delivery rehydrates every result to an existing raw store row
+    # and omits unresolved references. Disable to restore legacy snippet shaping.
+    recall_reference_strict: bool = True
     # Per-arm RRF fusion weights for lcm_recall's 3-arm hybrid (fts/summary/chunk).
     # Down-weighting the weak FTS arm keeps naive equal-weight fusion from dragging
     # fused recall below its best (vector) arm — measured −21 R@5 on LongMemEval.

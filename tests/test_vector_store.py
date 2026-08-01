@@ -391,6 +391,226 @@ def test_bounded_scan_uses_source_recency_after_newest_first_backfill(
         dag.close()
 
 
+def test_full_scan_reaches_best_vector_outside_recency_bound(tmp_path):
+    db_path = tmp_path / "full-scan.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        oldest = _add_summary(dag, created_at=1.0)
+        newest = _add_summary(dag, created_at=2.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, oldest, "summary", "full-scan", [1.0, 0.0])
+        _record_embedding(store, newest, "summary", "full-scan", [0.0, 1.0])
+
+        bounded = store.knn([1.0, 0.0], k=1, model="full-scan")
+        exhaustive = store.knn(
+            [1.0, 0.0],
+            k=1,
+            model="full-scan",
+            full_scan=True,
+        )
+
+        assert bounded.coverage == "bounded"
+        assert [row[0] for row in bounded] == [str(newest)]
+        assert exhaustive.coverage == "full"
+        assert exhaustive.reason is None
+        assert exhaustive.scanned == exhaustive.total == 2
+        assert [row[0] for row in exhaustive] == [str(oldest)]
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_full_scan_reports_incomplete_coverage_when_vector_decode_fails(tmp_path):
+    db_path = tmp_path / "full-scan-malformed.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        valid = _add_summary(dag, created_at=1.0)
+        malformed = _add_summary(dag, created_at=2.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, valid, "summary", "full-scan", [1.0, 0.0])
+        _record_embedding(store, malformed, "summary", "full-scan", [0.0, 1.0])
+        store.connection.execute(
+            "UPDATE lcm_embedding_vectors SET vec = ? WHERE embedded_id = ?",
+            (sqlite3.Binary(b"\x00"), str(malformed)),
+        )
+
+        result = store.knn(
+            [1.0, 0.0],
+            k=2,
+            model="full-scan",
+            full_scan=True,
+        )
+
+        assert result.coverage == "bounded"
+        assert result.reason == "malformed_vectors_skipped"
+        assert result.scanned == 1
+        assert result.total == 2
+        assert [row[0] for row in result] == [str(valid)]
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_full_scan_timeout_releases_read_snapshot(tmp_path, monkeypatch):
+    db_path = tmp_path / "full-scan-timeout.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        node_id = _add_summary(dag, created_at=1.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, node_id, "summary", "full-scan", [1.0, 0.0])
+        ticks = iter([0.0, 1.0])
+        monkeypatch.setattr(
+            vector_store_module.time, "monotonic", lambda: next(ticks, 1.0)
+        )
+
+        with pytest.raises(TimeoutError, match="deadline exhausted"):
+            store.knn(
+                [1.0, 0.0],
+                k=1,
+                model="full-scan",
+                full_scan=True,
+                deadline=0.5,
+            )
+        assert store.connection.in_transaction is False
+
+        monkeypatch.setattr(vector_store_module.time, "monotonic", lambda: 0.0)
+        recovered = store.knn(
+            [1.0, 0.0],
+            k=1,
+            model="full-scan",
+            full_scan=True,
+            deadline=1.0,
+        )
+        assert recovered.coverage == "full"
+        assert [row[0] for row in recovered] == [str(node_id)]
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_full_scan_timeout_clears_progress_handler_before_rollback_and_refreshes(
+    tmp_path, monkeypatch
+):
+    """An expired progress handler must not interrupt read-snapshot cleanup."""
+    db_path = tmp_path / "full-scan-progress-timeout.db"
+    dag = SummaryDAG(db_path)
+    real_connect = sqlite3.connect
+
+    class InterruptingRollbackConnection(sqlite3.Connection):
+        progress_handler_active = False
+
+        def set_progress_handler(self, progress_handler, n):
+            self.progress_handler_active = progress_handler is not None
+            return super().set_progress_handler(progress_handler, n)
+
+        def rollback(self):
+            if self.progress_handler_active:
+                raise sqlite3.OperationalError("interrupted")
+            return super().rollback()
+
+    def tracked_connect(*args, **kwargs):
+        kwargs["factory"] = InterruptingRollbackConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(vector_store_module.sqlite3, "connect", tracked_connect)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        first = _add_summary(dag, created_at=1.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, first, "summary", "full-scan", [1.0, 0.0])
+        store.connection.set_progress_handler(lambda: 0, 1000)
+        ticks = iter([0.0, 1.0])
+        monkeypatch.setattr(
+            vector_store_module.time, "monotonic", lambda: next(ticks, 1.0)
+        )
+
+        with pytest.raises(TimeoutError, match="deadline exhausted"):
+            store.knn(
+                [0.0, 1.0],
+                k=1,
+                model="full-scan",
+                full_scan=True,
+                deadline=0.5,
+            )
+        assert store.connection.in_transaction is False
+        assert store.connection.progress_handler_active is False
+
+        second = _add_summary(dag, created_at=2.0)
+        writer = VectorStore(db_path)
+        try:
+            _record_embedding(writer, second, "summary", "full-scan", [0.0, 1.0])
+        finally:
+            writer.close()
+
+        monkeypatch.setattr(vector_store_module.time, "monotonic", lambda: 0.0)
+        refreshed = store.knn(
+            [0.0, 1.0],
+            k=1,
+            model="full-scan",
+            full_scan=True,
+            deadline=1.0,
+        )
+        assert refreshed.coverage == "full"
+        assert [row[0] for row in refreshed] == [str(second)]
+        assert store.connection.in_transaction is False
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_full_scan_exception_releases_owned_read_transaction(tmp_path, monkeypatch):
+    db_path = tmp_path / "full-scan-exception.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        node_id = _add_summary(dag, created_at=1.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, node_id, "summary", "full-scan", [1.0, 0.0])
+
+        def fail_decode(*_args, **_kwargs):
+            raise RuntimeError("simulated decode failure")
+
+        monkeypatch.setattr(store, "_decode_stored_vec", fail_decode)
+        with pytest.raises(RuntimeError, match="simulated decode failure"):
+            store.knn(
+                [1.0, 0.0],
+                k=1,
+                model="full-scan",
+                full_scan=True,
+            )
+        assert store.connection.in_transaction is False
+    finally:
+        store.close()
+        dag.close()
+
+
+def test_full_scan_releases_preexisting_stale_read_transaction(tmp_path):
+    db_path = tmp_path / "full-scan-stale-transaction.db"
+    dag = SummaryDAG(db_path)
+    store = VectorStore(db_path, bounded_scan_rows=1)
+    try:
+        node_id = _add_summary(dag, created_at=1.0)
+        store.register_profile("full-scan", "local", 2)
+        _record_embedding(store, node_id, "summary", "full-scan", [1.0, 0.0])
+        store.connection.execute("BEGIN")
+        store.connection.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()
+
+        result = store.knn(
+            [1.0, 0.0],
+            k=1,
+            model="full-scan",
+            full_scan=True,
+        )
+
+        assert result.coverage == "full"
+        assert store.connection.in_transaction is False
+    finally:
+        store.close()
+        dag.close()
+
 
 def test_bounded_scan_keeps_null_latest_at_legacy_rows_by_created_at(
     tmp_path, monkeypatch
