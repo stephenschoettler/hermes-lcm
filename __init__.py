@@ -78,6 +78,55 @@ def _ensure_engine_bound_to_session(
         )
 
 
+def _session_context_value(name: str) -> str:
+    """Read task-local host session metadata with legacy env compatibility."""
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        return str(os.environ.get(name, "") or "")
+    try:
+        return str(get_session_env(name, "") or "")
+    except Exception:
+        # Once a concurrent host exposes task-local session context, never fall
+        # back to process-global env after a read failure: it may name another
+        # lane. Unbound is safer than cross-session command dispatch.
+        logger.debug("LCM plugin command could not read %s", name, exc_info=True)
+        return ""
+
+
+def _command_engine_for_current_session(engine, resolve_active_lcm_engine):
+    """Resolve the runtime serving the current plugin-command invocation.
+
+    Gateway hosts bind task-local session/lane metadata before dispatching a
+    plugin slash command. Prefer the already-active AIAgent clone registered for
+    that lane. If no clone exists yet, keep the process-wide prototype's genuine
+    ``(unbound)`` cold-start status rather than mutating shared runtime state.
+    """
+    session_id = _session_context_value("HERMES_SESSION_ID")
+    conversation_id = _session_context_value("HERMES_SESSION_KEY")
+    if session_id or conversation_id:
+        active_engine = resolve_active_lcm_engine(
+            session_id=session_id,
+            conversation_id=conversation_id,
+        )
+        if active_engine is not None:
+            return active_engine
+    return engine
+
+
+def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine):
+    def _handler(raw_args: str):
+        return handle_lcm_command(
+            raw_args,
+            _command_engine_for_current_session(
+                engine,
+                resolve_active_lcm_engine,
+            ),
+        )
+
+    return _handler
+
+
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
@@ -188,7 +237,11 @@ def register(ctx):
 
         register_command(
             "lcm",
-            lambda raw_args: handle_lcm_command(raw_args, engine),
+            _make_command_handler(
+                handle_lcm_command,
+                engine,
+                resolve_active_lcm_engine,
+            ),
             description="LCM status and diagnostics",
         )
     elif callable(register_command):

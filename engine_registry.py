@@ -44,6 +44,39 @@ def _engine_matches_conversation_binding(engine: Any, conversation_id: str) -> b
     )
 
 
+def _engine_matches_foreground_binding(
+    engine: Any,
+    session_id: str,
+    conversation_id: str,
+) -> bool:
+    """Return whether an engine's operator-facing foreground matches the lane.
+
+    A stateless/ignored side channel can temporarily own the engine's bound
+    session while ``current_session_id`` and ``current_conversation_id`` keep
+    pointing at the foreground conversation. The direct registries intentionally
+    follow the bound session for ingest dispatch, so operator commands need this
+    bounded fallback scan to recover the same clone without rebinding it.
+    """
+    if not _is_usable_lcm_engine(engine) or not (session_id or conversation_id):
+        return False
+    try:
+        foreground_session_id = str(
+            getattr(engine, "current_session_id", "") or ""
+        )
+        foreground_conversation_id = str(
+            getattr(engine, "current_conversation_id", "") or ""
+        )
+    except Exception:
+        return False
+    return bool(
+        (not session_id or foreground_session_id == session_id)
+        and (
+            not conversation_id
+            or foreground_conversation_id == conversation_id
+        )
+    )
+
+
 def _remove_registry_entries_for_engine(
     engine: Any,
     *,
@@ -92,4 +125,24 @@ def resolve_active_lcm_engine(session_id: str = "", conversation_id: str = "") -
                 return engine
             if engine is not None and not conversation_matches:
                 _ACTIVE_ENGINES_BY_CONVERSATION_ID.pop(conversation_id, None)
+        # Direct lookups above follow the engine's actively-bound ingest lane.
+        # If that lane is a side channel, find the same engine by its stable
+        # operator-facing foreground view. Registry size is bounded by live
+        # AIAgent clones and values are weak, so this scan does not retain stale
+        # runtimes or grow with historical sessions.
+        seen: set[int] = set()
+        for engine in (
+            list(_ACTIVE_ENGINES_BY_SESSION_ID.values())
+            + list(_ACTIVE_ENGINES_BY_CONVERSATION_ID.values())
+        ):
+            engine_id = id(engine)
+            if engine_id in seen:
+                continue
+            seen.add(engine_id)
+            if _engine_matches_foreground_binding(
+                engine,
+                session_id,
+                conversation_id,
+            ):
+                return engine
     return None
