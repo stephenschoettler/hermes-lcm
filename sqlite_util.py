@@ -8,10 +8,15 @@ example the session-end timeout budget).
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from typing import Iterator, List
+from typing import Callable, Iterator, List, TypeVar
+
+
+_T = TypeVar("_T")
+logger = logging.getLogger(__name__)
 
 
 def _is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -25,6 +30,59 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _is_sqlite_busy_snapshot_error(exc: BaseException) -> bool:
+    """Return True only for SQLite's stale read-snapshot write-upgrade error."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if (
+            isinstance(current, sqlite3.Error)
+            and getattr(current, "sqlite_errorcode", None)
+            == sqlite3.SQLITE_BUSY_SNAPSHOT
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _run_sqlite_write_with_snapshot_retry(
+    conn: sqlite3.Connection,
+    operation: Callable[[], _T],
+    *,
+    operation_name: str,
+) -> _T:
+    """Run one write transaction, retrying one stale-snapshot upgrade.
+
+    ``SQLITE_BUSY_SNAPSHOT`` cannot be fixed by waiting: the connection must
+    roll back its old read snapshot and begin the write from current state.
+    Retrying the complete transaction once is safe for bounded deterministic
+    LCM writes. Ordinary ``SQLITE_BUSY`` already receives SQLite's configured
+    busy timeout and is not multiplied here.
+    """
+    for attempt in range(2):
+        try:
+            with conn:
+                return operation()
+        except sqlite3.Error as exc:
+            # ``Connection.__exit__`` normally rolled back already. Keep this
+            # explicit so every error path leaves a reusable clean connection.
+            if conn.in_transaction:
+                conn.rollback()
+            if attempt == 0 and _is_sqlite_busy_snapshot_error(exc):
+                continue
+            if _is_sqlite_locked_error(exc):
+                logger.warning(
+                    "SQLite write lock recovery exhausted "
+                    "(operation=%s, code=%s, name=%s)",
+                    operation_name,
+                    getattr(exc, "sqlite_errorcode", None),
+                    getattr(exc, "sqlite_errorname", None),
+                )
+            raise
+    raise AssertionError("unreachable SQLite write retry state")
 
 
 def _sqlite_busy_timeout_ms(conn: sqlite3.Connection) -> int:

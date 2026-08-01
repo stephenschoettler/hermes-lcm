@@ -46,6 +46,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_util import _run_sqlite_write_with_snapshot_retry
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -379,13 +380,17 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
-        ids = []
-        with self._write_lock, self._conn:
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("MessageStore connection is closed")
+
+        def insert_messages() -> List[int]:
+            ids: List[int] = []
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
-                cur = self._conn.execute(
+                cur = conn.execute(
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned)
@@ -404,8 +409,17 @@ class MessageStore:
                         0,
                     ),
                 )
-                ids.append(cur.lastrowid)
-        return ids
+                if cur.lastrowid is None:
+                    raise RuntimeError("SQLite did not return a message id")
+                ids.append(int(cur.lastrowid))
+            return ids
+
+        with self._write_lock:
+            return _run_sqlite_write_with_snapshot_retry(
+                conn,
+                insert_messages,
+                operation_name="message_store.append_protected_batch",
+            )
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""

@@ -29,6 +29,7 @@ from hermes_lcm.db_bootstrap import (
     ensure_external_content_fts,
 )
 from hermes_lcm.search_query import sanitize_fts5_query
+from hermes_lcm.sqlite_util import _run_sqlite_write_with_snapshot_retry
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
     compile_session_pattern,
@@ -1314,6 +1315,65 @@ class TestMessageStore:
         ids = store.append_batch("sess1", msgs, [1, 2, 3])
         assert len(ids) == 3
         assert ids[0] < ids[1] < ids[2]
+
+    def test_append_batch_retries_after_stale_read_snapshot(self, tmp_path):
+        db_path = tmp_path / "append-snapshot-retry.db"
+        store = MessageStore(db_path)
+        writer = sqlite3.connect(db_path)
+        try:
+            store.connection.execute("BEGIN")
+            store.connection.execute("SELECT COUNT(*) FROM messages").fetchone()
+            writer.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('other-writer', 'advanced')"
+            )
+            writer.commit()
+
+            ids = store._append_protected_batch(
+                "snapshot",
+                [{"role": "user", "content": "retry on a fresh transaction"}],
+            )
+
+            assert len(ids) == 1
+            assert store.connection.in_transaction is False
+            assert store.get(ids[0])["content"] == "retry on a fresh transaction"
+        finally:
+            writer.close()
+            store.close()
+
+    def test_write_snapshot_retry_does_not_retry_ordinary_busy(self, tmp_path, caplog):
+        db_path = tmp_path / "append-ordinary-busy.db"
+        store = MessageStore(db_path)
+        store.connection.execute("PRAGMA busy_timeout=25")
+        holder = sqlite3.connect(db_path, timeout=0.025)
+        holder.execute("PRAGMA busy_timeout=25")
+        holder.execute("BEGIN IMMEDIATE")
+        attempts = 0
+
+        def blocked_write():
+            nonlocal attempts
+            attempts += 1
+            store.connection.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('victim', 'blocked')"
+            )
+
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked") as exc_info:
+                _run_sqlite_write_with_snapshot_retry(
+                    store.connection,
+                    blocked_write,
+                    operation_name="test.ordinary_busy",
+                )
+
+            assert exc_info.value.sqlite_errorcode == sqlite3.SQLITE_BUSY
+            assert attempts == 1
+            assert store.connection.in_transaction is False
+            assert "operation=test.ordinary_busy" in caplog.text
+            assert "code=5" in caplog.text
+            assert "name=SQLITE_BUSY" in caplog.text
+        finally:
+            holder.rollback()
+            holder.close()
+            store.close()
 
     def test_append_batch_accepts_content_parts(self, store):
         msgs = [
@@ -3249,6 +3309,64 @@ class TestSummaryDAG:
         self._assert_write_lock_obtainable(db_path)
 
         dag.close()
+
+    def test_add_node_lock_failure_rolls_back_connection(self, tmp_path, caplog):
+        db_path = tmp_path / "add-node-lock-cleanup.db"
+        dag = SummaryDAG(db_path)
+        dag.connection.execute("PRAGMA busy_timeout=25")
+        holder = sqlite3.connect(db_path, timeout=0.025)
+        holder.execute("PRAGMA busy_timeout=25")
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                dag.add_node(
+                    SummaryNode(
+                        session_id="locked",
+                        depth=0,
+                        summary="must roll back",
+                        token_count=3,
+                        source_ids=[1],
+                        source_type="messages",
+                    )
+                )
+            assert dag.connection.in_transaction is False
+            assert "operation=summary_dag.add_node" in caplog.text
+            assert "code=5" in caplog.text
+            assert "name=SQLITE_BUSY" in caplog.text
+        finally:
+            holder.rollback()
+            holder.close()
+            dag.close()
+
+    def test_add_node_retries_after_stale_read_snapshot(self, tmp_path):
+        db_path = tmp_path / "add-node-snapshot-retry.db"
+        dag = SummaryDAG(db_path)
+        writer = sqlite3.connect(db_path)
+        try:
+            dag.connection.execute("BEGIN")
+            dag.connection.execute("SELECT COUNT(*) FROM summary_nodes").fetchone()
+            writer.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('other-writer', 'advanced')"
+            )
+            writer.commit()
+
+            node_id = dag.add_node(
+                SummaryNode(
+                    session_id="snapshot",
+                    depth=0,
+                    summary="retry on a fresh transaction",
+                    token_count=6,
+                    source_ids=[1],
+                    source_type="messages",
+                )
+            )
+
+            assert node_id > 0
+            assert dag.connection.in_transaction is False
+            assert dag.get_node(node_id).summary == "retry on a fresh transaction"
+        finally:
+            writer.close()
+            dag.close()
 
     def test_add_and_get(self, dag):
         node = SummaryNode(
