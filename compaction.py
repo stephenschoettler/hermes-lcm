@@ -318,15 +318,36 @@ class CompactionMixin:
             working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
         else:
             working_leaf_chunk_tokens = self._config.leaf_chunk_tokens
+            ctx_cap = self._context_aware_leaf_cap()
+            if ctx_cap is not None and working_leaf_chunk_tokens > ctx_cap:
+                working_leaf_chunk_tokens = ctx_cap
         if raw_tokens_outside_tail < working_leaf_chunk_tokens:
             return False, "raw backlog outside fresh tail is below leaf chunk threshold"
         return True, "eligible raw backlog outside fresh tail"
 
+    def _context_aware_leaf_cap(self) -> int | None:
+        """Return a context-proportional cap for leaf chunk sizing.
+
+        When context_length is known, leaf chunks should never exceed
+        ~40% of the model window — otherwise the fresh tail alone can
+        consume the entire context and compression becomes impossible.
+        Returns None when context_length is unknown (no clamping).
+        """
+        ctx = getattr(self, "context_length", 0) or 0
+        if ctx <= 0:
+            return None
+        return max(1, int(ctx * 0.4))
+
     def _working_leaf_chunk_tokens(self, raw_tokens_outside_tail: int) -> int:
         base = max(1, self._config.leaf_chunk_tokens)
+        ctx_cap = self._context_aware_leaf_cap()
+        if ctx_cap is not None and base > ctx_cap:
+            base = ctx_cap
         if not self._config.dynamic_leaf_chunk_enabled:
             return base
         ceiling = max(base, self._config.dynamic_leaf_chunk_max)
+        if ctx_cap is not None and ceiling > ctx_cap:
+            ceiling = ctx_cap
         working = base
         while working < ceiling and raw_tokens_outside_tail > working * 2:
             working = min(ceiling, working * 2)
