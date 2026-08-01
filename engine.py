@@ -4636,6 +4636,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             protected_messages,
         ):
             if self._protected_message_uses_raw_payload_active_stub(protected_msg):
+                # Assistant messages must keep their original content in the
+                # active replay: the host renders active_replay_messages to the
+                # user and feeds it back to the model.  Replacing an assistant
+                # response with a placeholder makes the agent's own reasoning
+                # invisible to both.  The store still holds the externalized
+                # version for durable recovery via lcm_expand.
+                _orig_role = str(active_replay_messages[absolute_idx].get("role") or "")
+                if _orig_role == "assistant":
+                    continue
                 if active_replay_messages is replay_messages:
                     active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
                         replay_messages
