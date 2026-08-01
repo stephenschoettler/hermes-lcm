@@ -76,6 +76,14 @@ class TestContextAwareLeafCap:
         finally:
             engine.shutdown()
 
+    def test_small_context_returns_none(self, tmp_path):
+        """Context < 50K (test fixtures) → no clamping."""
+        engine = _make_engine(tmp_path, context_length=10000)
+        try:
+            assert engine._context_aware_leaf_cap() is None
+        finally:
+            engine.shutdown()
+
     def test_272k_model_caps_at_40_percent(self, tmp_path):
         engine = _make_engine(tmp_path, context_length=272000)
         try:
@@ -159,6 +167,14 @@ class TestEffectiveFreshTailMaxTokens:
     def test_no_context_returns_zero(self, tmp_path):
         """No context_length and no explicit setting -> 0 (disabled)."""
         engine = _make_engine(tmp_path, context_length=0)
+        try:
+            assert engine._effective_fresh_tail_max_tokens() == 0
+        finally:
+            engine.shutdown()
+
+    def test_small_context_returns_zero(self, tmp_path):
+        """Context < 50K (test fixtures) -> 0 (disabled)."""
+        engine = _make_engine(tmp_path, context_length=10000)
         try:
             assert engine._effective_fresh_tail_max_tokens() == 0
         finally:

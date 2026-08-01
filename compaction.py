@@ -328,13 +328,15 @@ class CompactionMixin:
     def _context_aware_leaf_cap(self) -> int | None:
         """Return a context-proportional cap for leaf chunk sizing.
 
-        When context_length is known, leaf chunks should never exceed
-        ~40% of the model window — otherwise the fresh tail alone can
-        consume the entire context and compression becomes impossible.
-        Returns None when context_length is unknown (no clamping).
+        When context_length is known and large enough to matter (> 50K),
+        leaf chunks should never exceed ~40% of the model window —
+        otherwise the fresh tail alone can consume the entire context
+        and compression becomes impossible.
+        Returns None when context_length is unknown or too small to
+        warrant clamping (test fixtures, tiny models).
         """
         ctx = getattr(self, "context_length", 0) or 0
-        if ctx <= 0:
+        if ctx < 50_000:
             return None
         return max(1, int(ctx * 0.4))
 

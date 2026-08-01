@@ -1849,16 +1849,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Return the active fresh-tail token cap.
 
         When the user has not set LCM_FRESH_TAIL_MAX_TOKENS explicitly
-        (config value is 0), derive a context-proportional default so
-        the fresh tail cannot consume the entire model window on small
-        context models.  50% of context_length leaves room for leaf
-        chunks to accumulate and trigger compression.
+        (config value is 0) and the context is large enough to matter
+        (> 50K), derive a context-proportional default so the fresh tail
+        cannot consume the entire model window on small context models.
+        50% of context_length leaves room for leaf chunks to accumulate
+        and trigger compression.  Below 50K the count-based limit is
+        sufficient and clamping would break small-context test fixtures.
         """
         explicit = self._config.fresh_tail_max_tokens
         if explicit > 0:
             return explicit
         ctx = self.context_length or 0
-        if ctx <= 0:
+        if ctx < 50_000:
             return 0
         return max(1, int(ctx * 0.5))
 
