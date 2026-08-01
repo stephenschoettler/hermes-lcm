@@ -128,11 +128,16 @@ def _require_engine(kwargs: Dict[str, Any]) -> "LCMEngine | None":
     return engine if engine is not None else None
 
 
-def _get_session_node(engine: "LCMEngine", node_id: int):
+def _get_session_node(engine: "LCMEngine", node_id: int, session_id: str | None = None):
+    target_session_id = engine.current_session_id if session_id is None else session_id
     node = engine._dag.get_node(node_id)
-    if node is None or node.session_id != engine.current_session_id:
+    if node is None or node.session_id != target_session_id:
         return None
     return node
+
+
+def _session_expand_hint(node_id: int, session_id: str) -> str:
+    return f"lcm_expand(node_id={node_id}, session_id={session_id!r})"
 
 
 def _get_externalized_payload(
@@ -279,6 +284,7 @@ _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS = 20_000
 _LCM_RECENT_MAX_RESPONSE_CHARS = _LCM_LOAD_SESSION_HARD_MAX_CONTENT_CHARS
 _LCM_INSPECT_DEFAULT_LIMIT = 20
 _LCM_INSPECT_HARD_LIMIT_CAP = 200
+_LCM_EXPAND_QUERY_SESSION_ID_CAP = 20
 _LCM_INSPECT_REF_SCAN_MESSAGE_LIMIT = 10_000
 _LCM_INSPECT_PAYLOAD_METADATA_READ_BYTES = 16_384
 _LCM_INSPECT_MAX_RESPONSE_CHARS = 20_000
@@ -698,11 +704,11 @@ def _expand_child_nodes(
         source_limit = remaining_source_count
     else:
         source_limit = min(max(0, source_limit), remaining_source_count)
-    selected_source_ids = node.source_ids[source_offset:source_offset + source_limit]
+    selected_source_ids = node.source_ids[source_offset : source_offset + source_limit]
     children: list[tuple[int, Any]] = []
     for relative_index, child_id in enumerate(selected_source_ids):
         child = engine._dag.get_node(child_id)
-        if child is None or child.session_id != engine.current_session_id:
+        if child is None or child.session_id != node.session_id:
             continue
         children.append((source_offset + relative_index, child))
 
@@ -719,14 +725,17 @@ def _expand_child_nodes(
                 next_source_offset = source_index
                 has_more = True
                 break
-            summary, summary_truncated = _truncate_text_to_token_budget(summary, remaining_tokens)
+            summary, summary_truncated = _truncate_text_to_token_budget(
+                summary, remaining_tokens
+            )
         expanded.append(
             {
                 "node_id": child.node_id,
                 "source_index": source_index,
                 "depth": child.depth,
                 "summary": summary[:1000] if max_tokens is None else summary,
-                "summary_truncated": summary_truncated or (max_tokens is None and len(child.summary) > 1000),
+                "summary_truncated": summary_truncated
+                or (max_tokens is None and len(child.summary) > 1000),
                 "token_count": child.token_count,
                 "source_token_count": child.source_token_count,
                 "expand_hint": child.expand_hint,
@@ -805,14 +814,17 @@ def _collect_descendant_evidence_blocks(
         stack.append((current, current_path, current_visited, source_index + 1))
         child_id = current.source_ids[source_index]
         child = engine._dag.get_node(child_id)
-        if child is None or child.session_id != engine.current_session_id:
+        if child is None or child.session_id != current.session_id:
             continue
         child_node_id = int(child.node_id)
         if child_node_id in current_visited:
             continue
 
         remaining_node_visits[0] -= 1
-        child_path = [*current_path, {"node_id": int(current.node_id), "source_index": source_index}]
+        child_path = [
+            *current_path,
+            {"node_id": int(current.node_id), "source_index": source_index},
+        ]
         remaining_tokens = max(0, max_tokens - budget_used)
         if child.source_type == "messages":
             messages, pagination = _expand_message_sources(
@@ -837,7 +849,9 @@ def _collect_descendant_evidence_blocks(
             continue
 
         if child.source_type == "nodes":
-            children, pagination = _expand_child_nodes(engine, child, max_tokens=remaining_tokens)
+            children, pagination = _expand_child_nodes(
+                engine, child, max_tokens=remaining_tokens
+            )
             if children or pagination.get("has_more"):
                 block = {
                     "type": "descendant_child_nodes",
@@ -1034,6 +1048,12 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
         elif block.get("type") in {"child_nodes", "descendant_child_nodes"}:
             total += sum(count_tokens(str(child.get("summary") or "")) for child in block.get("children", []))
     return total
+
+
+def _serialized_context_token_count(blocks: list[dict[str, Any]]) -> int:
+    from .tokens import count_tokens
+
+    return count_tokens(json.dumps(blocks, ensure_ascii=False))
 
 
 def _synthesize_expansion_answer(
@@ -2815,12 +2835,12 @@ def _lcm_recall_recency_boost(timestamp: Any, *, now: float) -> float:
 
 
 def _lcm_recall_summary_expand_hint(hit: dict[str, Any]) -> str:
-    # Cross-session summary/DAG expansion is deferred (lcm_expand node_id is
-    # current-session only), so a cross-session summary points at the session
-    # loader instead of a node handle it cannot expand.
     if hit.get("from_current_session"):
         return f"lcm_expand(node_id={hit.get('node_id')})"
-    return f"lcm_load_session(session_id='{hit.get('session_id') or ''}')"
+    return (
+        f"lcm_expand(node_id={hit.get('node_id')}, "
+        f"session_id='{hit.get('session_id') or ''}')"
+    )
 
 
 def _lcm_recall_excerpt_expand_hint(hit: dict[str, Any]) -> str:
@@ -3425,7 +3445,11 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
-            return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+            return json.dumps(
+                {
+                    "error": f"Externalized payload {externalized_ref} not found in current session"
+                }
+            )
         return json.dumps(
             {
                 "externalized_ref": externalized_ref,
@@ -3442,13 +3466,30 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
         )
 
     node_id = args.get("node_id")
-    session_id = engine.current_session_id
+    session_id_explicit = "session_id" in args
+    session_id_arg = args.get("session_id")
+    if session_id_explicit:
+        if not isinstance(session_id_arg, str) or not session_id_arg.strip():
+            return json.dumps({"error": "session_id must be a non-empty string"})
+        session_id = session_id_arg.strip()
+    else:
+        session_id = engine.current_session_id
 
     if node_id is not None:
-        node = _get_session_node(engine, node_id)
+        node = _get_session_node(engine, node_id, session_id)
         if node is None:
-            return json.dumps({"error": f"Node {node_id} not found in current session"})
+            scope = (
+                f"session {session_id}" if session_id_explicit else "current session"
+            )
+            return json.dumps({"error": f"Node {node_id} not found in {scope}"})
         info = engine._dag.describe_subtree(node_id)
+        if session_id_explicit:
+            info["session_id"] = node.session_id
+            info["expand_hint"] = _session_expand_hint(node.node_id, node.session_id)
+            for child in info.get("children", []):
+                child["expand_hint"] = _session_expand_hint(
+                    child["node_id"], node.session_id
+                )
         return json.dumps(info)
 
     depth_stats = engine._dag.get_session_depth_stats(session_id)
@@ -3473,7 +3514,11 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
                 {
                     "node_id": node.node_id,
                     "token_count": node.token_count,
-                    "expand_hint": node.expand_hint,
+                    "expand_hint": (
+                        _session_expand_hint(node.node_id, node.session_id)
+                        if session_id_explicit
+                        else node.expand_hint
+                    ),
                 }
                 for node in nodes
             ],
@@ -3488,11 +3533,10 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
     Mode selection (exactly one is required):
     - ``externalized_ref``: open a stored externalized payload by ref filename (current session only)
     - ``store_id``: fetch a single raw message by store_id; works across sessions
-    - ``node_id``: expand a summary node to its source content (current session only)
+    - ``node_id``: expand a summary node to its source content (explicit ``session_id`` required cross-session)
 
-    Only ``store_id`` mode accepts an arbitrary cross-session target. ``node_id``
-    stays current-session scoped, but carried-over current-session nodes may
-    reference raw source rows that still belong to the previous session.
+    Omitting ``session_id`` preserves current-session node lookup. Carried-over
+    current-session nodes may reference raw source rows from the previous session.
     """
     engine = _require_engine(kwargs)
     if engine is None:
@@ -3511,27 +3555,50 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         modes_provided.append("node_id")
 
     if len(modes_provided) > 1:
-        return json.dumps({
-            "error": (
-                "Provide only one of node_id, externalized_ref, store_id "
-                f"(got {', '.join(modes_provided)})"
-            ),
-        })
+        return json.dumps(
+            {
+                "error": (
+                    "Provide only one of node_id, externalized_ref, store_id "
+                    f"(got {', '.join(modes_provided)})"
+                ),
+            }
+        )
     if not modes_provided:
-        return json.dumps({
-            "error": "node_id, externalized_ref, or store_id is required",
-        })
+        return json.dumps(
+            {
+                "error": "node_id, externalized_ref, or store_id is required",
+            }
+        )
+
+    session_id_explicit = "session_id" in args
+    session_id_arg = args.get("session_id")
+    if session_id_explicit and "node_id" not in modes_provided:
+        return json.dumps({"error": "session_id is only valid with node_id"})
+    if session_id_explicit:
+        if not isinstance(session_id_arg, str) or not session_id_arg.strip():
+            return json.dumps({"error": "session_id must be a non-empty string"})
+        session_id = session_id_arg.strip()
+    else:
+        session_id = engine.current_session_id
 
     max_tokens = _parse_positive_int(args.get("max_tokens", 4000), 4000)
     source_offset = _parse_non_negative_int(args.get("source_offset", 0), 0)
     source_limit_arg = args.get("source_limit")
-    source_limit = _parse_positive_int(source_limit_arg, 0) if source_limit_arg is not None else None
+    source_limit = (
+        _parse_positive_int(source_limit_arg, 0)
+        if source_limit_arg is not None
+        else None
+    )
     content_offset = _parse_non_negative_int(args.get("content_offset", 0), 0)
 
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
         if payload is None:
-            return json.dumps({"error": f"Externalized payload {externalized_ref} not found in current session"})
+            return json.dumps(
+                {
+                    "error": f"Externalized payload {externalized_ref} not found in current session"
+                }
+            )
         content = payload.get("content", "")
         sliced = _slice_content_for_response(content, max_tokens, content_offset)
         return json.dumps(
@@ -3563,7 +3630,9 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         if stored is None:
             return json.dumps({"error": f"Message store_id {store_id} not found"})
         transcript_content = stored.get("content", "") or ""
-        sliced = _slice_content_for_response(transcript_content, max_tokens, content_offset)
+        sliced = _slice_content_for_response(
+            transcript_content, max_tokens, content_offset
+        )
         engine_session_id = engine.current_session_id
         stored_session_id = stored.get("session_id", "")
         result: Dict[str, Any] = {
@@ -3575,7 +3644,8 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             "role": stored.get("role"),
             "timestamp": stored.get("timestamp", 0),
             "tool_call_id": stored.get("tool_call_id") or "",
-            "from_current_session": bool(engine_session_id) and stored_session_id == engine_session_id,
+            "from_current_session": bool(engine_session_id)
+            and stored_session_id == engine_session_id,
             "content": sliced["content"],
             "content_chars": sliced["content_chars"],
             "content_offset": sliced["content_offset"],
@@ -3592,7 +3662,11 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
         ref_values = [transcript_content]
         if stored.get("tool_calls"):
             try:
-                ref_values.append(json.dumps(stored.get("tool_calls"), ensure_ascii=False, sort_keys=True))
+                ref_values.append(
+                    json.dumps(
+                        stored.get("tool_calls"), ensure_ascii=False, sort_keys=True
+                    )
+                )
             except (TypeError, ValueError):
                 ref_values.append(str(stored.get("tool_calls")))
         refs: list[str] = []
@@ -3627,11 +3701,12 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
                 )
         return json.dumps(result)
 
+    assert raw_node_id_arg is not None
     node_id = raw_node_id_arg
-
-    node = _get_session_node(engine, node_id)
+    node = _get_session_node(engine, node_id, session_id)
     if node is None:
-        return json.dumps({"error": f"Node {node_id} not found in current session"})
+        scope = f"session {session_id}" if session_id_explicit else "current session"
+        return json.dumps({"error": f"Node {node_id} not found in {scope}"})
 
     if node.source_type == "messages":
         messages, pagination = _expand_message_sources(
@@ -3642,15 +3717,16 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             source_limit=source_limit,
             content_offset=content_offset,
         )
-        return json.dumps(
-            {
-                "node_id": node_id,
-                "depth": node.depth,
-                "source_type": "messages",
-                "expanded": messages,
-                "pagination": pagination,
-            }
-        )
+        result = {
+            "node_id": node_id,
+            "depth": node.depth,
+            "source_type": "messages",
+            "expanded": messages,
+            "pagination": pagination,
+        }
+        if session_id_explicit:
+            result["session_id"] = node.session_id
+        return json.dumps(result)
 
     if node.source_type == "nodes":
         children, pagination = _expand_child_nodes(
@@ -3660,15 +3736,20 @@ def lcm_expand(args: Dict[str, Any], **kwargs) -> str:
             source_offset=source_offset,
             source_limit=source_limit,
         )
-        return json.dumps(
-            {
-                "node_id": node_id,
-                "depth": node.depth,
-                "source_type": "nodes",
-                "expanded": children,
-                "pagination": pagination,
-            }
-        )
+        result = {
+            "node_id": node_id,
+            "depth": node.depth,
+            "source_type": "nodes",
+            "expanded": children,
+            "pagination": pagination,
+        }
+        if session_id_explicit:
+            result["session_id"] = node.session_id
+            for child in result["expanded"]:
+                child["expand_hint"] = _session_expand_hint(
+                    child["node_id"], node.session_id
+                )
+        return json.dumps(result)
 
     return json.dumps({"error": f"Unknown source_type: {node.source_type}"})
 
@@ -3683,6 +3764,32 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if not prompt:
         return json.dumps({"error": "prompt is required"})
 
+    raw_output = args.get("output", "answer")
+    if not isinstance(raw_output, str):
+        return json.dumps({"error": "output must be one of: answer, evidence"})
+    output = raw_output.strip().lower()
+    if output not in {"answer", "evidence"}:
+        return json.dumps({"error": "output must be one of: answer, evidence"})
+
+    session_ids_explicit = "session_ids" in args
+    raw_session_ids = args.get("session_ids")
+    if not session_ids_explicit:
+        session_ids = [engine.current_session_id]
+    elif not isinstance(raw_session_ids, list) or not raw_session_ids:
+        return json.dumps({"error": "session_ids must be a non-empty array of strings"})
+    elif len(raw_session_ids) > _LCM_EXPAND_QUERY_SESSION_ID_CAP:
+        return json.dumps({"error": "session_ids accepts at most 20 entries"})
+    else:
+        session_ids = []
+        for raw_session_id in raw_session_ids:
+            if not isinstance(raw_session_id, str) or not raw_session_id.strip():
+                return json.dumps(
+                    {"error": "session_ids must contain only non-empty strings"}
+                )
+            session_id = raw_session_id.strip()
+            if session_id not in session_ids:
+                session_ids.append(session_id)
+
     def _parse_int_arg(name: str, default: int) -> tuple[int | None, str | None]:
         raw_value = args.get(name, default)
         try:
@@ -3694,8 +3801,13 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     if max_tokens_error:
         return json.dumps({"error": max_tokens_error})
     max_tokens = max(1, max_tokens)
-    context_default = max(max_tokens, int(getattr(engine._config, "expansion_context_tokens", 32_000) or 32_000))
-    context_max_tokens, context_max_tokens_error = _parse_int_arg("context_max_tokens", context_default)
+    context_default = max(
+        max_tokens,
+        int(getattr(engine._config, "expansion_context_tokens", 32_000) or 32_000),
+    )
+    context_max_tokens, context_max_tokens_error = _parse_int_arg(
+        "context_max_tokens", context_default
+    )
     if context_max_tokens_error:
         return json.dumps({"error": context_max_tokens_error})
     context_max_tokens = max(1, context_max_tokens)
@@ -3711,26 +3823,77 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     nodes = []
     raw_results: list[dict[str, Any]] = []
     if raw_node_ids:
+        allowed_session_ids = set(session_ids)
         for node_id in raw_node_ids:
             try:
                 parsed_node_id = int(node_id)
             except (TypeError, ValueError):
                 return json.dumps({"error": "node_ids must contain only integers"})
-            node = _get_session_node(engine, parsed_node_id)
-            if node is not None:
+            node = engine._dag.get_node(parsed_node_id)
+            if node is not None and node.session_id in allowed_session_ids:
                 nodes.append(node)
     elif query:
-        nodes = engine._dag.search(query, session_id=engine.current_session_id, limit=max_results)
-        raw_results = engine._store.search(query, session_id=engine.current_session_id, limit=max_results)
+        for session_id in session_ids:
+            nodes.extend(
+                engine._dag.search(query, session_id=session_id, limit=max_results)
+            )
+            raw_results.extend(
+                engine._store.search(query, session_id=session_id, limit=max_results)
+            )
+        if len(session_ids) > 1:
+            nodes.sort(
+                key=lambda node: (
+                    float(node.search_rank)
+                    if node.search_rank is not None
+                    else float("inf"),
+                    -float(node.search_directness or 0),
+                    -float(node.latest_at or node.created_at or 0),
+                )
+            )
+            raw_results.sort(
+                key=lambda row: _combined_result_sort_key(
+                    {
+                        "type": "message",
+                        "role": row.get("role"),
+                        "_sort_rank": row.get("search_rank"),
+                        "_sort_directness": row.get("_directness_score"),
+                        "_sort_ts": row.get("timestamp"),
+                    },
+                    "relevance",
+                )
+            )
+        nodes = nodes[:max_results]
+        raw_results = raw_results[:max_results]
     else:
         return json.dumps({"error": "Provide either query or node_ids"})
 
     if not nodes and not raw_results:
+        if output == "evidence":
+            payload = {
+                "prompt": prompt,
+                "query": query,
+                "output": "evidence",
+                "evidence": [],
+                "context_max_tokens": context_max_tokens,
+                "context_tokens": 0,
+                "context_truncated": False,
+                "context_pagination": [],
+                "node_ids": [],
+                "matches": [],
+                "raw_matches": [],
+            }
+            if session_ids_explicit:
+                payload["session_ids"] = session_ids
+            return json.dumps(payload)
         return json.dumps(
             {
                 "prompt": prompt,
                 "query": query,
-                "answer": "No matching summaries or raw messages found in the current session.",
+                "answer": (
+                    "No matching summaries or raw messages found in the requested sessions."
+                    if session_ids_explicit
+                    else "No matching summaries or raw messages found in the current session."
+                ),
                 "node_ids": [],
                 "matches": [],
                 "raw_matches": [],
@@ -3739,19 +3902,40 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
 
     context_blocks = []
     context_budget_used = 0
+    context_budget_truncated = False
     for node in nodes[:max_results]:
         remaining_context_tokens = max(0, context_max_tokens - context_budget_used)
+        if output == "evidence" and remaining_context_tokens <= 0:
+            context_budget_truncated = True
+            break
         node_blocks = _collect_context_blocks_for_node(
             engine,
             node,
             max_tokens=remaining_context_tokens,
-            hydrate_externalized_content=True,
+            hydrate_externalized_content=(
+                not session_ids_explicit or node.session_id == engine.current_session_id
+            ),
         )
-        context_blocks.extend(node_blocks)
-        context_budget_used += _context_content_token_count(node_blocks)
+        if session_ids_explicit:
+            for block in node_blocks:
+                block["session_id"] = node.session_id
+        if output == "evidence":
+            for block in node_blocks:
+                candidate_blocks = [*context_blocks, block]
+                candidate_tokens = _serialized_context_token_count(candidate_blocks)
+                if candidate_tokens > context_max_tokens:
+                    context_budget_truncated = True
+                    break
+                context_blocks.append(block)
+                context_budget_used = candidate_tokens
+            if context_budget_truncated:
+                break
+        else:
+            context_blocks.extend(node_blocks)
+            context_budget_used += _context_content_token_count(node_blocks)
 
     raw_matches: list[dict[str, Any]] = []
-    if raw_results:
+    if raw_results and context_budget_used < context_max_tokens:
         seen_store_ids = _collect_store_ids_from_context_blocks(context_blocks)
         remaining_context_tokens = max(0, context_max_tokens - context_budget_used)
         raw_block, raw_matches = _collect_raw_match_context_block(
@@ -3762,8 +3946,19 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             exclude_store_ids=seen_store_ids,
         )
         if raw_block is not None:
-            context_blocks.append(raw_block)
-            context_budget_used += _context_content_token_count([raw_block])
+            if output == "evidence":
+                candidate_blocks = [*context_blocks, raw_block]
+                candidate_tokens = _serialized_context_token_count(candidate_blocks)
+                if candidate_tokens <= context_max_tokens:
+                    context_blocks.append(raw_block)
+                    context_budget_used = candidate_tokens
+                else:
+                    context_budget_truncated = True
+            else:
+                context_blocks.append(raw_block)
+                context_budget_used += _context_content_token_count([raw_block])
+    elif raw_results:
+        context_budget_truncated = True
 
     context_pagination = []
     for block in context_blocks:
@@ -3771,30 +3966,36 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             continue
         block_type = block.get("type")
         if block_type == "summary" and block.get("summary_truncated"):
-            context_pagination.append(
-                {
-                    "node_id": block.get("node_id"),
-                    "type": "summary",
-                    "summary_truncated": True,
-                    "expand_args": {"node_id": block.get("node_id")},
-                }
-            )
+            item = {
+                "node_id": block.get("node_id"),
+                "type": "summary",
+                "summary_truncated": True,
+                "expand_args": {"node_id": block.get("node_id")},
+            }
+            if block.get("session_id") is not None:
+                item["session_id"] = block["session_id"]
+                item["expand_args"]["session_id"] = block["session_id"]
+            context_pagination.append(item)
             continue
 
         if block_type in {"child_nodes", "descendant_child_nodes"}:
             for child in block.get("children", []):
                 if child.get("summary_truncated"):
                     child_node_id = child.get("node_id")
-                    context_pagination.append(
-                        {
-                            "node_id": block.get("node_id"),
-                            "type": "child_summary" if block_type == "child_nodes" else "descendant_child_summary",
-                            "child_node_id": child_node_id,
-                            "source_index": child.get("source_index"),
-                            "summary_truncated": True,
-                            "expand_args": {"node_id": child_node_id},
-                        }
-                    )
+                    item = {
+                        "node_id": block.get("node_id"),
+                        "type": "child_summary"
+                        if block_type == "child_nodes"
+                        else "descendant_child_summary",
+                        "child_node_id": child_node_id,
+                        "source_index": child.get("source_index"),
+                        "summary_truncated": True,
+                        "expand_args": {"node_id": child_node_id},
+                    }
+                    if block.get("session_id") is not None:
+                        item["session_id"] = block["session_id"]
+                        item["expand_args"]["session_id"] = block["session_id"]
+                    context_pagination.append(item)
 
         pagination = block.get("pagination")
         if not pagination or not pagination.get("has_more"):
@@ -3805,9 +4006,15 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             "type": block_type,
             "pagination": pagination,
         }
+        if block.get("session_id") is not None:
+            item["session_id"] = block.get("session_id")
         if block_type in {"messages", "child_messages"}:
             truncated_message = next(
-                (message for message in block.get("messages", []) if message.get("content_truncated")),
+                (
+                    message
+                    for message in block.get("messages", [])
+                    if message.get("content_truncated")
+                ),
                 None,
             )
             if truncated_message:
@@ -3818,7 +4025,10 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
                 if externalized_ref:
                     item["externalized_ref"] = externalized_ref
                     item["tool_call_id"] = externalized.get("tool_call_id")
-                if truncated_message.get("content_source") == "externalized_payload" and externalized_ref:
+                if (
+                    truncated_message.get("content_source") == "externalized_payload"
+                    and externalized_ref
+                ):
                     item["expand_args"] = {
                         "externalized_ref": externalized_ref,
                         "content_offset": pagination.get("next_content_offset") or 0,
@@ -3837,7 +4047,11 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
                 }
         elif block_type == "raw_messages":
             truncated_message = next(
-                (message for message in block.get("messages", []) if message.get("content_truncated")),
+                (
+                    message
+                    for message in block.get("messages", [])
+                    if message.get("content_truncated")
+                ),
                 None,
             )
             if truncated_message:
@@ -3855,10 +4069,15 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
                 "node_id": block.get("node_id"),
                 "source_offset": pagination.get("next_source_offset") or 0,
             }
+        if item.get("session_id") is not None and "node_id" in item.get(
+            "expand_args", {}
+        ):
+            item["expand_args"]["session_id"] = item["session_id"]
         context_pagination.append(item)
 
-    context_truncated = any(
-        bool(item.get("summary_truncated")) or bool(item.get("pagination", {}).get("has_more"))
+    context_truncated = context_budget_truncated or any(
+        bool(item.get("summary_truncated"))
+        or bool(item.get("pagination", {}).get("has_more"))
         for item in context_pagination
     )
 
@@ -3872,7 +4091,29 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
         }
         for node in selected_nodes
     ]
+    if session_ids_explicit:
+        for match, node in zip(matches, selected_nodes):
+            match["session_id"] = node.session_id
+            match["expand_hint"] = _session_expand_hint(node.node_id, node.session_id)
     node_ids = [node.node_id for node in selected_nodes]
+
+    if output == "evidence":
+        payload = {
+            "prompt": prompt,
+            "query": query,
+            "output": "evidence",
+            "evidence": context_blocks,
+            "context_max_tokens": context_max_tokens,
+            "context_tokens": _serialized_context_token_count(context_blocks),
+            "context_truncated": context_truncated,
+            "context_pagination": context_pagination,
+            "node_ids": node_ids,
+            "matches": matches,
+            "raw_matches": raw_matches,
+        }
+        if session_ids_explicit:
+            payload["session_ids"] = session_ids
+        return json.dumps(payload)
 
     def _degraded_payload(reason: str, *, include_timeout: bool = False) -> str:
         payload: Dict[str, Any] = {

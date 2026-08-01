@@ -136,8 +136,8 @@ LCM_RECALL = {
         "Returns the most relevant memories — summaries and verbatim excerpts — ranked by relevance, "
         "recency, and relatedness to the current conversation, each with an expand_hint handle to the "
         "original content: verbatim/current-session hits get lcm_expand(...), while cross-session summary "
-        "hits get lcm_load_session(...) (lcm_expand's node_id mode is current-session only, so it cannot "
-        "expand a cross-session summary). Not for retrieving exact/verbatim text within a known time range — "
+        "hits retain lcm_load_session(...) transcript handles. A known cross-session summary node can also "
+        "be expanded with lcm_expand(node_id=..., session_id=...). Not for retrieving exact/verbatim text within a known time range — "
         "use lcm_grep(mode='full_text') for that. Not for full transcripts — after locating the right "
         "conversation, use lcm_load_session(session_id). Recency and current-conversation preference are soft "
         "ranking boosts, not filters; for hard time bounds use lcm_grep time_from/time_to."
@@ -225,7 +225,7 @@ LCM_LOAD_SESSION = {
         "and orders rows chronologically by store_id. Use this after session_search or lcm_grep has identified a session_id "
         "that already exists in lcm.db. Output is bounded by limit, per-row content is bounded by max_content_chars, "
         "and row pagination uses after_store_id/next_cursor. "
-        "It returns raw rows only; cross-session summary/DAG expansion remains out of scope."
+        "It returns raw rows only; use lcm_describe/lcm_expand with both node_id and session_id for summary DAGs."
     ),
     "parameters": {
         "type": "object",
@@ -279,14 +279,12 @@ LCM_LOAD_SESSION = {
 LCM_DESCRIBE = {
     "name": "lcm_describe",
     "description": (
-        "Inspect a current-session summary node's subtree metadata WITHOUT loading full "
-        "content, or inspect an externalized payload ref without opening the "
-        "full payload. Returns token counts, child manifest, expand hints, "
-        "or externalized payload metadata/preview. Use this to plan retrieval "
-        "strategy before spending tokens on lcm_expand inside the active conversation. "
-        "For cross-session recall, use session_search first. If called with no "
-        "node_id or externalized_ref, returns the top-level DAG overview for "
-        "the current session."
+        "Inspect a summary node's subtree metadata WITHOUT loading full content. "
+        "Node and overview lookup default to the active session; pass an explicit session_id "
+        "to inspect a known node or DAG from another LCM session. A node must belong to the "
+        "requested session. externalized_ref remains active-session only. Returns token counts, "
+        "child manifest, expand hints, or externalized payload metadata/preview. If called with "
+        "no node_id or externalized_ref, returns the top-level overview for the selected session."
     ),
     "parameters": {
         "type": "object",
@@ -294,6 +292,13 @@ LCM_DESCRIBE = {
             "node_id": {
                 "type": "integer",
                 "description": "Summary node ID to inspect. Omit for session overview.",
+            },
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "Optional explicit LCM session id for node or overview lookup. "
+                    "Omit to preserve active-session scope; an explicit id must be non-empty and match the node."
+                ),
             },
             "externalized_ref": {
                 "type": "string",
@@ -308,8 +313,9 @@ LCM_EXPAND = {
     "name": "lcm_expand",
     "description": (
         "Recover the original detail behind a summary node, externalized payload, or raw message. "
-        "Mode selection (exactly one): node_id (current session only) returns the source messages "
-        "or lower-depth summaries that were compacted into a summary node; externalized_ref "
+        "Mode selection (exactly one): node_id returns the source messages or lower-depth summaries "
+        "that were compacted into a summary node, defaulting to the active session unless an explicit "
+        "matching session_id is supplied; externalized_ref "
         "(current session only) returns a stored externalized payload's content; store_id returns "
         "a single raw message by store_id and works across sessions, suitable for drilling into "
         "cross-session lcm_grep results. Output is bounded by max_tokens; raw recovery is pageable "
@@ -322,8 +328,15 @@ LCM_EXPAND = {
             "node_id": {
                 "type": "integer",
                 "description": (
-                    "Summary node ID to expand. Current-session only — cross-session DAG expansion "
-                    "is not supported in this version."
+                    "Summary node ID to expand. Omit session_id for active-session lookup or pair it "
+                    "with an explicit matching session_id for cross-session DAG expansion."
+                ),
+            },
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "Optional explicit LCM session id for node_id mode only. Must be non-empty and "
+                    "match the node; it is rejected with externalized_ref or store_id mode."
                 ),
             },
             "externalized_ref": {
@@ -425,11 +438,10 @@ LCM_DOCTOR = {
 LCM_EXPAND_QUERY = {
     "name": "lcm_expand_query",
     "description": (
-        "Answer a natural-language question using expanded LCM context from the current session. Provide a prompt, and either "
-        "query matching summaries/raw messages to expand or explicit node_ids to inspect. Uses the expansion path "
-        "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
-        "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
-        "Prefer this for questions about the active conversation after compaction; for cross-session recall, use session_search first."
+        "Retrieve expanded LCM context from the active session by default or from up to 20 explicit session_ids. "
+        "Provide a prompt and either a query matching summaries/raw messages or explicit node_ids. output='answer' "
+        "(default) synthesizes a bounded answer with the expansion model; output='evidence' returns the same bounded "
+        "serialized context directly without an LLM call. Parent summaries are recursively descended under the context budget."
     ),
     "parameters": {
         "type": "object",
@@ -445,7 +457,26 @@ LCM_EXPAND_QUERY = {
             "node_ids": {
                 "type": "array",
                 "items": {"type": "integer"},
-                "description": "Optional explicit summary node IDs to expand instead of searching",
+                "description": "Optional summary node IDs to expand instead of searching. IDs must belong to the selected sessions.",
+            },
+            "session_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 20,
+                "description": (
+                    "Optional non-empty LCM session ids to search or authorize for node_ids. "
+                    "Omit for the active session. At most 20 entries are accepted."
+                ),
+            },
+            "output": {
+                "type": "string",
+                "enum": ["answer", "evidence"],
+                "description": (
+                    "'answer' runs bounded synthesis (default); 'evidence' returns bounded serialized "
+                    "context and pagination metadata without calling an LLM."
+                ),
+                "default": "answer",
             },
             "max_results": {
                 "type": "integer",
@@ -459,7 +490,7 @@ LCM_EXPAND_QUERY = {
             },
             "context_max_tokens": {
                 "type": "integer",
-                "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget for the auxiliary LLM before it returns the bounded answer (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
+                "description": "Expanded serialized summary/raw/child-source/externalized fresh context budget. Answer mode sends this context to the auxiliary LLM; evidence mode returns it directly (default max(answer max_tokens, 32000 or LCM_EXPANSION_CONTEXT_TOKENS))",
                 "default": 32000,
             },
         },

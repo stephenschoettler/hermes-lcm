@@ -23,6 +23,18 @@ from hermes_lcm.vector_store import EmbeddingIdentity, VectorStore
 CURRENT = "session-cur"
 
 
+def test_cross_session_summary_hint_targets_explicit_node_expansion():
+    hint = lcm_tools._lcm_recall_summary_expand_hint(
+        {
+            "node_id": 42,
+            "session_id": "archived-session",
+            "from_current_session": False,
+        }
+    )
+
+    assert hint == "lcm_expand(node_id=42, session_id='archived-session')"
+
+
 class MockProvider:
     provider_id = "mock"
     model_id = "mock-model"

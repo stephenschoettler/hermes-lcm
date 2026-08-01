@@ -4,18 +4,19 @@ Use this page when you need the exact LCM tool contract or archive-migration not
 
 ## Agent Tools
 
-Use these tools for current-session recall after compaction. Use `session_search`
-for earlier separate sessions or broad cross-session history.
+These tools default to current-session recall after compaction. Use `session_search`
+to discover earlier sessions; known LCM session and node ids can then be retrieved
+through the explicit cross-session arguments below.
 
 | Tool | Use |
 |------|-----|
 | `lcm_grep` | Search current-session raw messages and summaries. `mode='full_text'` is the byte-compatible default; `mode='semantic'` searches embedded summaries; `mode='hybrid'` combines full-text and semantic ranks with RRF. Opt into `content_scope='externalized'` or `'both'` for bounded literal search over recoverable payload prefixes owned by the active session. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only in full-text mode and cannot search externalized payloads. Raw-message filters `role`, `time_from`, `time_to`, `source`, and `conversation_id` are pushed into the full-text query; when any is supplied, externalized payload results are omitted, and summary hits are omitted for the role/time filters so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |
-| `lcm_recall` | Search the agent's entire memory across ALL conversations and all time by meaning. Runs three arms over the whole local database — full-text raw messages, embedded summary KNN, and verbatim chunk KNN (all cross-session, no filter) — fuses them with RRF, dedupes chunk hits against FTS by `store_id`, and applies a soft prior `final_score = rank_score × (1 + scope_bias × is_current_conversation) × recency_boost(half_life=30d, floor 0.5)`. `scope_bias` (0..1, default 0.5) and recency are ranking BOOSTS, never filters. `include` selects `all`/`summaries`/`verbatim`. An optional voyage `rerank-2.5-lite` stage (`LCM_RERANK_ENABLED`, default off) reorders the top window of candidates AFTER the scope/recency prior, as a pure rank-reorder (voyage relevance is never spliced onto the RRF scale); any failure skips silently to RRF order. When embeddings are disabled or the vector corpora are empty the tool degrades to the full-text arm — including for `include='summaries'`, whose only vector arm is dead in that state, so a summaries request still returns full-text hits rather than nothing. Each hit carries an `expand_hint`: verbatim/current-session hits get an `lcm_expand(...)` handle, while cross-session summary hits get an `lcm_load_session(...)` handle (`lcm_expand`'s `node_id` mode is current-session only). Use `lcm_grep(mode='full_text')` for exact text in a known range and `lcm_load_session` for full transcripts. |
+| `lcm_recall` | Search the agent's entire memory across ALL conversations and all time by meaning. Runs three arms over the whole local database — full-text raw messages, embedded summary KNN, and verbatim chunk KNN (all cross-session, no filter) — fuses them with RRF, dedupes chunk hits against FTS by `store_id`, and applies a soft prior `final_score = rank_score × (1 + scope_bias × is_current_conversation) × recency_boost(half_life=30d, floor 0.5)`. `scope_bias` (0..1, default 0.5) and recency are ranking BOOSTS, never filters. `include` selects `all`/`summaries`/`verbatim`. An optional voyage `rerank-2.5-lite` stage (`LCM_RERANK_ENABLED`, default off) reorders the top window of candidates AFTER the scope/recency prior, as a pure rank-reorder (voyage relevance is never spliced onto the RRF scale); any failure skips silently to RRF order. When embeddings are disabled or the vector corpora are empty the tool degrades to the full-text arm — including for `include='summaries'`, whose only vector arm is dead in that state, so a summaries request still returns full-text hits rather than nothing. Each hit carries an `expand_hint`: verbatim/current-session hits get an `lcm_expand(...)` handle, while cross-session summary hits retain an `lcm_load_session(...)` transcript handle. If both ids are known, the summary DAG can instead be opened with `lcm_expand(node_id=..., session_id=...)`. Use `lcm_grep(mode='full_text')` for exact text in a known range and `lcm_load_session` for full transcripts. |
 | `lcm_recent` | Retrieve recent summaries with natural UTC periods. Ready temporal rollups are preferred; missing, stale, disabled, and sub-day windows transparently use leaf summaries instead. |
 | `lcm_load_session` | Load one ordered raw-message transcript page for an explicit `session_id`. This is not search: it returns raw rows in `store_id` order, bounded by `limit`, with per-message content bounded by `max_content_chars`, and continues with `after_store_id` from `next_cursor`. |
-| `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
-| `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. |
-| `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
+| `lcm_describe` | Inspect the active-session DAG by default, or pass `session_id` with a known node/overview target. `externalized_ref` remains active-session only. |
+| `lcm_expand` | Recover source messages or child summaries with pagination. Node lookup defaults to the active session; explicit cross-session lookup requires matching `node_id` and `session_id`. `externalized_ref` remains active-session only; `store_id` fetches a raw message regardless of session. |
+| `lcm_expand_query` | Retrieve from the active session by default or up to 20 explicit `session_ids`. `output='answer'` runs bounded synthesis; `output='evidence'` returns bounded serialized context without an LLM call. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, message/frontier metadata, fresh tail, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. It returns metadata only; use `lcm_load_session`/`lcm_expand` when you need content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
@@ -28,6 +29,19 @@ bounded archive search over rows already present in `lcm.db` (raw-message hits
 only). Once a session id is known, `lcm_load_session` can enumerate that session's
 raw transcript in chronological `store_id` pages without a search query. Use
 Hermes `session_search` for broad cross-session history outside the LCM database.
+
+`lcm_describe` and `lcm_expand` keep their existing active-session behavior when
+`session_id` is omitted. An explicit id must be a non-empty string and must match
+the requested node; `lcm_expand` rejects `session_id` in `store_id` and
+`externalized_ref` modes. `lcm_expand_query` accepts a non-empty list of at most
+20 `session_ids`; omitted means active session. Explicit `node_ids` are admitted
+only when they belong to one of those sessions. Search results from multiple
+sessions are merged and bounded by `max_results` before context expansion.
+
+`lcm_expand_query(output='evidence')` uses the same `context_max_tokens` budget,
+recursive DAG traversal, raw-hit deduplication, and pagination metadata as answer
+mode, but returns the serialized blocks under `evidence` before synthesis. This
+path makes no auxiliary LLM call. `output='answer'` remains the default.
 
 Within the current session, `source` filters raw rows directly and filters
 summary nodes by descendant raw-message source lineage. `unknown` is a real
@@ -225,11 +239,11 @@ Tool responses are bounded so one retrieval call cannot flood the main context.
 Lossless recovery means raw content is stored with stable source lineage and can
 be recovered in deterministic pages.
 
-- `lcm_expand(node_id=...)` pages immediate sources with `source_offset` and `source_limit`
+- `lcm_expand(node_id=..., session_id=...)` pages immediate sources with `source_offset` and `source_limit`; omit `session_id` for the active-session default
 - `lcm_load_session(session_id=...)` pages ordered raw session rows with `after_store_id` and `next_cursor`; each row includes bounded content plus truncation metadata, and large individual rows can be recovered with `lcm_expand(store_id=...)` using `content_offset`
 - oversized raw messages continue with `content_offset`
 - `lcm_expand(externalized_ref=...)` pages payload content with `content_offset`
-- `lcm_expand_query` uses `context_max_tokens` for auxiliary context and reports truncation/pagination hints when needed
+- `lcm_expand_query` uses `context_max_tokens` for answer or evidence context and reports truncation/pagination hints when needed
 
 ### Searching externalized payloads
 
@@ -286,7 +300,7 @@ The script is intentionally conservative:
 - changing `--agent`, `--namespace`, or `--session-identity` under the same `--import-id` is treated as the same import and will skip already-tracked source messages; use a new `--import-id` for a different mapping
 - no OpenClaw config or separate secret tables are imported, but raw transcripts and tool payloads are imported and may contain sensitive user data
 
-This is a local archive migration path. It does not make LCM a general memory provider, and it does not change the current-session retrieval contract for agent tools.
+This is a local archive migration path. It does not make LCM a general memory provider, and it does not change the default current-session retrieval contract for agent tools.
 
 ## Related references
 
