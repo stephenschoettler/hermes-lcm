@@ -1457,22 +1457,15 @@ def protect_message_for_ingest(
                     externalized = {"placeholder": placeholder}
             if externalized is None:
                 kind = _externalization_kind_for_message(msg)
-                # Assistant messages must never be externalized in-place:
-                # the active context list is shared with the model and the
-                # user display, so replacing content with a placeholder makes
-                # the agent's own response invisible to both.  User and tool
-                # messages are safe to externalize because they are not shown
-                # verbatim after the turn completes.
-                if not (role == "assistant" and kind == "raw_payload"):
-                    externalized = maybe_externalize_payload(
-                        normalized_content,
-                        kind=kind,
-                        tool_call_id=str(msg.get("tool_call_id") or ""),
-                        session_id=session_id,
-                        role=role,
-                        config=config,
-                        hermes_home=hermes_home,
-                    )
+                externalized = maybe_externalize_payload(
+                    normalized_content,
+                    kind=kind,
+                    tool_call_id=str(msg.get("tool_call_id") or ""),
+                    session_id=session_id,
+                    role=role,
+                    config=config,
+                    hermes_home=hermes_home,
+                )
             if externalized:
                 msg["content"] = externalized["placeholder"]
             else:
