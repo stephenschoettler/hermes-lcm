@@ -129,6 +129,15 @@ class ReconcileMixin:
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        # System prompts are volatile host scaffolding: the host rebuilds
+        # them on every model/provider switch (different identity block,
+        # tool list, provider metadata).  Including the full content in
+        # the replay identity means any model switch breaks suffix
+        # matching at position 0 → cursor=0 → full re-ingest → duplication.
+        # The role anchor is sufficient: there is exactly one system prompt
+        # per session and it is always at position 0.
+        if role == "system":
+            return ("system", "", "", "")
         # Strip volatile compaction scaffolding suffixes so identity matching
         # survives compression cycles.  The host appends a task-list annotation
         # to the last user message during context compression; the annotation
