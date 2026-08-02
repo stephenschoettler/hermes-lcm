@@ -88,6 +88,33 @@ def _ensure_engine_bound_to_session(
         )
 
 
+def _make_session_finalize_handler(prototype_engine, resolve_active_lcm_engine):
+    """Close the exact per-agent LCM clone retired by a host session boundary."""
+
+    def _on_session_finalize(**payload) -> None:
+        session_id = str(payload.get("session_id") or "")
+        platform = str(payload.get("platform") or "").strip().lower()
+        if not session_id or platform == "cli":
+            # Interactive CLI /new finalizes the old session while reusing the
+            # same agent and context engine. Process exit closes its resources.
+            return
+
+        active_engine = resolve_active_lcm_engine(session_id=session_id)
+        if (
+            active_engine is None
+            or active_engine is prototype_engine
+            or _engine_bound_session_id(active_engine) != session_id
+        ):
+            return
+
+        try:
+            active_engine.shutdown()
+        except Exception as exc:
+            logger.debug("LCM finalized-clone shutdown failed: %s", exc)
+
+    return _on_session_finalize
+
+
 def _hook_question_date(payload: dict) -> object:
     """Return an explicit turn anchor without inventing event time."""
     explicit = payload.get("question_date") or payload.get("question_as_of")
@@ -386,6 +413,17 @@ def register(ctx):
             logger.info(
                 "LCM explicit subagent-lineage hooks unavailable on this Hermes "
                 "host; auxiliary detection uses the legacy frame-walk fallback: %s",
+                exc,
+            )
+
+        try:
+            register_hook(
+                "on_session_finalize",
+                _make_session_finalize_handler(engine, resolve_active_lcm_engine),
+            )
+        except Exception as exc:
+            logger.info(
+                "LCM finalized-clone cleanup hook unavailable on this Hermes host: %s",
                 exc,
             )
 
