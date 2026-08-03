@@ -4084,6 +4084,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Return true for active-context scaffolding that should not be re-ingested."""
         role = str(msg.get("role") or "")
         content = normalize_content_value(msg.get("content")) or ""
+        # Tool results are never scaffolding: they carry real durable content
+        # (delegation receipts, session links, summary excerpts quoted inside
+        # tool output).  A tool payload that happens to contain an
+        # "[Expand for details:" / "Summary (d0, node N)" excerpt must not be
+        # dropped from replay identity — doing so shifts suffix matching and
+        # forces cursor=0 → full re-ingest (duplication).
+        if role == "tool":
+            return False
         if role == "system":
             return (
                 "[Note: This conversation uses Lossless Context Management (LCM)." in content
