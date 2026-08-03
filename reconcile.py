@@ -50,6 +50,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+# When the user sends a message mid-turn, the host appends it to the tool
+# output currently being delivered, wrapped in this block.  LCM persists the
+# row WITH the block; on resume/restart the host replays the tool result
+# WITHOUT it (the user message was already delivered separately).  Strip the
+# block from the replay identity so matching survives the delivery split.
+_OOB_MESSAGE_BLOCK_RE = re.compile(
+    r"\[OUT-OF-BAND USER MESSAGE[^\]]*\].*?\[/OUT-OF-BAND USER MESSAGE\]",
+    re.DOTALL,
+)
 
 
 class ReconcileMixin:
@@ -127,6 +136,12 @@ class ReconcileMixin:
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        # Out-of-band user messages appended mid-turn are delivery scaffolding:
+        # the stored row carries them, the replayed row does not (or vice
+        # versa).  Removing every such block keeps identities stable across
+        # the delivery split.
+        if "[OUT-OF-BAND USER MESSAGE" in content:
+            content = _OOB_MESSAGE_BLOCK_RE.sub("", content).rstrip()
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)
