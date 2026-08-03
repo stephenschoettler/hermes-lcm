@@ -230,7 +230,13 @@ class TestExternalizedPlaceholderReconciliation:
             engine.shutdown()
 
     def test_role_mismatch_does_not_wildcard_match(self, tmp_path):
-        """Divergent conversation: no shared suffix → all incoming persisted."""
+        """Divergent conversation: tool row skipped, but system matches.
+
+        Stored: [system, tool(c1)].  Incoming: [system, user, assistant].
+        The stored tool row has no counterpart (compaction removed it) so it
+        is skipped; the system prompt still matches at cursor=1, and only the
+        user + assistant rows are new.  Total = 2 stored + 2 new = 4.
+        """
         engine = _make_engine(tmp_path)
         try:
             turn1 = [
@@ -240,8 +246,6 @@ class TestExternalizedPlaceholderReconciliation:
             engine._ingest_messages(turn1)
             assert engine._store.get_session_count("ext-reconcile-test") == 2
 
-            # Incoming has a user message where the tool placeholder is.
-            # Conversation genuinely diverged — no suffix match possible.
             turn2 = [
                 {"role": "system", "content": "System prompt."},
                 {"role": "user", "content": "Completely different message"},
@@ -251,9 +255,9 @@ class TestExternalizedPlaceholderReconciliation:
             engine._ingest_messages(turn2)
 
             count = engine._store.get_session_count("ext-reconcile-test")
-            # 5 = 2 old + 3 new (divergent, no suffix match, cursor=0)
-            assert count == 5, (
-                f"Expected 5 (divergent conversation, full persist), got {count}."
+            # 4 = 2 stored (system+tool) + 2 new (user+assistant)
+            assert count == 4, (
+                f"Expected 4 (system matches, tool skipped, 2 new), got {count}."
             )
         finally:
             engine.shutdown()
