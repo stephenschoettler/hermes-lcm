@@ -123,7 +123,11 @@ from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
 from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
-from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
+from .reconcile import (
+    ReconcileMixin,
+    _MODEL_SWITCH_NOTIFICATION_PREFIX,
+    _PRESERVED_OBJECTIVE_CONTEXT_PREFIX,
+)
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
@@ -4179,6 +4183,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
+        # A model-switch note injected as a STANDALONE message (no user
+        # content after the closing bracket) is ephemeral host scaffolding:
+        # LCM persists it, but the host removes the row from the active list
+        # on the next turn.  The stored tail then has a row the incoming
+        # replay lacks — suffix matching shifts, cursor=0, full re-ingest.
+        # A note PREPENDED to a real user message is NOT scaffolding — the
+        # user's content after the bracket is durable.
+        if content.lstrip().startswith(_MODEL_SWITCH_NOTIFICATION_PREFIX):
+            _bracket_end = content.find("]")
+            _remainder = (
+                content[_bracket_end + 1:].lstrip("\n") if _bracket_end != -1 else content
+            )
+            if not _remainder.strip():
+                return True
         if "[Expand for details:" not in content:
             return False
         return bool(

@@ -50,6 +50,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+# The host injects this as a standalone user message when the model changes
+# mid-session, then removes it from the active list on the next turn.
+_MODEL_SWITCH_NOTIFICATION_PREFIX = "[Note: model was just switched from "
 
 
 class ReconcileMixin:
@@ -849,6 +852,7 @@ class ReconcileMixin:
             row
             for row in stored_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
+            and not self._is_replayed_context_scaffold_message(row)
         ]
         stored_tail = [
             self._message_replay_identity(row, stored_row=True)
