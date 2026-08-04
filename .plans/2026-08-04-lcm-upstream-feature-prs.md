@@ -135,9 +135,13 @@ Request:
 
 ### Existing issue
 
-Use and close #463: `fix: agent clones multiply SQLite file descriptors`.
+Link #463: `fix: agent clones multiply SQLite file descriptors`.
 
-Include these measured receipts:
+Close #463 only if the final pull request covers the issue's full accepted direction. The local clone-family bundle does not yet prove cross-bundle construction locking for independently created engines that share one database path. Either add that behavior and its concurrency tests, obtain maintainer agreement that the narrower clone-family fix resolves the issue, or leave #463 open with the remaining work stated clearly.
+
+Re-run a checked-in or pull-request-attached clone benchmark against both the pinned upstream base and the final feature branch. The benchmark must measure retained-clone file descriptors, median clone setup, ten-clone setup, and initial startup. Record its exact command, environment, raw output path, and both commit SHAs.
+
+Historical private results provide targets, not publishable claims:
 
 - Before the prototype, 12 retained clones added about 72 file descriptors.
 - With the prototype, 12 retained clones added no physical SQLite descriptors.
@@ -145,19 +149,22 @@ Include these measured receipts:
 - Ten-clone setup improved from 91.63 ms to 1.96 ms.
 - Initial plugin startup stayed effectively flat.
 
+Publish only measurements reproduced by the final benchmark run. Do not copy the historical private timings into the issue or pull request unless the new receipt confirms them.
+
 ### Pull request
 
 **Title:** `fix: share SQLite storage across LCM engine clones`
 
-**Source:** storage, locking, lifecycle, and clone-test hunks from `17df35d`; fold `5f0832b` cleanup.
+**Source:** storage, locking, lifecycle, and clone-test hunks from `17df35d`. Do not replay `5f0832b`; the commit only repairs import pollution introduced by the mixed local commit.
 
 **Files:**
 
 - Modify `engine.py`.
 - Modify `store.py`.
 - Modify `dag.py`.
-- Modify `lifecycle_state.py` only for the clean import shape.
 - Modify `tests/test_lcm_core.py`.
+
+Keep the net `lifecycle_state.py` diff empty unless current upstream analysis proves a required storage behavior change. Do not carry the unused `functools.wraps` import or unrelated comment deletions from the local range.
 
 ### Behavior
 
@@ -230,19 +237,22 @@ Differentiate the request from:
 
 For each feature:
 
-1. Fetch and pin current upstream `main` immediately before branch creation.
-2. Create a fresh isolated worktree from that exact SHA.
-3. Configure Grant's verified public identity locally.
-4. Replay only approved feature hunks; never cherry-pick mixed `17df35d` wholesale.
-5. Use test-driven development for missing summary consumption.
-6. Verify commit count, files, cumulative diff, and whitespace.
-7. Rewrite only unpublished commits with `--reset-author` when needed.
-8. Require equal cumulative patch IDs before and after metadata-only rewriting.
-9. Create or verify the public fork while preserving upstream identity.
-10. Push only the focused branch to Grant's fork.
-11. Require local and remote SHAs to match.
-12. Open the upstream pull request with a body file and explicit repository, base, and head.
-13. Read back state, base, head owner, head SHA, commits, files, and checks.
+1. Open or reuse the governing upstream issue before branch creation and record its number.
+2. Require the planned commits and pull request body to contain `Refs #<number>`; use `Closes` only when the final scope fully resolves the accepted issue.
+3. Fetch and pin current upstream `main` immediately before branch creation.
+4. Create a fresh isolated worktree from that exact SHA.
+5. Configure Grant's verified public identity locally.
+6. Replay only approved feature hunks; never cherry-pick mixed `17df35d` wholesale.
+7. Use test-driven development for missing summary consumption.
+8. For shared storage, create and run the named clone descriptor and latency benchmark against the pinned base and final branch.
+9. Verify commit count, files, cumulative diff, and whitespace.
+10. Rewrite only unpublished commits with `--reset-author` when needed.
+11. Require equal cumulative patch IDs before and after metadata-only rewriting.
+12. Create or verify the public fork while preserving upstream identity.
+13. Push only the focused branch to Grant's fork.
+14. Require local and remote SHAs to match.
+15. Open the upstream pull request with a body file and explicit repository, base, and head.
+16. Read back state, base, head owner, head SHA, commits, files, issue references, and checks.
 
 ## Validation for every pull request
 
