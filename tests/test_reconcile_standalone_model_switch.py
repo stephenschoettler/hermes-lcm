@@ -46,8 +46,8 @@ from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
 STANDALONE_NOTE = (
-    "[Note: model was just switched from kimi-k3 to deepseek-v4-flash "
-    "via OpenCode Go. Adjust your self-identification accordingly.]"
+    "[Note: model was just switched from model-a to model-b "
+    "via the router. Adjust your self-identification accordingly.]"
 )
 
 
