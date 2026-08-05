@@ -532,13 +532,13 @@ def _verify_query_view_schema(conn: sqlite3.Connection) -> list[str]:
 class QueryViewStore:
     """Versioned, exact-provenance materialized evidence views."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, db_lock: Any | None = None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
-        self._write_lock = threading.RLock()
+        self._write_lock = db_lock or threading.RLock()
         try:
             refuse_schema_version_too_new(self._conn)
             configure_connection(self._conn)

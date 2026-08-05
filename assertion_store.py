@@ -215,10 +215,16 @@ def _bounded_probability(value: float | None, field: str) -> float | None:
 class AssertionStore:
     """SQLite assertion store bound to the same physical DB as ``MessageStore``."""
 
-    def __init__(self, db_path: str | Path, *, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        read_only: bool = False,
+        db_lock: Any | None = None,
+    ):
         self.db_path = Path(db_path)
         self.read_only = bool(read_only)
-        self._write_lock = threading.RLock()
+        self._write_lock = db_lock or threading.RLock()
         self._conn = self._open_connection()
         try:
             self._init_db()
