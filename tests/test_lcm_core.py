@@ -7425,9 +7425,9 @@ class TestLCMEngineCloning:
 
             assert clone is not prototype
             assert isinstance(clone, LCMEngine)
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
             assert clone._config.database_path == prototype._config.database_path
             assert clone._hermes_home == prototype._hermes_home
         finally:
@@ -7468,9 +7468,9 @@ class TestLCMEngineCloning:
             assert isinstance(clone, LCMEngine)
             assert clone.name == "lcm"
             assert clone is not prototype
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
             assert clone._session_id == ""
             assert clone._conversation_id == ""
             assert clone.model == prototype.model

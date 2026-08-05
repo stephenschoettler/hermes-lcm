@@ -7,9 +7,34 @@ import sys
 import importlib
 from pathlib import Path
 
-# Make the repo root importable (for agent.context_engine etc.)
-repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-if repo_root not in sys.path:
+# Find the Hermes agent module (agent.context_engine)
+# Try common locations where the agent module might be
+potential_roots = [
+    str(Path(__file__).resolve().parent.parent.parent.parent),  # coder profile root
+    str(Path(__file__).resolve().parent.parent.parent.parent.parent),  # one level up
+    "/home/hermes/hermes-agent-qwen-pr",  # explicit hermes-agent location
+    "/home/hermes/hermes-agent",  # alternative hermes-agent location
+]
+
+repo_root = None
+for root in potential_roots:
+    agent_module = Path(root) / "agent" / "context_engine.py"
+    if agent_module.exists():
+        repo_root = root
+        break
+
+if repo_root is None:
+    # Fallback: try to find agent module by searching upward
+    current = Path(__file__).resolve()
+    for _ in range(6):  # Search up to 6 levels up
+        parent = current.parent
+        agent_check = parent / "agent" / "context_engine.py"
+        if agent_check.exists():
+            repo_root = str(parent)
+            break
+        current = parent
+
+if repo_root and repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
 # Register the plugin directory as a proper package
