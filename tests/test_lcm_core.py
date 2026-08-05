@@ -7782,3 +7782,98 @@ class TestSummaryDagLikeSanitization:
             assert emoji_only in {node.node_id for node in results}
         finally:
             dag.close()
+
+
+class _CloseProbe:
+    def __init__(self, error=None):
+        self.error = error
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+        if self.error is not None:
+            raise self.error
+
+
+def test_storage_bundle_closes_all_helpers_after_first_failure(caplog):
+    from hermes_lcm.engine import _StorageBundle
+
+    first = _CloseProbe(RuntimeError("first helper failed"))
+    second = _CloseProbe()
+    bundle = _StorageBundle(first, second)
+
+    with pytest.raises(RuntimeError, match="first helper failed"):
+        bundle.release()
+
+    assert first.closed is True
+    assert second.closed is True
+    assert "storage helper 0 failed to close" in caplog.text
+
+
+def test_context_engine_runtime_contract_shares_storage_and_closes_bundle(tmp_path):
+    from hermes_lcm.engine import LCMEngine
+
+    prototype = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "runtime.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    try:
+        bundle = prototype._storage_bundle
+        assert bundle is not None
+        assert bundle._refs == 1
+
+        runtime = prototype.create_runtime()
+        assert runtime is not prototype
+        assert runtime._store is prototype._store
+        assert bundle._refs == 2
+
+        runtime.close()
+        assert bundle._refs == 1
+        runtime.close()
+        assert bundle._refs == 1
+    finally:
+        prototype.close()
+
+
+@pytest.mark.parametrize(
+    ("config_kwargs", "helper_name", "failure"),
+    [
+        (
+            {"adaptive_retrieval_enabled": True},
+            "AdaptiveRetrievalRegistry",
+            "adaptive constructor failed",
+        ),
+        (
+            {"assertions_enabled": True, "assertion_extraction_enabled": True},
+            "ModelAssertionExtractor",
+            "assertion constructor failed",
+        ),
+    ],
+)
+def test_runtime_constructor_failure_releases_acquired_storage_bundle(
+    tmp_path, monkeypatch, config_kwargs, helper_name, failure
+):
+    import hermes_lcm.engine as engine_module
+
+    prototype = engine_module.LCMEngine(
+        config=LCMConfig(
+            database_path=str(tmp_path / f"{helper_name}.db"),
+            **config_kwargs,
+        ),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    try:
+        bundle = prototype._storage_bundle
+        assert bundle is not None
+        refs_before = bundle._refs
+
+        def fail_constructor(*args, **kwargs):
+            raise RuntimeError(failure)
+
+        monkeypatch.setattr(engine_module, helper_name, fail_constructor)
+        with pytest.raises(RuntimeError, match=failure):
+            prototype.create_runtime()
+
+        assert bundle._refs == refs_before
+    finally:
+        prototype.close()

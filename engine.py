@@ -391,10 +391,23 @@ class _StorageBundle:
             self._refs -= 1
             if self._refs:
                 return
-        for helper in self.helpers:
+        first_error: BaseException | None = None
+        for index, helper in enumerate(self.helpers):
             close = getattr(helper, "close", None)
             if callable(close):
-                close()
+                try:
+                    close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    logger.warning(
+                        "LCM storage helper %d failed to close: %s",
+                        index,
+                        exc,
+                        exc_info=True,
+                    )
+        if first_error is not None:
+            raise first_error
 
 
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
@@ -679,18 +692,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             hermes_home=self._hermes_home,
             _bind_storage=False,
         )
-        clone._adopt_storage_bundle(self._storage_bundle)
-        if bool(getattr(clone._config, "adaptive_retrieval_enabled", False)):
-            clone._adaptive_retrieval = AdaptiveRetrievalRegistry(clone._query_views)
-        if (
-            clone._assertions is not None
-            and bool(getattr(clone._config, "assertion_extraction_enabled", False))
-        ):
-            clone._assertion_extractor = ModelAssertionExtractor(
-                clone._assertions,
-                model=clone._assertion_extraction_model(),
-                timeout_seconds=clone._assertion_extraction_timeout(),
-            )
+        try:
+            clone._adopt_storage_bundle(self._storage_bundle)
+            if bool(getattr(clone._config, "adaptive_retrieval_enabled", False)):
+                clone._adaptive_retrieval = AdaptiveRetrievalRegistry(clone._query_views)
+            if (
+                clone._assertions is not None
+                and bool(getattr(clone._config, "assertion_extraction_enabled", False))
+            ):
+                clone._assertion_extractor = ModelAssertionExtractor(
+                    clone._assertions,
+                    model=clone._assertion_extraction_model(),
+                    timeout_seconds=clone._assertion_extraction_timeout(),
+                )
+        except Exception:
+            # The bundle reference is acquired before optional runtime helpers
+            # are constructed.  Release it if any helper constructor rejects
+            # the clone, without masking the original failure.
+            clone._close_storage()
+            raise
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key
@@ -717,6 +737,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         clone._update_model_pending_session_start = False
         clone._lcm_current_start_allows_bypass_lineage = False
         return clone
+
+    def create_runtime(self) -> "LCMEngine":
+        """Create the isolated, agent-owned runtime required by Hermes core."""
+        return self.clone_for_agent()
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
         """Copy the plugin runtime without pickling SQLite-backed helpers.
@@ -6728,5 +6752,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     # -- Lifecycle ---------------------------------------------------------
 
     def shutdown(self):
+        self.close()
+
+    def close(self) -> None:
+        """Release this runtime's shared storage bundle at agent teardown."""
         self._unregister_active_engine_binding()
         self._close_storage()
