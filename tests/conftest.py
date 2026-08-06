@@ -3,39 +3,24 @@
 Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
+import os
 import sys
 import importlib
 from pathlib import Path
 
-# Find the Hermes agent module (agent.context_engine)
-# Try common locations where the agent module might be
-potential_roots = [
-    str(Path(__file__).resolve().parent.parent.parent.parent),  # coder profile root
-    str(Path(__file__).resolve().parent.parent.parent.parent.parent),  # one level up
-    "/home/hermes/hermes-agent-qwen-pr",  # explicit hermes-agent location
-    "/home/hermes/hermes-agent",  # alternative hermes-agent location
-]
-
-repo_root = None
-for root in potential_roots:
-    agent_module = Path(root) / "agent" / "context_engine.py"
-    if agent_module.exists():
-        repo_root = root
-        break
-
-if repo_root is None:
-    # Fallback: try to find agent module by searching upward
-    current = Path(__file__).resolve()
-    for _ in range(6):  # Search up to 6 levels up
-        parent = current.parent
-        agent_check = parent / "agent" / "context_engine.py"
-        if agent_check.exists():
-            repo_root = str(parent)
-            break
-        current = parent
-
-if repo_root and repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
+# The standalone CI bootstrap places its hermes-agent stub in this checkout.
+# A host integration run may explicitly point at a real hermes-agent checkout;
+# never discover one by searching unrelated parent directories.
+plugin_dir = Path(__file__).resolve().parent.parent
+repo_root = Path(os.environ.get("HERMES_AGENT_ROOT", plugin_dir)).resolve()
+if not (repo_root / "agent" / "context_engine.py").is_file():
+    if "HERMES_AGENT_ROOT" in os.environ:
+        raise RuntimeError(
+            "HERMES_AGENT_ROOT must contain agent/context_engine.py: "
+            f"{repo_root}"
+        )
+else:
+    sys.path.insert(0, str(repo_root))
 
 # Register the plugin directory as a proper package
 plugin_dir = Path(__file__).resolve().parent.parent
