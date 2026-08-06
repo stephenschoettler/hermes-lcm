@@ -989,6 +989,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         return self._last_compression_status
 
+    @last_compression_status.setter
+    def last_compression_status(self, value: str) -> None:
+        """Allow host to reset status before each compress() pass.
+
+        Without a setter, ``setattr(engine, "last_compression_status", "")``
+        in ``conversation_compression.py`` raises ``AttributeError: property
+        has no setter``, crashing context compression.
+        """
+        self._last_compression_status = value
+
     @property
     def last_compression_noop_reason(self) -> str:
         """Human-readable reason for the latest no-op compression decision."""
