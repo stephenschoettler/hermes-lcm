@@ -50,6 +50,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
+_MODEL_SWITCH_NOTIFICATION_PREFIX = "[Note: model was just switched from "
 
 
 class ReconcileMixin:
@@ -127,6 +129,26 @@ class ReconcileMixin:
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        # Strip volatile compaction scaffolding suffixes so identity matching
+        # survives compression cycles.  The host appends a task-list annotation
+        # to the last user message during context compression; the annotation
+        # changes on every cycle (task statuses update), so including it in the
+        # replay identity causes reconciliation to fail and triggers full
+        # re-ingest of already-stored messages (duplication bug).
+        _todo_idx = content.find(_PRESERVED_TODO_CONTEXT_PREFIX)
+        if _todo_idx > 0:
+            content = content[:_todo_idx].rstrip()
+        # Model-switch notifications are ephemeral host scaffolding: the
+        # host prepends "[Note: model was just switched from X to Y...]"
+        # to the user's message, then strips the prefix on the next turn.
+        # The stored row keeps the prefix; the incoming row does not.
+        # Strip ONLY the prefix (up to and including the closing "]" and
+        # trailing newlines) so the user's actual content survives and
+        # identity matching works across the switch boundary.
+        if content.startswith(_MODEL_SWITCH_NOTIFICATION_PREFIX):
+            _bracket_end = content.find("]")
+            if _bracket_end != -1:
+                content = content[_bracket_end + 1:].lstrip("\n")
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)
@@ -925,6 +947,42 @@ class ReconcileMixin:
             )
             logger.warning(
                 "LCM skipped stale no-overlap snapshot after existing-session bind: session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
+                self._session_id,
+                len(messages),
+                len(incoming_identities),
+                len(stored_tail),
+                session_count,
+            )
+            return len(messages)
+
+        # Fork / side-channel guard: a forked agent (background review,
+        # cron side-channel) shares the parent's session_id but carries a
+        # shorter, divergent message list.  When its ingest reaches this
+        # fallback, persisting it corrupts the stored tail and causes the
+        # parent's next reconcile to fail → cursor=0 → full re-ingest →
+        # duplication.  A legitimate restart always shares tail messages
+        # with the durable store; a fork does not.  Skip the batch when
+        # the incoming list is strictly shorter than the durable session
+        # AND its tail has zero overlap with the stored tail.
+        if (
+            len(incoming_identities) < session_count
+            and len(incoming_identities) > 5
+            and not set(
+                incoming_identities[-min(5, len(incoming_identities)):]
+            ).intersection(set(stored_tail))
+        ):
+            self._record_ingest_reconciliation(
+                action="skipped batch",
+                reason="skipped fork or side-channel snapshot (no tail overlap)",
+                cursor=len(messages),
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.warning(
+                "LCM skipped fork/side-channel snapshot after existing-session bind: "
+                "session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
                 self._session_id,
                 len(messages),
                 len(incoming_identities),
