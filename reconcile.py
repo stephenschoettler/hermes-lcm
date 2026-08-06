@@ -933,6 +933,42 @@ class ReconcileMixin:
             )
             return len(messages)
 
+        # Fork / side-channel guard: a forked agent (background review,
+        # cron side-channel) shares the parent's session_id but carries a
+        # shorter, divergent message list.  When its ingest reaches this
+        # fallback, persisting it corrupts the stored tail and causes the
+        # parent's next reconcile to fail → cursor=0 → full re-ingest →
+        # duplication.  A legitimate restart always shares tail messages
+        # with the durable store; a fork does not.  Skip the batch when
+        # the incoming list is strictly shorter than the durable session
+        # AND its tail has zero overlap with the stored tail.
+        if (
+            len(incoming_identities) < session_count
+            and len(incoming_identities) > 5
+            and not set(
+                incoming_identities[-min(5, len(incoming_identities)):]
+            ).intersection(set(stored_tail))
+        ):
+            self._record_ingest_reconciliation(
+                action="skipped batch",
+                reason="skipped fork or side-channel snapshot (no tail overlap)",
+                cursor=len(messages),
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.warning(
+                "LCM skipped fork/side-channel snapshot after existing-session bind: "
+                "session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
+                self._session_id,
+                len(messages),
+                len(incoming_identities),
+                len(stored_tail),
+                session_count,
+            )
+            return len(messages)
+
         self._record_ingest_reconciliation(
             action="persisted batch",
             reason="persisted ambiguous delta",
