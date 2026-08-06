@@ -50,6 +50,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
+_MODEL_SWITCH_NOTIFICATION_PREFIX = "[Note: model was just switched from "
+# When the user sends a message mid-turn, the host appends it to the tool
+# output currently being delivered, wrapped in this block.  LCM persists the
+# row WITH the block; on resume/restart the host replays the tool result
+# WITHOUT it (the user message was already delivered separately).  Strip the
+# block from the replay identity so matching survives the delivery split.
+_OOB_MESSAGE_BLOCK_RE = re.compile(
+    r"\[OUT-OF-BAND USER MESSAGE[^\]]*\].*?\[/OUT-OF-BAND USER MESSAGE\]",
+    re.DOTALL,
+)
 
 
 class ReconcileMixin:
@@ -127,6 +138,32 @@ class ReconcileMixin:
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        # Strip volatile compaction scaffolding suffixes so identity matching
+        # survives compression cycles.  The host appends a task-list annotation
+        # to the last user message during context compression; the annotation
+        # changes on every cycle (task statuses update), so including it in the
+        # replay identity causes reconciliation to fail and triggers full
+        # re-ingest of already-stored messages (duplication bug).
+        _todo_idx = content.find(_PRESERVED_TODO_CONTEXT_PREFIX)
+        if _todo_idx > 0:
+            content = content[:_todo_idx].rstrip()
+        # Model-switch notifications are ephemeral host scaffolding: the
+        # host prepends "[Note: model was just switched from X to Y...]"
+        # to the user's message, then strips the prefix on the next turn.
+        # The stored row keeps the prefix; the incoming row does not.
+        # Strip ONLY the prefix (up to and including the closing "]" and
+        # trailing newlines) so the user's actual content survives and
+        # identity matching works across the switch boundary.
+        if content.startswith(_MODEL_SWITCH_NOTIFICATION_PREFIX):
+            _bracket_end = content.find("]")
+            if _bracket_end != -1:
+                content = content[_bracket_end + 1:].lstrip("\n")
+        # Out-of-band user messages appended mid-turn are delivery scaffolding:
+        # the stored row carries them, the replayed row does not (or vice
+        # versa).  Removing every such block keeps identities stable across
+        # the delivery split.
+        if "[OUT-OF-BAND USER MESSAGE" in content:
+            content = _OOB_MESSAGE_BLOCK_RE.sub("", content).rstrip()
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)
@@ -849,6 +886,7 @@ class ReconcileMixin:
             row
             for row in stored_rows
             if not self._matches_ignore_message_patterns(row, stored_row=True)
+            and not self._is_replayed_context_scaffold_message(row)
         ]
         stored_tail = [
             self._message_replay_identity(row, stored_row=True)
