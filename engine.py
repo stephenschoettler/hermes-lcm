@@ -447,6 +447,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._assertion_extraction_last_error = ""
         self._assertion_extraction_last_model = ""
         self._storage_bundle: _StorageBundle | None = None
+        # Runtime-owned lifecycle boundary: a runtime releases its bundle at
+        # most once. A repeated close must not fall through and close helpers
+        # owned by the prototype or sibling runtimes.
+        self._storage_closed = False
         self._store: Any = None
         self._dag: Any = None
         self._lifecycle: Any = None
@@ -709,7 +713,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             # The bundle reference is acquired before optional runtime helpers
             # are constructed.  Release it if any helper constructor rejects
             # the clone, without masking the original failure.
-            clone._close_storage()
+            clone._close_storage(suppress_errors=True)
             raise
         clone.model = self.model
         clone.base_url = self.base_url
@@ -766,6 +770,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        # A successful bind starts a fresh runtime-owned storage lease.  This
+        # matters when profile rebinding follows a prior close or a failed
+        # construction attempt.
+        self._storage_closed = False
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -817,23 +825,37 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._query_views,
             )
         except Exception:
-            self._close_storage()
+            self._close_storage(suppress_errors=True)
             raise
 
     def _adopt_storage_bundle(self, bundle: _StorageBundle | None) -> None:
         if bundle is None:
             raise RuntimeError("LCM engine has no storage bundle to share")
-        self._storage_bundle = bundle.acquire()
+        acquired = bundle.acquire()
+        self._storage_closed = False
+        self._storage_bundle = acquired
         self._store, self._dag, self._lifecycle, self._assertions, self._query_views = bundle.helpers
 
-    def _close_storage(self) -> None:
-        """Best-effort close of currently bound SQLite helpers."""
+    def _close_storage(self, *, suppress_errors: bool = False) -> None:
+        """Release this runtime's storage exactly once.
+
+        Suppression is used only while unwinding construction, where a
+        cleanup error must not replace the constructor's original exception.
+        Normal runtime teardown preserves the first real close error after
+        attempting all applicable cleanup.
+        """
+        if self._storage_closed:
+            return
+        self._storage_closed = True
+        first_error: BaseException | None = None
+
         adaptive = getattr(self, "_adaptive_retrieval", None)
         close = getattr(adaptive, "close", None)
         if callable(close):
             try:
                 close()
-            except Exception:
+            except BaseException as exc:
+                first_error = exc
                 logger.debug("LCM failed closing adaptive retrieval during storage close", exc_info=True)
         self._adaptive_retrieval = None
 
@@ -842,18 +864,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._storage_bundle = None
             try:
                 bundle.release()
-            except Exception:
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
                 logger.debug("LCM failed closing shared storage bundle", exc_info=True)
-            return
+        else:
+            for attr in ("_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
+                helper = getattr(self, attr, None)
+                close = getattr(helper, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except BaseException as exc:
+                        if first_error is None:
+                            first_error = exc
+                        logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
-        for attr in ("_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
-            helper = getattr(self, attr, None)
-            close = getattr(helper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        if first_error is not None and not suppress_errors:
+            raise first_error
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -947,6 +975,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         self._close_storage()
         self._hermes_home = hermes_home
+        self._storage_closed = False
         self._bind_storage(db_path, hermes_home)
         self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)

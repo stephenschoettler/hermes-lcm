@@ -7817,21 +7817,30 @@ def test_context_engine_runtime_contract_shares_storage_and_closes_bundle(tmp_pa
         config=LCMConfig(database_path=str(tmp_path / "runtime.db")),
         hermes_home=str(tmp_path / "hermes"),
     )
+    sibling = None
     try:
         bundle = prototype._storage_bundle
         assert bundle is not None
         assert bundle._refs == 1
 
         runtime = prototype.create_runtime()
+        sibling = prototype.create_runtime()
         assert runtime is not prototype
         assert runtime._store is prototype._store
-        assert bundle._refs == 2
+        assert bundle._refs == 3
 
         runtime.close()
-        assert bundle._refs == 1
+        assert bundle._refs == 2
         runtime.close()
-        assert bundle._refs == 1
+        assert bundle._refs == 2
+
+        # Repeated close must not release storage owned by the live prototype
+        # or sibling runtime. Exercise both database handles after it.
+        prototype.ingest([{"role": "user", "content": "prototype remains live"}])
+        sibling.ingest([{"role": "user", "content": "sibling remains live"}])
     finally:
+        if sibling is not None:
+            sibling.close()
         prototype.close()
 
 
