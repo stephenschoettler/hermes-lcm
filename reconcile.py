@@ -243,6 +243,17 @@ class ReconcileMixin:
         )
 
     @staticmethod
+    def _non_tool_identity_count(identities: list[tuple[str, str, str, str]]) -> int:
+        """Count non-tool identities in a replay identity list.
+
+        Leaf compaction removes tool rows from the active context while the
+        durable store keeps them, so the incoming list is shorter than the
+        stored session.  Full-replay length checks must compare non-tool
+        counts on both sides.
+        """
+        return sum(1 for identity in identities if identity[0] != "tool")
+
+    @staticmethod
     def _matches_store_tail_suffix(
         stored_tail: list[tuple[str, str, str, str]],
         candidate_prefix: list[tuple[str, str, str, str]],
@@ -252,6 +263,41 @@ class ReconcileMixin:
         if len(candidate_prefix) > len(stored_tail):
             return False
         return stored_tail[-len(candidate_prefix) :] == candidate_prefix
+
+    @staticmethod
+    def _matches_store_tail_suffix_tool_tolerant(
+        stored_tail: list[tuple[str, str, str, str]],
+        candidate_prefix: list[tuple[str, str, str, str]],
+    ) -> bool:
+        """Suffix match that tolerates compacted-out tool rows.
+
+        Leaf compaction summarizes tool results into DAG nodes and removes
+        them from the active context, while the durable store keeps the rows
+        (lossless design).  A stored tool row with no counterpart in the
+        incoming list must not break the suffix match, otherwise the cursor
+        falls to 0 and the whole session is re-ingested (duplication).
+
+        Only safe when the incoming prefix contains NO tool rows at all: a
+        normal restart replays tool rows verbatim and needs exact matching
+        (persisted-output marker identity depends on it).  This fallback is
+        therefore gated on ``candidate_has_no_tools`` by the caller.
+        """
+        if not candidate_prefix:
+            return True
+        if len(candidate_prefix) > len(stored_tail):
+            return False
+        i = len(stored_tail) - 1
+        j = len(candidate_prefix) - 1
+        while j >= 0 and i >= 0:
+            if stored_tail[i] == candidate_prefix[j]:
+                i -= 1
+                j -= 1
+                continue
+            if stored_tail[i][0] == "tool" and candidate_prefix[j][0] != "tool":
+                i -= 1
+                continue
+            return False
+        return j < 0
 
     @staticmethod
     def _strip_inline_persisted_output_generation_identity(
@@ -431,6 +477,18 @@ class ReconcileMixin:
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
         sanitized_tail_collapsed = len(sanitized_replay_tail) < len(stored_tail)
+        # Leaf compaction summarizes tool results into DAG nodes and removes
+        # them from the active context, while the durable store keeps the
+        # rows.  The incoming list therefore has fewer rows than the stored
+        # session.  Length checks below ("full replay") must compare on the
+        # same basis: non-tool counts on both sides, otherwise a compaction
+        # boundary fails full-replay detection → cursor=0 → full re-ingest.
+        stored_effective_non_tool_count = sum(
+            1 for identity in sanitized_replay_tail if identity[0] != "tool"
+        )
+        stored_raw_non_tool_count = sum(
+            1 for identity in stored_tail if identity[0] != "tool"
+        )
         boundary_messages = list(stored_tail_rows or [])
         if not boundary_messages:
             for role, content, tool_call_id, tool_calls in stored_tail:
@@ -508,7 +566,28 @@ class ReconcileMixin:
                 len(candidate_prefix) <= len(sanitized_replay_tail)
                 and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix)
             )
+            # Tool-tolerant fallback: leaf compaction removes tool rows from
+            # the active context while the store keeps them, so after a
+            # compaction the incoming list has no tool rows at all and exact
+            # suffix matching fails.  Only engage the tolerant matcher when
+            # the FULL incoming list is genuinely tool-free — a normal restart
+            # replays tool rows verbatim and must keep exact matching.  Check
+            # the full message list, not the cursor-truncated candidate: a
+            # cursor that stops before the tool rows must not enable the
+            # fallback, or a changed tool marker would be wrongly replayed.
+            candidate_has_no_tools = not any(
+                str(msg.get("role") or "") == "tool" for msg in messages
+            )
+            matches_sanitized_tail_tool_tolerant = (
+                candidate_has_no_tools
+                and self._non_tool_identity_count(candidate_prefix) <= len(sanitized_replay_tail)
+                and self._matches_store_tail_suffix_tool_tolerant(sanitized_replay_tail, candidate_prefix)
+            )
             matches_raw_tail = self._matches_store_tail_suffix(stored_tail, candidate_prefix)
+            matches_raw_tail_tool_tolerant = (
+                candidate_has_no_tools
+                and self._matches_store_tail_suffix_tool_tolerant(stored_tail, candidate_prefix)
+            )
             matches_visible_sanitized_tail = (
                 filtered_candidate_placeholders
                 and bool(candidate_visible_prefix)
@@ -565,14 +644,16 @@ class ReconcileMixin:
                     generationless_sanitized_tail,
                     generationless_candidate_prefix,
                 )
-            raw_tail_suffix = stored_tail[-len(candidate_prefix) :] if matches_raw_tail else []
+            raw_tail_suffix = stored_tail[-len(candidate_prefix) :] if (matches_raw_tail or matches_raw_tail_tool_tolerant) else []
             raw_suffix_needs_cleanup_equivalence = any(
                 self._active_cleanup_replay_identity(identity) != identity
                 for identity in raw_tail_suffix
             )
             if (
                 not matches_sanitized_tail
+                and not matches_sanitized_tail_tool_tolerant
                 and not matches_raw_tail
+                and not matches_raw_tail_tool_tolerant
                 and not matches_inline_generation_cleanup_tail
                 and not matches_durable_persisted_output_full_replay
             ):
@@ -645,15 +726,19 @@ class ReconcileMixin:
                 )
             )
             has_filtered_full_replay = (
-                matches_sanitized_tail
+                (matches_sanitized_tail or matches_sanitized_tail_tool_tolerant)
                 and candidate_dropped_quarantine_replay_placeholder
-                and len(candidate_prefix) >= effective_session_count
+                and (
+                    self._non_tool_identity_count(candidate_prefix) >= stored_effective_non_tool_count
+                    if matches_sanitized_tail_tool_tolerant
+                    else len(candidate_prefix) >= effective_session_count
+                )
                 and effective_session_count > 0
             )
             has_inline_generation_cleanup_replay = (
                 matches_inline_generation_cleanup_tail
                 and candidate_has_unrecoverable_persisted_marker
-                and len(candidate_prefix) >= effective_session_count
+                and self._non_tool_identity_count(candidate_prefix) >= stored_effective_non_tool_count
                 and effective_session_count > 0
             )
             has_inline_persisted_generation_suffix_replay = (
@@ -684,8 +769,12 @@ class ReconcileMixin:
             )
             has_effective_full_replay = (
                 has_persisted_marker_specific_replay_evidence
-                and matches_sanitized_tail
-                and len(candidate_prefix) >= effective_session_count
+                and (matches_sanitized_tail or matches_sanitized_tail_tool_tolerant)
+                and (
+                    self._non_tool_identity_count(candidate_prefix) >= stored_effective_non_tool_count
+                    if matches_sanitized_tail_tool_tolerant
+                    else len(candidate_prefix) >= effective_session_count
+                )
                 and (
                     candidate_has_system
                     or (effective_session_count > 1 and not sanitized_tail_collapsed)
@@ -699,9 +788,13 @@ class ReconcileMixin:
             )
             has_raw_full_replay = (
                 has_persisted_marker_specific_replay_evidence
-                and matches_raw_tail
+                and (matches_raw_tail or matches_raw_tail_tool_tolerant)
                 and not has_scaffold_evidence
-                and len(candidate_messages) >= raw_session_count
+                and (
+                    self._non_tool_identity_count(candidate_prefix) >= stored_raw_non_tool_count
+                    if matches_raw_tail_tool_tolerant
+                    else len(candidate_prefix) >= raw_session_count
+                )
                 and raw_session_count > 1
             )
             has_preserved_objective_scaffold = any(
