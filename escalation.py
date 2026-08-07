@@ -371,6 +371,7 @@ def _invoke_summary_llm_chain(
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
+    deadline: float | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
@@ -382,6 +383,19 @@ def _invoke_summary_llm_chain(
                 candidate_model or _DEFAULT_ROUTE_KEY,
             )
             continue
+        call_timeout = timeout
+        if deadline is not None:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                logger.warning(
+                    "LCM summary deadline exhausted; deferring to deterministic fallback"
+                )
+                break
+            call_timeout = (
+                remaining_seconds
+                if timeout is None
+                else min(timeout, remaining_seconds)
+            )
         # Check the spend guard per-route so a mid-chain trip stops the
         # remaining fallbacks instead of over-spending by up to len(chain)-1.
         if spend_guard is not None and not spend_guard.try_record_call():
@@ -395,7 +409,7 @@ def _invoke_summary_llm_chain(
                 prompt,
                 max_tokens,
                 model=candidate_model,
-                timeout=timeout,
+                timeout=call_timeout,
             )
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
@@ -556,6 +570,7 @@ def summarize_with_escalation(
     fallback_models: list[str] | tuple[str, ...] | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
+    deadline: float | None = None,
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
 
@@ -575,6 +590,7 @@ def summarize_with_escalation(
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
+        deadline=deadline,
     )
 
     if l1_result:
@@ -595,6 +611,7 @@ def summarize_with_escalation(
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
+        deadline=deadline,
     )
 
     if l2_result:

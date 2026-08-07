@@ -1591,9 +1591,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             try:
                 timeout_seconds = self._config.summary_timeout_ms / 1000
                 if deadline is not None:
-                    remaining_seconds = deadline - time.monotonic()
-                    if remaining_seconds <= 0:
-                        raise TimeoutError("threshold full sweep time budget exhausted")
+                    remaining_seconds = max(0.0, deadline - time.monotonic())
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
                 summary_text, level = summarize_with_escalation(
                     text=serialized,
@@ -1605,6 +1603,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     circuit_breaker=self._summary_circuit_breaker,
                     spend_guard=self._summary_spend_guard,
                     timeout=timeout_seconds,
+                    deadline=deadline,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
@@ -5429,6 +5428,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         focus_topic: Optional[str] = None,
         *,
+        deadline: Optional[float] = None,
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
         critical_budget_pressure: bool = False,
@@ -5475,6 +5475,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens, summary_tokens, level = self._condense_summary_nodes(
                 to_condense,
                 focus_topic=focus_topic,
+                deadline=deadline,
             )
             condensed_any = True
 
@@ -5508,9 +5509,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         token_budget = max(1000, int(source_tokens * 0.40))
         timeout_seconds = self._config.summary_timeout_ms / 1000
         if deadline is not None:
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                raise TimeoutError("threshold full sweep time budget exhausted")
+            remaining_seconds = max(0.0, deadline - time.monotonic())
             timeout_seconds = min(timeout_seconds, remaining_seconds)
         summary_text, level = summarize_with_escalation(
             text=combined_text,
@@ -5522,6 +5521,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             circuit_breaker=self._summary_circuit_breaker,
             spend_guard=self._summary_spend_guard,
             timeout=timeout_seconds,
+            deadline=deadline,
             l2_budget_ratio=self._config.l2_budget_ratio,
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",

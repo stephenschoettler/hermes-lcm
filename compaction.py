@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .escalation import _deterministic_truncate
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -384,6 +385,11 @@ class CompactionMixin:
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
+        _compress_started_monotonic = time.monotonic()
+        compaction_deadline = (
+            _compress_started_monotonic
+            + max(0.0, self._config.summary_timeout_ms / 1000)
+        )
 
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
@@ -472,7 +478,10 @@ class CompactionMixin:
             and self.threshold_tokens > 0
             and estimated_active_tokens >= self.threshold_tokens
         )
-        sweep_deadline = time.monotonic() + _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        sweep_deadline = min(
+            compaction_deadline,
+            _compress_started_monotonic + _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
+        )
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
         sweep_target_tokens = max(
             1,
@@ -684,6 +693,7 @@ class CompactionMixin:
                 else:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
+                working_leaf_chunk_tokens = max(1, self._config.leaf_chunk_tokens)
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
                     if not (deferred_maintenance_active and critical_budget_pressure):
                         noop_reason = (
@@ -700,6 +710,11 @@ class CompactionMixin:
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
+            oversized_singleton = (
+                len(selected_raw_chunk) == 1
+                and count_message_tokens(selected_raw_chunk[0])
+                > working_leaf_chunk_tokens
+            )
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
                 source_tokens = count_messages_tokens(selected_raw_chunk)
@@ -709,18 +724,31 @@ class CompactionMixin:
                 )
                 _level = 0
                 _rescue_attempts = 0
+            elif oversized_singleton:
+                compacted_chunk = summary_input_chunk
+                source_tokens = count_messages_tokens(compacted_chunk)
+                summary_text = _deterministic_truncate(
+                    self._serialize_messages(compacted_chunk),
+                    self._config.l3_truncate_tokens,
+                )
+                _level = 3
+                _rescue_attempts = 0
             else:
                 # Pre-compaction extraction: best-effort, never blocks compaction.
                 # Use the same dependency-filtered view as summarization so ignored
                 # turns cannot leak through derived assistant/tool replies.
                 if self._config.extraction_enabled:
-                    extraction_timeout = None
-                    if threshold_full_sweep_active:
-                        extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
-                    self._run_pre_compaction_extraction(
-                        summary_input_chunk,
-                        timeout_seconds=extraction_timeout,
+                    effective_deadline = (
+                        sweep_deadline
+                        if threshold_full_sweep_active
+                        else compaction_deadline
                     )
+                    remaining_seconds = effective_deadline - time.monotonic()
+                    if remaining_seconds > 0:
+                        self._run_pre_compaction_extraction(
+                            summary_input_chunk,
+                            timeout_seconds=max(0.001, remaining_seconds),
+                        )
                 if bool(
                     getattr(
                         self._config,
@@ -731,9 +759,14 @@ class CompactionMixin:
                     self._schedule_pre_compaction_assertions(summary_input_chunk)
 
                 try:
-                    summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
-                    if threshold_full_sweep_active:
-                        summary_kwargs["deadline"] = sweep_deadline
+                    summary_kwargs: dict[str, Any] = {
+                        "focus_topic": focus_topic,
+                        "deadline": (
+                            sweep_deadline
+                            if threshold_full_sweep_active
+                            else compaction_deadline
+                        ),
+                    }
                     (
                         compacted_chunk,
                         source_tokens,
@@ -944,6 +977,7 @@ class CompactionMixin:
         else:
             self._maybe_condense(
                 focus_topic=focus_topic,
+                deadline=compaction_deadline,
                 leaf_compacted_this_turn=True,
                 force_overflow=force_overflow,
                 critical_budget_pressure=critical_budget_pressure,
