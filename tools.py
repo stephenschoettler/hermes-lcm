@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
@@ -82,6 +83,7 @@ from .search_query import AGE_DECAY_RATE, normalize_search_sort
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .sqlite_util import _sqlite_savepoint
 from .store import build_message_fts_spec
+from .operators import AgenticMap
 from .vector_store import VectorStore
 
 if TYPE_CHECKING:
@@ -3452,6 +3454,155 @@ def _lcm_grep_hybrid(
     return response
 
 
+def _regex_summary_message_ids(engine: "LCMEngine", summary_id: int) -> set[int]:
+    """Resolve a summary's recursive raw lineage without exposing pending rows."""
+    root = engine._dag.get_node(summary_id)
+    if root is None or root.session_id != engine.current_session_id:
+        return set()
+    raw_ids: set[int] = set()
+    pending = [root]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if node.node_id in seen:
+            continue
+        seen.add(node.node_id)
+        if node.source_type == "messages":
+            raw_ids.update(int(value) for value in node.source_ids)
+            continue
+        for child_id in node.source_ids:
+            child = engine._dag.get_node(int(child_id))
+            if child is not None and child.session_id == root.session_id:
+                pending.append(child)
+    return raw_ids
+
+
+def _lcm_grep_regex(args: Dict[str, Any], *, engine: "LCMEngine") -> str:
+    pattern = str(args.get("query") or "")
+    if not pattern:
+        return json.dumps({"error": "No query provided"})
+    try:
+        expression = re.compile(pattern)
+    except re.error as exc:
+        return json.dumps({"error": f"Invalid regular expression: {exc}"})
+    requested_limit = _parse_int_value(args.get("limit", 10), 10)
+    if requested_limit <= 0:
+        return json.dumps({"error": "limit must be a positive integer"})
+    limit = min(requested_limit, _LCM_GREP_HARD_LIMIT_CAP)
+    scope = str(args.get("session_scope") or "current").lower()
+    explicit_session = str(args.get("session_id") or "").strip()
+    if scope == "current":
+        if explicit_session:
+            return json.dumps({"error": "session_id is only valid with session_scope=session"})
+        session_id = engine.current_session_id
+    elif scope == "session":
+        if not explicit_session:
+            return json.dumps({"error": "session_scope=session requires session_id"})
+        session_id = explicit_session
+    elif scope == "all":
+        if explicit_session:
+            return json.dumps({"error": "session_id is not used with session_scope=all"})
+        session_id = None
+    else:
+        return json.dumps({"error": "session_scope must be one of: current, all, session"})
+    summary_id = args.get("summary_id")
+    allowed_ids: set[int] | None = None
+    if summary_id is not None:
+        try:
+            summary_id = int(summary_id)
+        except (TypeError, ValueError):
+            return json.dumps({"error": "summary_id must be an integer"})
+        if scope != "current":
+            return json.dumps({"error": "summary_id requires session_scope=current"})
+        allowed_ids = _regex_summary_message_ids(engine, summary_id)
+        if not allowed_ids:
+            return json.dumps({"error": "Summary not found or has no raw-message lineage"})
+    role, role_error = _parse_grep_role(args.get("role"))
+    if role_error:
+        return json.dumps({"error": role_error})
+    source = str(args.get("source") or "").strip() or None
+    conversation_id = str(args.get("conversation_id") or "").strip() or None
+    time_from, error = _parse_optional_timestamp(args.get("time_from"), "time_from")
+    if error:
+        return json.dumps({"error": error})
+    time_to, error = _parse_optional_timestamp(args.get("time_to"), "time_to")
+    if error:
+        return json.dumps({"error": error})
+    if time_from is not None and time_to is not None and time_to < time_from:
+        return json.dumps({"error": "time_to must be greater than or equal to time_from"})
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if session_id is not None:
+        clauses.append("session_id=?")
+        params.append(session_id)
+    if role is not None:
+        clauses.append("role=?")
+        params.append(role)
+    if source is not None:
+        clauses.append("source=?")
+        params.append(source)
+    if conversation_id is not None:
+        clauses.append("conversation_id=?")
+        params.append(conversation_id)
+    if time_from is not None:
+        clauses.append("timestamp>=?")
+        params.append(time_from)
+    if time_to is not None:
+        clauses.append("timestamp<=?")
+        params.append(time_to)
+    if allowed_ids is not None:
+        placeholders = ",".join("?" for _ in allowed_ids)
+        clauses.append(f"store_id IN ({placeholders})")
+        params.extend(sorted(allowed_ids))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    conn = engine._store.connection
+    assert conn is not None
+    rows = conn.execute(
+        "SELECT store_id,session_id,source,role,content,timestamp,token_estimate,conversation_id "
+        f"FROM messages{where} ORDER BY timestamp DESC, store_id DESC LIMIT 100000",
+        params,
+    ).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        store_id, row_session, row_source, row_role, content, timestamp, token_estimate, row_conversation = row
+        match = expression.search(str(content or ""))
+        if match is None:
+            continue
+        start = max(0, match.start() - 120)
+        end = min(len(str(content or "")), match.end() + 180)
+        results.append({
+            "type": "message",
+            "depth": "raw",
+            "store_id": int(store_id),
+            "session_id": row_session,
+            "source": row_source,
+            "role": row_role,
+            "snippet": str(content or "")[start:end],
+            "match_start": match.start(),
+            "match_end": match.end(),
+            "timestamp": timestamp,
+            "token_count": int(token_estimate or 0),
+            "conversation_id": row_conversation,
+            "from_current_session": bool(engine.current_session_id and row_session == engine.current_session_id),
+        })
+        if len(results) >= limit:
+            break
+    response: dict[str, Any] = {
+        "query": pattern,
+        "mode": "regex",
+        "session_scope": scope,
+        "limit": limit,
+        "total_results": len(results),
+        "results": results,
+    }
+    if summary_id is not None:
+        response["summary_id"] = summary_id
+    if requested_limit > _LCM_GREP_HARD_LIMIT_CAP:
+        response["limit_clamped_from"] = requested_limit
+    return json.dumps(response)
+
+
 def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     """Search LCM history using full-text, semantic, or RRF hybrid retrieval."""
     request_started = time.monotonic()
@@ -3462,6 +3613,8 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
+    if mode == "regex":
+        return _lcm_grep_regex(args, engine=engine)
     timeout_s = max(
         0.001,
         float(getattr(engine._config, "embedding_query_timeout_s", 3.0)),
@@ -3474,8 +3627,94 @@ def lcm_grep(args: Dict[str, Any], **kwargs) -> str:
     if mode == "hybrid":
         return json.dumps(_lcm_grep_hybrid(args, engine=engine, deadline=deadline))
     return json.dumps({
-        "error": "mode must be one of: full_text, semantic, hybrid",
+        "error": "mode must be one of: full_text, regex, semantic, hybrid",
     })
+
+
+def _map_result_json(result: Any) -> str:
+    return json.dumps(asdict(result), ensure_ascii=False)
+
+
+def llm_map(args: Dict[str, Any], **kwargs) -> str:
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    try:
+        batch_id = str(args.get("batch_id") or "").strip()
+        if batch_id:
+            return _map_result_json(engine._llm_map_operator.resume(batch_id))
+        result = engine._llm_map_operator.run(
+            input_path=args["input_path"],
+            output_path=args.get("output_path"),
+            prompt=args["prompt"],
+            output_schema=args["output_schema"],
+            concurrency=int(args.get("concurrency", 16)),
+            max_retries=int(args.get("max_retries", 2)),
+        )
+        return _map_result_json(result)
+    except Exception as exc:
+        return json.dumps({"error": f"llm_map failed: {exc}"})
+
+
+def agentic_map(args: Dict[str, Any], **kwargs) -> str:
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+    parent_agent = kwargs.get("agent")
+    if parent_agent is None:
+        return json.dumps({"error": "agentic_map requires a Hermes agent execution context"})
+
+    def execute_item(*, item, prompt, attempt, validation_error, read_only):
+        from tools.delegate_tool import delegate_task
+
+        correction = (
+            f"\nPrior output validation error: {validation_error}. Correct it."
+            if validation_error else ""
+        )
+        raw = delegate_task(
+            goal=(
+                f"{prompt}\n\nInput JSON:\n{json.dumps(item, ensure_ascii=False)}"
+                f"{correction}\nReturn only the requested JSON value."
+            ),
+            context="This is one isolated agentic_map item.",
+            role="leaf",
+            background=False,
+            read_only=bool(read_only),
+            parent_agent=parent_agent,
+        )
+        payload = json.loads(raw)
+        if payload.get("error"):
+            raise RuntimeError(str(payload["error"]))
+        results = payload.get("results") or []
+        if not results:
+            raise RuntimeError("sub-agent returned no result")
+        item_result = results[0]
+        value = item_result.get("result", item_result.get("output", item_result))
+        if isinstance(value, str):
+            return engine._parse_map_json_response(value)
+        return value
+
+    operator = AgenticMap(
+        engine._store.db_path,
+        executor=execute_item,
+        file_registry=engine._file_registry,
+    )
+    try:
+        batch_id = str(args.get("batch_id") or "").strip()
+        if batch_id:
+            return _map_result_json(operator.resume(batch_id))
+        result = operator.run(
+            input_path=args["input_path"],
+            output_path=args.get("output_path"),
+            prompt=args["prompt"],
+            output_schema=args["output_schema"],
+            read_only=args["read_only"],
+            concurrency=int(args.get("concurrency", 16)),
+            max_retries=int(args.get("max_retries", 2)),
+        )
+        return _map_result_json(result)
+    except Exception as exc:
+        return json.dumps({"error": f"agentic_map failed: {exc}"})
 
 
 def _lcm_recall_recency_boost(timestamp: Any, *, now: float) -> float:
@@ -5238,6 +5477,24 @@ def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
+    file_id = str(args.get("file_id") or "").strip()
+    if file_id:
+        record = engine._file_registry.get(file_id)
+        if record is None:
+            return json.dumps({"error": f"File {file_id} not found"})
+        return json.dumps(
+            {
+                "file_id": record.file_id,
+                "path": record.path,
+                "mime_type": record.mime_type,
+                "size_bytes": record.size_bytes,
+                "token_count": record.token_count,
+                "mtime_ns": record.mtime_ns,
+                "exploration_summary": record.exploration_summary,
+            },
+            ensure_ascii=False,
+        )
+
     externalized_ref = str(args.get("externalized_ref") or "").strip()
     if externalized_ref:
         payload = _get_externalized_payload(engine, externalized_ref)
@@ -6456,6 +6713,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "context_threshold_source": full_status.get("context_threshold_source", ""),
         "context_threshold_autoraised": full_status.get("context_threshold_autoraised"),
         "threshold_tokens": engine.threshold_tokens,
+        "async_compaction": full_status.get("async_compaction", engine.get_async_compaction_status()),
+        "pending_ingest_batches": full_status.get("pending_ingest_batches", 0),
         "last_prompt_tokens": engine.last_prompt_tokens,
         "last_input_tokens": engine.last_input_tokens,
         "last_output_tokens": engine.last_output_tokens,
@@ -6492,6 +6751,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "threshold_full_sweep_max_passes": 12,
             "threshold_full_sweep_max_seconds": 120,
             "context_threshold": engine._config.context_threshold,
+            "hard_context_threshold": engine._config.hard_context_threshold,
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
             "summary_model": engine._config.summary_model or "(auxiliary)",
@@ -6587,6 +6847,15 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
             "last_error": getattr(engine, "_last_ingest_error", "") or "",
             "last_error_time": getattr(engine, "_last_ingest_error_time", 0) or 0,
         } if ingest_failures else "no ingest failures recorded",
+    })
+    pending_ingest = engine._store.pending_ingest_count()
+    checks.append({
+        "check": "pending_ingest_recovery",
+        "status": "warn" if pending_ingest else "pass",
+        "detail": {
+            "pending_batches": pending_ingest,
+            "guarantee": "fsynced sidecar with receipt-based exactly-once replay",
+        },
     })
 
     # ignore_message_patterns drops discard raw content that is never persisted.
@@ -6825,6 +7094,21 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         "status": "pass" if not config_warnings else "warn",
         "detail": config_warnings if config_warnings else "all settings within normal ranges",
     })
+
+    try:
+        async_status = engine.get_async_compaction_status()
+        async_unhealthy = int(async_status.get("failed_batches", 0)) > 0
+        checks.append({
+            "check": "async_compaction_state",
+            "status": "warn" if async_unhealthy else "pass",
+            "detail": async_status,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "async_compaction_state",
+            "status": "fail",
+            "detail": str(e),
+        })
 
     # 5. Source-lineage hygiene
     try:

@@ -3317,8 +3317,11 @@ class TestLifecycleStateStore:
         store.append("s1", {"role": "user", "content": "hi"}, source="cli")
         state.bind_session("s1")
 
+        statements = []
+        state.connection.set_trace_callback(statements.append)
         deleted = state.prune_empty_sessions()
         assert deleted == 0
+        assert not any(statement == "BEGIN IMMEDIATE" for statement in statements)
         state.close()
 
     def test_prune_empty_sessions_handles_empty_table(self, tmp_path):
@@ -7149,6 +7152,64 @@ class TestExtraction:
 
 
 class TestLCMEngineCloning:
+    def test_storage_bundle_ignores_runtime_only_config_differences(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        db_path = tmp_path / "lcm-storage-contract.db"
+        first_config = LCMConfig(
+            database_path=str(db_path),
+            summary_timeout_ms=20_000,
+        )
+        second_config = LCMConfig(
+            database_path=str(db_path),
+            summary_timeout_ms=45_000,
+        )
+        first = LCMEngine(config=first_config, hermes_home=str(tmp_path))
+        second = LCMEngine(config=second_config, hermes_home=str(tmp_path))
+        try:
+            assert second._store is first._store
+            assert second._dag is first._dag
+            assert second._lifecycle is first._lifecycle
+        finally:
+            first.shutdown()
+            second.shutdown()
+
+    def test_storage_bundle_normalizes_default_home_to_database_parent(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        db_path = tmp_path / "lcm-default-home.db"
+        config = LCMConfig(database_path=str(db_path))
+        implicit_home = LCMEngine(config=copy.deepcopy(config))
+        explicit_home = LCMEngine(
+            config=copy.deepcopy(config),
+            hermes_home=str(tmp_path),
+        )
+        try:
+            assert explicit_home._store is implicit_home._store
+        finally:
+            implicit_home.shutdown()
+            explicit_home.shutdown()
+
+    def test_storage_bundle_separates_storage_affecting_config(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        db_path = tmp_path / "lcm-storage-feature.db"
+        disabled = LCMEngine(
+            config=LCMConfig(database_path=str(db_path), assertions_enabled=False),
+            hermes_home=str(tmp_path),
+        )
+        enabled = LCMEngine(
+            config=LCMConfig(database_path=str(db_path), assertions_enabled=True),
+            hermes_home=str(tmp_path),
+        )
+        try:
+            assert enabled._store is not disabled._store
+            assert disabled._assertions is None
+            assert enabled._assertions is not None
+        finally:
+            disabled.shutdown()
+            enabled.shutdown()
+
     def test_clone_for_agent_isolates_session_binding_while_sharing_store(self, tmp_path):
         from hermes_lcm.engine import LCMEngine
 
@@ -7254,15 +7315,64 @@ class TestLCMEngineCloning:
 
             assert clone is not prototype
             assert isinstance(clone, LCMEngine)
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
             assert clone._config.database_path == prototype._config.database_path
             assert clone._hermes_home == prototype._hermes_home
+            assert clone._summary_circuit_breaker is prototype._summary_circuit_breaker
+            assert clone._summary_spend_guard is prototype._summary_spend_guard
         finally:
             prototype.shutdown()
             if clone is not None:
                 clone.shutdown()
+
+    def test_clone_shutdown_keeps_shared_store_alive_until_last_owner(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-refcount.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        clone = prototype.clone_for_agent()
+        shared_store = prototype._store
+
+        clone.shutdown()
+        assert shared_store.connection is not None
+        prototype.on_session_start("still-live", platform="cli")
+        prototype.ingest([{"role": "user", "content": "survives sibling close"}])
+        assert shared_store.get_session_count("still-live") == 1
+
+        prototype.shutdown()
+        assert shared_store.connection is None
+
+    def test_closed_shared_bundle_is_replaced_without_old_owner_closing_replacement(
+        self, tmp_path
+    ):
+        from hermes_lcm.engine import LCMEngine
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-stale-bundle.db"))
+        old_owner = LCMEngine(config=config, hermes_home=str(tmp_path))
+        old_bundle = old_owner._storage_bundle
+
+        # Preserve the historical standalone lifecycle: callers sometimes
+        # close the exposed helpers directly before constructing a restart.
+        old_owner._store.close()
+        old_owner._dag.close()
+        old_owner._lifecycle.close()
+
+        replacement = LCMEngine(config=config, hermes_home=str(tmp_path))
+        try:
+            assert replacement._storage_bundle is not old_bundle
+            assert replacement._store.connection is not None
+
+            # The stale owner's later finalizer must not decrement or close the
+            # newly installed bundle at the same pool key.
+            old_owner.shutdown()
+            replacement.on_session_start("replacement-session", platform="cli")
+            replacement.ingest([{"role": "user", "content": "still writable"}])
+            assert replacement._store.get_session_count("replacement-session") == 1
+        finally:
+            old_owner.shutdown()
+            replacement.shutdown()
 
     def test_deepcopy_matches_hermes_host_copy_contract_without_fallback(self, tmp_path):
         from hermes_lcm.engine import LCMEngine
@@ -7297,9 +7407,9 @@ class TestLCMEngineCloning:
             assert isinstance(clone, LCMEngine)
             assert clone.name == "lcm"
             assert clone is not prototype
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
             assert clone._session_id == ""
             assert clone._conversation_id == ""
             assert clone.model == prototype.model
@@ -7611,3 +7721,349 @@ class TestSummaryDagLikeSanitization:
             assert emoji_only in {node.node_id for node in results}
         finally:
             dag.close()
+
+
+def test_externalized_tool_replay_lookup_reads_only_matching_call_files(tmp_path, monkeypatch):
+    from hermes_lcm.externalize import (
+        find_externalized_tool_result_content_for_call,
+        maybe_externalize_tool_output,
+    )
+
+    output_dir = tmp_path / "externalized"
+    config = LCMConfig(
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=1,
+        large_output_externalization_path=str(output_dir),
+    )
+    wanted_call_id = "call[target]*"
+    wanted = maybe_externalize_tool_output(
+        "wanted durable content",
+        tool_call_id=wanted_call_id,
+        session_id="session-1",
+        force=True,
+        config=config,
+        hermes_home=str(tmp_path),
+    )
+    assert wanted is not None
+    for index in range(25):
+        created = maybe_externalize_tool_output(
+            f"unrelated durable content {index}",
+            tool_call_id=f"other-call-{index}",
+            session_id="session-1",
+            force=True,
+            config=config,
+            hermes_home=str(tmp_path),
+        )
+        assert created is not None
+
+    original_read_text = Path.read_text
+    read_paths = []
+
+    def tracked_read_text(path, *args, **kwargs):
+        read_paths.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked_read_text)
+    recovered = find_externalized_tool_result_content_for_call(
+        tool_call_id=wanted_call_id,
+        session_id="session-1",
+        config=config,
+        hermes_home=str(tmp_path),
+    )
+
+    assert recovered == "wanted durable content"
+    assert read_paths == [wanted["path"]]
+
+
+def test_externalized_tool_replay_lookup_indexes_stable_archive_once(tmp_path, monkeypatch):
+    from hermes_lcm.externalize import (
+        find_externalized_tool_result_content_for_call,
+        maybe_externalize_tool_output,
+    )
+
+    output_dir = tmp_path / "externalized"
+    config = LCMConfig(
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=1,
+        large_output_externalization_path=str(output_dir),
+    )
+    expected = {}
+    for index in range(20):
+        call_id = f"call-{index}"
+        content = f"durable content {index}"
+        created = maybe_externalize_tool_output(
+            content,
+            tool_call_id=call_id,
+            session_id="session-1",
+            force=True,
+            config=config,
+            hermes_home=str(tmp_path),
+        )
+        assert created is not None
+        expected[call_id] = content
+
+    original_iterdir = Path.iterdir
+    archive_scans = 0
+
+    def tracked_iterdir(path):
+        nonlocal archive_scans
+        if path == output_dir:
+            archive_scans += 1
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", tracked_iterdir)
+    for call_id, content in expected.items():
+        assert find_externalized_tool_result_content_for_call(
+            tool_call_id=call_id,
+            session_id="session-1",
+            config=config,
+            hermes_home=str(tmp_path),
+        ) == content
+
+    assert archive_scans == 1
+
+
+def test_reconciliation_computes_each_incoming_identity_once(tmp_path, monkeypatch):
+    if "agent.context_engine" not in sys.modules:
+        agent_mod = ModuleType("agent")
+        agent_mod.__path__ = []
+        context_engine_mod = ModuleType("agent.context_engine")
+
+        class ContextEngine:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.last_prompt_tokens = 0
+
+            def get_status(self):
+                return {}
+
+        context_engine_mod.ContextEngine = ContextEngine
+        monkeypatch.setitem(sys.modules, "agent", agent_mod)
+        monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_mod)
+    existing_engine_module = sys.modules.get("hermes_lcm.engine")
+    if existing_engine_module is not None and not hasattr(existing_engine_module, "LCMEngine"):
+        monkeypatch.delitem(sys.modules, "hermes_lcm.engine")
+
+    from hermes_lcm.engine import LCMEngine
+
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "lcm.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    try:
+        messages = [
+            {"role": "assistant", "content": f"incoming-{index}"}
+            for index in range(40)
+        ]
+        stored_tail = [
+            ("assistant", f"stored-{index}", "", "")
+            for index in range(40)
+        ]
+        original_identity = engine._message_replay_identity
+        identity_calls = {}
+
+        def counted_identity(message, *, stored_row=False):
+            key = id(message)
+            identity_calls[key] = identity_calls.get(key, 0) + 1
+            return original_identity(message, stored_row=stored_row)
+
+        monkeypatch.setattr(engine, "_message_replay_identity", counted_identity)
+        cursor = engine._find_reconciled_cursor_for_store_tail(
+            messages,
+            stored_tail,
+            allow_empty_prefix=False,
+            session_count=len(stored_tail),
+            raw_session_count=len(stored_tail),
+        )
+
+        assert cursor is None
+        assert identity_calls
+        assert max(identity_calls.values()) == 1
+    finally:
+        engine.shutdown()
+
+
+def test_reconciliation_large_mismatch_classifies_messages_linearly(tmp_path, monkeypatch):
+    if "agent.context_engine" not in sys.modules:
+        agent_mod = ModuleType("agent")
+        agent_mod.__path__ = []
+        context_engine_mod = ModuleType("agent.context_engine")
+
+        class ContextEngine:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.last_prompt_tokens = 0
+
+            def get_status(self):
+                return {}
+
+        context_engine_mod.ContextEngine = ContextEngine
+        monkeypatch.setitem(sys.modules, "agent", agent_mod)
+        monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_mod)
+    existing_engine_module = sys.modules.get("hermes_lcm.engine")
+    if existing_engine_module is not None and not hasattr(existing_engine_module, "LCMEngine"):
+        monkeypatch.delitem(sys.modules, "hermes_lcm.engine")
+
+    from hermes_lcm.engine import LCMEngine
+
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "lcm.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    try:
+        message_count = 2_000
+        messages = [
+            {"role": "assistant", "content": f"incoming-{index}"}
+            for index in range(message_count)
+        ]
+        stored_tail = [
+            ("assistant", f"stored-{index}", "", "")
+            for index in range(message_count)
+        ]
+        original_scaffold_check = engine._is_replayed_context_scaffold_message
+        scaffold_checks = 0
+
+        def counted_scaffold_check(message):
+            nonlocal scaffold_checks
+            scaffold_checks += 1
+            return original_scaffold_check(message)
+
+        monkeypatch.setattr(engine, "_is_replayed_context_scaffold_message", counted_scaffold_check)
+        cursor = engine._find_reconciled_cursor_for_store_tail(
+            messages,
+            stored_tail,
+            allow_empty_prefix=False,
+            session_count=len(stored_tail),
+            raw_session_count=len(stored_tail),
+        )
+
+        assert cursor is None
+        assert scaffold_checks <= message_count * 4
+    finally:
+        engine.shutdown()
+
+
+def test_reconciliation_large_replay_accepts_long_durable_suffix(tmp_path, monkeypatch):
+    if "agent.context_engine" not in sys.modules:
+        agent_mod = ModuleType("agent")
+        agent_mod.__path__ = []
+        context_engine_mod = ModuleType("agent.context_engine")
+
+        class ContextEngine:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.last_prompt_tokens = 0
+
+            def get_status(self):
+                return {}
+
+        context_engine_mod.ContextEngine = ContextEngine
+        monkeypatch.setitem(sys.modules, "agent", agent_mod)
+        monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_mod)
+    existing_engine_module = sys.modules.get("hermes_lcm.engine")
+    if existing_engine_module is not None and not hasattr(existing_engine_module, "LCMEngine"):
+        monkeypatch.delitem(sys.modules, "hermes_lcm.engine")
+
+    from hermes_lcm.engine import LCMEngine
+
+    engine = LCMEngine(
+        config=LCMConfig(database_path=str(tmp_path / "lcm.db")),
+        hermes_home=str(tmp_path / "hermes"),
+    )
+    try:
+        message_count = 4_096
+        durable_suffix_count = 1_024
+        messages = [
+            {"role": "assistant", "content": f"rewritten-active-{index}"}
+            for index in range(message_count - durable_suffix_count)
+        ] + [
+            {"role": "assistant", "content": f"durable-tail-{index}"}
+            for index in range(durable_suffix_count)
+        ]
+        stored_tail = [
+            ("assistant", f"older-durable-{index}", "", "")
+            for index in range(message_count - durable_suffix_count)
+        ] + [
+            ("assistant", f"durable-tail-{index}", "", "")
+            for index in range(durable_suffix_count)
+        ]
+
+        cursor = engine._find_reconciled_cursor_for_store_tail(
+            messages,
+            stored_tail,
+            allow_empty_prefix=True,
+            session_count=len(stored_tail),
+            raw_session_count=len(stored_tail) * 2,
+        )
+
+        assert cursor == len(messages)
+    finally:
+        engine.shutdown()
+
+
+def test_reconciliation_ignores_host_transient_empty_user_rows(tmp_path, monkeypatch):
+    if "agent.context_engine" not in sys.modules:
+        agent_mod = ModuleType("agent")
+        agent_mod.__path__ = []
+        context_engine_mod = ModuleType("agent.context_engine")
+
+        class ContextEngine:
+            def __init__(self, **kwargs):
+                self.compression_count = 0
+                self.last_prompt_tokens = 0
+
+            def get_status(self):
+                return {}
+
+        context_engine_mod.ContextEngine = ContextEngine
+        monkeypatch.setitem(sys.modules, "agent", agent_mod)
+        monkeypatch.setitem(sys.modules, "agent.context_engine", context_engine_mod)
+    existing_engine_module = sys.modules.get("hermes_lcm.engine")
+    if existing_engine_module is not None and not hasattr(existing_engine_module, "LCMEngine"):
+        monkeypatch.delitem(sys.modules, "hermes_lcm.engine")
+
+    from hermes_lcm.engine import LCMEngine
+
+    config = LCMConfig(database_path=str(tmp_path / "lcm.db"))
+    before_restart = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    before_restart.on_session_start("session", platform="discord")
+    trigger_header = (
+        "[Triggering message id: `1234` — use as `message_id` for "
+        "reply/react/pin via the discord tools.]"
+    )
+    current_notice = f"{trigger_header}\n\n[IMPORTANT: Background process current exited.]"
+    old_notice = f"{trigger_header}\n\n[IMPORTANT: Background process old exited.]"
+    cumulative_notice = (
+        f"{old_notice}\n\n"
+        f"{current_notice}"
+    )
+    durable_messages = [
+        {"role": "user", "content": cumulative_notice},
+        {"role": "assistant", "content": "initial response"},
+        {"role": "assistant", "content": "first restore marker"},
+        {"role": "user", "content": ""},
+        {"role": "assistant", "content": "second restore marker"},
+    ]
+    before_restart._ingest_messages(durable_messages)
+    before_restart.shutdown()
+
+    after_restart = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+    try:
+        after_restart.on_session_start("session", platform="discord")
+        after_restart._ingest_messages([
+            {"role": "user", "content": old_notice},
+            {"role": "user", "content": current_notice},
+            durable_messages[1],
+            durable_messages[2],
+            {"role": "user", "content": ""},
+            durable_messages[4],
+            {"role": "user", "content": "new request"},
+        ])
+
+        rows = after_restart._store.get_session_messages("session")
+        assert [row["content"] for row in rows] == [
+            *(message["content"] for message in durable_messages),
+            "new request",
+        ]
+    finally:
+        after_restart.shutdown()

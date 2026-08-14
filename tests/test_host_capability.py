@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 EXPECTED_LCM_TOOLS = {
+    "agentic_map",
     "lcm_grep",
     "lcm_recall",
     "lcm_query_state",
@@ -21,6 +22,7 @@ EXPECTED_LCM_TOOLS = {
     "lcm_status",
     "lcm_inspect",
     "lcm_doctor",
+    "llm_map",
 }
 
 

@@ -1,10 +1,4 @@
-"""RED spike tests for opt-in async/background compaction.
-
-These tests intentionally describe the desired public/private contract before
-implementation exists. They stay xfailed on the design branch so the normal
-suite remains green, but strict xfail means each scenario becomes a real gate as
-soon as the feature starts landing.
-"""
+"""Regression tests for opt-in asynchronous compaction and atomic promotion."""
 
 from __future__ import annotations
 
@@ -15,12 +9,6 @@ import pytest
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.engine import LCMEngine
 
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="async/background compaction with atomic publish is design-only; implementation not landed",
-)
-
-
 def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conversation"):
     config = LCMConfig(
         database_path=str(tmp_path / f"{session_id}.db"),
@@ -28,8 +16,6 @@ def _engine(tmp_path, *, session_id="async-session", conversation_id="async-conv
         leaf_chunk_tokens=20,
         context_threshold=0.10,
     )
-    # Future config fields. They are dynamic here so these RED tests can be
-    # written before the dataclass grows the real fields.
     config.async_background_compaction_enabled = True
     config.async_background_compaction_worker_enabled = False
     engine = LCMEngine(config=config)
@@ -102,6 +88,22 @@ def test_pending_summaries_are_invisible_until_atomic_promotion(tmp_path):
         assert status["dag"]["total_nodes"] == 0
         grep = json.loads(engine.handle_tool_call("lcm_grep", {"query": "message"}))
         assert all(result.get("kind") != "pending_summary" for result in grep.get("results", []))
+    finally:
+        engine.shutdown()
+
+
+def test_atomic_promotion_carries_file_ids_into_canonical_dag(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        messages = _messages(prefix="file_0123456789abcdef")
+        engine.ingest(messages)
+        batch = engine.prepare_background_compaction_once(messages)
+
+        result = engine.promote_prepared_compaction(batch.batch_id, messages)
+
+        assert result.promoted is True
+        nodes = engine._dag.get_session_nodes(engine.current_session_id)
+        assert nodes[0].file_ids == ["file_0123456789abcdef"]
     finally:
         engine.shutdown()
 

@@ -25,6 +25,7 @@ from .db_bootstrap import (
     add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
+    ensure_relational_summary_provenance,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -152,6 +153,7 @@ class SummaryNode:
     earliest_at: float | None = None
     latest_at: float | None = None
     expand_hint: str = ""  # "Expand for details about: ..."
+    file_ids: List[str] = field(default_factory=list)
     search_rank: float | None = None
     search_directness: float = 0.0
 
@@ -196,7 +198,8 @@ class SummaryDAG:
                 created_at REAL NOT NULL,
                 earliest_at REAL,
                 latest_at REAL,
-                expand_hint TEXT DEFAULT ''
+                expand_hint TEXT DEFAULT '',
+                file_ids TEXT NOT NULL DEFAULT '[]'
             );
             CREATE INDEX IF NOT EXISTS idx_nodes_session_depth
                 ON summary_nodes(session_id, depth, created_at);
@@ -216,6 +219,7 @@ class SummaryDAG:
         )
         run_versioned_migrations(self._conn)
         self._ensure_source_window_columns()
+        ensure_relational_summary_provenance(self._conn)
         self._conn.commit()
 
     def _ensure_source_window_columns(self) -> None:
@@ -229,6 +233,10 @@ class SummaryDAG:
         add_column_if_missing(
             self._conn, columns, "latest_at",
             "ALTER TABLE summary_nodes ADD COLUMN latest_at REAL",
+        )
+        add_column_if_missing(
+            self._conn, columns, "file_ids",
+            "ALTER TABLE summary_nodes ADD COLUMN file_ids TEXT NOT NULL DEFAULT '[]'",
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
@@ -244,31 +252,203 @@ class SummaryDAG:
 
     # -- Write --------------------------------------------------------------
 
-    def add_node(self, node: SummaryNode) -> int:
-        """Insert a summary node and return its node_id."""
-        with self._db_lock:
-            cur = self._conn.execute(
+    @staticmethod
+    def _validated_source_ids(
+        conn: sqlite3.Connection,
+        node: SummaryNode,
+        *,
+        allow_empty_legacy_store: bool,
+    ) -> tuple[list[int], bool]:
+        """Validate a node's source set before any canonical row is inserted.
+
+        The boolean result says whether relational edges should be published.
+        A completely empty target table is tolerated only for old standalone
+        DAG clients/tests which historically used synthetic IDs without opening
+        the message store.  Real compaction always persists sources first.
+        """
+        if node.source_type not in {"messages", "nodes"}:
+            raise ValueError("source_type must be 'messages' or 'nodes'")
+        source_ids: list[int] = []
+        for raw_value in node.source_ids:
+            try:
+                source_id = int(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid source id: {raw_value!r}") from exc
+            if source_id not in source_ids:
+                source_ids.append(source_id)
+        if not source_ids:
+            return source_ids, True
+
+        edge_table = (
+            "lcm_summary_message_sources"
+            if node.source_type == "messages"
+            else "lcm_summary_node_sources"
+        )
+        provenance_ready = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (edge_table,),
+        ).fetchone()
+        if not provenance_ready:
+            if allow_empty_legacy_store:
+                return source_ids, False
+            raise RuntimeError("relational summary provenance schema is unavailable")
+
+        if node.source_type == "messages":
+            rows = conn.execute(
+                f"SELECT store_id, session_id FROM messages WHERE store_id IN "
+                f"({','.join('?' for _ in source_ids)})",
+                source_ids,
+            ).fetchall()
+            by_id = {int(row[0]): str(row[1]) for row in rows}
+            missing = [value for value in source_ids if value not in by_id]
+            if missing:
+                target_count = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+                if allow_empty_legacy_store and target_count == 0:
+                    logger.debug(
+                        "LCM retaining JSON-only synthetic message lineage because the message store is empty: %s",
+                        missing,
+                    )
+                    return source_ids, False
+                raise ValueError(f"message source does not exist: {missing[0]}")
+            # Message lineage may intentionally aggregate immutable evidence
+            # across conversations. Node-to-node edges remain session-local so
+            # the per-session DAG itself stays acyclic and independently
+            # traversable.
+            return source_ids, True
+
+        rows = conn.execute(
+            f"SELECT node_id, session_id, depth FROM summary_nodes WHERE node_id IN "
+            f"({','.join('?' for _ in source_ids)})",
+            source_ids,
+        ).fetchall()
+        by_id = {int(row[0]): (str(row[1]), int(row[2])) for row in rows}
+        missing = [value for value in source_ids if value not in by_id]
+        if missing:
+            raise ValueError(f"node source does not exist: {missing[0]}")
+        cross_session = [value for value in source_ids if by_id[value][0] != node.session_id]
+        if cross_session:
+            raise ValueError(f"node source must belong to the same session: {cross_session[0]}")
+        invalid_depth = [value for value in source_ids if by_id[value][1] >= int(node.depth)]
+        if invalid_depth:
+            raise ValueError(
+                f"node source must have lower depth than its parent: {invalid_depth[0]}"
+            )
+        return source_ids, True
+
+    @classmethod
+    def _insert_node_on_connection(
+        cls,
+        conn: sqlite3.Connection,
+        node: SummaryNode,
+        *,
+        allow_empty_legacy_store: bool,
+    ) -> int:
+        source_ids, publish_edges = cls._validated_source_ids(
+            conn,
+            node,
+            allow_empty_legacy_store=allow_empty_legacy_store,
+        )
+        cur = conn.execute(
                 """INSERT INTO summary_nodes
                    (session_id, depth, summary, token_count, source_token_count,
-                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint,
+                    file_ids)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     node.session_id,
                     node.depth,
                     node.summary,
                     node.token_count,
                     node.source_token_count,
-                    json.dumps(node.source_ids),
+                    json.dumps(source_ids),
                     node.source_type,
                     node.created_at or time.time(),
                     node.earliest_at,
                     node.latest_at,
                     node.expand_hint,
+                    json.dumps(list(dict.fromkeys(str(value) for value in node.file_ids))),
                 ),
             )
-            self._conn.commit()
-            node.node_id = cur.lastrowid
-            return node.node_id
+        node_id = int(cur.lastrowid)
+        if publish_edges and source_ids:
+            if node.source_type == "messages":
+                conn.executemany(
+                    "INSERT INTO lcm_summary_message_sources"
+                    "(summary_node_id, message_store_id, source_ordinal) VALUES (?, ?, ?)",
+                    ((node_id, source_id, ordinal) for ordinal, source_id in enumerate(source_ids)),
+                )
+            else:
+                conn.executemany(
+                    "INSERT INTO lcm_summary_node_sources"
+                    "(summary_node_id, source_node_id, source_ordinal) VALUES (?, ?, ?)",
+                    ((node_id, source_id, ordinal) for ordinal, source_id in enumerate(source_ids)),
+                )
+        return node_id
+
+    def add_node(self, node: SummaryNode) -> int:
+        """Insert a summary node and its validated provenance atomically."""
+        with self._db_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                node_id = self._insert_node_on_connection(
+                    self._conn,
+                    node,
+                    allow_empty_legacy_store=True,
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            node.node_id = node_id
+            node.source_ids = list(dict.fromkeys(int(value) for value in node.source_ids))
+            return node_id
+
+    def publish_node_and_advance_frontier(
+        self,
+        node: SummaryNode,
+        *,
+        conversation_id: str,
+        frontier_store_id: int,
+    ) -> int:
+        """Atomically publish canonical summary lineage and its checkpoint.
+
+        A missing/mismatched lifecycle binding is an error: committing a node
+        without the matching frontier would make the same source range eligible
+        for compaction again after restart.
+        """
+        if not conversation_id:
+            raise ValueError("conversation_id is required for atomic publication")
+        with self._db_lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                node_id = self._insert_node_on_connection(
+                    self._conn,
+                    node,
+                    allow_empty_legacy_store=False,
+                )
+                cursor = self._conn.execute(
+                    """UPDATE lcm_lifecycle_state
+                       SET current_frontier_store_id = MAX(current_frontier_store_id, ?),
+                           updated_at = ?
+                       WHERE conversation_id = ? AND current_session_id = ?""",
+                    (
+                        int(frontier_store_id or 0),
+                        time.time(),
+                        conversation_id,
+                        node.session_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(
+                        "lifecycle session is not bound for atomic summary publication"
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            node.node_id = node_id
+            node.source_ids = list(dict.fromkeys(int(value) for value in node.source_ids))
+            return node_id
 
     @staticmethod
     def stage_delete_session_scope(
@@ -309,21 +489,73 @@ class SummaryDAG:
             return []
         where = "1 = 1"
         args: list[object] = []
-        order = "n.session_id, n.node_id"
+        # Delete parents before their sources so FK RESTRICT never observes a
+        # dangling retained parent.  Depth is a topological rank for all newly
+        # validated edges.
+        order = "n.session_id, n.depth DESC, n.node_id"
+        required_cte = ""
+        required_filter = ""
         if min_depth is not None:
             where += " AND n.depth < ?"
             args.append(int(min_depth))
-            order = "n.session_id, n.depth, n.node_id"
+            # Retained high-level nodes are useful only while every lower-level
+            # node in their transitive lineage remains expandable.  Traverse
+            # the compatibility JSON cache as well as relational provenance so
+            # databases created before the edge-table migration are safe too.
+            required_cte = f"""
+                WITH RECURSIVE required(node_id) AS (
+                    SELECT retained.node_id
+                    FROM summary_nodes AS retained
+                    JOIN {_DELETE_SESSION_SCOPE_TABLE} AS retained_scope
+                      ON retained_scope.session_id = retained.session_id
+                    WHERE retained.depth >= ?
+                    UNION
+                    SELECT CAST(j.value AS INTEGER)
+                    FROM required AS r
+                    JOIN summary_nodes AS parent ON parent.node_id = r.node_id
+                    JOIN json_each(
+                        CASE WHEN json_valid(parent.source_ids)
+                             THEN parent.source_ids ELSE '[]' END
+                    ) AS j
+                    JOIN summary_nodes AS child
+                      ON child.node_id = CAST(j.value AS INTEGER)
+                     AND child.session_id = parent.session_id
+                    WHERE parent.source_type = 'nodes'
+                )
+            """
+            args.insert(0, int(min_depth))
+            required_filter = " AND NOT EXISTS (SELECT 1 FROM required WHERE required.node_id = n.node_id)"
         rows = conn.execute(
-            f"SELECT n.node_id FROM summary_nodes AS n "
+            f"{required_cte} SELECT n.node_id FROM summary_nodes AS n "
             f"JOIN {_DELETE_SESSION_SCOPE_TABLE} AS scope "
-            f"ON scope.session_id = n.session_id WHERE {where} "
+            f"ON scope.session_id = n.session_id WHERE {where}{required_filter} "
             f"ORDER BY {order} LIMIT ?",
             (*args, limit),
         ).fetchall()
         node_ids = [int(row[0]) for row in rows]
         if node_ids:
             id_placeholders = ",".join("?" for _ in node_ids)
+            # Parent deletions cascade these rows too.  Deleting explicitly in
+            # the batch also handles an old SQLite build with FK enforcement
+            # disabled on the caller-owned connection.
+            available_tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'lcm_summary_%_sources'"
+                ).fetchall()
+            }
+            if "lcm_summary_node_sources" in available_tables:
+                conn.execute(
+                    f"DELETE FROM lcm_summary_node_sources "
+                    f"WHERE summary_node_id IN ({id_placeholders})",
+                    node_ids,
+                )
+            if "lcm_summary_message_sources" in available_tables:
+                conn.execute(
+                    f"DELETE FROM lcm_summary_message_sources "
+                    f"WHERE summary_node_id IN ({id_placeholders})",
+                    node_ids,
+                )
             conn.execute(
                 f"DELETE FROM summary_nodes WHERE node_id IN ({id_placeholders})",
                 node_ids,
@@ -849,6 +1081,7 @@ class SummaryDAG:
             "source_token_count": node.source_token_count,
             "source_type": node.source_type,
             "num_sources": len(node.source_ids),
+            "file_ids": node.file_ids,
             "earliest_at": node.earliest_at,
             "latest_at": node.latest_at,
             "expand_hint": node.expand_hint,
@@ -871,7 +1104,8 @@ class SummaryDAG:
             earliest_at=row[9],
             latest_at=row[10],
             expand_hint=row[11] or "",
-            search_rank=row[12] if len(row) > 12 else None,
+            file_ids=json.loads(row[12]) if len(row) > 12 and row[12] else [],
+            search_rank=row[13] if len(row) > 13 else None,
         )
 
     def close(self) -> None:

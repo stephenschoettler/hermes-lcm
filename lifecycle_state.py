@@ -720,83 +720,93 @@ class LifecycleStateStore:
         assert conn is not None
         protected = {str(s) for s in (protected_session_ids or ()) if s}
 
+        sessions_with_data: set[str] = set()
+        tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        def _session_has_data(session_id: str) -> bool:
+            if not session_id:
+                return False
+            if "messages" in tables and conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone():
+                return True
+            if "summary_nodes" in tables and conn.execute(
+                "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone():
+                return True
+            return False
+
+        if "messages" in tables:
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM messages"
+            ).fetchall():
+                sessions_with_data.add(str(row[0]))
+        if "summary_nodes" in tables:
+            for row in conn.execute(
+                "SELECT DISTINCT session_id FROM summary_nodes"
+            ).fetchall():
+                sessions_with_data.add(str(row[0]))
+
+        now = time.time()
+        max_age_seconds = (
+            float(max_age_hours) * 3600.0
+            if max_age_hours is not None
+            else None
+        )
+        rows = conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
+        candidates: list[str] = []
+        for row in rows:
+            cur = str(row["current_session_id"] or "")
+            fin = str(row["last_finalized_session_id"] or "")
+
+            if ((cur and cur in sessions_with_data)
+                    or (fin and fin in sessions_with_data)):
+                continue
+
+            refs = {r for r in (cur, fin) if r}
+            if refs & protected:
+                continue
+
+            if max_age_seconds is not None:
+                row_age = (
+                    row["current_bound_at"]
+                    or row["last_finalized_at"]
+                    or row["updated_at"]
+                )
+                if row_age is not None and (now - float(row_age)) < max_age_seconds:
+                    continue
+
+            candidates.append(str(row["conversation_id"]))
+
+        # The common healthy path has no candidates. Do not acquire SQLite's
+        # sole writer slot merely to roll back an empty maintenance pass.
+        if not candidates:
+            return 0
+
         conn.execute("BEGIN IMMEDIATE")
         try:
-            sessions_with_data: set[str] = set()
-            tables = {
-                row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-
-            def _session_has_data(session_id: str) -> bool:
-                if not session_id:
-                    return False
-                if "messages" in tables and conn.execute(
-                    "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                if "summary_nodes" in tables and conn.execute(
-                    "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
-                    (session_id,),
-                ).fetchone():
-                    return True
-                return False
-
-            if "messages" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM messages"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-            if "summary_nodes" in tables:
-                for row in conn.execute(
-                    "SELECT DISTINCT session_id FROM summary_nodes"
-                ).fetchall():
-                    sessions_with_data.add(str(row[0]))
-
-            now = time.time()
-            max_age_seconds = (
-                float(max_age_hours) * 3600.0
-                if max_age_hours is not None
-                else None
-            )
             deleted = 0
-
-            rows = conn.execute(
-                "SELECT * FROM lcm_lifecycle_state"
-            ).fetchall()
-            for row in rows:
+            for conversation_id in candidates:
+                row = conn.execute(
+                    "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if row is None:
+                    continue
                 cur = str(row["current_session_id"] or "")
                 fin = str(row["last_finalized_session_id"] or "")
-
-                if ((cur and cur in sessions_with_data)
-                        or (fin and fin in sessions_with_data)):
-                    continue
-
-                refs = {r for r in (cur, fin) if r}
-                if refs & protected:
-                    continue
-
-                if max_age_seconds is not None:
-                    row_age = (
-                        row["current_bound_at"]
-                        or row["last_finalized_at"]
-                        or row["updated_at"]
-                    )
-                    if row_age is not None and (now - float(row_age)) < max_age_seconds:
-                        continue
-
-                # Recheck against the tables right before deletion. BEGIN
-                # IMMEDIATE blocks concurrent writers while this transaction is
-                # open; this fresh query also keeps the safety check honest if
-                # the broad snapshot logic above changes later.
                 if _session_has_data(cur) or _session_has_data(fin):
                     continue
 
                 conn.execute(
                     "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
-                    (row["conversation_id"],),
+                    (conversation_id,),
                 )
                 deleted += 1
 

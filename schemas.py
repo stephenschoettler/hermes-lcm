@@ -1,5 +1,12 @@
 """Tool schemas for LCM — what the LLM sees."""
 
+from .operator_schemas import AGENTIC_MAP_SCHEMA, LLM_MAP_SCHEMA
+
+# The public contract uses one flat schema object per tool.  The operator
+# module also exports OpenAI-style wrappers for hosts that need them directly.
+LLM_MAP = LLM_MAP_SCHEMA["function"]
+AGENTIC_MAP = AGENTIC_MAP_SCHEMA["function"]
+
 LCM_GREP = {
     "name": "lcm_grep",
     "description": (
@@ -18,13 +25,17 @@ LCM_GREP = {
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["full_text", "semantic", "hybrid"],
+                "enum": ["full_text", "regex", "semantic", "hybrid"],
                 "description": (
                     "Retrieval mode. 'full_text' preserves the historical FTS behavior byte-for-byte. "
                     "'semantic' searches embedded summaries and degrades to full-text on provider timeout or transient unavailability. "
                     "'hybrid' fuses full-text and semantic ranks with reciprocal-rank fusion (RRF)."
                 ),
                 "default": "full_text",
+            },
+            "summary_id": {
+                "type": "integer",
+                "description": "Optional summary node whose recursive raw-message lineage bounds a regex search.",
             },
             "query": {
                 "type": "string",
@@ -1007,6 +1018,10 @@ LCM_DESCRIBE = {
             "externalized_ref": {
                 "type": "string",
                 "description": "Optional externalized payload ref filename to inspect instead of a summary node.",
+            },
+            "file_id": {
+                "type": "string",
+                "description": "Optional opaque LCM file ID to inspect instead of a summary node.",
             },
         },
         "required": [],

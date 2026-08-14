@@ -101,11 +101,123 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                               readers cache WAL pages in RAM.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    # Source-lineage sidecars use real foreign keys.  SQLite defaults FK
+    # enforcement off for every new connection, so setting it only during the
+    # migration would leave ordinary writes unprotected.
+    conn.execute("PRAGMA foreign_keys=ON")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
+
+
+def ensure_relational_summary_provenance(conn: sqlite3.Connection) -> None:
+    """Install and backfill FK-enforced summary-source edge tables.
+
+    ``summary_nodes.source_ids`` remains as a compatibility/read cache for old
+    databases and older binaries.  New writes publish the JSON value and its
+    relational edges in one transaction.  Backfill is intentionally tolerant:
+    malformed legacy references remain readable through the JSON column but do
+    not become falsely validated relational edges.
+    """
+    tables = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "summary_nodes" not in tables or "messages" not in tables:
+        return
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS lcm_summary_message_sources (
+            summary_node_id INTEGER NOT NULL
+                REFERENCES summary_nodes(node_id) ON DELETE CASCADE,
+            message_store_id INTEGER NOT NULL
+                REFERENCES messages(store_id) ON DELETE RESTRICT,
+            source_ordinal INTEGER NOT NULL,
+            PRIMARY KEY(summary_node_id, source_ordinal),
+            UNIQUE(summary_node_id, message_store_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lcm_summary_message_source
+            ON lcm_summary_message_sources(message_store_id, summary_node_id);
+
+        CREATE TABLE IF NOT EXISTS lcm_summary_node_sources (
+            summary_node_id INTEGER NOT NULL
+                REFERENCES summary_nodes(node_id) ON DELETE CASCADE,
+            source_node_id INTEGER NOT NULL
+                REFERENCES summary_nodes(node_id) ON DELETE RESTRICT,
+            source_ordinal INTEGER NOT NULL,
+            PRIMARY KEY(summary_node_id, source_ordinal),
+            UNIQUE(summary_node_id, source_node_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_lcm_summary_node_source
+            ON lcm_summary_node_sources(source_node_id, summary_node_id);
+
+        DROP TRIGGER IF EXISTS lcm_summary_message_source_validate;
+        CREATE TRIGGER lcm_summary_message_source_validate
+        BEFORE INSERT ON lcm_summary_message_sources BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1
+                FROM summary_nodes AS parent
+                JOIN messages AS source
+                  ON source.store_id = NEW.message_store_id
+                WHERE parent.node_id = NEW.summary_node_id
+                  AND parent.source_type = 'messages'
+            ) THEN RAISE(ABORT, 'invalid summary message source') END;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS lcm_summary_node_source_validate
+        BEFORE INSERT ON lcm_summary_node_sources BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+                SELECT 1
+                FROM summary_nodes AS parent
+                JOIN summary_nodes AS source
+                  ON source.node_id = NEW.source_node_id
+                WHERE parent.node_id = NEW.summary_node_id
+                  AND parent.source_type = 'nodes'
+                  AND parent.session_id = source.session_id
+                  AND source.depth < parent.depth
+            ) THEN RAISE(ABORT, 'invalid summary node source') END;
+        END;
+        """
+    )
+
+    rows = conn.execute(
+        "SELECT node_id, session_id, depth, source_ids, source_type "
+        "FROM summary_nodes ORDER BY node_id"
+    ).fetchall()
+    for node_id, session_id, depth, raw_source_ids, source_type in rows:
+        try:
+            source_ids = list(dict.fromkeys(int(value) for value in json.loads(raw_source_ids or "[]")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for ordinal, source_id in enumerate(source_ids):
+            if source_type == "messages":
+                valid = conn.execute(
+                    "SELECT 1 FROM messages WHERE store_id = ?",
+                    (source_id,),
+                ).fetchone()
+                if valid:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO lcm_summary_message_sources"
+                        "(summary_node_id, message_store_id, source_ordinal) VALUES (?, ?, ?)",
+                        (node_id, source_id, ordinal),
+                    )
+            elif source_type == "nodes":
+                valid = conn.execute(
+                    "SELECT 1 FROM summary_nodes "
+                    "WHERE node_id = ? AND session_id = ? AND depth < ?",
+                    (source_id, session_id, depth),
+                ).fetchone()
+                if valid:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO lcm_summary_node_sources"
+                        "(summary_node_id, source_node_id, source_ordinal) VALUES (?, ?, ?)",
+                        (node_id, source_id, ordinal),
+                    )
 
 
 def _execute_wal_conversion_with_lock_retry(
@@ -272,7 +384,13 @@ _V5_CORE_TABLE_COLUMNS: dict[str, frozenset[str]] = {
 # have them until MessageStore opens it. Their presence is recognised, but an
 # unrelated extra core column still fails closed as a genuinely newer shape.
 _V5_CORE_OPTIONAL_COLUMNS: dict[str, frozenset[str]] = {
-    "messages": frozenset({"ingested_at", "observed_at", "observed_at_source"}),
+    "messages": frozenset({
+        "ingested_at", "observed_at", "observed_at_source", "provider_state",
+    }),
+    # Whitepaper file-awareness is a marker-gated, backward-compatible sidecar
+    # on the summary cache.  A v5 database opened by this build can gain it
+    # without changing the core numeric schema ladder.
+    "summary_nodes": frozenset({"file_ids"}),
 }
 
 # Core FTS5 virtual tables: presence is enough — their column layout is owned by
@@ -290,6 +408,12 @@ _KNOWN_FEATURE_TABLE_PREFIXES = (
     "lcm_assertion",
     "lcm_query",
     "lcm_trajectory",
+    "lcm_summary_",
+    "lcm_ingest_",
+    "lcm_files",
+    "lcm_operator_",
+    "compaction_batches",
+    "pending_summary_nodes",
 )
 
 # The known opt-in feature families whose derived tables an interim build may

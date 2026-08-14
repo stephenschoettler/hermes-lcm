@@ -1272,10 +1272,16 @@ def _doctor_source_apply_text(engine) -> str:
 
 
 def _doctor_text(engine) -> str:
-    db_path = Path(engine._store.db_path)
+    store = getattr(engine, "_store", None)
+    dag = getattr(engine, "_dag", None)
+    db_path = Path(
+        store.db_path
+        if store is not None
+        else engine._resolve_db_path(engine._hermes_home)
+    )
     runtime_identity = engine.get_runtime_identity()
-    store_conn = engine._store.connection
-    dag_conn = engine._dag.connection
+    store_conn = getattr(store, "connection", None)
+    dag_conn = getattr(dag, "connection", None)
 
     issues: list[str] = []
     recommended_actions: list[str] = []
@@ -1504,7 +1510,7 @@ def _doctor_text(engine) -> str:
         recommended_actions.append("inspect payload storage diagnostics before cleanup or deletion")
 
     try:
-        source_stats = engine._store.get_source_stats()
+        source_stats = store.get_source_stats()
     except Exception as exc:  # pragma: no cover - defensive
         issues.append("source_lineage")
         source_stats = {
@@ -1877,14 +1883,10 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
                 "WHERE scope.session_id = messages.session_id)"
             ).fetchall()
         ]
-        msg_cur = conn.execute(
-            f"DELETE FROM messages WHERE EXISTS ("
-            f"SELECT 1 FROM {scope_table} AS scope "
-            "WHERE scope.session_id = messages.session_id)"
-        )
-        archive_chunks = getattr(engine, "_archive_chunks_for_messages", None)
-        if callable(archive_chunks) and deleted_store_ids:
-            archive_chunks(deleted_store_ids, connection=conn)
+        # Delete summaries before their immutable raw sources.  Relational
+        # provenance intentionally uses ON DELETE RESTRICT on message sources;
+        # reversing this order would either fail or punch a hole in retained
+        # lineage.  Both deletes remain inside this one transaction.
         nodes_deleted = 0
         purge = getattr(engine, "_purge_embeddings_for_nodes", None)
         while True:
@@ -1898,6 +1900,15 @@ def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[s
             nodes_deleted += len(deleted_ids)
             if callable(purge):
                 purge(deleted_ids, connection=conn)
+
+        msg_cur = conn.execute(
+            f"DELETE FROM messages WHERE EXISTS ("
+            f"SELECT 1 FROM {scope_table} AS scope "
+            "WHERE scope.session_id = messages.session_id)"
+        )
+        archive_chunks = getattr(engine, "_archive_chunks_for_messages", None)
+        if callable(archive_chunks) and deleted_store_ids:
+            archive_chunks(deleted_store_ids, connection=conn)
 
         lifecycle_scope = "temp_lcm_delete_lifecycle_scope"
         conn.execute(

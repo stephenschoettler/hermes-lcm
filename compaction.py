@@ -16,10 +16,16 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .fresh_tail import (
+    fit_active_context_to_token_cap,
+    resolve_emergency_fresh_tail_boundary,
+)
+from .file_registry import union_file_ids
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -31,6 +37,73 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def _hard_context_token_cap(self) -> Optional[int]:
+        """Resolve the blocking compaction limit, including safe defaults.
+
+        Explicit assembly guardrails remain authoritative. When both optional
+        assembly knobs are disabled, the model's effective context length is
+        still a real hard limit; treating it as unbounded lets a protected fresh
+        tail grow past the provider window forever.
+        """
+        configured_cap = self._effective_assembly_token_cap()
+        if configured_cap is not None and configured_cap > 0:
+            return configured_cap
+        context_length = max(0, int(getattr(self, "context_length", 0) or 0))
+        if not context_length:
+            return None
+        hard_ratio = float(getattr(self._config, "hard_context_threshold", 0.85) or 0.85)
+        hard_ratio = min(1.0, max(float(self.context_threshold), hard_ratio))
+        return max(1, int(context_length * hard_ratio))
+
+    def _requires_hard_pressure_recovery(
+        self,
+        *,
+        observed_tokens: Optional[int] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        if self._should_force_overflow_recovery(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        ):
+            return True
+        cap = self._hard_context_token_cap()
+        if cap is None:
+            return False
+        if messages is not None:
+            # With no explicit assembly guardrail the derived cap constrains the
+            # active message view. Provider prompt totals may include a large or
+            # stale system/tool-schema overhead that this engine cannot compact.
+            return count_messages_tokens(messages) >= cap
+        return bool(observed_tokens is not None and observed_tokens >= cap)
+
+    def _hard_pressure_assembly_cap(
+        self,
+        *,
+        observed_tokens: Optional[int],
+        messages: List[Dict[str, Any]],
+    ) -> Optional[int]:
+        configured = self._overflow_recovery_assembly_cap(
+            observed_tokens=observed_tokens,
+            messages=messages,
+        )
+        if configured is not None:
+            return configured
+        cap = self._hard_context_token_cap()
+        if cap is None:
+            return None
+        return cap
+
+    @staticmethod
+    def _compaction_fresh_tail_start(
+        messages: List[Dict[str, Any]],
+        *,
+        shrink_protected_tail: bool,
+        normal_start: int,
+    ) -> int:
+        if not shrink_protected_tail:
+            return normal_start
+        return resolve_emergency_fresh_tail_boundary(messages).start
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -52,7 +125,7 @@ class CompactionMixin:
                     tokens = self._current_auxiliary_prompt_tokens(auxiliary_session_id)
                 else:
                     tokens = self.last_prompt_tokens
-            if self._should_force_overflow_recovery(observed_tokens=tokens):
+            if self._requires_hard_pressure_recovery(observed_tokens=tokens):
                 return True
             if self.threshold_tokens <= 0:
                 return False
@@ -60,10 +133,14 @@ class CompactionMixin:
         if self._compression_boundary_cooldown_active():
             return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
-        if self._should_force_overflow_recovery(observed_tokens=tokens):
+        if self._requires_hard_pressure_recovery(observed_tokens=tokens):
             return True
         if self.threshold_tokens <= 0:
             return False
+        if bool(getattr(self._config, "async_background_compaction_enabled", False)):
+            hard_cap = self._hard_context_token_cap()
+            if hard_cap is not None and tokens < hard_cap:
+                return False
         return tokens >= self.threshold_tokens
 
     def should_compress_preflight(self, messages):
@@ -75,10 +152,11 @@ class CompactionMixin:
             rough = count_messages_tokens(messages)
             if self._compression_boundary_cooldown_active():
                 return False
-            if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
+            if self._requires_hard_pressure_recovery(observed_tokens=rough, messages=messages):
                 return True
             return self.threshold_tokens > 0 and rough >= self.threshold_tokens
-        rough = count_messages_tokens(messages)
+        native_boundary = self._native_compaction_boundary(messages)
+        rough = count_messages_tokens(self._provider_effective_messages(messages))
         pre_ingest_placeholder_ambiguous_noop = False
         pre_ingest_noop_reason = ""
         if (
@@ -102,7 +180,7 @@ class CompactionMixin:
         replay_messages = None
         if self._session_id and messages:
             try:
-                replay_messages = self._ingest_messages(messages)
+                replay_messages = self._ingest_messages(messages, durable_on_lock=True)
                 self._record_ingest_success()
             except Exception as e:
                 # Fail closed for NORMAL threshold compaction: the store did not
@@ -112,8 +190,28 @@ class CompactionMixin:
                 # job is to keep the prompt under the provider limit; it converges
                 # via deterministic L3 truncation without needing the store write.
                 self._record_ingest_failure("preflight", e)
-                if self._should_force_overflow_recovery(observed_tokens=rough):
+                if native_boundary is not None:
+                    return False
+                if self._requires_hard_pressure_recovery(
+                    observed_tokens=rough,
+                    messages=messages,
+                ):
                     return True
+                return False
+        if native_boundary is not None:
+            if replay_messages is not None and replay_messages != messages:
+                return self._mark_preflight_compression_requested()
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "provider-native compaction boundary active"
+            return False
+        if bool(getattr(self._config, "async_background_compaction_enabled", False)):
+            promoted = self._promote_oldest_ready_compaction(messages)
+            if promoted is not None and promoted.promoted:
+                self._preflight_async_promotion_only = True
+                return self._mark_preflight_compression_requested()
+            self._schedule_background_compaction(replay_messages or messages)
+            hard_cap = self._hard_context_token_cap()
+            if hard_cap is not None and rough < hard_cap:
                 return False
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
@@ -121,10 +219,10 @@ class CompactionMixin:
                 messages,
                 replay_messages,
             )
-            force_overflow_requested = self._should_force_overflow_recovery(
+            force_overflow_requested = self._requires_hard_pressure_recovery(
                 observed_tokens=rough,
                 messages=messages,
-            ) or self._should_force_overflow_recovery(
+            ) or self._requires_hard_pressure_recovery(
                 observed_tokens=replay_rough,
                 messages=replay_messages,
             )
@@ -174,7 +272,10 @@ class CompactionMixin:
             return False
         if self._compression_boundary_cooldown_active():
             return False
-        if self._should_force_overflow_recovery(observed_tokens=rough):
+        if self._requires_hard_pressure_recovery(
+            observed_tokens=rough,
+            messages=messages,
+        ):
             return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             if pre_ingest_placeholder_ambiguous_noop:
@@ -359,6 +460,22 @@ class CompactionMixin:
                 focus_topic=focus_topic,
                 force=force,
             )
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                self._last_compression_status = "error"
+                self._last_compression_noop_reason = ""
+                raise
+            # A transient writer collision must never abort the user turn.
+            # Spool any unpersisted suffix durably, preserve the full active
+            # context, and retry compaction on a later turn.
+            try:
+                replay = self._ingest_messages(messages, durable_on_lock=True)
+            except Exception:
+                replay = messages
+            self._record_ingest_failure("compression", exc)
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = "sqlite writer busy; compaction deferred"
+            return self._remember_active_replay_messages(messages, replay)
         except BaseException:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
@@ -385,6 +502,31 @@ class CompactionMixin:
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
 
+        if self._native_compaction_boundary(messages) is not None:
+            replay_messages = self._ingest_messages(messages, durable_on_lock=True)
+            changed = replay_messages != messages
+            self._last_compression_status = "compacted" if changed else "noop"
+            self._last_compression_noop_reason = (
+                "" if changed else "provider-native compaction boundary active"
+            )
+            return self._remember_active_replay_messages(messages, replay_messages)
+
+        if self._preflight_async_promotion_only:
+            self._preflight_async_promotion_only = False
+            working_messages = self._ingest_messages(messages, durable_on_lock=True)
+            leading = self._leading_anchor_count(working_messages)
+            tail_start = self._fresh_tail_start(working_messages)
+            compressed = self._assemble_context(
+                working_messages[0] if leading else None,
+                working_messages[max(leading, tail_start):],
+            )
+            self._ingest_cursor = len(compressed)
+            self.compression_count += 1
+            self._last_compression_status = "compacted"
+            self._last_compression_noop_reason = ""
+            self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
+            return self._remember_active_replay_messages(compressed, compressed)
+
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             bypass_current_tokens = current_tokens
@@ -404,9 +546,18 @@ class CompactionMixin:
             )
 
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
-        force_overflow = self._should_force_overflow_recovery(
+        force_overflow = self._requires_hard_pressure_recovery(
             observed_tokens=observed_prompt_tokens,
             messages=messages,
+        )
+        # Existing explicit assembly caps already have a bounded active-tail
+        # selector. Override the normal protected suffix only for the previously
+        # unbounded default case where context_length supplies the hard cap.
+        shrink_protected_tail = bool(
+            force_overflow
+            and self._effective_assembly_token_cap() is None
+            and int(getattr(self, "context_length", 0) or 0) > 0
+            and count_messages_tokens(messages) >= int(self.context_length)
         )
         # NOTE: deliberately do NOT clear the spend guard on force_overflow.
         # force_overflow is automatic (set every turn the prompt exceeds the
@@ -415,7 +566,7 @@ class CompactionMixin:
         # in the case it exists for. A tripped guard still converges the
         # emergency via deterministic L3 truncation (no LLM spend).
         recovery_assembly_cap = (
-            self._overflow_recovery_assembly_cap(
+            self._hard_pressure_assembly_cap(
                 observed_tokens=observed_prompt_tokens,
                 messages=messages,
             )
@@ -426,8 +577,29 @@ class CompactionMixin:
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
-        working_messages = self._ingest_messages(messages)
+        working_messages = self._ingest_messages(messages, durable_on_lock=True)
         ingest_cleanup_changed_active_context = working_messages != messages
+        if self._effective_assembly_token_cap() is None:
+            # Ignore/redaction cleanup can remove the content that created the
+            # apparent pressure. Re-evaluate the derived context-length limit on
+            # the provider-visible replay before sacrificing fresh-tail history.
+            force_overflow = self._requires_hard_pressure_recovery(
+                observed_tokens=observed_prompt_tokens,
+                messages=working_messages,
+            )
+            shrink_protected_tail = bool(
+                force_overflow
+                and int(getattr(self, "context_length", 0) or 0) > 0
+                and count_messages_tokens(working_messages) >= int(self.context_length)
+            )
+            recovery_assembly_cap = (
+                self._hard_pressure_assembly_cap(
+                    observed_tokens=observed_prompt_tokens,
+                    messages=working_messages,
+                )
+                if force_overflow
+                else None
+            )
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
             and not force_overflow
@@ -531,7 +703,11 @@ class CompactionMixin:
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
                 sweep_stop_reason = "time_budget_exhausted"
                 break
-            fresh_tail_start = self._fresh_tail_start(pressure_messages)
+            fresh_tail_start = self._compaction_fresh_tail_start(
+                pressure_messages,
+                shrink_protected_tail=shrink_protected_tail,
+                normal_start=self._fresh_tail_start(pressure_messages),
+            )
 
             # Keep only a real system prompt anchored. Gateway sessions may
             # pass only conversation messages, so index 0 can be an old user
@@ -556,7 +732,11 @@ class CompactionMixin:
                 working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
                 pressure_messages = pressure_messages[:leading_anchor_count] + pressure_messages[candidate_start:]
                 candidate_start = leading_anchor_count
-                fresh_tail_start = self._fresh_tail_start(pressure_messages)
+                fresh_tail_start = self._compaction_fresh_tail_start(
+                    pressure_messages,
+                    shrink_protected_tail=shrink_protected_tail,
+                    normal_start=self._fresh_tail_start(pressure_messages),
+                )
                 if fresh_tail_start <= leading_anchor_count:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
@@ -623,7 +803,11 @@ class CompactionMixin:
                         + kept_pressure
                         + pressure_messages[fresh_tail_start:]
                     )
-                    fresh_tail_start = self._fresh_tail_start(pressure_messages)
+                    fresh_tail_start = self._compaction_fresh_tail_start(
+                        pressure_messages,
+                        shrink_protected_tail=shrink_protected_tail,
+                        normal_start=self._fresh_tail_start(pressure_messages),
+                    )
                 if drop_dependent_reply_into_tail:
                     tail_scan_start = max(fresh_tail_start, leading_anchor_count)
                     pending_tail_dependents: list[tuple[Dict[str, Any], str]] = []
@@ -679,10 +863,10 @@ class CompactionMixin:
                             "raw backlog outside fresh tail is below leaf chunk threshold"
                         )
                         break
-                if force_overflow:
-                    to_compact = candidate_raw
-                else:
-                    to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
+                to_compact = self._select_oldest_leaf_chunk(
+                    candidate_raw,
+                    working_leaf_chunk_tokens,
+                )
             else:
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
                     if not (deferred_maintenance_active and critical_budget_pressure):
@@ -773,31 +957,81 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
-            source_store_ids = sorted(dict.fromkeys(source_store_ids))
-            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
-            consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
-            earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
+            # Use the full active-replay map captured before selection. Rebuilding
+            # a map from only the selected subset changes duplicate-occurrence
+            # accounting and can falsely classify a valid persisted row as
+            # synthetic when older identical messages exist.
+            lineage_map = self._current_compress_store_ids_by_message_id or {}
+            raw_source_store_ids = [
+                lineage_map[id(message)]
+                for message in source_lineage_chunk
+                if id(message) in lineage_map
+            ]
+            raw_consumed_store_ids = [
+                lineage_map[id(message)]
+                for message in source_lookup_chunk
+                if id(message) in lineage_map
+            ]
+            filtered_only_marker = not summary_input_chunk
+            if filtered_only_marker and len(raw_consumed_store_ids) != len(source_lookup_chunk):
+                raise RuntimeError(
+                    "LCM refused leaf publication: selected compacted content "
+                    "lacks complete raw store lineage"
+                )
+            if not filtered_only_marker and len(raw_source_store_ids) != len(source_lineage_chunk):
+                raise RuntimeError(
+                    "LCM refused leaf publication: summarized content lacks "
+                    "complete raw store lineage"
+                )
+            source_store_ids = sorted(dict.fromkeys(raw_source_store_ids))
+            consumed_store_ids = sorted(dict.fromkeys(raw_consumed_store_ids))
+            if not filtered_only_marker and not source_store_ids:
+                raise RuntimeError(
+                    "LCM refused leaf publication: raw store lineage is empty"
+                )
             summary_tokens = count_tokens(summary_text)
+            conversation_id = self._conversation_id or self._session_id
+            lifecycle_state = self._lifecycle.get_by_conversation(conversation_id)
+            if lifecycle_state is None or lifecycle_state.current_session_id != self._session_id:
+                self._lifecycle.bind_session(
+                    self._session_id,
+                    conversation_id=conversation_id,
+                )
 
-            node = SummaryNode(
-                session_id=self._session_id,
-                depth=0,
-                summary=summary_text,
-                token_count=summary_tokens,
-                source_token_count=source_tokens,
-                source_ids=source_store_ids,
-                source_type="messages",
-                created_at=time.time(),
-                earliest_at=earliest_at,
-                latest_at=latest_at,
-                expand_hint=self._extract_expand_hint(summary_text),
-            )
-            self._dag.add_node(node)
-            self._invalidate_rollups_for_published_node(node)
-            self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
+            if filtered_only_marker:
+                # Dependent replies intentionally excluded from summarization
+                # stay available as immutable raw rows.  Advance the consumed
+                # frontier without publishing a misleading summary edge to
+                # content the summarizer was forbidden to inspect.
+                self._lifecycle.advance_frontier(
+                    conversation_id,
+                    self._session_id,
+                    max(consumed_store_ids),
+                )
+            else:
+                earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
+                node = SummaryNode(
+                    session_id=self._session_id,
+                    depth=0,
+                    summary=summary_text,
+                    token_count=summary_tokens,
+                    source_token_count=source_tokens,
+                    source_ids=source_store_ids,
+                    source_type="messages",
+                    created_at=time.time(),
+                    earliest_at=earliest_at,
+                    latest_at=latest_at,
+                    expand_hint=self._extract_expand_hint(summary_text),
+                    file_ids=list(union_file_ids(source_lookup_chunk)),
+                )
+                self._dag.publish_node_and_advance_frontier(
+                    node,
+                    conversation_id=conversation_id,
+                    frontier_store_id=max(consumed_store_ids),
+                )
+                self._invalidate_rollups_for_published_node(node)
+                self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            self._persist_frontier_marker()
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
@@ -808,7 +1042,11 @@ class CompactionMixin:
 
             if threshold_full_sweep_active:
                 leading_anchor_count = self._leading_anchor_count(working_messages)
-                remaining_fresh_tail_start = self._fresh_tail_start(pressure_messages)
+                remaining_fresh_tail_start = self._compaction_fresh_tail_start(
+                    pressure_messages,
+                    shrink_protected_tail=shrink_protected_tail,
+                    normal_start=self._fresh_tail_start(pressure_messages),
+                )
                 remaining_raw = working_messages[
                     leading_anchor_count:remaining_fresh_tail_start
                 ]
@@ -825,7 +1063,11 @@ class CompactionMixin:
                 if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
-                remaining_fresh_tail_start = self._fresh_tail_start(pressure_messages)
+                remaining_fresh_tail_start = self._compaction_fresh_tail_start(
+                    pressure_messages,
+                    shrink_protected_tail=shrink_protected_tail,
+                    normal_start=self._fresh_tail_start(pressure_messages),
+                )
                 remaining_raw = working_messages[
                     leading_anchor_count:remaining_fresh_tail_start
                 ]
@@ -839,6 +1081,22 @@ class CompactionMixin:
                 if remaining_raw_tokens < remaining_threshold:
                     if not (deferred_maintenance_active and critical_budget_pressure):
                         break
+            else:
+                # Blocking recovery still compacts deterministic oldest blocks
+                # rather than collapsing the whole backlog into one node. Once
+                # the active estimate reaches the ordinary target, stop; if no
+                # soft target is configured, the hard cap is the target.
+                recovery_target = (
+                    self.threshold_tokens
+                    if self.threshold_tokens > 0
+                    else (self._hard_context_token_cap() or 0)
+                )
+                if (
+                    recovery_target > 0
+                    and estimated_active_tokens < recovery_target
+                    and not critical_budget_pressure
+                ):
+                    break
 
         if (
             threshold_full_sweep_active
@@ -860,6 +1118,14 @@ class CompactionMixin:
                     working_messages[leading_anchor_count:],
                     assembly_cap_override=recovery_assembly_cap,
                 )
+                if (
+                    recovery_assembly_cap is not None
+                    and count_messages_tokens(compressed) >= recovery_assembly_cap
+                ):
+                    compressed = fit_active_context_to_token_cap(
+                        compressed,
+                        recovery_assembly_cap,
+                    )
                 return self._finalize_forced_overflow_result(
                     working_messages,
                     compressed,
@@ -965,6 +1231,14 @@ class CompactionMixin:
             )
         finally:
             self._pending_context_anchor_messages = None
+        if (
+            recovery_assembly_cap is not None
+            and count_messages_tokens(compressed) >= recovery_assembly_cap
+        ):
+            compressed = fit_active_context_to_token_cap(
+                compressed,
+                recovery_assembly_cap,
+            )
         self.compression_count += 1
         self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
         logger.info(
@@ -1037,5 +1311,43 @@ class CompactionMixin:
         self._write_generated_ignored_placeholder_hash_ordinals(
             self._generated_placeholder_digest_ordinals_for_active_replay(compressed)
         )
+        # The host continues from the reassembled transcript, not from the raw
+        # input that _ingest_messages cached at the start of this call.  Keep
+        # the replay cache aligned with that returned transcript so the next
+        # appended turn can trust the numeric cursor.  Without this, the
+        # prefix-identity guard correctly notices a replacement but then has to
+        # reconstruct the boundary from storage; synthetic summary scaffolding
+        # can be mistaken for new immutable messages during that fallback.
+        return self._remember_active_replay_messages(compressed, compressed)
+    @staticmethod
+    def _native_compaction_boundary(messages: List[Dict[str, Any]]) -> int | None:
+        """Return the newest valid provider-native compaction turn index."""
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            items = message.get("codex_compaction_items")
+            if isinstance(items, list) and any(
+                isinstance(item, dict)
+                and item.get("type") == "compaction"
+                and isinstance(item.get("encrypted_content"), str)
+                and bool(item.get("encrypted_content"))
+                for item in items
+            ):
+                return index
+        return None
 
-        return compressed
+    @classmethod
+    def _provider_effective_messages(
+        cls, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Count only the canonical suffix after native server compaction."""
+        boundary = cls._native_compaction_boundary(messages)
+        if boundary is None:
+            return messages
+        leading_system = (
+            [messages[0]]
+            if boundary > 0 and messages and messages[0].get("role") == "system"
+            else []
+        )
+        return leading_system + messages[boundary:]

@@ -315,6 +315,7 @@ def register(ctx):
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
+        AGENTIC_MAP,
         LCM_GREP,
         LCM_RECALL,
         LCM_QUERY_STATE,
@@ -330,6 +331,7 @@ def register(ctx):
         LCM_STATUS,
         LCM_INSPECT,
         LCM_DOCTOR,
+        LLM_MAP,
     )
 
     config = LCMConfig.from_env()
@@ -443,6 +445,8 @@ def register(ctx):
         ("lcm_status", LCM_STATUS, "💚"),
         ("lcm_inspect", LCM_INSPECT, "🧭"),
         ("lcm_doctor", LCM_DOCTOR, "🏥"),
+        ("llm_map", LLM_MAP, "🗺️"),
+        ("agentic_map", AGENTIC_MAP, "🧭"),
     ]
     register_tool = getattr(ctx, "register_tool", None)
     if callable(register_tool) and _host_forwards_registered_tool_messages(ctx):

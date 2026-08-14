@@ -40,7 +40,10 @@ def engine(tmp_path):
 def _replace_with_header_only_sqlite_db(e: LCMEngine) -> Path:
     """Replace the active DB file with a valid SQLite header and no tables."""
     db_path = Path(e._store.db_path)
-    e.shutdown()
+    # Close the shared helpers without clearing the engine's references: the
+    # doctor call below intentionally inspects replacement connections on the
+    # same engine instance.
+    e._storage_bundle.close()
     for path in (db_path, Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
         path.unlink(missing_ok=True)
     with sqlite3.connect(str(db_path)) as conn:

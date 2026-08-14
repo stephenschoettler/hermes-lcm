@@ -7,13 +7,24 @@ This page keeps the implementation model and product-positioning nuance outside 
 - **SQLite message store** - preserves raw messages by default before compaction
 - **Summary DAG** - compacts older context into depth-aware summary nodes
 - **Bounded recovery** - pages raw messages, child summaries, and externalized payloads without flooding the main context
-- **Agent tools** - `lcm_grep`, `lcm_describe`, `lcm_expand`, and `lcm_expand_query`
+- **Agent tools** - retrieval/diagnostic tools plus persistent `llm_map` and `agentic_map` operators
 - **Source-aware retrieval** - filters raw rows and summaries by descendant source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with glob patterns
 - **Large payload controls** - optional ingest-time externalization for oversized tool/media/raw payloads, plus transcript GC for already-externalized tool results
 - **Sensitive-pattern controls** - optional named redaction of API keys, bearer tokens, passwords, and private keys before LCM stores or summarizes them
 - **Storage-boundary payload guard** - media-ish `data:*;base64` and long base64-looking strings are externalized before LCM writes them to SQLite
 - **Diagnostics** - `lcm_status`, `lcm_inspect`, `lcm_doctor`, and optional `/lcm` slash commands
+
+### Provider-native reasoning and compaction
+
+On the first-party GPT-5.6 Codex Responses route, Hermes requests encrypted
+all-turn reasoning continuity and server-side compaction at 175K tokens
+(`HERMES_CODEX_NATIVE_COMPACTION_THRESHOLD` overrides the threshold). The
+provider's compaction item remains the canonical active-context boundary. LCM
+still archives every raw message and the opaque provider capsule, but does not
+locally summarize pre-boundary history again. Opaque provider state is stored
+outside FTS and is excluded from summaries, retrieval results, and public
+message expansion.
 
 ## LCM vs built-in compression
 
@@ -39,6 +50,8 @@ claim that Hermes core has no persisted record of pre-compression history.
 4. **Escalate** - shrink oversize summaries from detailed to bullets to deterministic truncate
 5. **Assemble** - combine system prompt, highest-depth summaries, and fresh tail
 6. **Retrieve** - use LCM tools to drill into compacted history or synthesize from expanded context
+7. **Map** - process JSONL datasets outside the active prompt with persistent,
+   schema-validated `llm_map` or `agentic_map` batches
 
 ## Development
 
@@ -50,6 +63,9 @@ Plugin surface
   __init__.py            plugin registration and optional slash-command registration
   schemas.py             tool schemas shown to the model
   tools.py               lcm_grep, lcm_load_session, lcm_describe, lcm_expand, lcm_expand_query
+  operator_schemas.py    llm_map/agentic_map schemas and bounded JSON Schema validation
+  operators.py           persistent map batches, atomic claims, retries, JSONL output
+  file_registry.py       stable path-only file IDs and type-aware exploration summaries
   command.py             /lcm command handlers
   config.py              env var defaults and overrides
   presets.py             operator config presets

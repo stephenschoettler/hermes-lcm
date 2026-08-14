@@ -36,8 +36,8 @@ def test_release_candidate_identity_surfaces_are_synchronized():
     ).read_text(encoding="utf-8")
 
     assert f"version: {RELEASE_VERSION}" in manifest
-    assert f"hermes-lcm v{RELEASE_VERSION} (15 tools)" in readme
-    assert f"hermes-lcm v{RELEASE_VERSION} (15 tools)" in operator_guide
+    assert f"hermes-lcm v{RELEASE_VERSION} (17 tools)" in readme
+    assert f"hermes-lcm v{RELEASE_VERSION} (17 tools)" in operator_guide
     assert f"## v{RELEASE_VERSION} - " in changelog
     assert f"v{RELEASE_VERSION}, main, or commit SHA" in bug_report
 

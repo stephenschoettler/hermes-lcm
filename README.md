@@ -21,9 +21,40 @@ Based on the [LCM paper](https://papers.voltropy.com/LCM) by Ehrlich & Blackman
 OpenClaw. For an interactive visualization of the LCM idea, see
 [losslesscontext.ai](https://losslesscontext.ai/).
 
+## Codex, concurrency, and whitepaper extensions
+
+The engine includes changes exercised under large, concurrent Hermes gateway
+workloads:
+
+- **Fast restart reconciliation.** Durable tool-output recovery looks up files
+  by escaped tool-call ID instead of deserializing the entire externalized
+  output archive. Incoming replay identities are computed once per pass rather
+  than once for every candidate prefix. On the production archive that exposed
+  the defect (12,799 sidecars, about 540 MB), one lookup now takes about 23 ms
+  and a 590K-token session reconciles in about 2 seconds instead of timing out
+  after 30 seconds.
+- **Codex-native continuity.** OpenAI Codex reasoning and compaction capsules
+  are archived losslessly as opaque provider state. A valid provider-native
+  boundary remains authoritative, so LCM does not summarize the same history a
+  second time. Opaque capsules stay out of FTS, summaries, and public expansion.
+- **Whitepaper-conformant compaction.** Separate soft and hard pressure paths,
+  optional background preparation, oldest-first leaf compaction, a hierarchical
+  summary DAG, and deterministic level-3 truncation guarantee convergence while
+  keeping exact source pointers.
+- **Reliable concurrent storage.** Engines sharing the same database reuse one
+  reference-counted storage bundle. Closed bundles are detected and replaced
+  safely, WAL-backed writes use bounded lock waits, and lock-contended raw
+  ingests enter an fsync-backed queue that replays exactly once.
+- **Operator-level recursion.** Persistent `llm_map` and `agentic_map` process
+  JSONL datasets with atomic claims, bounded concurrency, retries, ordered
+  output, and dependency-free JSON Schema validation.
+- **Large-file awareness.** Stable path-only file IDs and type-aware exploration
+  summaries let file references survive repeated summary-DAG condensation.
+
 ## Table of contents
 
 - [What it does](#what-it-does)
+- [Codex, concurrency, and whitepaper extensions](#codex-concurrency-and-whitepaper-extensions)
 - [LCM vs built-in compression](#lcm-vs-built-in-compression)
 - [Quick start](#quick-start)
 - [Commands and tools](#commands-and-tools)
@@ -80,7 +111,7 @@ Core capabilities:
   payloads instead of dumping everything into the prompt
 - **Agent tools** - `lcm_grep`, `lcm_recall`, `lcm_query_state`, `lcm_compute`, `lcm_compile_evidence`, `lcm_evidence_pack`, `lcm_retrieve`, `lcm_recent`, `lcm_load_session`,
   `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`,
-  and `lcm_doctor`
+  `lcm_doctor`, `llm_map`, and `agentic_map`
 - **Source-aware retrieval** - filters raw rows and summaries by descendant
   source lineage
 - **Session controls** - ignore noisy sessions or keep sessions read-only with
@@ -197,7 +228,7 @@ Expected signals:
 - selected context engine is `lcm`
 - tool list includes `lcm_grep`, `lcm_recall`, `lcm_recent`,
   `lcm_load_session`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`,
-  `lcm_status`, `lcm_inspect`, and `lcm_doctor`
+  `lcm_status`, `lcm_inspect`, `lcm_doctor`, `llm_map`, and `agentic_map`
 - the normal available-skills index includes `hermes-lcm`; current hosts can
   also resolve the explicit plugin-qualified skill `hermes-lcm:hermes-lcm`
 
@@ -205,7 +236,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.21.0-rc2 (15 tools)
+  ✓ hermes-lcm v0.21.0-rc2 (17 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -280,6 +311,8 @@ outside the LCM database.
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
+| `llm_map` | Apply one stateless model call to every item in an input JSONL file. LCM persists batch/item state, claims work atomically, runs with bounded concurrency (default 16), validates each result against the supplied JSON Schema, retries failures with validation feedback, and writes ordered JSONL output. |
+| `agentic_map` | Apply one isolated tool-capable sub-agent to every item in an input JSONL file. It uses the same durable claims, schema validation, retries, and JSONL output as `llm_map`; callers must explicitly choose the per-agent `read_only` capability boundary. |
 
 ## Recall skill and policy
 
@@ -826,6 +859,9 @@ config.py        env var defaults and overrides
 command.py       /lcm command handlers
 tools.py         lcm_grep, lcm_load_session, lcm_describe, lcm_expand, lcm_expand_query
 schemas.py       tool schemas shown to the model
+operators.py     persistent llm_map and agentic_map execution
+file_registry.py stable path-only file IDs and structural exploration summaries
+operator_schemas.py map tool schemas and dependency-free output validation
 tests/           standalone pytest coverage
 ```
 

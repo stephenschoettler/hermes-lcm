@@ -229,31 +229,27 @@ def _sanitize_reasoning_summary(text: str) -> str:
 def _call_llm_for_summary(prompt: str, max_tokens: int,
                            model: str = "", timeout: float | None = None) -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
-    try:
-        from agent.auxiliary_client import call_llm
-        call_kwargs = {
-            "task": "compression",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": max_tokens,
-        }
-        apply_lcm_model_route(call_kwargs, model)
-        if timeout is not None:
-            call_kwargs["timeout"] = timeout
-        response = call_llm(**call_kwargs)
-        content = response.choices[0].message.content
-        if not isinstance(content, str):
-            content = str(content) if content else ""
-        sanitized = _sanitize_reasoning_summary(content)
-        if content.strip() and not sanitized:
-            logger.warning(
-                "LCM summary discarded reasoning-only output (model=%s); escalating",
-                model or "<default>",
-            )
-        return sanitized
-    except Exception as e:
-        logger.warning("LLM summarization failed: %s", e)
-        return None
+    from agent.auxiliary_client import call_llm
+    call_kwargs = {
+        "task": "compression",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": max_tokens,
+    }
+    apply_lcm_model_route(call_kwargs, model)
+    if timeout is not None:
+        call_kwargs["timeout"] = timeout
+    response = call_llm(**call_kwargs)
+    content = response.choices[0].message.content
+    if not isinstance(content, str):
+        content = str(content) if content else ""
+    sanitized = _sanitize_reasoning_summary(content)
+    if content.strip() and not sanitized:
+        logger.warning(
+            "LCM summary discarded reasoning-only output (model=%s); escalating",
+            model or "<default>",
+        )
+    return sanitized
 
 
 def _invoke_summary_llm(prompt: str, max_tokens: int, model: str = "", timeout: float | None = None) -> Optional[str]:
@@ -371,6 +367,7 @@ def _invoke_summary_llm_chain(
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
+    stats: dict[str, int] | None = None,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
@@ -390,6 +387,8 @@ def _invoke_summary_llm_chain(
                 "deferring to deterministic fallback"
             )
             break
+        if stats is not None:
+            stats["attempts"] = stats.get("attempts", 0) + 1
         try:
             result = _invoke_summary_llm(
                 prompt,
@@ -398,6 +397,8 @@ def _invoke_summary_llm_chain(
                 timeout=timeout,
             )
         except Exception as exc:
+            if stats is not None:
+                stats["exceptions"] = stats.get("exceptions", 0) + 1
             logger.warning("LLM summarization failed: %s", exc)
             result = None
         if result and (accepts_result is None or accepts_result(result)):
@@ -566,6 +567,7 @@ def summarize_with_escalation(
     l1_prompt = _build_l1_prompt(text, token_budget, depth,
                                  focus_topic=focus_topic,
                                  custom_instructions=custom_instructions)
+    l1_stats: dict[str, int] = {}
     l1_result = _invoke_summary_llm_chain(
         l1_prompt,
         token_budget * 2,
@@ -575,33 +577,61 @@ def summarize_with_escalation(
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
+        stats=l1_stats,
     )
 
     if l1_result:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
         return l1_result, 1
 
-    # Level 2: aggressive bullets at reduced budget
-    l2_budget = int(token_budget * l2_budget_ratio)
-    l2_prompt = _build_l2_prompt(text, l2_budget,
-                                 focus_topic=focus_topic,
-                                 custom_instructions=custom_instructions)
-    l2_result = _invoke_summary_llm_chain(
-        l2_prompt,
-        l2_budget * 2,
-        model=model,
-        fallback_models=fallback_models,
-        timeout=timeout,
-        circuit_breaker=circuit_breaker,
-        spend_guard=spend_guard,
-        accepts_result=lambda result: count_tokens(result) < source_tokens,
+    # Level 2 improves a successful-but-noncompressing model response. It
+    # cannot improve transport/auth/provider failures, and retrying the same
+    # dead route doubles user-facing latency before deterministic L3. When
+    # every route actually attempted at L1 raised, skip directly to L3.
+    l1_attempts = l1_stats.get("attempts", 0)
+    provider_chain_failed = (
+        l1_attempts > 0 and l1_stats.get("exceptions", 0) == l1_attempts
     )
+    l2_result = None
+    if provider_chain_failed:
+        logger.warning(
+            "LCM summary provider chain failed; skipping duplicate L2 network wait"
+        )
+    else:
+        l2_budget = int(token_budget * l2_budget_ratio)
+        l2_prompt = _build_l2_prompt(text, l2_budget,
+                                     focus_topic=focus_topic,
+                                     custom_instructions=custom_instructions)
+        l2_result = _invoke_summary_llm_chain(
+            l2_prompt,
+            l2_budget * 2,
+            model=model,
+            fallback_models=fallback_models,
+            timeout=timeout,
+            circuit_breaker=circuit_breaker,
+            spend_guard=spend_guard,
+            accepts_result=lambda result: count_tokens(result) < source_tokens,
+        )
 
     if l2_result:
         logger.debug("L2 summarization succeeded (%d tokens)", count_tokens(l2_result))
         return l2_result, 2
 
-    # Level 3: deterministic truncation — guaranteed convergence
-    l3_result = _deterministic_truncate(text, l3_truncate_tokens)
+    # Level 3: deterministic truncation — guaranteed convergence.  The
+    # configured cap is an upper bound, not a reason to return a short source
+    # unchanged: reserve at least one token of reduction even when the source is
+    # already below the usual 512-token fallback size. A one-token source can
+    # only converge to the empty string.
+    actual_source_tokens = count_tokens(text)
+    strict_cap = max(
+        0,
+        min(
+            max(0, int(l3_truncate_tokens or 0)),
+            max(0, actual_source_tokens - 1),
+        ),
+    )
+    l3_result = _deterministic_truncate(text, strict_cap)
+    if actual_source_tokens > 0 and count_tokens(l3_result) >= actual_source_tokens:
+        l3_result = _truncate_text_to_tokens(text, actual_source_tokens - 1)
     logger.debug("L3 deterministic truncation (%d tokens)", count_tokens(l3_result))
     return l3_result, 3

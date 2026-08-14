@@ -60,10 +60,12 @@ def externalized_search_engine(tmp_path):
 def test_shutdown_closes_lifecycle_store(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "shutdown-lifecycle.db"))
     engine = LCMEngine(config=config)
+    lifecycle = engine._lifecycle
 
     engine.shutdown()
 
-    assert engine._lifecycle._conn is None
+    assert engine._lifecycle is None
+    assert lifecycle._conn is None
 
 
 def test_assertion_store_is_default_off_and_closes_when_enabled(tmp_path):
@@ -376,7 +378,7 @@ def test_compress_exception_sets_terminal_error_status_and_reraises_same_excepti
     engine._last_compression_status = "noop"
     engine._last_compression_noop_reason = "stale no-op reason"
 
-    def fail_ingest(_messages):
+    def fail_ingest(_messages, **_kwargs):
         raise original
 
     monkeypatch.setattr(engine, "_ingest_messages", fail_ingest)
@@ -4926,7 +4928,7 @@ class TestEngineABC:
         assert "dag_nodes" in status
 
     def test_ingest_failure_is_surfaced_in_status_and_not_swallowed(self, engine):
-        def boom(_messages):
+        def boom(_messages, **_kwargs):
             raise sqlite3.OperationalError("disk I/O error")
 
         engine._ingest_messages = boom
@@ -4954,7 +4956,7 @@ class TestEngineABC:
         # Fail-closed defers NORMAL compaction on ingest failure, but emergency
         # overflow recovery (which keeps the prompt under the provider limit and
         # converges via deterministic L3) must still be requested.
-        def boom(_messages):
+        def boom(_messages, **_kwargs):
             raise sqlite3.OperationalError("disk I/O error")
 
         engine._ingest_messages = boom
@@ -4967,7 +4969,7 @@ class TestEngineABC:
     def test_tool_call_ingest_failure_is_surfaced_in_status(self, engine):
         engine.on_session_start("live-search-failure", platform="telegram", context_length=200000)
 
-        def boom(_messages):
+        def boom(_messages, **_kwargs):
             raise sqlite3.OperationalError("disk I/O error")
 
         engine._ingest_messages = boom
@@ -12256,7 +12258,7 @@ class TestSessionRollover:
     def test_on_session_end_fails_open_when_ingest_store_is_locked(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
 
-        def locked_ingest(messages):
+        def locked_ingest(messages, **_kwargs):
             raise sqlite3.OperationalError("database is locked")
 
         monkeypatch.setattr(engine, "_ingest_messages", locked_ingest)
@@ -12269,7 +12271,7 @@ class TestSessionRollover:
     def test_on_session_end_fails_open_when_ingest_is_interrupted(self, engine, monkeypatch, caplog):
         engine.on_session_start("test-session", platform="discord")
 
-        def interrupted_ingest(messages):
+        def interrupted_ingest(messages, **_kwargs):
             raise KeyboardInterrupt()
 
         monkeypatch.setattr(engine, "_ingest_messages", interrupted_ingest)
@@ -12330,7 +12332,7 @@ class TestSessionRollover:
     def test_on_session_end_reraises_non_lock_errors(self, engine, monkeypatch):
         engine.on_session_start("test-session", platform="discord")
 
-        def broken_ingest(messages):
+        def broken_ingest(messages, **_kwargs):
             raise RuntimeError("not a lock")
 
         monkeypatch.setattr(engine, "_ingest_messages", broken_ingest)
@@ -12731,7 +12733,7 @@ class TestSessionRollover:
         )
         messages = [{"role": "assistant", "content": "raw assistant output"}]
 
-        def replay_diff(_messages):
+        def replay_diff(_messages, **_kwargs):
             return [{"role": "assistant", "content": "sanitized assistant output"}]
 
         monkeypatch.setattr(engine, "_ingest_messages", replay_diff)

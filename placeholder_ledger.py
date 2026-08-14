@@ -260,7 +260,12 @@ class PlaceholderLedgerMixin:
             serialized = json.dumps(payload, sort_keys=True)
             # skip_unchanged avoids the fsync commit (under synchronous=FULL) when
             # the stored value already matches; this runs on every ingest.
-            self._store.write_metadata_json(count_keys, serialized, skip_unchanged=True)
+            self._store.write_metadata_json(
+                count_keys,
+                serialized,
+                skip_unchanged=True,
+                busy_timeout_ms=50,
+            )
         except Exception:
             logger.debug("LCM ignored placeholder count metadata write failed", exc_info=True)
 
@@ -321,7 +326,12 @@ class PlaceholderLedgerMixin:
             serialized = json.dumps(payload, sort_keys=True)
             # Skip the write (and its fsync commit) when unchanged; see the counts
             # writer above for rationale.
-            self._store.write_metadata_json(ordinal_keys, serialized, skip_unchanged=True)
+            self._store.write_metadata_json(
+                ordinal_keys,
+                serialized,
+                skip_unchanged=True,
+                busy_timeout_ms=50,
+            )
         except Exception:
             logger.debug("LCM ignored placeholder ordinal metadata write failed", exc_info=True)
 

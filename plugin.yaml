@@ -18,3 +18,5 @@ provides_tools:
   - lcm_status
   - lcm_inspect
   - lcm_doctor
+  - llm_map
+  - agentic_map

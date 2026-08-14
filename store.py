@@ -12,9 +12,13 @@ row identity (`store_id`) for DAG/source lookup.
 import json
 import logging
 import math
+import os
 import sqlite3
 import threading
 import time
+import uuid
+from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -49,6 +53,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_util import _is_sqlite_locked_error, _temporary_sqlite_busy_timeout
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -62,6 +67,40 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+_PROVIDER_STATE_KEYS = (
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+    "codex_compaction_items",
+    "finish_reason",
+)
+
+
+def _encode_provider_state(message: Dict[str, Any]) -> str | None:
+    """Serialize provider continuity state without making it searchable.
+
+    The values are opaque replay capsules/signatures.  They are intentionally
+    excluded from FTS, summaries, and ``to_openai_msg``; this column is only a
+    lossless durable archive for provider-aware recovery code.
+    """
+    state = {
+        key: message[key]
+        for key in _PROVIDER_STATE_KEYS
+        if message.get(key) is not None
+    }
+    if not state:
+        return None
+    return json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class DurableAppendResult:
+    """Outcome of an append that may have fallen back to the disk queue."""
+
+    persisted: bool
+    store_ids: tuple[int, ...] = ()
+    pending_batch_id: str = ""
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -306,7 +345,8 @@ class MessageStore:
                 pinned INTEGER DEFAULT 0,
                 ingested_at REAL,
                 observed_at REAL,
-                observed_at_source TEXT
+                observed_at_source TEXT,
+                provider_state TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_msg_session
                 ON messages(session_id, store_id);
@@ -317,6 +357,11 @@ class MessageStore:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS lcm_ingest_receipts (
+                batch_id TEXT PRIMARY KEY,
+                persisted_at REAL NOT NULL
+            );
         """)
         ensure_external_content_fts(
             self._conn,
@@ -326,6 +371,7 @@ class MessageStore:
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
+        self._ensure_provider_state_column()
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -384,6 +430,17 @@ class MessageStore:
             "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
         )
 
+    def _ensure_provider_state_column(self) -> None:
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        add_column_if_missing(
+            self._conn,
+            columns,
+            "provider_state",
+            "ALTER TABLE messages ADD COLUMN provider_state TEXT",
+        )
+
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
@@ -406,8 +463,8 @@ class MessageStore:
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    observed_at, observed_at_source, provider_state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -423,6 +480,7 @@ class MessageStore:
                     ingested_at,
                     observed_at,
                     "host_message_timestamp" if observed_at is not None else None,
+                    _encode_provider_state(msg),
                 ),
             )
             self._conn.commit()
@@ -452,7 +510,9 @@ class MessageStore:
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                *,
+                                batch_id: str = "") -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
@@ -465,6 +525,11 @@ class MessageStore:
 
         ids = []
         with self._write_lock, self._conn:
+            if batch_id and self._conn.execute(
+                "SELECT 1 FROM lcm_ingest_receipts WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone():
+                return []
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
@@ -474,8 +539,8 @@ class MessageStore:
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        observed_at, observed_at_source, provider_state)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
@@ -491,10 +556,168 @@ class MessageStore:
                         ts,
                         observed_at,
                         "host_message_timestamp" if observed_at is not None else None,
+                        _encode_provider_state(msg),
                     ),
                 )
                 ids.append(cur.lastrowid)
+            if batch_id:
+                self._conn.execute(
+                    "INSERT INTO lcm_ingest_receipts(batch_id, persisted_at) VALUES (?, ?)",
+                    (batch_id, time.time()),
+                )
         return ids
+
+    @property
+    def _pending_ingest_dir(self) -> Path:
+        return self.db_path.parent / f".{self.db_path.name}.pending-ingest"
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _write_pending_ingest_file(self, batch_id: str, payload: Dict[str, Any]) -> Path:
+        """Durably publish one immutable pending-ingest sidecar."""
+        queue_dir = self._pending_ingest_dir
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        final_path = queue_dir / f"{batch_id}.json"
+        temp_path = queue_dir / f".{batch_id}.{uuid.uuid4().hex}.tmp"
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            offset = 0
+            while offset < len(encoded):
+                offset += os.write(descriptor, encoded[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temp_path, final_path)
+        self._fsync_directory(queue_dir)
+        return final_path
+
+    def append_batch_durable(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        token_estimates: List[int] | None = None,
+        source: str = "",
+        conversation_id: str = "",
+        *,
+        busy_timeout_ms: int = 250,
+    ) -> DurableAppendResult:
+        """Append once or durably spool the batch when SQLite is locked.
+
+        The receipt is committed in the same transaction as the messages.  If
+        the process crashes after that commit but before deleting a replay
+        sidecar, the next drain sees the receipt and does not duplicate rows.
+        """
+        protected_messages = protect_messages_for_ingest(
+            messages,
+            config=self._ingest_protection_config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
+        return self.append_protected_batch_durable(
+            session_id,
+            protected_messages,
+            token_estimates,
+            source=source,
+            conversation_id=conversation_id,
+            busy_timeout_ms=busy_timeout_ms,
+        )
+
+    def append_protected_batch_durable(
+        self,
+        session_id: str,
+        protected_messages: List[Dict[str, Any]],
+        token_estimates: List[int] | None = None,
+        source: str = "",
+        conversation_id: str = "",
+        *,
+        busy_timeout_ms: int = 250,
+    ) -> DurableAppendResult:
+        """Durably append messages already transformed by ingest protection."""
+        estimates = list(token_estimates or [0] * len(protected_messages))
+        batch_id = uuid.uuid4().hex
+        payload: Dict[str, Any] = {
+            "batch_id": batch_id,
+            "session_id": session_id,
+            "messages": protected_messages,
+            "token_estimates": estimates,
+            "source": source,
+            "conversation_id": conversation_id,
+        }
+        try:
+            # The busy-timeout PRAGMA is connection-scoped. Keep it under the
+            # same process-wide store lock as the write so a sibling engine
+            # cannot observe the temporary 50/250ms value mid-transaction.
+            with self._write_lock:
+                with _temporary_sqlite_busy_timeout([self._conn], busy_timeout_ms):
+                    ids = self._append_protected_batch(
+                        session_id,
+                        protected_messages,
+                        estimates,
+                        source=source,
+                        conversation_id=conversation_id,
+                        batch_id=batch_id,
+                    )
+            return DurableAppendResult(True, tuple(ids), "")
+        except Exception as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            self._write_pending_ingest_file(batch_id, payload)
+            return DurableAppendResult(False, (), batch_id)
+
+    def pending_ingest_count(self) -> int:
+        queue_dir = self._pending_ingest_dir
+        if not queue_dir.exists():
+            return 0
+        return sum(1 for path in queue_dir.glob("*.json") if path.is_file())
+
+    def drain_pending_ingest(
+        self,
+        *,
+        limit: int = 100,
+        busy_timeout_ms: int | None = None,
+    ) -> int:
+        """Replay durable pending batches, leaving the first failed file intact."""
+        queue_dir = self._pending_ingest_dir
+        if not queue_dir.exists():
+            return 0
+        processed = 0
+        for path in sorted(queue_dir.glob("*.json"))[:max(0, int(limit))]:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            batch_id = str(payload["batch_id"])
+            with self._write_lock:
+                if busy_timeout_ms is None:
+                    self._append_protected_batch(
+                        str(payload["session_id"]),
+                        list(payload["messages"]),
+                        [int(value) for value in payload.get("token_estimates", [])],
+                        source=str(payload.get("source") or ""),
+                        conversation_id=str(payload.get("conversation_id") or ""),
+                        batch_id=batch_id,
+                    )
+                else:
+                    with _temporary_sqlite_busy_timeout([self._conn], busy_timeout_ms):
+                        self._append_protected_batch(
+                            str(payload["session_id"]),
+                            list(payload["messages"]),
+                            [int(value) for value in payload.get("token_estimates", [])],
+                            source=str(payload.get("source") or ""),
+                            conversation_id=str(payload.get("conversation_id") or ""),
+                            batch_id=batch_id,
+                        )
+            path.unlink()
+            self._fsync_directory(queue_dir)
+            processed += 1
+        return processed
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""
@@ -798,6 +1021,38 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def get_conversation_messages_after(
+        self,
+        conversation_id: str,
+        after_store_id: int = 0,
+        limit: int = 10000,
+        *,
+        current_session_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Get ordered messages across every segment of one conversation.
+
+        Compression rollover intentionally leaves immutable rows owned by the
+        session segment that produced them.  Context rebuilt in the next
+        segment can therefore contain an un-compacted tail from the previous
+        segment, and provenance reconciliation must be able to see those rows.
+        """
+        if current_session_id:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE (conversation_id = ? OR session_id = ?)
+                     AND store_id > ?
+                   ORDER BY store_id LIMIT ?""",
+                (conversation_id, current_session_id, after_store_id, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE conversation_id = ? AND store_id > ?
+                   ORDER BY store_id LIMIT ?""",
+                (conversation_id, after_store_id, limit),
+            ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
@@ -1025,6 +1280,7 @@ class MessageStore:
         serialized: str,
         *,
         skip_unchanged: bool = False,
+        busy_timeout_ms: int | None = None,
     ) -> bool:
         """Write the pre-serialized JSON string ``serialized`` to every key in ``keys``.
 
@@ -1033,31 +1289,39 @@ class MessageStore:
         commit. With ``skip_unchanged=True`` a key already holding ``serialized``
         is left untouched and the commit is skipped entirely when nothing changed
         -- the ingest-hot-path optimization used by the placeholder count/ordinal
-        writers. Returns ``True`` if any key was written.
+        writers. ``busy_timeout_ms`` lets best-effort hot-path metadata avoid
+        inheriting the connection's normal 30-second writer wait. Returns
+        ``True`` if any key was written.
         """
         conn = self._conn
         if conn is None:
             return False
         wrote = False
         with self._write_lock:
-            for key in keys:
-                if skip_unchanged:
-                    existing = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?", (key,)
-                    ).fetchone()
-                    if existing is not None and existing[0] == serialized:
-                        continue
-                conn.execute(
-                    """
-                    INSERT INTO metadata(key, value)
-                    VALUES(?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                    """,
-                    (key, serialized),
-                )
-                wrote = True
-            if wrote:
-                conn.commit()
+            timeout_scope = (
+                _temporary_sqlite_busy_timeout([conn], busy_timeout_ms)
+                if busy_timeout_ms is not None
+                else nullcontext()
+            )
+            with timeout_scope:
+                for key in keys:
+                    if skip_unchanged:
+                        existing = conn.execute(
+                            "SELECT value FROM metadata WHERE key = ?", (key,)
+                        ).fetchone()
+                        if existing is not None and existing[0] == serialized:
+                            continue
+                    conn.execute(
+                        """
+                        INSERT INTO metadata(key, value)
+                        VALUES(?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (key, serialized),
+                    )
+                    wrote = True
+                if wrote:
+                    conn.commit()
         return wrote
 
     # -- Compaction telemetry ------------------------------------------------
@@ -1508,6 +1772,21 @@ class MessageStore:
         if stored.get("tool_name"):
             msg["name"] = stored["tool_name"]
         return msg
+
+    def get_provider_state(self, store_id: int) -> Dict[str, Any] | None:
+        """Return opaque archived provider state for trusted internal recovery."""
+        row = self._conn.execute(
+            "SELECT provider_state FROM messages WHERE store_id = ?",
+            (store_id,),
+        ).fetchone()
+        if row is None or not row[0]:
+            return None
+        try:
+            state = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Ignoring invalid provider_state for store_id=%s", store_id)
+            return None
+        return state if isinstance(state, dict) else None
 
     # -- Connection access --------------------------------------------------
 

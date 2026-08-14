@@ -16,6 +16,7 @@ import math
 import os
 import re
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
@@ -26,6 +27,15 @@ _EXTERNALIZED_REF_RE = re.compile(
 )
 _EXTERNALIZED_SEARCH_HEADER_BYTES = 64 * 1024
 _EXTERNALIZED_SEARCH_TAIL_BYTES = 64 * 1024
+_TOOL_RESULT_FILENAME_RE = re.compile(
+    r"^\d{8}_\d{6}_(?P<tool_call_stub>.+)_[0-9a-f]{12}_[0-9a-f]+\.json$"
+)
+_TOOL_RESULT_ARCHIVE_CACHE_LOCK = threading.RLock()
+_TOOL_RESULT_ARCHIVE_CACHE: dict[
+    str,
+    tuple[tuple[int, int, int], dict[str, tuple[Path, ...]], tuple[Path, ...]],
+] = {}
+_TOOL_RESULT_ARCHIVE_CACHE_MAX_DIRS = 32
 
 
 def _placeholder_metadata(value: Any) -> str:
@@ -48,6 +58,65 @@ def _safe_stub(value: str, fallback: str) -> str:
 
 def _content_digest_prefix(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _directory_generation(path: Path) -> tuple[int, int, int]:
+    directory_stat = path.stat()
+    return (directory_stat.st_mtime_ns, directory_stat.st_ctime_ns, directory_stat.st_size)
+
+
+def _tool_result_archive_index(
+    storage_dir: Path,
+) -> tuple[dict[str, tuple[Path, ...]], tuple[Path, ...]]:
+    """Index stable sidecar filenames once per directory generation.
+
+    Restart reconciliation can recover thousands of persisted tool results in
+    one pass. Re-running ``Path.glob`` for every call turns that work into a
+    directory-size multiplied by message-count scan. The directory generation
+    tuple invalidates this bounded cache whenever entries are added or removed.
+    """
+    cache_key = str(storage_dir.resolve())
+    with _TOOL_RESULT_ARCHIVE_CACHE_LOCK:
+        generation = _directory_generation(storage_dir)
+        cached = _TOOL_RESULT_ARCHIVE_CACHE.get(cache_key)
+        if cached is not None and cached[0] == generation:
+            return cached[1], cached[2]
+
+        paths_by_stub: dict[str, list[Path]] = {}
+        unparsed_paths: list[Path] = []
+        for path in storage_dir.iterdir():
+            if not path.is_file() or path.suffix != ".json":
+                continue
+            match = _TOOL_RESULT_FILENAME_RE.fullmatch(path.name)
+            if match is None:
+                unparsed_paths.append(path)
+                continue
+            paths_by_stub.setdefault(match.group("tool_call_stub"), []).append(path)
+
+        frozen_index = {
+            stub: tuple(sorted(paths))
+            for stub, paths in paths_by_stub.items()
+        }
+        frozen_unparsed = tuple(sorted(unparsed_paths))
+        # Capture the post-scan generation. A concurrent writer will either be
+        # included by the iterator or invalidate this entry on the next lookup.
+        generation = _directory_generation(storage_dir)
+        _TOOL_RESULT_ARCHIVE_CACHE[cache_key] = (
+            generation,
+            frozen_index,
+            frozen_unparsed,
+        )
+        while len(_TOOL_RESULT_ARCHIVE_CACHE) > _TOOL_RESULT_ARCHIVE_CACHE_MAX_DIRS:
+            _TOOL_RESULT_ARCHIVE_CACHE.pop(next(iter(_TOOL_RESULT_ARCHIVE_CACHE)))
+        return frozen_index, frozen_unparsed
+
+
+def _tool_result_archive_candidates(storage_dir: Path, tool_call_id: str) -> tuple[Path, ...]:
+    tool_call_stub = _tool_call_stub(tool_call_id)
+    paths_by_stub, unparsed_paths = _tool_result_archive_index(storage_dir)
+    legacy_fragment = f"_{tool_call_stub}_"
+    legacy_matches = tuple(path for path in unparsed_paths if legacy_fragment in path.name)
+    return paths_by_stub.get(tool_call_stub, ()) + legacy_matches
 
 
 def _preview_sha256(preview_prefix: Any) -> str:
@@ -1007,7 +1076,11 @@ def find_externalized_tool_result_content_for_call(
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
         return None
-    for path in sorted(storage_dir.glob("*.json")):
+    # Tool-result sidecars are written with the bounded tool-call stub in the
+    # filename. Build one generation-aware archive index so a restart replay
+    # with thousands of tool results does not rescan the directory per call.
+    candidates = _tool_result_archive_candidates(storage_dir, tool_call_id)
+    for path in candidates:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):

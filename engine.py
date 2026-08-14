@@ -7,6 +7,7 @@ with a DAG-based summarization system that preserves every message.
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -89,6 +90,7 @@ from .assertion_store import AssertionStore, SourceSnapshot
 from .adaptive_retrieval import AdaptiveRetrievalRegistry
 from .query_view_store import QueryViewStore
 from .schemas import (
+    AGENTIC_MAP,
     LCM_DESCRIBE,
     LCM_DOCTOR,
     LCM_EXPAND,
@@ -104,6 +106,7 @@ from .schemas import (
     LCM_RECENT,
     LCM_RETRIEVE,
     LCM_STATUS,
+    LLM_MAP,
 )
 from .sanitize import (
     _clean_active_assistant_message,
@@ -127,6 +130,9 @@ from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
 from .compaction import CompactionMixin
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
+from .async_compaction import AsyncCompactionMixin
+from .file_registry import FileRegistry, union_file_ids
+from .operators import LLMMap
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
     normalize_content_value,
@@ -360,7 +366,76 @@ _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across co
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
-class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
+class _SharedStorageBundle:
+    """Process-local SQLite helpers shared by session-isolated engine clones."""
+
+    def __init__(self, store, dag, lifecycle, assertions, query_views):
+        self.store = store
+        self.dag = dag
+        self.lifecycle = lifecycle
+        self.assertions = assertions
+        self.query_views = query_views
+        self.refs = 1
+
+    def is_open(self) -> bool:
+        """Return whether every SQLite helper still has a live connection."""
+        return all(
+            helper is None or getattr(helper, "_conn", None) is not None
+            for helper in (
+                self.store,
+                self.dag,
+                self.lifecycle,
+                self.assertions,
+                self.query_views,
+            )
+        )
+
+    def close(self) -> None:
+        for helper in (
+            self.query_views,
+            self.assertions,
+            self.lifecycle,
+            self.dag,
+            self.store,
+        ):
+            close = getattr(helper, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("LCM failed closing shared storage", exc_info=True)
+
+
+_SHARED_STORAGE_LOCK = threading.RLock()
+_StorageContract = tuple[object, ...]
+_StorageBundleKey = tuple[str, str, _StorageContract]
+_SHARED_STORAGE: dict[_StorageBundleKey, _SharedStorageBundle] = {}
+_EMPTY_LIFECYCLE_GC_LOCK = threading.Lock()
+_EMPTY_LIFECYCLE_GC_LAST_ATTEMPT: dict[str, float] = {}
+_EMPTY_LIFECYCLE_GC_INTERVAL_SECONDS = 300.0
+
+
+def _storage_contract(config: LCMConfig) -> _StorageContract:
+    """Return only configuration that changes shared SQLite helper behavior.
+
+    Per-agent runtime settings (summary routes/timeouts, context thresholds,
+    retrieval budgets, etc.) must not create another pool of connections for
+    the same database. MessageStore retains the first config object, so fields
+    it consults while serializing durable rows remain part of the key.
+    """
+    return (
+        bool(getattr(config, "assertions_enabled", False)),
+        bool(getattr(config, "query_views_enabled", False))
+        or bool(getattr(config, "adaptive_retrieval_enabled", False)),
+        bool(getattr(config, "sensitive_patterns_enabled", False)),
+        tuple(str(value) for value in (getattr(config, "sensitive_patterns", ()) or ())),
+        bool(getattr(config, "large_output_externalization_enabled", False)),
+        int(getattr(config, "large_output_externalization_threshold_chars", 0) or 0),
+        str(getattr(config, "large_output_externalization_path", "") or ""),
+    )
+
+
+class LCMEngine(AsyncCompactionMixin, CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
     Automatic LCM compaction is routine background maintenance. Hosts that
@@ -399,6 +474,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         db_path = self._resolve_db_path(hermes_home)
         self._bind_storage(db_path, hermes_home)
+        self._initialize_async_compaction()
+        self._file_registry = FileRegistry(db_path)
+        self._llm_map_operator = LLMMap(db_path, executor=self._execute_llm_map_item, file_registry=self._file_registry)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -559,6 +637,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # One-shot handoff from preflight: adopt an already-durable replay
         # cleanup during boundary cooldown without running summary work.
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        self._preflight_async_promotion_only = False
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -632,6 +711,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         clone.api_key = self.api_key
         clone.provider = self.provider
         clone.api_mode = self.api_mode
+        # Provider health and spend are process-level properties, not session
+        # state. Sharing these guards across clones prevents concurrent gateway
+        # sessions from each retrying the same degraded summarizer route and
+        # multiplying compaction latency. Forced/manual compaction still calls
+        # clear() on the same guard, preserving the operator repair path.
+        clone._summary_circuit_breaker = self._summary_circuit_breaker
+        clone._summary_spend_guard = self._summary_spend_guard
         if self._context_length_source:
             clone._set_context_length(
                 self.raw_context_length,
@@ -661,8 +747,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         AIAgent instances. A default object deepcopy walks into MessageStore,
         SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
         cannot be pickled. LCM already exposes clone_for_agent() as the safe
-        boundary: share durable configuration/database path, but allocate fresh
-        per-agent runtime/storage helper objects.
+        boundary: allocate isolated per-agent runtime state while sharing one
+        ref-counted set of SQLite helpers for an identical database/config.
         """
         clone = self.clone_for_agent()
         memo[id(self)] = clone
@@ -678,33 +764,88 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        resolved_db_path = str(Path(db_path).expanduser().resolve())
+        # MessageStore already treats an omitted home as the DB parent. Use
+        # that same canonical identity here so registration-time prototypes
+        # and profile-bound clones do not allocate duplicate helper bundles.
+        normalized_home = str(
+            Path(hermes_home).expanduser().resolve()
+            if hermes_home
+            else Path(resolved_db_path).parent
+        )
+        bundle_key: _StorageBundleKey = (
+            resolved_db_path,
+            normalized_home,
+            _storage_contract(self._config),
+        )
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
         self._assertion_extractor = None
+        self._storage_bundle_key = None
+        self._storage_bundle = None
+        with _SHARED_STORAGE_LOCK:
+            bundle = _SHARED_STORAGE.get(bundle_key)
+            if bundle is not None and not bundle.is_open():
+                # A caller may explicitly close the exposed store/DAG helpers
+                # before constructing a replacement engine (the historical
+                # standalone-engine lifecycle).  Never hand those closed
+                # connections to the replacement or let the old engine's
+                # eventual shutdown decrement a newly-created bundle.
+                _SHARED_STORAGE.pop(bundle_key, None)
+                bundle.close()
+                bundle = None
+            if bundle is None:
+                store = dag = lifecycle = assertions = query_views = None
+                try:
+                    store = MessageStore(
+                        resolved_db_path,
+                        ingest_protection_config=self._config,
+                        hermes_home=hermes_home,
+                    )
+                    try:
+                        store.drain_pending_ingest(busy_timeout_ms=250)
+                    except Exception:
+                        logger.warning("LCM pending-ingest recovery deferred", exc_info=True)
+                    dag = SummaryDAG(resolved_db_path)
+                    if self._config.temporal_rollups_enabled:
+                        initialize_rollup_invalidation_outbox(dag)
+                    lifecycle = LifecycleStateStore(resolved_db_path)
+                    assertions = (
+                        AssertionStore(resolved_db_path)
+                        if bool(getattr(self._config, "assertions_enabled", False))
+                        else None
+                    )
+                    query_views = (
+                        QueryViewStore(resolved_db_path)
+                        if bool(getattr(self._config, "query_views_enabled", False))
+                        or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
+                        else None
+                    )
+                    bundle = _SharedStorageBundle(
+                        store, dag, lifecycle, assertions, query_views
+                    )
+                    _SHARED_STORAGE[bundle_key] = bundle
+                except Exception:
+                    for helper in (query_views, assertions, lifecycle, dag, store):
+                        close = getattr(helper, "close", None)
+                        if callable(close):
+                            try:
+                                close()
+                            except Exception:
+                                pass
+                    raise
+            else:
+                bundle.refs += 1
+
+        self._storage_bundle_key = bundle_key
+        self._storage_bundle = bundle
+        self._store = bundle.store
+        self._dag = bundle.dag
+        self._lifecycle = bundle.lifecycle
+        self._assertions = bundle.assertions
+        self._query_views = bundle.query_views
         try:
-            self._store = MessageStore(
-                db_path,
-                ingest_protection_config=self._config,
-                hermes_home=hermes_home,
-            )
-            self._dag = SummaryDAG(db_path)
-            if self._config.temporal_rollups_enabled:
-                # Install the transaction-coupled summary mutation triggers before
-                # this engine can publish or delete a DAG node.
-                initialize_rollup_invalidation_outbox(self._dag)
-            self._lifecycle = LifecycleStateStore(db_path)
-            self._assertions = (
-                AssertionStore(db_path)
-                if bool(getattr(self._config, "assertions_enabled", False))
-                else None
-            )
-            self._query_views = (
-                QueryViewStore(db_path)
-                if bool(getattr(self._config, "query_views_enabled", False))
-                or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
-                else None
-            )
             self._adaptive_retrieval = (
                 AdaptiveRetrievalRegistry(self._query_views)
                 if bool(
@@ -726,22 +867,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
 
     def _close_storage(self) -> None:
-        """Best-effort close of currently bound SQLite helpers."""
-        for attr in (
-            "_adaptive_retrieval",
-            "_store",
-            "_dag",
-            "_lifecycle",
-            "_assertions",
-            "_query_views",
-        ):
-            helper = getattr(self, attr, None)
-            close = getattr(helper, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+        """Release this engine's reference and close the last shared bundle."""
+        adaptive = getattr(self, "_adaptive_retrieval", None)
+        close_adaptive = getattr(adaptive, "close", None)
+        if callable(close_adaptive):
+            try:
+                close_adaptive()
+            except Exception:
+                logger.debug("LCM failed closing adaptive retrieval", exc_info=True)
+        self._adaptive_retrieval = None
+
+        key = getattr(self, "_storage_bundle_key", None)
+        owned_bundle = getattr(self, "_storage_bundle", None)
+        self._storage_bundle_key = None
+        self._storage_bundle = None
+        bundle_to_close = None
+        if key is not None and owned_bundle is not None:
+            with _SHARED_STORAGE_LOCK:
+                current = _SHARED_STORAGE.get(key)
+                owned_bundle.refs -= 1
+                if current is owned_bundle and owned_bundle.refs <= 0:
+                    _SHARED_STORAGE.pop(key, None)
+                    bundle_to_close = owned_bundle
+        if bundle_to_close is not None:
+            bundle_to_close.close()
+
+        for attr in ("_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
+            setattr(self, attr, None)
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -1515,18 +1667,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return
         if self._session_id and messages:
             try:
+                try:
+                    self._store.drain_pending_ingest(
+                        busy_timeout_ms=_SESSION_END_BUSY_TIMEOUT_MS
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower():
+                        raise
+                    logger.debug("LCM pending-ingest drain deferred by SQLite lock")
                 self._remember_lcm_normal_message_prefix(
                     self._session_id,
                     messages,
                     conversation_id=self._conversation_id,
                 )
-                self._ingest_messages(messages)
+                replay_messages = self._ingest_messages(messages, durable_on_lock=True)
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
                     "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
                     self._session_id, len(messages), self._ingest_cursor,
                 )
+                self._schedule_background_compaction(replay_messages)
             except Exception as e:
                 self._record_ingest_failure("per-turn ingest()", e)
 
@@ -1727,15 +1888,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._config.empty_lifecycle_gc_enabled
             and self._lifecycle.row_count() > self._config.empty_lifecycle_gc_threshold
         ):
-            protected = {str(self._session_id)} if self._session_id else None
-            max_age = self._config.empty_lifecycle_gc_max_age_hours
-            try:
-                deleted = self._lifecycle.prune_empty_sessions(
-                    protected_session_ids=protected,
-                    max_age_hours=max_age,
-                )
-            except Exception:
-                deleted = 0
+            db_key = str(Path(self._lifecycle.db_path).expanduser().resolve())
+            now = time.monotonic()
+            with _EMPTY_LIFECYCLE_GC_LOCK:
+                last_attempt = _EMPTY_LIFECYCLE_GC_LAST_ATTEMPT.get(db_key, 0.0)
+                run_gc = now - last_attempt >= _EMPTY_LIFECYCLE_GC_INTERVAL_SECONDS
+                if run_gc:
+                    _EMPTY_LIFECYCLE_GC_LAST_ATTEMPT[db_key] = now
+            deleted = 0
+            if run_gc:
+                protected = {str(self._session_id)} if self._session_id else None
+                max_age = self._config.empty_lifecycle_gc_max_age_hours
+                try:
+                    deleted = self._lifecycle.prune_empty_sessions(
+                        protected_session_ids=protected,
+                        max_age_hours=max_age,
+                    )
+                except Exception:
+                    deleted = 0
             if deleted:
                 logger.info(
                     "LCM pruned %d lifecycle rows with zero stored data "
@@ -3382,7 +3552,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     # Best-effort final flush. Keep this path bounded because
                     # host gateways call session-end hooks from lifecycle paths
                     # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
+                    ingest = self._ingest_messages
+                    try:
+                        ingest_parameters = inspect.signature(ingest).parameters.values()
+                    except (TypeError, ValueError):
+                        ingest_parameters = ()
+                    supports_durable_on_lock = any(
+                        parameter.name == "durable_on_lock"
+                        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in ingest_parameters
+                    )
+                    if supports_durable_on_lock:
+                        ingest(messages, durable_on_lock=True)
+                    else:
+                        # Preserve the long-standing one-argument seam used by
+                        # host adapters and tests which replace the ingest hook.
+                        ingest(messages)
                 except KeyboardInterrupt:
                     logger.warning(
                         "LCM session-end raw-message ingest interrupted; "
@@ -3632,8 +3817,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return 0
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [
+    def get_tool_schemas(self, *, is_subagent: bool = True) -> List[Dict[str, Any]]:
+        schemas = [
             LCM_GREP,
             LCM_RECALL,
             LCM_QUERY_STATE,
@@ -3649,9 +3834,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_STATUS,
             LCM_INSPECT,
             LCM_DOCTOR,
+            LLM_MAP,
+            AGENTIC_MAP,
         ]
+        if not is_subagent:
+            schemas = [
+                schema for schema in schemas
+                if schema.get("name") not in {"lcm_expand", "lcm_expand_query"}
+            ]
+        return schemas
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+        if name in {"lcm_expand", "lcm_expand_query"} and kwargs.get("is_subagent") is False:
+            return json.dumps({
+                "error": (
+                    f"{name} is restricted to sub-agents so expanded history cannot flood "
+                    "the primary interaction context; delegate a bounded inspection task"
+                )
+            })
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
@@ -3662,7 +3862,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 self._session_ignored or self._session_stateless or self._thread_context_stateless()
             ):
                 try:
-                    self._ingest_messages(messages)
+                    self._ingest_messages(messages, durable_on_lock=True)
                     self._record_ingest_success()
                     self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 except Exception as e:
@@ -3684,11 +3884,46 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "lcm_status": lcm_tools.lcm_status,
             "lcm_inspect": lcm_tools.lcm_inspect,
             "lcm_doctor": lcm_tools.lcm_doctor,
+            "llm_map": lcm_tools.llm_map,
+            "agentic_map": lcm_tools.agentic_map,
         }
         handler = handlers.get(name)
         if handler:
-            return handler(args, engine=self)
+            return handler(args, engine=self, **kwargs)
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
+
+    @staticmethod
+    def _parse_map_json_response(text: str) -> Any:
+        candidate = str(text or "").strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```$", "", candidate)
+        return json.loads(candidate)
+
+    def _execute_llm_map_item(
+        self,
+        *,
+        item: Any,
+        prompt: str,
+        attempt: int,
+        validation_error: str | None,
+    ) -> Any:
+        from agent.auxiliary_client import call_llm
+
+        correction = (
+            f"\nThe previous output failed validation: {validation_error}. Return a corrected value."
+            if validation_error else ""
+        )
+        response = call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": (
+                f"{prompt}\n\nInput JSON:\n{json.dumps(item, ensure_ascii=False)}"
+                f"{correction}\nReturn only the requested JSON value."
+            )}],
+            temperature=0,
+            timeout=self._config.summary_timeout_ms / 1000,
+        )
+        return self._parse_map_json_response(response.choices[0].message.content)
 
     def _database_path_source(self) -> str:
         if self._config.database_path:
@@ -3710,11 +3945,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         conversation_id = self.current_conversation_id
         lifecycle_state = None
         lifecycle_error = ""
-        if conversation_id:
+        lifecycle = getattr(self, "_lifecycle", None)
+        if conversation_id and lifecycle is not None:
             try:
-                lifecycle_state = self._lifecycle.get_by_conversation(conversation_id)
+                lifecycle_state = lifecycle.get_by_conversation(conversation_id)
             except Exception as exc:  # pragma: no cover - defensive
                 lifecycle_error = str(exc)
+
+        store = getattr(self, "_store", None)
+        database_path = (
+            Path(store.db_path)
+            if store is not None
+            else self._resolve_db_path(self._hermes_home)
+        )
 
         identity: Dict[str, Any] = {
             "engine": self.name,
@@ -3723,7 +3966,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "plugin_path": str(_PLUGIN_ROOT),
             "module_path": str(Path(__file__).resolve()),
             "hermes_home": str(self._hermes_home or ""),
-            "database_path": str(self._store.db_path),
+            "database_path": str(database_path),
             "database_path_source": self._database_path_source(),
             "session_id": session_id,
             "session_platform": self.current_session_platform,
@@ -3784,6 +4027,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
+            "async_compaction": self.get_async_compaction_status(),
+            "pending_ingest_batches": self._store.pending_ingest_count(),
         })
         with self._assertion_extraction_metrics_lock:
             status["assertion_extraction"] = {
@@ -4357,7 +4602,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
-    def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _ingest_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        durable_on_lock: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list
@@ -4384,6 +4634,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         n = len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
+        # Hosts may replace the active transcript between calls (for example
+        # after an overflow recovery) instead of appending to the previous
+        # list.  A numeric cursor is only meaningful while that prefix is
+        # unchanged.  Reconcile against durable history before deciding that
+        # the replacement prefix has already been ingested; otherwise a later
+        # leaf can contain provider-visible messages with no store lineage.
+        if cursor > 0 and not self._ingest_cursor_needs_reconcile:
+            cached_source_identities = getattr(
+                self,
+                "_last_active_replay_source_identities",
+                None,
+            )
+            if cached_source_identities is not None:
+                current_prefix_identities = [
+                    self._message_replay_identity(message)
+                    for message in messages[:cursor]
+                ]
+                if current_prefix_identities != cached_source_identities[:cursor]:
+                    self._ingest_cursor_needs_reconcile = True
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
@@ -4438,7 +4707,36 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 else replay_msg
                 for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
             ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+            reconciled_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+            cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
+            if (
+                cursor > 0
+                and len(messages) > cursor
+                and (
+                    any(
+                        self._is_replayed_context_scaffold_message(message)
+                        for message in messages[:cursor]
+                    )
+                    or (
+                        cached_active_replay_messages is not None
+                        and len(cached_active_replay_messages) >= cursor
+                        and [
+                            self._message_replay_identity(message)
+                            for message in messages[:cursor]
+                        ]
+                        == [
+                            self._message_replay_identity(message)
+                            for message in cached_active_replay_messages[:cursor]
+                        ]
+                    )
+                )
+            ):
+                # Reconciliation may classify a compacted scaffold plus its
+                # generated placeholders as a replay-only prefix. It must not
+                # extend that classification over newly appended, byte-equal
+                # user text beyond the cached active replay boundary.
+                reconciled_cursor = min(reconciled_cursor, cursor)
+            self._ingest_cursor = reconciled_cursor
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
@@ -4648,6 +4946,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     or metadata_replayed_active_placeholder
                 )
                 if (
+                    replayed_active_placeholder
+                    and cursor > 0
+                    and absolute_idx >= len(self._last_active_replay_messages)
+                    and not ignored_original_messages[absolute_idx]
+                ):
+                    # A literal user quote appended after the cached replay is
+                    # new immutable input, even when its text is byte-identical
+                    # to an engine-generated placeholder. Provenance applies to
+                    # cached occurrences, not to every future equal string.
+                    replayed_active_placeholder = False
+                if (
                     ignored_original_messages[absolute_idx]
                     or generated_volatile_placeholder
                     or replayed_active_placeholder
@@ -4744,13 +5053,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 active_replay_messages[absolute_idx] = stubbed_message
 
         estimates = [count_message_tokens(m) for m in protected_messages]
-        self._store._append_protected_batch(
-            self._session_id,
-            protected_messages,
-            estimates,
-            source=self._session_platform,
-            conversation_id=self._conversation_id,
-        )
+        if durable_on_lock:
+            durable_result = self._store.append_protected_batch_durable(
+                self._session_id,
+                protected_messages,
+                estimates,
+                source=self._session_platform,
+                conversation_id=self._conversation_id,
+                busy_timeout_ms=_SESSION_END_BUSY_TIMEOUT_MS,
+            )
+            if not durable_result.persisted:
+                logger.warning(
+                    "LCM session-end raw-message ingest skipped due to SQLite lock "
+                    "in the primary store and queued durably: batch=%s",
+                    durable_result.pending_batch_id,
+                )
+        else:
+            self._store._append_protected_batch(
+                self._session_id,
+                protected_messages,
+                estimates,
+                source=self._session_platform,
+                conversation_id=self._conversation_id,
+            )
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
         # raw ingest: marking a period stale before its covering summary exists
@@ -5543,6 +5868,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             earliest_at=earliest_at,
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
+            file_ids=list(union_file_ids(*(node.file_ids for node in nodes))),
         )
         self._dag.add_node(condensed_node)
         self._invalidate_rollups_for_published_node(condensed_node)
@@ -6519,12 +6845,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+        self._close_async_compaction()
+        self._close_storage()
+
+    def __del__(self) -> None:  # pragma: no cover - defensive refcount cleanup
+        try:
+            self.shutdown()
+        except Exception:
+            pass

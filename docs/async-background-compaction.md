@@ -1,6 +1,6 @@
 # Opt-in async/background compaction with atomic publish
 
-Design spike for preparing old stable chunks off the turn-critical path while keeping current LCM behavior unchanged unless explicitly enabled.
+Implementation notes for preparing old stable chunks off the turn-critical path while keeping current LCM behavior unchanged unless explicitly enabled.
 
 Refs:
 
@@ -10,7 +10,12 @@ Refs:
 
 ## Problem
 
-Today `LCMEngine.compress()` does the expensive work synchronously: ingest, select the oldest raw backlog outside the fresh tail, call the summarizer, write canonical DAG nodes, optionally condense, then assemble the active context. That preserves the important cache-friendly property: active context changes only at threshold/full-sweep boundaries. The downside is foreground latency, especially with slow local summarizers or serial leaf chains.
+The foreground fallback in `LCMEngine.compress()` performs ingest, leaf selection,
+summarization, canonical DAG publication, optional condensation, and active-context
+assembly synchronously. When the async feature and worker flags are enabled, stable
+leaf work is prepared ahead of that path and promoted during the foreground
+preflight. The synchronous path remains available whenever prepared work is absent,
+incomplete, stale, or invalid.
 
 The safe target is not “write summaries in another thread and flip a boolean.” The target is a two-phase lifecycle:
 
@@ -27,7 +32,7 @@ Until promotion, active context, search, recall, expansion, transcript GC, and d
 - No replacement for foreground compaction. If prepared work is absent, incomplete, stale, or invalid, foreground compaction falls back to today’s path.
 - No persisted threshold override that can win over live config. Persisted metadata is evidence to validate against live policy, not policy itself.
 
-## Proposed flags
+## Configuration
 
 Add config fields, all disabled by default:
 
@@ -267,19 +272,23 @@ Doctor should warn, not fail, for normal disabled state. It should warn on:
 - failed batches whose backoff has expired but no worker has retried;
 - pending rows whose batch is missing.
 
-## Implementation sequence
+## Implemented lifecycle
 
-1. **Acceptance tests first** for stale rejection, config change rejection, foreground/background race, summary failure/backoff, restart recovery, successful atomic promotion, pending invisibility, and status/doctor counts.
-2. Schema only: create the two tables and reader filters, with feature disabled and no behavior change.
-3. Manual one-shot preparer behind the flag, no automatic worker yet.
-4. Atomic promotion path in `compress()` before foreground summarization, with fallback on any reject.
-5. Status/doctor async counts.
-6. Optional worker loop with backpressure and retry policy.
-7. Later: pending condensed layers, if leaf-only promotion leaves too much foreground work.
+1. The store creates separate batch and pending-node tables; canonical readers never
+   see preparation state.
+2. Per-turn ingest schedules a bounded worker when both async flags are enabled.
+3. The worker claims a stable source range and prepares a complete leaf batch.
+4. Foreground preflight validates session, policy, route, source identities, fresh
+   tail, overlap, and coverage before one transactional promotion.
+5. Invalid or missing work is rejected/superseded and normal synchronous compaction
+   proceeds.
+6. Restart recovery, retry backoff, status counters, and doctor diagnostics expose
+   the durable lifecycle.
 
 ## Test matrix
 
-These are mirrored in `tests/test_async_background_compaction_design.py` as xfailed RED spike tests until the implementation exists.
+These regression tests are implemented in
+`tests/test_async_background_compaction_design.py`.
 
 | Test | Proves |
 | --- | --- |
@@ -296,9 +305,11 @@ These are mirrored in `tests/test_async_background_compaction_design.py` as xfai
 | `test_atomic_promotion_rolls_back_partial_publish_failure` | A mid-promotion failure leaves no canonical node/frontier/batch half-state. |
 | `test_status_and_doctor_report_async_compaction_counts` | Operators see pending/prepared/promoted/rejected/failed counts. |
 
-## Open questions
+## Deferred extensions
 
-- Should v1 reject a ready batch when only a prefix is still publishable, or support prefix promotion? Recommendation: reject in v1. Prefix promotion makes continuity and expected leaf counts more complex.
-- Should automatic workers live inside `LCMEngine`, a plugin lifecycle helper, or a host-managed scheduler? Recommendation: start with a manual one-shot preparer and make the automatic worker a later slice.
-- Should route fingerprint include fallback model order? Recommendation: yes. Different fallback order can change output after partial failures.
-- Should summary timeout changes reject prepared work? Recommendation: no unless timeout policy changes the output contract; include route/model/policy version, not operational timing knobs.
+- Ready batches are rejected when only a prefix remains publishable. Prefix
+  promotion would complicate continuity and expected-leaf accounting.
+- V1 prepares leaf nodes only; pending condensed layers remain a possible later
+  optimization.
+- Route fingerprints cover the selected summary route. Expanding that contract to
+  model fallback ordering can be considered if fallback execution is added.

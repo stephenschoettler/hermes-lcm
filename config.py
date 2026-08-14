@@ -313,6 +313,11 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
+    _EnvFieldSpec("hard_context_threshold", "LCM_HARD_CONTEXT_THRESHOLD", float),
+    _EnvFieldSpec("async_background_compaction_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_worker_enabled", "LCM_ASYNC_BACKGROUND_COMPACTION_WORKER_ENABLED", bool),
+    _EnvFieldSpec("async_background_compaction_max_batches", "LCM_ASYNC_BACKGROUND_COMPACTION_MAX_BATCHES", int),
+    _EnvFieldSpec("async_background_compaction_retry_backoff_seconds", "LCM_ASYNC_BACKGROUND_COMPACTION_RETRY_BACKOFF_SECONDS", float),
     _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
     _EnvFieldSpec("condensation_fanin", "LCM_CONDENSATION_FANIN", int),
     _EnvFieldSpec("dynamic_leaf_chunk_enabled", "LCM_DYNAMIC_LEAF_CHUNK_ENABLED", bool),
@@ -455,6 +460,14 @@ class LCMConfig:
     leaf_chunk_tokens: int = 20_000
     # Fraction of context window that triggers compaction (0.0–1.0)
     context_threshold: float = 0.35
+    # Hard pressure always blocks for a convergent foreground compaction.  The
+    # soft threshold above may instead prepare summaries in the background.
+    hard_context_threshold: float = 0.85
+    # Background compaction is opt-in until a host explicitly enables it.
+    async_background_compaction_enabled: bool = False
+    async_background_compaction_worker_enabled: bool = False
+    async_background_compaction_max_batches: int = 2
+    async_background_compaction_retry_backoff_seconds: float = 300.0
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
     # when LCM is inheriting the host compression threshold. Explicit LCM
     # threshold overrides remain authoritative.

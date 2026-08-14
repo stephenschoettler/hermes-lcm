@@ -50,9 +50,121 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_TRIGGERING_MESSAGE_HEADER_RE = re.compile(
+    r"(?m)^\[Triggering message id: `(?P<message_id>[^`]+)`[^\n]*\](?:\r?\n)?"
+)
+_LARGE_REPLAY_MIN_ITEMS = 4_096
+_LARGE_REPLAY_DURABLE_SUFFIX_ITEMS = 1_024
+
+
+def _prefix_lengths_matching_tail_suffix(
+    prefix_items: list[tuple[str, str, str, str]],
+    tail_items: list[tuple[str, str, str, str]],
+) -> set[int]:
+    """Return prefix lengths whose values equal a suffix of ``tail_items``.
+
+    The prefix-function construction finds every viable replay boundary in
+    linear time. Following failure links from the final match yields shorter
+    matching boundaries without retrying every progressively shorter message
+    prefix.
+    """
+    if not prefix_items or not tail_items:
+        return set()
+    separator = object()
+    combined: list[Any] = [*prefix_items, separator, *tail_items]
+    prefix_function = [0] * len(combined)
+    for index in range(1, len(combined)):
+        match_length = prefix_function[index - 1]
+        while match_length and combined[index] != combined[match_length]:
+            match_length = prefix_function[match_length - 1]
+        if combined[index] == combined[match_length]:
+            match_length += 1
+        prefix_function[index] = match_length
+
+    matches: set[int] = set()
+    match_length = prefix_function[-1]
+    while match_length:
+        if match_length <= len(prefix_items):
+            matches.add(match_length)
+        match_length = prefix_function[match_length - 1]
+    return matches
+
+
+def _matching_suffix_length(
+    left: list[tuple[str, str, str, str]],
+    right: list[tuple[str, str, str, str]],
+) -> int:
+    match_length = 0
+    limit = min(len(left), len(right))
+    while match_length < limit and left[-1 - match_length] == right[-1 - match_length]:
+        match_length += 1
+    return match_length
 
 
 class ReconcileMixin:
+    @staticmethod
+    def _triggering_message_id(msg: Dict[str, Any]) -> str:
+        if str(msg.get("role") or "") != "user":
+            return ""
+        content = normalize_content_value(msg.get("content")) or ""
+        match = _TRIGGERING_MESSAGE_HEADER_RE.match(content)
+        return match.group("message_id") if match is not None else ""
+
+    @classmethod
+    def _collapse_superseded_triggering_user_messages(
+        cls,
+        messages: list[Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        """Keep the latest row in an adjacent run for one Discord message id."""
+        collapsed: list[Dict[str, Any]] = []
+        for msg in messages:
+            message_id = cls._triggering_message_id(msg)
+            if (
+                message_id
+                and collapsed
+                and cls._triggering_message_id(collapsed[-1]) == message_id
+            ):
+                collapsed[-1] = msg
+            else:
+                collapsed.append(msg)
+        return collapsed
+
+    @staticmethod
+    def _is_host_transient_empty_replay_message(msg: Dict[str, Any]) -> bool:
+        """Identify host lifecycle placeholders that are not durable turns.
+
+        Hermes can leave empty user rows in active SessionDB history while
+        restoring an interrupted gateway run. They carry no user content or
+        tool identity and are not consistently presented to context engines at
+        creation time, so treating them as replay identities prevents an
+        otherwise exact durable transcript from reconciling after restart.
+        """
+        return bool(
+            str(msg.get("role") or "") == "user"
+            and not (normalize_content_value(msg.get("content")) or "").strip()
+            and not msg.get("tool_call_id")
+            and not msg.get("tool_calls")
+            and not msg.get("tool_name")
+        )
+
+    @staticmethod
+    def _canonical_user_replay_content(content: str) -> str:
+        """Collapse cumulative Discord runtime injections to their latest view.
+
+        Background-process completions can rewrite one active user row by
+        appending another copy of its stable triggering-message envelope. LCM
+        may have persisted the cumulative view while SessionDB later exposes
+        only the newest suffix. The repeated platform message id is durable
+        evidence that both representations refer to the same host row.
+        """
+        matches = list(_TRIGGERING_MESSAGE_HEADER_RE.finditer(content))
+        if len(matches) < 2 or matches[0].start() != 0:
+            return content
+        message_id = matches[0].group("message_id")
+        if any(match.group("message_id") != message_id for match in matches[1:]):
+            return content
+        return content[matches[-1].start():]
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -234,6 +346,8 @@ class ReconcileMixin:
             )
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
+        if role == "user":
+            content = self._canonical_user_replay_content(content)
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
             role,
@@ -446,13 +560,135 @@ class ReconcileMixin:
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
         empty_prefix_cursor: int | None = None
-        for cursor in range(len(messages), -1, -1):
+        identity_cache: dict[int, tuple[str, str, str, str]] = {}
+
+        def replay_identity(msg: Dict[str, Any]) -> tuple[str, str, str, str]:
+            """Compute each incoming message identity at most once per pass."""
+            key = id(msg)
+            identity = identity_cache.get(key)
+            if identity is None:
+                identity = self._message_replay_identity(msg)
+                identity_cache[key] = identity
+            return identity
+
+        # Classify and identify the incoming replay once. Candidate prefixes are
+        # prefixes of these two sequences, so KMP can identify every boundary
+        # capable of matching a durable tail without an O(n^2) descending scan.
+        incoming_visible_identities: list[tuple[str, str, str, str]] = []
+        incoming_candidate_identities: list[tuple[str, str, str, str]] = []
+        visible_count_by_cursor = [0]
+        candidate_count_by_cursor = [0]
+        base_visible_messages = [
+            msg
+            for msg in messages
+            if not self._is_replayed_context_scaffold_message(msg)
+            and not self._is_host_transient_empty_replay_message(msg)
+            and not self._matches_ignore_message_patterns(msg)
+        ]
+        collapsed_visible_messages = self._collapse_superseded_triggering_user_messages(
+            base_visible_messages
+        )
+        superseded_visible_message_ids = {
+            id(msg) for msg in base_visible_messages
+        } - {
+            id(msg) for msg in collapsed_visible_messages
+        }
+        for msg in messages:
+            is_visible = (
+                not self._is_replayed_context_scaffold_message(msg)
+                and not self._is_host_transient_empty_replay_message(msg)
+                and not self._matches_ignore_message_patterns(msg)
+                and id(msg) not in superseded_visible_message_ids
+            )
+            if is_visible:
+                identity = replay_identity(msg)
+                incoming_visible_identities.append(identity)
+                content = text_content_for_pattern_matching(msg.get("content")) or ""
+                is_filtered_placeholder = (
+                    self._is_volatile_ignored_quarantine_placeholder(msg, content)
+                    or self._is_ignored_active_replay_placeholder(msg, content)
+                    or (
+                        self._compiled_ignore_message_patterns
+                        and self._is_quarantined_assistant_replay_identity(identity)
+                        and self._matches_ignore_message_patterns(msg, stored_row=True)
+                    )
+                )
+                if not is_filtered_placeholder:
+                    incoming_candidate_identities.append(identity)
+            visible_count_by_cursor.append(len(incoming_visible_identities))
+            candidate_count_by_cursor.append(len(incoming_candidate_identities))
+
+        candidate_match_lengths: set[int] = set()
+        visible_match_lengths: set[int] = set()
+        for tail in (stored_tail, sanitized_replay_tail):
+            candidate_match_lengths.update(
+                _prefix_lengths_matching_tail_suffix(incoming_candidate_identities, tail)
+            )
+            visible_match_lengths.update(
+                _prefix_lengths_matching_tail_suffix(incoming_visible_identities, tail)
+            )
+        generationless_candidate_identities = [
+            self._strip_inline_persisted_output_generation_identity(identity)
+            for identity in incoming_candidate_identities
+        ]
+        generationless_sanitized_tail = [
+            self._strip_inline_persisted_output_generation_identity(identity)
+            for identity in sanitized_replay_tail
+        ]
+        candidate_match_lengths.update(
+            _prefix_lengths_matching_tail_suffix(
+                generationless_candidate_identities,
+                generationless_sanitized_tail,
+            )
+        )
+
+        # Hermes may rewrite old SessionDB rows in place while preserving a
+        # long, already-durable newest tail (for example cumulative background
+        # process notifications). In a chronological transcript, new messages
+        # cannot precede an exact durable suffix. A deliberately high anchor
+        # lets large restart snapshots reconcile without weakening the
+        # ambiguity safeguards used for ordinary deltas and repeated turns.
+        if len(incoming_candidate_identities) >= _LARGE_REPLAY_MIN_ITEMS:
+            durable_suffix_length = max(
+                _matching_suffix_length(incoming_candidate_identities, stored_tail),
+                _matching_suffix_length(incoming_candidate_identities, sanitized_replay_tail),
+            )
+            if durable_suffix_length >= _LARGE_REPLAY_DURABLE_SUFFIX_ITEMS:
+                return len(messages)
+
+        plausible_cursors: set[int] = set()
+        for cursor in range(len(messages) + 1):
+            candidate_count = candidate_count_by_cursor[cursor]
+            visible_count = visible_count_by_cursor[cursor]
+            if (
+                candidate_count in candidate_match_lengths
+                or (bool(stored_tail) and candidate_count == len(stored_tail))
+                or (
+                    candidate_count < visible_count
+                    and visible_count in visible_match_lengths
+                )
+            ):
+                plausible_cursors.add(cursor)
+        if allow_empty_prefix:
+            plausible_cursors.add(0)
+            # The original descending scan returns the longest leading run of
+            # synthetic/ignored context whose effective replay prefix is empty.
+            # Keep that exact boundary so scaffolds are skipped while the first
+            # real delta remains eligible for ingestion.
+            for cursor in range(len(messages), -1, -1):
+                if candidate_count_by_cursor[cursor] == 0:
+                    plausible_cursors.add(cursor)
+                    break
+
+        for cursor in sorted(plausible_cursors, reverse=True):
             candidate_messages = messages[:cursor]
             candidate_visible_messages = [
                 msg
                 for msg in candidate_messages
                 if not self._is_replayed_context_scaffold_message(msg)
+                and not self._is_host_transient_empty_replay_message(msg)
                 and not self._matches_ignore_message_patterns(msg)
+                and id(msg) not in superseded_visible_message_ids
             ]
             candidate_non_placeholder_messages = [
                 msg
@@ -468,7 +704,7 @@ class ReconcileMixin:
                 and not (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        replay_identity(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
@@ -478,7 +714,7 @@ class ReconcileMixin:
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
             candidate_has_quarantined_replay_evidence = any(
-                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
+                self._is_quarantined_assistant_replay_identity(replay_identity(msg))
                 for msg in candidate_messages
             )
             candidate_identity_messages = (
@@ -487,11 +723,11 @@ class ReconcileMixin:
                 else candidate_visible_messages
             )
             candidate_visible_prefix = [
-                self._message_replay_identity(msg)
+                replay_identity(msg)
                 for msg in candidate_visible_messages
             ]
             candidate_prefix = [
-                self._message_replay_identity(msg)
+                replay_identity(msg)
                 for msg in candidate_identity_messages
             ]
             if not candidate_prefix:
@@ -601,7 +837,7 @@ class ReconcileMixin:
                 or (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        replay_identity(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
@@ -767,11 +1003,16 @@ class ReconcileMixin:
         self,
         messages: List[Dict[str, Any]],
     ) -> list[tuple[str, str, str, str]]:
-        return [
-            self._message_replay_identity(msg)
+        visible_messages = [
+            msg
             for msg in messages
             if not self._is_replayed_context_scaffold_message(msg)
+            and not self._is_host_transient_empty_replay_message(msg)
             and not self._matches_ignore_message_patterns(msg)
+        ]
+        return [
+            self._message_replay_identity(msg)
+            for msg in self._collapse_superseded_triggering_user_messages(visible_messages)
         ]
 
     def _is_suspicious_stale_no_overlap_snapshot(
@@ -845,11 +1086,12 @@ class ReconcileMixin:
         stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
         if not stored_rows:
             return 0
-        stored_tail_rows = [
+        stored_tail_rows = self._collapse_superseded_triggering_user_messages([
             row
             for row in stored_rows
+            if not self._is_host_transient_empty_replay_message(row)
             if not self._matches_ignore_message_patterns(row, stored_row=True)
-        ]
+        ])
         stored_tail = [
             self._message_replay_identity(row, stored_row=True)
             for row in stored_tail_rows
@@ -966,10 +1208,17 @@ class ReconcileMixin:
         candidates: list[Dict[str, Any]] = []
         next_candidate_after = self._last_compacted_store_id
         while True:
-            page = self._store.get_session_messages_after(
-                self._session_id,
-                after_store_id=next_candidate_after,
-            )
+            if self._conversation_id:
+                page = self._store.get_conversation_messages_after(
+                    self._conversation_id,
+                    after_store_id=next_candidate_after,
+                    current_session_id=self._session_id,
+                )
+            else:
+                page = self._store.get_session_messages_after(
+                    self._session_id,
+                    after_store_id=next_candidate_after,
+                )
             if not page:
                 break
             candidates.extend(page)

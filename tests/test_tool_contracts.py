@@ -72,12 +72,12 @@ def _manifest_tool_names() -> list[str]:
 def _schema_by_tool_name() -> dict[str, dict]:
     public_schemas = {}
     for symbol, value in vars(schemas).items():
-        if not symbol.startswith("LCM_"):
+        if not (symbol.startswith("LCM_") or symbol in {"LLM_MAP", "AGENTIC_MAP"}):
             continue
         if not isinstance(value, dict) or not isinstance(value.get("name"), str):
             continue
         name = value["name"]
-        if not name.startswith("lcm_"):
+        if not (name.startswith("lcm_") or name in {"llm_map", "agentic_map"}):
             continue
         expected_symbol = name.upper()
         assert symbol == expected_symbol, f"{symbol} should be exported as {expected_symbol}"

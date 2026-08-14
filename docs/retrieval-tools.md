@@ -40,6 +40,13 @@ is the active context engine.
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, message/frontier metadata, fresh tail, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. It returns metadata only; use `lcm_load_session`/`lcm_expand` when you need content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
+| `llm_map` | Apply a prompt independently to every JSONL input item as a stateless model call. Persistent batch/item states, atomic claims, bounded concurrency, schema validation, retry feedback, and ordered JSONL output are engine-managed. |
+| `agentic_map` | Apply a prompt independently to every JSONL input item using an isolated tool-capable sub-agent. The caller must set `read_only`; execution otherwise uses the same persistent claims, schema validation, retries, and ordered output contract as `llm_map`. |
+
+The map operators keep datasets outside the active prompt. Their output files
+receive stable LCM file IDs containing only the canonical path, MIME/size/token
+metadata, and a bounded structural exploration summary; file bytes remain on
+the filesystem.
 
 ### Retrieval contract
 

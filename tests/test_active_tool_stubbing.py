@@ -387,7 +387,11 @@ def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
     engine.threshold_tokens = 100_000
     engine._last_boundary_skip_time = time.time()
     messages, cleanup_messages = externalized_raw_cleanup_messages()
-    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
+    monkeypatch.setattr(
+        engine,
+        "_ingest_messages",
+        lambda _messages, **_kwargs: cleanup_messages,
+    )
 
     assert engine.should_compress_preflight(messages) is True
     assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
@@ -401,7 +405,11 @@ def test_flag_off_replay_cleanup_cooldown_publishes_without_summary_llm(
     engine.threshold_tokens = 100_000
     engine._last_boundary_skip_time = time.time()
     messages, cleanup_messages = externalized_raw_cleanup_messages()
-    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
+    monkeypatch.setattr(
+        engine,
+        "_ingest_messages",
+        lambda _messages, **_kwargs: cleanup_messages,
+    )
     summary_spy = Mock(
         side_effect=AssertionError("cooldown-limited replay cleanup must not summarize")
     )
@@ -425,7 +433,11 @@ def test_flag_off_noncleanup_replay_diff_remains_blocked_during_cooldown(
     engine._last_boundary_skip_time = time.time()
     messages = [{"role": "user", "content": "original visible payload"}]
     replay_messages = [{"role": "user", "content": "normalized visible payload"}]
-    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay_messages)
+    monkeypatch.setattr(
+        engine,
+        "_ingest_messages",
+        lambda _messages, **_kwargs: replay_messages,
+    )
 
     assert engine._replay_diff_requests_ingest_cleanup(messages, replay_messages) is False
     assert engine._should_force_overflow_recovery(messages=replay_messages) is False

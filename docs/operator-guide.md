@@ -123,11 +123,11 @@ Expected signals:
 
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
-- tool list includes all 15 schemas: `lcm_grep`, `lcm_recall`,
+- tool list includes all 17 schemas: `lcm_grep`, `lcm_recall`,
   `lcm_query_state`, `lcm_compute`, `lcm_compile_evidence`,
   `lcm_evidence_pack`, `lcm_retrieve`, `lcm_recent`, `lcm_load_session`,
   `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`,
-  and `lcm_doctor`
+  `lcm_doctor`, `llm_map`, and `agentic_map`
 - ordinary skill discovery includes `hermes-lcm`; plugin-qualified explicit
   loading is `hermes-lcm:hermes-lcm` on hosts that support plugin skills
 
@@ -135,7 +135,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.21.0-rc2 (15 tools)
+  ✓ hermes-lcm v0.21.0-rc2 (17 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -169,8 +169,8 @@ LCM tools are still available through the context-engine schema/dispatch path
 registration (Path A) on those hosts because Path A would shadow Path B and lose
 current-turn ingest.
 
-Healthy signals are the same as above: selected context engine `lcm`, all 15
-`lcm_*` tools in the live tool list, and `lcm_status` / `lcm_inspect` / `lcm_doctor` responding
+Healthy signals are the same as above: selected context engine `lcm`, all 17
+LCM tools in the live tool list, and `lcm_status` / `lcm_inspect` / `lcm_doctor` responding
 after one normal message initializes the session.
 
 ### `/lcm status` looks unbound after restart
@@ -241,7 +241,7 @@ environment variables:
 
 ### Evidence and adaptive retrieval (0.21 RC)
 
-Hermes exposes all 15 LCM tool schemas whenever LCM is the active context
+Hermes exposes all 17 LCM tool schemas whenever LCM is the active context
 engine. Exposure is not activation. On a stock install:
 
 - `lcm_compute`, `lcm_compile_evidence`, and `lcm_evidence_pack` are bounded,
