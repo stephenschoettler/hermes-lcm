@@ -498,10 +498,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
-        # Host compatibility: LCM treats successful automatic compaction as
-        # silent maintenance. Manual /lcm diagnostics and warning/error paths
-        # remain explicit.
-        self.emit_automatic_compaction_status = False
+        # Host compatibility: LCM used to treat successful automatic compaction
+        # as silent maintenance. Interactive surfaces (desktop/TUI) rely on the
+        # lifecycle status to show a "Summarizing…" indicator instead of a
+        # silent timer, so emit it by default; LCM_EMIT_AUTOMATIC_COMPACTION_STATUS=0
+        # restores the silent behavior. Manual /lcm diagnostics and warning/error
+        # paths remain explicit either way.
+        self.emit_automatic_compaction_status = os.environ.get(
+            "LCM_EMIT_AUTOMATIC_COMPACTION_STATUS", "1"
+        ).lower() not in ("0", "false", "no")
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._summary_circuit_breaker = SummaryCircuitBreaker(
