@@ -713,7 +713,7 @@ class CompactionMixin:
             oversized_singleton = (
                 len(selected_raw_chunk) == 1
                 and count_message_tokens(selected_raw_chunk[0])
-                > working_leaf_chunk_tokens
+                > max(working_leaf_chunk_tokens, self._config.l3_truncate_tokens)
             )
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk

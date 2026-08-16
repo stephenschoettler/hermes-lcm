@@ -11331,7 +11331,8 @@ class TestEngineCompress:
             token_pairs.append((last_pressure_tokens, count_messages_tokens(candidate_raw)))
             return candidate_raw[:1]
 
-        def fake_summary(chunk, focus_topic=None):
+        def fake_summary(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
             return chunk, count_messages_tokens(chunk), "Window summary.\nExpand for details about: current window", 1, 0
 
         monkeypatch.setattr(engine, "_working_leaf_chunk_tokens", record_working_leaf_chunk_tokens)
