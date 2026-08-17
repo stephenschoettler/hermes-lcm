@@ -20532,6 +20532,41 @@ class TestConfigCleanup:
 
 
 class TestAssemblyGuardrails:
+    def test_overflow_recovery_does_not_turn_estimator_skew_into_one_token_cap(self, tmp_path):
+        """The host pressure estimate is not an LCM message-overhead contract."""
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_overflow_estimator_skew.db"),
+            max_assembly_tokens=220_000,
+        )
+        instance = LCMEngine(config=config)
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": "continue the active task",
+                    # These fields are replayed by Codex transports but are
+                    # intentionally outside LCM's canonical message counter.
+                    "reasoning": "opaque provider replay envelope " * 1000,
+                    "codex_reasoning_items": [{"type": "reasoning", "text": "x" * 1000}],
+                    "codex_message_items": [{"type": "message", "text": "y" * 1000}],
+                }
+            ]
+            observed_tokens = 340_733
+
+            assert count_messages_tokens(messages) < 10_000
+            assert instance._overflow_recovery_assembly_cap(
+                observed_tokens=observed_tokens,
+                messages=messages,
+            ) == 220_000
+            recovered = instance._assemble_overflow_recovery_context(
+                None,
+                messages,
+                assembly_cap_override=220_000,
+            )
+            assert recovered and recovered[0]["role"] == "user"
+        finally:
+            instance.shutdown()
+
     def test_max_assembly_tokens_caps_recent_tail(self, tmp_path, monkeypatch):
         import importlib
 
@@ -20846,7 +20881,7 @@ class TestAssemblyGuardrails:
         assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]
 
-    def test_forced_overflow_recovery_reserves_provider_overhead(self, tmp_path, monkeypatch):
+    def test_forced_overflow_recovery_uses_message_assembly_cap(self, tmp_path, monkeypatch):
         import importlib
 
         config = LCMConfig(
@@ -20878,8 +20913,8 @@ class TestAssemblyGuardrails:
 
         result = instance.compress(messages, current_tokens=100)
 
-        assert result == [messages[0], messages[-1]]
-        assert lcm_engine_module.count_messages_tokens(result) < 70
+        assert result == messages
+        assert lcm_engine_module.count_messages_tokens(result) <= 90
 
     def test_forced_overflow_recovery_does_not_duplicate_existing_summary_message(self, tmp_path, monkeypatch):
         import importlib

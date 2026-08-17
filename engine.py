@@ -6139,15 +6139,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         observed_tokens: Optional[int] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[int]:
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is None:
-            return None
-        if messages is None or observed_tokens is None or observed_tokens <= 0:
-            return assembly_cap
+        """Return the cap used while rebuilding the provider-visible context.
 
-        message_tokens = count_messages_tokens(messages)
-        overhead_tokens = max(0, observed_tokens - message_tokens)
-        return max(1, assembly_cap - overhead_tokens)
+        ``observed_tokens`` is a pressure signal from the host.  It is not a
+        message-only count: Hermes may include system prompts, tool schemas,
+        and provider replay metadata that LCM's message estimator deliberately
+        does not model.  Subtracting ``observed_tokens - message_tokens``
+        therefore treats estimator skew as fixed assembly overhead and can
+        collapse a normal cap to one token.  Headroom for non-message payloads
+        belongs in ``reserve_tokens_floor`` (or an explicit cap), so recovery
+        must use the configured message-assembly cap unchanged.
+        """
+        assembly_cap = self._effective_assembly_token_cap()
+        return assembly_cap
 
     def _effective_assembly_token_cap(self) -> Optional[int]:
         """Return the active assembly cap, if any.
