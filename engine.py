@@ -5917,6 +5917,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         result = []
 
+        # An assembly_cap_override is the forced-overflow-recovery signature:
+        # every caller that passes one is rebuilding the context under
+        # recovery pressure. Project the inputs onto canonical message keys
+        # here so the recovery guarantee holds no matter which entry point
+        # (_assemble_overflow_recovery_context, the post-leaf-compaction
+        # assembly in compaction.py) reached this method — replay metadata
+        # that count_message_tokens does not model must not survive into a
+        # payload assembled against the cap. Normal (override-less) assembly
+        # never strips: replay fields are the host's business there.
+        if assembly_cap_override is not None:
+            system_msg = _strip_replay_metadata_for_recovery_message(system_msg)
+            tail_messages = [
+                _strip_replay_metadata_for_recovery_message(msg)
+                for msg in tail_messages
+            ]
+
         # Leading anchor with optional LCM annotation. Only a true system prompt
         # is a safe permanent anchor; gateway sessions can start directly with
         # user messages, and those user turns must remain compactable.

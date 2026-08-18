@@ -500,6 +500,61 @@ def test_live_interceptor_survives_fresh_tail_overflow_recovery(make_engine):
     assert engine.last_compression_status in {"sanitized", "overflow_recovery"}
 
 
+def test_post_leaf_overflow_assembly_strips_replay_metadata(make_engine, monkeypatch):
+    """Forced overflow that also leaf-compacts must still project canonically.
+
+    The post-leaf Step-7 assembly calls _assemble_context directly with the
+    recovery cap override; replay metadata on the system anchor or the
+    retained fresh tail used to survive there while the estimator stayed
+    under the cap (Codex review P1 follow-up on PR #533).
+    """
+    engine = make_engine(
+        fresh_tail_count=2,
+        leaf_chunk_tokens=1,
+        max_assembly_tokens=400,
+    )
+    engine.threshold_tokens = 1
+    monkeypatch.setattr(
+        lcm_engine,
+        "summarize_with_escalation",
+        lambda **_kwargs: ("compact summary of the raw backlog", 1),
+    )
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "old request one", "reasoning": "replay envelope " * 50},
+        {
+            "role": "assistant",
+            "content": "old answer one",
+            "codex_reasoning_items": [{"type": "reasoning", "text": "x" * 400}],
+        },
+        {"role": "user", "content": "old request two"},
+        {"role": "assistant", "content": "old answer two"},
+        {
+            "role": "user",
+            "content": "fresh request",
+            "codex_message_items": [{"type": "message", "text": "y" * 400}],
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+
+    assert engine._should_force_overflow_recovery(
+        observed_tokens=10_000, messages=messages
+    )
+    result = engine.compress(messages, current_tokens=10_000)
+
+    assert result
+    canonical = {"role", "name", "content", "tool_calls", "tool_call_id"}
+    for msg in result:
+        leaked = set(msg) - canonical
+        assert not leaked, f"recovery leaked replay metadata: {sorted(leaked)}"
+    assert any(m.get("content") == "fresh request" for m in result)
+    assert engine.last_compression_status in {"compacted", "overflow_recovery"}
+    # The caller's dicts are never mutated.
+    assert "reasoning" in messages[1]
+    assert "codex_reasoning_items" in messages[2]
+    assert "codex_message_items" in messages[5]
+
+
 def test_live_interceptor_is_preserved_after_normal_leaf_compaction(make_engine, monkeypatch):
     engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
     engine.threshold_tokens = 1
