@@ -20567,6 +20567,99 @@ class TestAssemblyGuardrails:
         finally:
             instance.shutdown()
 
+    def test_overflow_recovery_strips_replay_metadata_from_recovered_payload(self, tmp_path):
+        """Recovery output must not retain transport-replayed provider metadata.
+
+        count_message_tokens only models canonical content/tool_calls, so a
+        recovered payload that keeps ``reasoning`` / ``codex_*`` fields can
+        measure at the cap while shipping a provider-visible payload far
+        past it — re-overflowing on the next request (PR #533 review P1).
+        """
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_overflow_replay_strip.db"),
+            max_assembly_tokens=220_000,
+        )
+        instance = LCMEngine(config=config)
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": "continue the active task",
+                    "reasoning": "opaque provider replay envelope " * 1000,
+                    "codex_reasoning_items": [{"type": "reasoning", "text": "x" * 1000}],
+                    "codex_message_items": [{"type": "message", "text": "y" * 1000}],
+                },
+                {
+                    "role": "assistant",
+                    "content": "working on it",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{\"path\": \"a\"}"},
+                        }
+                    ],
+                    "codex_reasoning_items": [{"type": "reasoning", "text": "z" * 500}],
+                },
+            ]
+
+            recovered = instance._assemble_overflow_recovery_context(
+                None,
+                messages,
+                assembly_cap_override=220_000,
+            )
+
+            assert recovered, "recovery returned an empty context"
+            canonical = {
+                "role",
+                "name",
+                "content",
+                "tool_calls",
+                "tool_call_id",
+            }
+            for msg in recovered:
+                assert not (set(msg) - canonical), (
+                    f"recovered message retained replay metadata: "
+                    f"{sorted(set(msg) - canonical)}"
+                )
+            # The required user turn survives with its content intact, and
+            # canonical tool calls survive alongside it.
+            user_rows = [m for m in recovered if m["role"] == "user"]
+            assert user_rows and user_rows[-1]["content"] == "continue the active task"
+            assistant_rows = [m for m in recovered if m["role"] == "assistant" and m.get("tool_calls")]
+            assert assistant_rows and assistant_rows[0]["tool_calls"][0]["id"] == "call-1"
+
+            # The caller's dicts are never mutated: the host owns the
+            # original message list and may replay it after recovery.
+            assert "reasoning" in messages[0]
+            assert "codex_reasoning_items" in messages[1]
+        finally:
+            instance.shutdown()
+
+    def test_overflow_recovery_strips_replay_metadata_from_system_anchor(self, tmp_path):
+        """The recovery system anchor gets the same canonical projection."""
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_overflow_replay_strip_system.db"),
+            max_assembly_tokens=220_000,
+        )
+        instance = LCMEngine(config=config)
+        try:
+            system_msg = {
+                "role": "system",
+                "content": "anchor prompt",
+                "codex_message_items": [{"type": "message", "text": "replayed" * 100}],
+            }
+            recovered = instance._assemble_overflow_recovery_context(
+                system_msg,
+                [{"role": "user", "content": "hi"}],
+                assembly_cap_override=220_000,
+            )
+            assert recovered and recovered[0]["role"] == "system"
+            assert set(recovered[0]) == {"role", "content"}
+            assert "codex_message_items" in system_msg
+        finally:
+            instance.shutdown()
+
     def test_max_assembly_tokens_caps_recent_tail(self, tmp_path, monkeypatch):
         import importlib
 

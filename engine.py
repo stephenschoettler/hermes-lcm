@@ -359,6 +359,36 @@ _AUTO_FOCUS_MAX_CHARS = 700
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
+# Canonical provider-visible message keys. Overflow recovery rebuilds the
+# active context from these only; every other key on an incoming message is
+# transport-replayed provider metadata (``reasoning``, ``codex_reasoning_items``,
+# ``codex_message_items``, ...) that count_message_tokens deliberately does
+# not model — keeping it would break the recovery cap in the provider-visible
+# payload (PR #533 review).
+_RECOVERY_CANONICAL_MESSAGE_KEYS = (
+    "role",
+    "name",
+    "content",
+    "tool_calls",
+    "tool_call_id",
+)
+
+
+def _strip_replay_metadata_for_recovery_message(
+    message: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of *message* keeping only canonical provider keys.
+
+    Non-dict input passes through untouched (defensive, matches the
+    tolerance of the message estimator). Messages that already carry only
+    canonical keys are returned as-is — no copy, no mutation.
+    """
+    if not isinstance(message, dict):
+        return message
+    if not (set(message) - set(_RECOVERY_CANONICAL_MESSAGE_KEYS)):
+        return message
+    return {key: message[key] for key in _RECOVERY_CANONICAL_MESSAGE_KEYS if key in message}
+
 
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
@@ -6189,6 +6219,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        # Recovery rebuilds the provider-visible payload from canonical
+        # message parts only. Transports replay provider metadata such as
+        # ``reasoning`` / ``codex_reasoning_items`` / ``codex_message_items``
+        # alongside each message; count_message_tokens does not count them,
+        # so retaining them would let a recovered context that measured at
+        # the cap ship a payload far past it and re-overflow on the next
+        # request. Copies, never mutates the caller's dicts.
+        system_msg = _strip_replay_metadata_for_recovery_message(system_msg)
+        tail_messages = [
+            _strip_replay_metadata_for_recovery_message(msg) for msg in tail_messages
+        ]
         if tail_messages:
             first = tail_messages[0]
             content = first.get("content") or ""
