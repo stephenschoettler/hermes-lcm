@@ -1183,3 +1183,42 @@ LCM_EXPAND_QUERY = {
         "required": ["prompt"],
     },
 }
+
+LCM_PIN = {
+    "name": "lcm_pin",
+    "description": (
+        "Mark a message as pinned, protecting it from compaction summarization and GC. "
+        "A pinned message is excluded from summary-candidate selection, stays raw in the "
+        "store, and remains verbatim-recoverable forever via lcm_expand(store_id=...). "
+        "Works for any role (user, assistant, tool). Does not retroactively unpin existing "
+        "summary nodes; it applies at the next compaction selection."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "store_id": {
+                "type": "integer",
+                "description": "The store_id of the message to pin (from lcm_grep, lcm_expand, lcm_load_session, lcm_inspect, etc.).",
+            },
+        },
+        "required": ["store_id"],
+    },
+}
+
+LCM_UNPIN = {
+    "name": "lcm_unpin",
+    "description": (
+        "Unmark a previously pinned message, returning it to normal compaction and GC "
+        "treatment. Takes the store_id of the message to unpin."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "store_id": {
+                "type": "integer",
+                "description": "The store_id of the message to unpin.",
+            },
+        },
+        "required": ["store_id"],
+    },
+}

@@ -25048,6 +25048,96 @@ class TestEngineTools:
         assert not pinned_content.startswith("[GC'd externalized tool output:")
         assert content[:100] not in pinned_content
 
+    def test_compress_excludes_pinned_non_tool_messages_from_summary(self, tmp_path, monkeypatch):
+        """A pinned non-tool message (user text) must survive compaction raw, with no summary node over it."""
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_pin_compress.db"),
+            fresh_tail_count=0,
+            leaf_chunk_tokens=50,
+        )
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * config.context_threshold)
+
+        captured: dict[str, str] = {}
+
+        def capture_summary(**kwargs):
+            captured["text"] = kwargs.get("text", "")
+            return "summarized backlog\n[Expand for details: backlog]", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+
+        anchor_content = "ANCHOR identity fact that must survive compaction verbatim " + "x" * 200
+        messages = [
+            {"role": "user", "content": anchor_content},
+            {"role": "user", "content": "ordinary backlog message that may be summarized " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail reply"},
+        ]
+        engine._ingest_messages(messages)
+        anchor_id = next(
+            row for row in engine._store.get_session_messages("test-session")
+            if row["role"] == "user" and row["content"].startswith("ANCHOR")
+        )["store_id"]
+        engine._store.pin(anchor_id)
+
+        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        pinned = engine._store.get(anchor_id)
+        assert pinned["pinned"] == 1
+        # raw content intact, never folded
+        assert pinned["content"].startswith("ANCHOR identity fact")
+        # pinned content never entered the summarizer input
+        assert "ANCHOR" not in captured.get("text", "")
+        assert "ordinary backlog" in captured.get("text", "")
+
+    def test_lcm_pin_tool_marks_row_pinned(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_tool_pin.db"))
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        engine._ingest_messages([{"role": "user", "content": "pin me"}])
+        store_id = engine._store.get_session_messages("test-session")[0]["store_id"]
+
+        result = json.loads(engine.handle_tool_call("lcm_pin", {"store_id": store_id}))
+
+        assert result["success"] is True
+        assert result["store_id"] == store_id
+        assert result["pinned"] is True
+        assert engine._store.get(store_id)["pinned"] == 1
+
+    def test_lcm_unpin_tool_unmarks_row(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_tool_unpin.db"))
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+        engine._ingest_messages([{"role": "user", "content": "pin then unpin me"}])
+        store_id = engine._store.get_session_messages("test-session")[0]["store_id"]
+        engine._store.pin(store_id)
+
+        result = json.loads(engine.handle_tool_call("lcm_unpin", {"store_id": store_id}))
+
+        assert result["success"] is True
+        assert result["pinned"] is False
+        assert engine._store.get(store_id)["pinned"] == 0
+
+    def test_lcm_pin_tool_rejects_missing_store_id(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_tool_pin_missing.db"))
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        result = json.loads(engine.handle_tool_call("lcm_pin", {}))
+
+        assert "error" in result
+        assert "store_id" in result["error"].lower()
+
+    def test_lcm_pin_tool_rejects_unknown_store_id(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_tool_pin_unknown.db"))
+        engine = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        engine._session_id = "test-session"
+
+        result = json.loads(engine.handle_tool_call("lcm_pin", {"store_id": 999999}))
+
+        assert result["success"] is False
+
     def test_gc_helper_does_not_miss_tool_rows_when_chunk_contains_unmatched_synthetic_messages(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_gc_helper.db"),

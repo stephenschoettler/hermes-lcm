@@ -468,6 +468,9 @@ def _help_text(error: str | None = None) -> str:
         "- /lcm preset apply <name> --dry-run: preview env-var changes without mutating live config",
         "- /lcm embed warmup: download/probe the configured embedding model and register its dimension",
         "- /lcm embed backfill [--apply] [--limit N]: preview or populate missing leaf-summary embeddings",
+        "- /lcm pin <store_id>: mark a message so it survives compaction and GC",
+        "- /lcm unpin <store_id>: clear a previously pinned message",
+        "- /lcm pins: list currently pinned messages (store_id + content)",
         "- /lcm help: show this help",
     ])
     return "\n".join(lines)
@@ -4989,6 +4992,48 @@ def _embedding_backfill_status(
     return "partial"
 
 
+def _pin_store_id(token: str, engine) -> tuple[int | None, str | None]:
+    """Parse a store_id token and verify the row exists.
+
+    Returns ``(store_id, None)`` on success or ``(None, error_text)``.
+    """
+    try:
+        store_id = int(token)
+    except (TypeError, ValueError):
+        return None, _help_text(f"`{token}` is not a valid store_id (expected an integer).")
+    stored = engine._store.get(store_id)
+    if stored is None:
+        return None, _help_text(f"No stored message with store_id `{store_id}` (not found).")
+    return store_id, None
+
+
+def _pin_text(token: str, engine) -> str:
+    store_id, err = _pin_store_id(token, engine)
+    if err is not None:
+        return err
+    engine._store.pin(store_id)
+    return f"store_id: {store_id}, pinned: true"
+
+
+def _unpin_text(token: str, engine) -> str:
+    store_id, err = _pin_store_id(token, engine)
+    if err is not None:
+        return err
+    engine._store.unpin(store_id)
+    return f"store_id: {store_id}, pinned: false"
+
+
+def _pins_text(engine) -> str:
+    rows = engine._store.list_pinned()
+    if not rows:
+        return "No pinned messages."
+    lines = ["Pinned messages:"]
+    for row in rows:
+        content = (row.get("content") or "").strip().replace("\n", " ")
+        lines.append(f"- store_id {row['store_id']} ({row.get('role')}): {content[:120]}")
+    return "\n".join(lines)
+
+
 def handle_lcm_command(raw_args: str | None, engine) -> str:
     tokens = [part.strip() for part in (raw_args or "").strip().split() if part.strip()]
     if not tokens:
@@ -5061,6 +5106,21 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
         if rest and rest[0].lower() == "backfill":
             return _embedding_backfill_text(rest[1:], engine)
         return _help_text("`/lcm embed` requires the `warmup` or `backfill` subcommand.")
+
+    if head == "pin":
+        if len(rest) != 1:
+            return _help_text("`/lcm pin <store_id>` marks a message so it survives compaction and GC.")
+        return _pin_text(rest[0], engine)
+
+    if head == "unpin":
+        if len(rest) != 1:
+            return _help_text("`/lcm unpin <store_id>` clears a previously pinned message.")
+        return _unpin_text(rest[0], engine)
+
+    if head == "pins":
+        if rest:
+            return _help_text("`/lcm pins` does not accept extra arguments.")
+        return _pins_text(engine)
 
     if head == "help":
         return _help_text()

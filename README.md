@@ -218,7 +218,7 @@ best-effort git identity:
 
 If startup logs say LCM tools are available through `context-engine schemas` or
 mention the `Path B fallback`, that is expected on older Hermes hosts such as
-Hermes Agent v0.16. All 15 `lcm_*` tools remain available through the
+Hermes Agent v0.16. All 17 `lcm_*` tools remain available through the
 context-engine path; standalone plugin-registry registration is not required
 there.
 
@@ -277,6 +277,8 @@ outside the LCM database.
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message from a cross-session `lcm_grep` result and `include_exact_ref=true` when its returned slice must be cited or computed. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
+| `lcm_pin` | Mark a message by `store_id` as pinned so it survives compaction and GC, recoverable raw and verbatim. |
+| `lcm_unpin` | Clear a previously pinned message by `store_id`. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |

@@ -5232,6 +5232,56 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     return json.dumps(response)
 
 
+def _parse_store_id_arg(args: Dict[str, Any]) -> tuple[int | None, str | None]:
+    """Parse a required integer ``store_id`` argument.
+
+    Returns ``(store_id, None)`` on success or ``(None, error_message)`` when
+    missing or non-integral.
+    """
+    raw = args.get("store_id")
+    if raw is None:
+        return None, "store_id is required"
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, "store_id must be an integer"
+
+
+def lcm_pin(args: Dict[str, Any], **kwargs) -> str:
+    """Mark a message as pinned so it survives compaction and GC."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    store_id, err = _parse_store_id_arg(args)
+    if err is not None:
+        return json.dumps({"error": err})
+    assert store_id is not None  # guaranteed by _parse_store_id_arg when err is None
+    stored = engine._store.get(store_id)
+    if stored is None:
+        return json.dumps({"success": False, "store_id": store_id, "error": f"store_id {store_id} not found"})
+
+    engine._store.pin(store_id)
+    return json.dumps({"success": True, "store_id": store_id, "pinned": True})
+
+
+def lcm_unpin(args: Dict[str, Any], **kwargs) -> str:
+    """Unmark a previously pinned message."""
+    engine = _require_engine(kwargs)
+    if engine is None:
+        return json.dumps({"error": "LCM engine not initialized"})
+
+    store_id, err = _parse_store_id_arg(args)
+    if err is not None:
+        return json.dumps({"error": err})
+    stored = engine._store.get(store_id)
+    if stored is None:
+        return json.dumps({"success": False, "store_id": store_id, "error": f"store_id {store_id} not found"})
+
+    engine._store.unpin(store_id)
+    return json.dumps({"success": True, "store_id": store_id, "pinned": False})
+
+
 def lcm_describe(args: Dict[str, Any], **kwargs) -> str:
     """Inspect a summary node's subtree or get session DAG overview."""
     engine = _require_engine(kwargs)

@@ -30,7 +30,7 @@ Make packaging a separate implementation lane only when one of these is true:
 2. Users need version-pinned installs without direct git checkouts.
 3. Release automation needs packaged artifacts beyond GitHub tags/releases.
 
-The narrow next step would be packaging metadata plus tests that prove a packaged install still exposes `hermes-lcm`, context engine `lcm`, and all 15 LCM tools through `hermes plugins`. Until then, clone/symlink remains the documented path.
+The narrow next step would be packaging metadata plus tests that prove a packaged install still exposes `hermes-lcm`, context engine `lcm`, and all 17 LCM tools through `hermes plugins`. Until then, clone/symlink remains the documented path.
 
 ## Current install and update references
 

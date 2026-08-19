@@ -103,6 +103,8 @@ from .schemas import (
     LCM_RECALL,
     LCM_RECENT,
     LCM_RETRIEVE,
+    LCM_PIN,
+    LCM_UNPIN,
     LCM_STATUS,
 )
 from .sanitize import (
@@ -3646,6 +3648,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_DESCRIBE,
             LCM_EXPAND,
             LCM_EXPAND_QUERY,
+            LCM_PIN,
+            LCM_UNPIN,
             LCM_STATUS,
             LCM_INSPECT,
             LCM_DOCTOR,
@@ -3681,6 +3685,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "lcm_describe": lcm_tools.lcm_describe,
             "lcm_expand": lcm_tools.lcm_expand,
             "lcm_expand_query": lcm_tools.lcm_expand_query,
+            "lcm_pin": lcm_tools.lcm_pin,
+            "lcm_unpin": lcm_tools.lcm_unpin,
             "lcm_status": lcm_tools.lcm_status,
             "lcm_inspect": lcm_tools.lcm_inspect,
             "lcm_doctor": lcm_tools.lcm_doctor,
@@ -4120,6 +4126,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             logger.debug("LCM stored ignore-pattern lookup failed", exc_info=True)
             return False
         return bool(stored and self._matches_ignore_message_patterns(stored, stored_row=True))
+
+    def _mapped_stored_row_is_pinned(self, msg: Dict[str, Any]) -> bool:
+        """Return whether the stored row a candidate maps to is pinned.
+
+        A pinned row must never become a summarization candidate. Mirrors the
+        store-id resolution in ``_mapped_stored_row_matches_ignore_message_patterns``:
+        prefer an explicit ``store_id`` on the message, else fall back to the
+        active replay map by ``id(msg)``. Unresolvable or unpinned rows return
+        ``False`` so they are not excluded.
+        """
+        store_id = msg.get("store_id")
+        if store_id is None:
+            store_id = self._current_compress_store_ids_by_message_id.get(id(msg))
+        if store_id is None:
+            return False
+        try:
+            stored = self._store.get(int(store_id))
+        except Exception:
+            logger.debug("LCM stored pinned lookup failed", exc_info=True)
+            return False
+        return bool(stored and stored.get("pinned"))
 
     def _copy_active_replay_messages_preserving_generated_ids(
         self,

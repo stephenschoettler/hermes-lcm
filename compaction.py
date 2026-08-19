@@ -280,13 +280,19 @@ class CompactionMixin:
         candidate_raw = messages[leading_anchor_count:fresh_tail_start]
         if not candidate_raw:
             return False, "no eligible raw backlog outside fresh tail"
+
+        # Resolve store_ids once so both the pinned exclusion and the ignore
+        # pattern checks can look up stored rows. Pinned rows must never become
+        # summarization candidates, regardless of ignore-pattern config.
         generated_placeholder_hashes = self._load_generated_ignored_placeholder_hashes()
-        if self._compiled_ignore_message_patterns or generated_placeholder_hashes:
-            previous_store_id_map = self._current_compress_store_ids_by_message_id
-            self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(candidate_raw)
-            try:
-                filtered_candidate_raw: list[Dict[str, Any]] = []
-                for msg in candidate_raw:
+        previous_store_id_map = self._current_compress_store_ids_by_message_id
+        self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(candidate_raw)
+        try:
+            filtered_candidate_raw: list[Dict[str, Any]] = []
+            for msg in candidate_raw:
+                if self._mapped_stored_row_is_pinned(msg):
+                    continue
+                if self._compiled_ignore_message_patterns or generated_placeholder_hashes:
                     content_text = text_content_for_pattern_matching(msg.get("content")) or ""
                     volatile_digest = self._active_replay_placeholder_digest(content_text)
                     generated_volatile_placeholder = (
@@ -301,12 +307,12 @@ class CompactionMixin:
                         or generated_volatile_placeholder
                     ):
                         continue
-                    filtered_candidate_raw.append(msg)
-            finally:
-                self._current_compress_store_ids_by_message_id = previous_store_id_map
-            candidate_raw = filtered_candidate_raw
-            if not candidate_raw:
-                return False, "no eligible raw backlog outside fresh tail"
+                filtered_candidate_raw.append(msg)
+        finally:
+            self._current_compress_store_ids_by_message_id = previous_store_id_map
+        candidate_raw = filtered_candidate_raw
+        if not candidate_raw:
+            return False, "no eligible raw backlog outside fresh tail"
 
         if force_overflow:
             return True, "forced overflow recovery"
@@ -697,8 +703,14 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
+            # Pinned messages must never become summarization candidates: drop
+            # them from the summarizer input so their content cannot be folded
+            # into a summary node. Their stored rows survive intact (GC already
+            # skips pinned rows), so they remain recoverable raw.
             summary_input_chunk = [
-                message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
+                message for message in selected_raw_chunk
+                if id(message) not in dependent_reply_message_ids
+                and not self._mapped_stored_row_is_pinned(message)
             ]
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk

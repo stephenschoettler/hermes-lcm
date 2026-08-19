@@ -37,6 +37,8 @@ is the active context engine.
 | `lcm_describe` | Inspect the current-session DAG or preview an `externalized_ref` without loading full content. |
 | `lcm_expand` | Recover source messages, child summaries, or externalized payloads with pagination. Use `store_id` to fetch a single raw message regardless of session, suitable for drilling into a cross-session `lcm_grep` result. In `store_id` mode, `include_exact_ref=true` adds the exact returned slice without changing default bytes. |
 | `lcm_expand_query` | Answer a question using expanded current-session LCM context while returning a bounded answer. |
+| `lcm_pin` | Mark a message so it survives compaction and GC. |
+| `lcm_unpin` | Clear a previously pinned message. |
 | `lcm_status` | Show runtime health, context pressure, config, source lineage, and lifecycle stats. |
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, message/frontier metadata, fresh tail, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. It returns metadata only; use `lcm_load_session`/`lcm_expand` when you need content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |

@@ -577,6 +577,14 @@ class MessageStore:
             )
             self._conn.commit()
 
+    def list_pinned(self) -> List[Dict[str, Any]]:
+        """Return message dicts for every currently pinned row, newest first."""
+        rows = self._conn.execute(  # type: ignore[union-attr]  # matches get()/get_batch()
+            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages "
+            "WHERE pinned = 1 ORDER BY store_id DESC"
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
     # -- Read operations ----------------------------------------------------
 
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:

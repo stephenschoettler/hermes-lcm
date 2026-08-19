@@ -123,10 +123,11 @@ Expected signals:
 
 - plugin list includes `hermes-lcm`
 - selected context engine is `lcm`
-- tool list includes all 15 schemas: `lcm_grep`, `lcm_recall`,
+- tool list includes all 17 schemas: `lcm_grep`, `lcm_recall`,
   `lcm_query_state`, `lcm_compute`, `lcm_compile_evidence`,
   `lcm_evidence_pack`, `lcm_retrieve`, `lcm_recent`, `lcm_load_session`,
-  `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_status`, `lcm_inspect`,
+  `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `lcm_pin`, `lcm_unpin`,
+  `lcm_status`, `lcm_inspect`,
   and `lcm_doctor`
 - ordinary skill discovery includes `hermes-lcm`; plugin-qualified explicit
   loading is `hermes-lcm:hermes-lcm` on hosts that support plugin skills
@@ -169,7 +170,7 @@ LCM tools are still available through the context-engine schema/dispatch path
 registration (Path A) on those hosts because Path A would shadow Path B and lose
 current-turn ingest.
 
-Healthy signals are the same as above: selected context engine `lcm`, all 15
+Healthy signals are the same as above: selected context engine `lcm`, all 17
 `lcm_*` tools in the live tool list, and `lcm_status` / `lcm_inspect` / `lcm_doctor` responding
 after one normal message initializes the session.
 
@@ -241,7 +242,7 @@ environment variables:
 
 ### Evidence and adaptive retrieval (0.21 RC)
 
-Hermes exposes all 15 LCM tool schemas whenever LCM is the active context
+Hermes exposes all 17 LCM tool schemas whenever LCM is the active context
 engine. Exposure is not activation. On a stock install:
 
 - `lcm_compute`, `lcm_compile_evidence`, and `lcm_evidence_pack` are bounded,
@@ -364,6 +365,25 @@ truncated SHA-256 digest for correlation. `password_assignment` placeholders omi
 the digest to avoid making password-like values easier to dictionary-check.
 `lcm_status`, `lcm_inspect`, and `lcm_doctor` expose the enabled state, configured pattern names,
 unknown names, source, and placeholder format without exposing raw secret values.
+
+### Message pinning
+
+LCM can preserve specific messages verbatim forever via **pinning**. A pinned
+message is excluded from summarization and GC: it is never folded into a summary
+node, is never a compaction candidate, and remains recoverable raw through
+`lcm_expand(store_id=...)`.
+
+- `lcm_pin(store_id)` marks a message pinned; `lcm_unpin(store_id)` clears it.
+- `/lcm pin <store_id>` / `/lcm unpin <store_id>` do the same interactively;
+  `/lcm pins` lists currently pinned rows with their content preview.
+- Pinning is **structural**: identity/relationship facts or any content you want
+  to survive compaction can be pinned by `store_id` and will stay verbatim.
+- Pinning is **backwards-compatible**: the `pinned` column already exists in the
+  schema, there is no migration, and unpinned behavior is unchanged. It applies
+  at the next compaction selection; it does not retroactively unpin existing
+  summary nodes.
+- Pinning does **not** bypass sensitive-pattern redaction: values redacted at
+  ingest (before storage) stay redacted on a pinned row.
 
 ### Cache policy boundary
 

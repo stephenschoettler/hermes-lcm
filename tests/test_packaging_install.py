@@ -24,6 +24,8 @@ EXPECTED_LCM_TOOLS = {
     "lcm_describe",
     "lcm_expand",
     "lcm_expand_query",
+    "lcm_pin",
+    "lcm_unpin",
     "lcm_status",
     "lcm_inspect",
     "lcm_doctor",

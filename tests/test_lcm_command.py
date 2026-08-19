@@ -296,6 +296,53 @@ def test_lcm_status_text_reports_config_source_for_context_threshold(tmp_path, m
     assert "context_threshold_source: config_yaml:compression.threshold" in result
 
 
+def test_lcm_pin_command_marks_row_pinned(engine):
+    engine._ingest_messages([{"role": "user", "content": "pinned via slash command"}])
+    store_id = engine._store.get_session_messages("test-session")[0]["store_id"]
+
+    result = handle_lcm_command(f"pin {store_id}", engine)
+
+    assert f"store_id: {store_id}" in result
+    assert "pinned: true" in result
+    assert engine._store.get(store_id)["pinned"] == 1
+
+
+def test_lcm_unpin_command_unmarks_row(engine):
+    engine._ingest_messages([{"role": "user", "content": "unpinned via slash command"}])
+    store_id = engine._store.get_session_messages("test-session")[0]["store_id"]
+    engine._store.pin(store_id)
+
+    result = handle_lcm_command(f"unpin {store_id}", engine)
+
+    assert f"store_id: {store_id}" in result
+    assert "pinned: false" in result
+    assert engine._store.get(store_id)["pinned"] == 0
+
+
+def test_lcm_pin_command_reports_unknown_store_id(engine):
+    result = handle_lcm_command("pin 999999", engine)
+
+    assert "not found" in result.lower() or "unknown" in result.lower()
+
+
+def test_lcm_pins_command_lists_only_pinned_rows(engine):
+    engine._ingest_messages(
+        [
+            {"role": "user", "content": "pinned visible"},
+            {"role": "user", "content": "unpinned hidden"},
+        ]
+    )
+    rows = engine._store.get_session_messages("test-session")
+    pinned_id = next(r for r in rows if r["content"] == "pinned visible")["store_id"]
+    engine._store.pin(pinned_id)
+
+    result = handle_lcm_command("pins", engine)
+
+    assert str(pinned_id) in result
+    assert "pinned visible" in result
+    assert "unpinned hidden" not in result
+
+
 def test_lcm_doctor_warns_about_ignored_lcm_config_yaml_keys(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir()
