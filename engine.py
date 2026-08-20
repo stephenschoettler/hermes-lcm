@@ -124,7 +124,7 @@ from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
-from .compaction import CompactionMixin
+from .compaction import CompactionMixin, LCMCompressionCancelled
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -573,6 +573,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
+        self._compression_cancelled_check: Callable[[], bool] | None = None
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
@@ -1587,6 +1588,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         attempt_number = 0
 
         while attempt_chunk and attempt_number < max_attempts:
+            self._raise_if_compression_cancelled()
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
             serialized = self._serialize_messages(attempt_chunk)
@@ -1614,6 +1616,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     focus_topic=focus_topic or "",
                     custom_instructions=self._config.custom_instructions,
                 )
+                self._raise_if_compression_cancelled()
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
@@ -5459,6 +5462,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
+            self._raise_if_compression_cancelled()
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
@@ -5477,11 +5481,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
             # Take the first fanin nodes and condense
             to_condense = uncondensed[:fanin]
-            source_tokens, summary_tokens, level = self._condense_summary_nodes(
-                to_condense,
-                focus_topic=focus_topic,
-                deadline=deadline,
-            )
+            try:
+                source_tokens, summary_tokens, level = self._condense_summary_nodes(
+                    to_condense,
+                    focus_topic=focus_topic,
+                    deadline=deadline,
+                )
+            except LCMCompressionCancelled:
+                return
             condensed_any = True
 
             logger.info(
@@ -5504,6 +5511,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         deadline: Optional[float] = None,
     ) -> tuple[int, int, int]:
         """Persist one same-depth condensation and return source/output tokens and level."""
+        self._raise_if_compression_cancelled()
         if not nodes:
             raise ValueError("condensation requires at least one summary node")
         depth = nodes[0].depth
@@ -5532,6 +5540,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
         )
+        self._raise_if_compression_cancelled()
         earliest_at, latest_at = self._dag.get_source_time_window(
             [node.node_id for node in nodes]
         )
@@ -5615,6 +5624,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     focus_topic=focus_topic,
                     deadline=deadline,
                 )
+            except LCMCompressionCancelled:
+                return passes, "compression_cancelled"
             except Exception as exc:
                 logger.warning(
                     "LCM threshold full sweep condensation stopped after %d pass(es): %s",
