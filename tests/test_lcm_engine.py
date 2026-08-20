@@ -11821,6 +11821,95 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
+    def test_leaf_summary_cancelled_after_provider_return_does_not_publish_node(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_cancelled_leaf_summary.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        cancelled = {"value": False}
+        calls = 0
+
+        def cancelled_check():
+            return cancelled["value"]
+
+        def mock_summary(**kwargs):
+            del kwargs
+            nonlocal calls
+            calls += 1
+            cancelled["value"] = True
+            return "late leaf summary", 1
+
+        monkeypatch.setattr(instance, "_compression_cancelled_check", cancelled_check)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+        try:
+            messages = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "old source " + ("detail " * 20)},
+                {"role": "user", "content": "fresh request"},
+                {"role": "assistant", "content": "fresh answer"},
+            ]
+
+            result = instance.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            assert calls == 1
+            assert result == messages
+            assert instance._dag.get_session_nodes("test-session") == []
+            assert instance.last_compression_status == "noop"
+            assert instance.last_compression_noop_reason == "compression cancelled by host"
+        finally:
+            instance.shutdown()
+
+    def test_condensation_cancelled_after_provider_return_does_not_publish_parent(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            condensation_fanin=2,
+            incremental_max_depth=1,
+            database_path=str(tmp_path / "lcm_cancelled_condensation.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        cancelled = {"value": False}
+        calls = 0
+        for index in range(2):
+            instance._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=0,
+                    summary=f"leaf {index}",
+                    token_count=100,
+                    source_token_count=200,
+                    source_ids=[],
+                    source_type="messages",
+                    created_at=float(index),
+                )
+            )
+
+        def cancelled_check():
+            return cancelled["value"]
+
+        def mock_summary(**kwargs):
+            del kwargs
+            nonlocal calls
+            calls += 1
+            cancelled["value"] = True
+            return "late parent summary", 1
+
+        monkeypatch.setattr(instance, "_compression_cancelled_check", cancelled_check)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+        try:
+            instance._maybe_condense()
+
+            assert calls == 1
+            assert instance._dag.get_session_nodes("test-session", depth=1) == []
+        finally:
+            instance.shutdown()
+
     def test_threshold_full_sweep_uses_earlier_compaction_deadline(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
