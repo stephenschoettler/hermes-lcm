@@ -11443,7 +11443,7 @@ class TestEngineCompress:
         assert call_count == 1
         assert engine._dag.get_session_nodes("test-session") == []
 
-    def test_deferred_leaf_rescue_shares_compaction_deadline_with_extraction(self, engine, monkeypatch):
+    def test_deferred_leaf_rescue_caps_pre_compaction_extraction(self, engine, monkeypatch):
         engine._config.summary_timeout_ms = 100_000
         engine._config.fresh_tail_count = 1
         engine._config.leaf_chunk_tokens = 800
@@ -11495,7 +11495,7 @@ class TestEngineCompress:
         compressed = engine.compress(messages, current_tokens=90)
 
         assert compressed
-        assert extraction_timeouts == pytest.approx([100.0, 60.0])
+        assert extraction_timeouts == pytest.approx([5.0, 5.0])
         assert summary_deadlines == pytest.approx([100.0, 100.0, 100.0])
         assert summary_timeouts == pytest.approx([80.0, 60.0, 60.0])
         assert len(engine._dag.get_session_nodes("deadline-debt-session", depth=0)) == 2

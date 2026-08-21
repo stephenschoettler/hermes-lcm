@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
+_PRE_COMPACTION_EXTRACTION_MAX_SECONDS = 5.0
 
 
 class LCMCompressionCancelled(Exception):
@@ -789,7 +790,13 @@ class CompactionMixin:
                     if remaining_seconds > 0:
                         self._run_pre_compaction_extraction(
                             summary_input_chunk,
-                            timeout_seconds=max(0.001, remaining_seconds),
+                            timeout_seconds=max(
+                                0.001,
+                                min(
+                                    remaining_seconds,
+                                    _PRE_COMPACTION_EXTRACTION_MAX_SECONDS,
+                                ),
+                            ),
                         )
                 if bool(
                     getattr(
