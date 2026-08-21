@@ -880,7 +880,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     ) -> tuple[int, int | None, str]:
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
-        cap = _codex_oauth_context_cap(route_model, route_provider)
+        cap = _codex_oauth_context_cap(
+            route_model,
+            route_provider,
+            api_key=self.api_key,
+        )
         if cap is not None and raw_context_length > cap:
             return (
                 cap,
