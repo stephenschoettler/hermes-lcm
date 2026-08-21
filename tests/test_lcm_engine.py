@@ -3827,6 +3827,7 @@ class TestEngineABC:
         )
         combined_context = "\n".join(str(msg.get("content", "")) for msg in active_context)
         assert "Current user objective preserved" in combined_context
+        assert "direct user guidance, not a summary or inferred intent" in combined_context
         assert latest_request in combined_context
 
     def test_preserved_objective_anchor_externalizes_inline_payloads(self, tmp_path):
@@ -3852,6 +3853,28 @@ class TestEngineABC:
         assert expanded["kind"] == "ingest_payload"
         assert expanded["content"] == data_uri
         assert expanded["field_path"] == "preserved_objective.content"
+
+    def test_preserved_objective_anchor_marks_direct_user_words_as_authoritative(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "preserved-objective-guidance.db")),
+            hermes_home=str(tmp_path),
+        )
+        engine.on_session_start(
+            "preserved-objective-guidance-session",
+            platform="desktop",
+            conversation_id="preserved-objective-guidance-conversation",
+            context_length=200000,
+        )
+
+        exact_user_words = "متغيرش الـAPI وخلي التنفيذ على أصغر scope"
+        anchor = engine._build_preserved_objective_summary_part(
+            {"role": "user", "content": exact_user_words}
+        )
+
+        assert exact_user_words in anchor
+        assert "direct user guidance, not a summary or inferred intent" in anchor
+        assert "Later direct user messages override earlier ones" in anchor
+        assert "lcm_grep or lcm_expand" in anchor
 
     def test_existing_large_session_restart_reconciles_beyond_short_tail_window(self, tmp_path):
         db_path = tmp_path / "restart-large.db"

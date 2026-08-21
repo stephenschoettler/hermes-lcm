@@ -4437,6 +4437,17 @@ class TestEscalation:
         assert "Additional instructions:" not in l1
         assert "Additional instructions:" not in l2
 
+    def test_summary_prompts_preserve_direct_user_authority(self):
+        from hermes_lcm.escalation import _build_l1_prompt, _build_l2_prompt
+
+        for prompt in (
+            _build_l1_prompt("test", 500, depth=0),
+            _build_l2_prompt("test", 500),
+        ):
+            assert "user-authored directives, corrections, constraints, and approvals" in prompt
+            assert "Quote the user's exact wording" in prompt
+            assert "Never turn assistant proposals into user decisions" in prompt
+
 
 class TestAssemblyBudgetSelection:
     def _engine(self, tmp_path: Path, monkeypatch, *, max_assembly_tokens: int = 120):

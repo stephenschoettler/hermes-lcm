@@ -145,6 +145,13 @@ logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
 
+_POST_COMPACTION_USER_GUIDANCE = (
+    "Post-compaction reminder: the verbatim text below is direct user guidance, "
+    "not a summary or inferred intent. Preserve its scope and meaning. Later "
+    "direct user messages override earlier ones. If exact wording or omitted "
+    "session guidance matters, use lcm_grep or lcm_expand before guessing."
+)
+
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
 
@@ -5704,7 +5711,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             content,
             role=str(message.get("role") or "user"),
         )
-        return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
+        return (
+            f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n"
+            f"{_POST_COMPACTION_USER_GUIDANCE}\n\n"
+            f"{content}"
+        )
 
     def _latest_user_context_anchor(
         self,
@@ -5976,6 +5987,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             anchor_msg = {"role": summary_role, "content": anchor_part}
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
                 summary_parts.append(anchor_part)
+            else:
+                compact_anchor = anchor_part.replace(
+                    f"{_POST_COMPACTION_USER_GUIDANCE}\n\n",
+                    "",
+                    1,
+                )
+                compact_anchor_msg = {"role": summary_role, "content": compact_anchor}
+                if count_message_tokens(compact_anchor_msg) <= summary_budget:
+                    anchor_part = compact_anchor
+                    summary_parts.append(anchor_part)
 
         # Node ids placed in the summary prefix — used to dedupe proactive-recall
         # injection against summaries already visible in the active context.

@@ -443,6 +443,8 @@ def _build_l1_prompt(text: str, token_budget: int, depth: int,
 
     return f"""Summarize this conversation segment for future turns.
 {guidance}
+Preserve user-authored directives, corrections, constraints, and approvals as direct user authority.
+Quote the user's exact wording when paraphrasing could change scope, meaning, or authority. Never turn assistant proposals into user decisions.
 Remove repetition and conversational filler.
 End with: "Expand for details about: <what was compressed>"
 {focus_guidance}{custom_block}
@@ -464,6 +466,8 @@ def _build_l2_prompt(text: str, token_budget: int,
 
     return f"""Compress this into bullet points. Maximum {token_budget} tokens.
 Keep only: decisions made, files changed, errors hit, current state.
+Preserve user-authored directives, corrections, constraints, and approvals as direct user authority.
+Quote the user's exact wording when paraphrasing could change scope, meaning, or authority. Never turn assistant proposals into user decisions.
 Drop all reasoning, alternatives considered, and process detail.
 {focus_guidance}{custom_block}
 
