@@ -25,6 +25,7 @@ from .codex_routing import (
     _is_codex_gpt55_route,
 )
 from .config import LCMConfig
+from .db_bootstrap import open_readonly_connection
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
@@ -1321,8 +1322,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not path.exists():
             return False
         try:
-            uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = open_readonly_connection(path)
             try:
                 row = conn.execute(
                     """

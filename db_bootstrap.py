@@ -11,6 +11,7 @@ from functools import lru_cache
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import shutil
 import sqlite3
@@ -49,6 +50,32 @@ REQUIRED_CORE_TABLES = (
     "messages_fts",
     "nodes_fts",
 )
+
+
+READONLY_STATE_DB_TIMEOUT_SECONDS = 120.0
+READONLY_STATE_DB_BUSY_TIMEOUT_MS = 120_000
+
+
+def open_readonly_connection(
+    db_path: str | os.PathLike[str],
+    *,
+    timeout: float = READONLY_STATE_DB_TIMEOUT_SECONDS,
+    busy_timeout_ms: int = READONLY_STATE_DB_BUSY_TIMEOUT_MS,
+) -> sqlite3.Connection:
+    """Open a state database without becoming a hidden writer.
+
+    Auxiliary LCM probes read Hermes' live ``state.db`` while the gateway owns
+    its write path. A normal ``sqlite3.connect(path)`` can create journals or
+    other side effects, and changing ``journal_mode`` from a reader adds lock
+    contention. Read-only URI mode plus explicit wait/query-only settings keeps
+    these probes from mutating the source database.
+    """
+    path = Path(db_path).expanduser().resolve()
+    uri = path.as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=timeout)
+    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+    conn.execute("PRAGMA query_only=ON")
+    return conn
 
 
 class ExternalContentFtsSpec:

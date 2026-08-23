@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .db_bootstrap import (
+    configure_connection,
+    open_readonly_connection,
+    refuse_schema_version_too_new,
+    run_versioned_migrations,
+)
 
 
 def _synchronized(method):
@@ -455,8 +460,7 @@ class LifecycleStateStore:
             if path.exists():
                 stats["state_db_checked"] = True
                 try:
-                    state_uri = path.resolve().as_uri() + "?mode=ro"
-                    state_conn = sqlite3.connect(state_uri, uri=True)
+                    state_conn = open_readonly_connection(path)
                     try:
                         state_rows = state_conn.execute("SELECT id FROM sessions WHERE id IS NOT NULL").fetchall()
                     finally:
