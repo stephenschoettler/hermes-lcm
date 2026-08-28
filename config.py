@@ -372,6 +372,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
     _EnvFieldSpec("rerank_model", "LCM_RERANK_MODEL", str),
+    _EnvFieldSpec("rerank_base_url", "LCM_RERANK_BASE_URL", str),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
     _EnvFieldSpec("recall_scan_max_rows", "LCM_RECALL_SCAN_MAX_ROWS", int),
     _EnvFieldSpec("recall_scan_budget_s", "LCM_RECALL_SCAN_BUDGET_S", float),
@@ -619,6 +620,10 @@ class LCMConfig:
     rerank_enabled: bool = False
     # Empty preserves the selected provider's rerank default.
     rerank_model: str = ""
+    # Empty keeps rerank co-located with the embedding endpoint (same
+    # base_url). Set to point rerank at a dedicated endpoint (e.g. a
+    # separate reranker container alongside an embedding server).
+    rerank_base_url: str = ""
     embedding_bounded_scan_rows: int = 2_000
     # Vector storage dtype for NEWLY-registered embedding profiles: float32
     # (default; a stock install keeps summary vectors byte-identical) or int8

@@ -1368,6 +1368,45 @@ def test_openai_compatible_rerank_request_shape_and_success(monkeypatch):
     assert call["headers"]["Authorization"] == "Bearer test-key"
 
 
+def test_openai_compatible_rerank_url_defaults_to_embedding_base_url():
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1/"
+    )
+
+    assert provider.rerank_base_url == ""
+    assert provider.rerank_url == "https://api.example.com/v1/rerank"
+
+
+def test_openai_compatible_rerank_dedicated_base_url(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_rerank_response([{"index": 0, "relevance_score": 0.9}])
+    )
+    provider = OpenAICompatibleProvider(
+        "BAAI/bge-m3",
+        base_url="https://embed.example.com/v1",
+        rerank_base_url="https://rerank.example.com/v1/",
+        transport=transport,
+    )
+
+    assert provider.rerank_url == "https://rerank.example.com/v1/rerank"
+    assert provider.rerank("q", ["only"], timeout=5.0) == [(0, 0.9)]
+    assert transport.calls[0]["url"] == "https://rerank.example.com/v1/rerank"
+
+
+def test_rerank_base_url_env_and_resolve_pass_through(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("LCM_EMBEDDING_MODEL", "BAAI/bge-m3")
+    monkeypatch.setenv("LCM_EMBEDDING_BASE_URL", "https://embed.example.com/v1")
+    monkeypatch.setenv("LCM_RERANK_BASE_URL", "https://rerank.example.com")
+    config = LCMConfig.from_env()
+
+    assert config.rerank_base_url == "https://rerank.example.com"
+    provider = resolve_provider(config)
+    assert provider.base_url == "https://embed.example.com/v1"
+    assert provider.rerank_url == "https://rerank.example.com/rerank"
+
+
 def test_openai_compatible_rerank_top_k_maps_to_top_n(monkeypatch):
     monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
     transport = FakeTransport(

@@ -149,6 +149,19 @@ For a local endpoint, rerank requests do not require an API key. The rerank
 route is Cohere-compatible (`/rerank`), while embeddings continue to use the
 OpenAI-compatible `/embeddings` route.
 
+### Reranking via a dedicated endpoint
+
+If embeddings and reranker live on different endpoints (e.g. an embedding
+server plus a separate reranker container), point rerank at its own base URL.
+The value follows the same convention as `LCM_EMBEDDING_BASE_URL` (vLLM
+exposes Cohere `/rerank` under `/v1`, Infinity at the root):
+
+```bash
+export LCM_RERANK_BASE_URL=http://gpu-host:7998/v1
+```
+
+When unset (default), rerank requests go to the embedding endpoint.
+
 ## What you get
 
 `lcm_grep` gains two modes on top of the existing ones:

@@ -1550,6 +1550,7 @@ class OpenAICompatibleProvider(_ResilientProvider):
         sleeper: Callable[[float], None] = time.sleep,
         breaker: EmbeddingCircuitBreaker | None = None,
         spend_guard: EmbeddingSpendGuard | None = None,
+        rerank_base_url: str = "",
     ) -> None:
         super().__init__(breaker=breaker, spend_guard=spend_guard)
         self._model_id = str(model).strip()
@@ -1560,6 +1561,9 @@ class OpenAICompatibleProvider(_ResilientProvider):
             raise ValueError(
                 "LCM_EMBEDDING_BASE_URL must be set for openai-compatible provider"
             )
+        # Optional dedicated rerank endpoint; empty keeps rerank co-located
+        # with the embedding base_url (default behavior, wire unchanged).
+        self.rerank_base_url = str(rerank_base_url).strip().rstrip("/")
         self.api_key_env = str(api_key_env).strip() or "LCM_EMBEDDING_API_KEY"
         self._transport = transport or _default_http_transport
         self.timeout = float(timeout)
@@ -1573,6 +1577,11 @@ class OpenAICompatibleProvider(_ResilientProvider):
     @property
     def dim(self) -> int:
         return self._dim
+
+    @property
+    def rerank_url(self) -> str:
+        """Rerank endpoint URL; defaults to the embedding base_url."""
+        return f"{self.rerank_base_url or self.base_url}/rerank"
 
     def _request(
         self,
@@ -1784,7 +1793,7 @@ class OpenAICompatibleProvider(_ResilientProvider):
             headers["Authorization"] = f"Bearer {api_key}"
         try:
             response = self._transport(
-                url=f"{self.base_url}/rerank",
+                url=self.rerank_url,
                 payload={
                     "model": str(model) or _OPENAI_COMPATIBLE_RERANK_MODEL,
                     "query": str(query),
@@ -2073,6 +2082,7 @@ def resolve_provider(
             api_key_env=getattr(config, "embedding_api_key_env", "LCM_EMBEDDING_API_KEY"),
             timeout=timeout,
             spend_guard=spend_guard,
+            rerank_base_url=getattr(config, "rerank_base_url", ""),
         )
     raise ProviderUnavailable(
         f"Unsupported embedding provider {provider!r}; use voyage, ollama, "
