@@ -127,6 +127,28 @@ remote providers: `LCM_EMBEDDING_QUERY_TIMEOUT_S` bounds interactive queries,
 stored under the full `(provider, model, ...)` identity so switching back to
 this provider reactivates existing vectors without re-backfilling.
 
+### Reranking via the same endpoint
+
+[infinity](https://github.com/michaelfeil/infinity) can serve both the embedding
+model (`BAAI/bge-m3`) and cross-encoder reranker (`BAAI/bge-reranker-v2-m3`) from
+the same endpoint:
+
+```bash
+infinity serve --model-id BAAI/bge-m3 --model-id BAAI/bge-reranker-v2-m3
+```
+
+Enable the optional recall rerank stage with:
+
+```bash
+export LCM_RERANK_ENABLED=true
+# Optional: overrides the provider's default rerank model.
+export LCM_RERANK_MODEL=BAAI/bge-reranker-v2-m3
+```
+
+For a local endpoint, rerank requests do not require an API key. The rerank
+route is Cohere-compatible (`/rerank`), while embeddings continue to use the
+OpenAI-compatible `/embeddings` route.
+
 ## What you get
 
 `lcm_grep` gains two modes on top of the existing ones:

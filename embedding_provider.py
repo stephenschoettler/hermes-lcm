@@ -36,6 +36,7 @@ _VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank"
 # lcm_recall's cross-encoder rerank model. A lite model keeps the single extra
 # API call cheap and inside the latency-sensitive recall deadline.
 _VOYAGE_RERANK_MODEL = "rerank-2.5-lite"
+_OPENAI_COMPATIBLE_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 _VOYAGE_MAX_BATCH_TOKENS = 80_000
 _VOYAGE_MAX_DOCUMENT_TOKENS = 27_000
 # Voyage caps a single request at 1000 input items regardless of token count;
@@ -1513,7 +1514,6 @@ class OllamaProvider(_ResilientProvider):
             (text,), timeout=timeout, deadline_budget_s=timeout
         )[0]
 
-
 def _load_fastembed():
     """Import the optional dependency in one patchable location."""
     from fastembed import TextEmbedding
@@ -1753,6 +1753,90 @@ class OpenAICompatibleProvider(_ResilientProvider):
         return self._embed(
             (text,), timeout=timeout, deadline_budget_s=timeout
         )[0]
+
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_k: int | None = None,
+        timeout: float,
+        model: str = "",
+    ) -> list[tuple[int, float]]:
+        """Rerank documents through a Cohere-compatible ``/rerank`` endpoint."""
+        docs = [str(document) for document in documents]
+        if not docs:
+            return []
+        if top_k is not None and (
+            isinstance(top_k, bool) or not isinstance(top_k, int)
+        ):
+            raise ValueError("top_k must be an integer or None")
+        if top_k is not None and top_k <= 0:
+            return []
+
+        budget = max(0.001, float(timeout))
+        deadline = time.monotonic() + budget
+        api_key = os.environ.get(self.api_key_env, "").strip()
+        if not api_key:
+            api_key = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            response = self._transport(
+                url=f"{self.base_url}/rerank",
+                payload={
+                    "model": str(model) or _OPENAI_COMPATIBLE_RERANK_MODEL,
+                    "query": str(query),
+                    "documents": docs,
+                    "top_n": len(docs) if top_k is None else min(top_k, len(docs)),
+                },
+                headers=headers,
+                timeout=budget,
+            )
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise EmbeddingProviderError(
+                f"OpenAI-compatible rerank network error: {exc}"
+            ) from exc
+        if not 200 <= response.status < 300:
+            raise EmbeddingProviderError(
+                f"OpenAI-compatible rerank request failed ({response.status})"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EmbeddingProviderError("OpenAI-compatible rerank deadline exceeded")
+
+        def parse() -> list[tuple[int, float]]:
+            payload = _response_json(response, provider="OpenAI-compatible rerank")
+            rows = payload.get("results")
+            if not isinstance(rows, list):
+                raise EmbeddingProviderError(
+                    "OpenAI-compatible rerank response did not contain result data"
+                )
+            ranked: list[tuple[int, float]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    raw_index = row["index"]
+                    raw_score = row["relevance_score"]
+                    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+                        continue
+                    index = int(raw_index)
+                    score = float(raw_score)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not 0 <= index < len(docs):
+                    continue
+                ranked.append((index, score))
+            ranked.sort(key=lambda item: (-item[1], item[0]))
+            return ranked
+
+        return _run_blocking_with_deadline(
+            parse,
+            timeout=remaining,
+            provider="OpenAI-compatible rerank response processing",
+        )
 
 
 class FastembedProvider(_ResilientProvider):

@@ -4531,28 +4531,37 @@ def _lcm_recall_rerank(
 
     ``ordered`` MUST already carry the scope/recency prior so the window reflects
     the true top-N rather than the raw RRF order (RERANK-1). Any failure (no
-    provider, non-voyage, network, deadline) skips silently back to the incoming
+    provider, unavailable capability, network, deadline) skips silently back to the incoming
     order with a ``skipped: <reason>`` status.
     """
     if not bool(getattr(config, "rerank_enabled", False)):
         return ordered, "disabled"
-    if (
-        provider is None
-        or getattr(provider, "provider_id", "") != "voyage"
-        or not hasattr(provider, "rerank")
-    ):
-        return ordered, "skipped: rerank requires the voyage provider"
+    if provider is None or not hasattr(provider, "rerank"):
+        return ordered, "skipped: provider does not support rerank"
     head = ordered[:window]
     if not head:
         return ordered, "skipped: no candidates to rerank"
-    documents = [str(entry["hit"].get("snippet") or "") for entry in head]
+    eligible = [
+        (head_pos, snippet)
+        for head_pos, entry in enumerate(head)
+        if (snippet := str(entry["hit"].get("snippet") or "")).strip()
+    ]
+    if not eligible:
+        return ordered, "skipped: no non-empty snippets to rerank"
+    documents = [snippet for _head_pos, snippet in eligible]
+    rerank_kwargs: dict[str, Any] = {
+        "top_k": len(documents),
+        "timeout": max(0.001, deadline - time.monotonic()),
+    }
+    rerank_model = getattr(config, "rerank_model", "")
+    if rerank_model:
+        rerank_kwargs["model"] = rerank_model
     try:
         ranked = _run_within_deadline(
             lambda: provider.rerank(
                 query,
                 documents,
-                top_k=len(documents),
-                timeout=max(0.001, deadline - time.monotonic()),
+                **rerank_kwargs,
             ),
             remaining_s=deadline - time.monotonic(),
             name="lcm-recall-rerank",
@@ -4561,17 +4570,23 @@ def _lcm_recall_rerank(
         return ordered, f"skipped: {exc}"
     if not ranked:
         return ordered, "skipped: empty rerank result"
-    reordered: list[dict[str, Any]] = []
+    ranked_head_positions: list[int] = []
     seen: set[int] = set()
     for index, _relevance in ranked:
-        if 0 <= index < len(head) and index not in seen:
-            reordered.append(head[index])
+        if 0 <= index < len(eligible) and index not in seen:
+            ranked_head_positions.append(eligible[index][0])
             seen.add(index)
-    for index, entry in enumerate(head):
-        if index not in seen:
-            reordered.append(entry)
+    for eligible_index, (head_pos, _document) in enumerate(eligible):
+        if eligible_index not in seen:
+            ranked_head_positions.append(head_pos)
+    reordered = list(head)
+    for (destination_pos, _document), source_pos in zip(eligible, ranked_head_positions):
+        reordered[destination_pos] = head[source_pos]
     reordered.extend(ordered[window:])
-    return reordered, "applied"
+    status = "applied"
+    if len(eligible) != len(head):
+        status = f"applied (n={len(eligible)}/{len(head)})"
+    return reordered, status
 
 
 def lcm_recall(args: Dict[str, Any], **kwargs) -> str:

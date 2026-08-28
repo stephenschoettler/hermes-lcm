@@ -387,13 +387,13 @@ def test_rerank_disabled_by_default(recall_engine, monkeypatch):
     assert payload["provenance"]["rerank"] == "disabled"
 
 
-def test_rerank_skips_silently_on_non_voyage_provider(recall_engine, monkeypatch):
+def test_rerank_gate_is_capability_based(recall_engine, monkeypatch):
     recall_engine._config.rerank_enabled = True
     node = _add_summary(recall_engine, "kanban rerank skip", session_id="session-a", created_at=5.0)
     _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
 
     payload = _recall(recall_engine, monkeypatch, include="summaries", limit=5)
-    assert payload["provenance"]["rerank"].startswith("skipped")
+    assert payload["provenance"]["rerank"] == "skipped: provider does not support rerank"
     assert payload["hits"]  # order preserved from RRF, not dropped
 
 
@@ -420,6 +420,89 @@ def test_rerank_applies_and_reorders_with_voyage_provider(recall_engine, monkeyp
     )
     assert payload["provenance"]["rerank"] == "applied"
     assert payload["hits"][0]["node_id"] == b
+
+
+def test_rerank_applies_with_openai_compatible_provider(recall_engine, monkeypatch):
+    recall_engine._config.rerank_enabled = True
+    recall_engine._config.rerank_model = "custom-reranker"
+    a = _add_summary(recall_engine, "kanban alpha", session_id="session-a", created_at=5.0)
+    b = _add_summary(recall_engine, "kanban beta", session_id="session-b", created_at=5.0)
+    _seed_summary_vectors(
+        recall_engine, [(a, [1.0, 0.0]), (b, [0.95, 0.312])], provider="openai-compatible"
+    )
+
+    class RerankProvider(MockProvider):
+        provider_id = "openai-compatible"
+
+        def __init__(self):
+            super().__init__()
+            self.rerank_models = []
+
+        def rerank(self, query, documents, *, top_k=None, timeout, model=""):
+            self.rerank_models.append(model)
+            return [(1, 0.9), (0, 0.1)]
+
+    provider = RerankProvider()
+    payload = _recall(
+        recall_engine, monkeypatch, provider=provider, include="summaries", scope_bias=0.0, limit=5
+    )
+    assert payload["provenance"]["rerank"] == "applied"
+    assert payload["hits"][0]["node_id"] == b
+    assert all(hit["score"] < 0.1 for hit in payload["hits"])
+    assert provider.rerank_models == ["custom-reranker"]
+
+
+def test_rerank_passes_through_empty_snippets():
+    class RerankProvider:
+        calls = []
+
+        def rerank(self, query, documents, **kwargs):
+            self.calls.append((documents, kwargs))
+            return [(2, 0.9), (1, 0.8), (0, 0.7)]
+
+    provider = RerankProvider()
+    head = [
+        {"hit": {"snippet": "A"}},
+        {"hit": {"snippet": ""}},
+        {"hit": {"snippet": "B"}},
+        {"hit": {"snippet": "C"}},
+    ]
+    ordered, status = lcm_tools._lcm_recall_rerank(
+        provider,
+        "q",
+        head,
+        window=4,
+        deadline=time.monotonic() + 5.0,
+        config=SimpleNamespace(rerank_enabled=True, rerank_model=""),
+    )
+
+    assert [entry["hit"]["snippet"] for entry in ordered] == ["C", "", "B", "A"]
+    assert provider.calls[0][0] == ["A", "B", "C"]
+    assert "model" not in provider.calls[0][1]
+    assert status == "applied (n=3/4)"
+
+
+def test_rerank_all_empty_snippets_skips_call():
+    class RerankProvider:
+        calls = 0
+
+        def rerank(self, *args, **kwargs):
+            self.calls += 1
+            return []
+
+    provider = RerankProvider()
+    ordered, status = lcm_tools._lcm_recall_rerank(
+        provider,
+        "q",
+        [{"hit": {"snippet": ""}}, {"hit": {"snippet": "  "}}],
+        window=2,
+        deadline=time.monotonic() + 5.0,
+        config=SimpleNamespace(rerank_enabled=True, rerank_model=""),
+    )
+
+    assert status == "skipped: no non-empty snippets to rerank"
+    assert provider.calls == 0
+    assert [entry["hit"]["snippet"] for entry in ordered] == ["", "  "]
 
 
 def test_rerank_failure_falls_back_to_rrf_order(recall_engine, monkeypatch):
