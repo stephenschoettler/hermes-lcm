@@ -18,6 +18,7 @@ avoid an import cycle (staticmethod resolution is identical).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -50,6 +51,18 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+
+# Replay-proof metadata namespaces. Both are session-scoped, versioned, bounded
+# and best-effort. They are kept strictly separate so provenance controls
+# consumption:
+#   * ENGINE-assembled compacted snapshots (proven by this engine emitting them
+#     as provider-visible context) are consumed by ordinary ingest/compress.
+#   * SESSION-END full-history snapshots (proven only by a successful
+#     current-session ``on_session_end`` persistence) are consumed ONLY by the
+#     current-session full-history session-end ingest, never by ordinary ingest.
+# Host-supplied session-end history must never leak proof into normal ingest.
+_COMPACTED_ACTIVE_REPLAY_METADATA_PREFIX = "compacted_active_replay_snapshot_digests"
+_SESSION_END_REPLAY_METADATA_PREFIX = "session_end_replay_snapshot_digests"
 
 
 class ReconcileMixin:
@@ -242,6 +255,163 @@ class ReconcileMixin:
             tool_calls_identity,
         )
 
+    def _replay_snapshot_digest(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        require_lcm_system_note: bool,
+    ) -> str:
+        """Fingerprint an eligible compacted snapshot for one proof source.
+
+        Engine-assembled proof remains anchored by BOTH the generated LCM
+        system note and a generated summary scaffold. Session-end full-history
+        proof may accept a summary-only snapshot because hosts can drop the
+        system note, but that weaker proof lives in a separate namespace and is
+        consumed only by the explicitly marked session-end path.
+        """
+        has_lcm_system_note = any(
+            str(message.get("role") or "") == "system"
+            and "[Note: This conversation uses Lossless Context Management (LCM)." in (
+                normalize_content_value(message.get("content")) or ""
+            )
+            and "Earlier turns have been compacted into hierarchical summaries below." in (
+                normalize_content_value(message.get("content")) or ""
+            )
+            for message in messages
+        )
+        has_generated_summary = any(
+            str(message.get("role") or "") != "system"
+            and "[Expand for details:" in (normalize_content_value(message.get("content")) or "")
+            and bool(
+                re.search(
+                    r"\[(?:Recent|Session Arc|Durable|Depth-\d+) Summary \(d\d+, node \d+\)\]",
+                    normalize_content_value(message.get("content")) or "",
+                )
+            )
+            for message in messages
+        )
+        if not has_generated_summary or (require_lcm_system_note and not has_lcm_system_note):
+            return ""
+        identities = [list(self._message_replay_identity(message)) for message in messages]
+        payload = json.dumps(
+            {"version": 1, "messages": identities},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _compacted_active_replay_snapshot_digest(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> str:
+        """Fingerprint engine-assembled context using the stronger anchor."""
+        return self._replay_snapshot_digest(messages, require_lcm_system_note=True)
+
+    def _session_end_replay_snapshot_digest(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> str:
+        """Fingerprint summary-only full history for session-end proof only."""
+        return self._replay_snapshot_digest(messages, require_lcm_system_note=False)
+
+    def _replay_snapshot_metadata_key(self, prefix: str) -> str:
+        return f"{prefix}:{getattr(self, '_session_id', '')}"
+
+    def _load_replay_snapshot_digests(self, prefix: str) -> list[str]:
+        """Load a bounded, versioned digest list from a replay-proof namespace.
+
+        Any missing/corrupt/unreadable metadata resolves to an empty list, so a
+        caller can never mistake a load failure for durable replay proof.
+        """
+        if not getattr(self, "_session_id", ""):
+            return []
+        store = getattr(self, "_store", None)
+        if store is None:
+            return []
+        try:
+            data = store.read_metadata_json(self._replay_snapshot_metadata_key(prefix))
+        except Exception:
+            logger.debug("LCM replay snapshot metadata load failed", exc_info=True)
+            return []
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return []
+        raw_digests = data.get("digests")
+        if not isinstance(raw_digests, list):
+            return []
+        ordered: list[str] = []
+        for digest in raw_digests:
+            normalized = str(digest)
+            if re.fullmatch(r"[0-9a-f]{64}", normalized) and normalized not in ordered:
+                ordered.append(normalized)
+        return ordered[-16:]
+
+    def _remember_replay_snapshot(
+        self,
+        prefix: str,
+        digest: str,
+    ) -> None:
+        if not getattr(self, "_session_id", ""):
+            return
+        store = getattr(self, "_store", None)
+        if store is None or not digest:
+            return
+        ordered = self._load_replay_snapshot_digests(prefix)
+        ordered = [item for item in ordered if item != digest]
+        ordered.append(digest)
+        ordered = ordered[-16:]
+        try:
+            store.write_metadata_json(
+                [self._replay_snapshot_metadata_key(prefix)],
+                json.dumps({"version": 1, "digests": ordered}, sort_keys=True),
+                skip_unchanged=True,
+            )
+        except Exception:
+            # Missing metadata must fail toward duplicate preservation, never
+            # toward silently dropping an ambiguous incoming delta.
+            logger.debug("LCM replay snapshot metadata write failed", exc_info=True)
+
+    # -- Engine-assembled compacted snapshot proof (consumed by normal ingest) --
+
+    def _active_replay_snapshot_metadata_key(self) -> str:
+        return self._replay_snapshot_metadata_key(_COMPACTED_ACTIVE_REPLAY_METADATA_PREFIX)
+
+    def _load_compacted_active_replay_snapshot_digests(self) -> list[str]:
+        return self._load_replay_snapshot_digests(_COMPACTED_ACTIVE_REPLAY_METADATA_PREFIX)
+
+    def _remember_compacted_active_replay_snapshot(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        self._remember_replay_snapshot(
+            _COMPACTED_ACTIVE_REPLAY_METADATA_PREFIX,
+            self._compacted_active_replay_snapshot_digest(messages),
+        )
+
+    # -- Session-end full-history proof (consumed ONLY by current-session
+    #    full-history session-end ingest) --
+
+    def _session_end_replay_snapshot_metadata_key(self) -> str:
+        return self._replay_snapshot_metadata_key(_SESSION_END_REPLAY_METADATA_PREFIX)
+
+    def _load_session_end_replay_snapshot_digests(self) -> list[str]:
+        return self._load_replay_snapshot_digests(_SESSION_END_REPLAY_METADATA_PREFIX)
+
+    def _remember_session_end_replay_snapshot(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        # Bind proof strictly to the currently-bound session. A late/off-current
+        # end (e.g. session A ending after B is bound) must never write proof
+        # under the bound session's namespace.
+        if session_id != getattr(self, "_session_id", ""):
+            return
+        self._remember_replay_snapshot(
+            _SESSION_END_REPLAY_METADATA_PREFIX,
+            self._session_end_replay_snapshot_digest(messages),
+        )
+
     @staticmethod
     def _matches_store_tail_suffix(
         stored_tail: list[tuple[str, str, str, str]],
@@ -427,6 +597,7 @@ class ReconcileMixin:
         allow_empty_prefix: bool,
         session_count: int,
         raw_session_count: int,
+        allow_session_end_replay_proof: bool = False,
     ) -> int | None:
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
@@ -445,6 +616,17 @@ class ReconcileMixin:
                     "tool_calls": decoded_tool_calls,
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
+        # Engine-assembled compacted-snapshot proof is always eligible. The
+        # session-end full-history proof namespace is admitted ONLY for the
+        # current-session full-history session-end ingest; ordinary
+        # ingest/compress/tool-call reconciliation must never consume it, so a
+        # host-supplied session-end history cannot silently skip a fresh delta.
+        engine_snapshot_digests = set(self._load_compacted_active_replay_snapshot_digests())
+        session_end_snapshot_digests = (
+            set(self._load_session_end_replay_snapshot_digests())
+            if allow_session_end_replay_proof
+            else set()
+        )
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             candidate_messages = messages[:cursor]
@@ -509,6 +691,22 @@ class ReconcileMixin:
                 and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix)
             )
             matches_raw_tail = self._matches_store_tail_suffix(stored_tail, candidate_prefix)
+            engine_snapshot_digest = self._compacted_active_replay_snapshot_digest(candidate_messages)
+            session_end_snapshot_digest = (
+                self._session_end_replay_snapshot_digest(candidate_messages)
+                if allow_session_end_replay_proof
+                else ""
+            )
+            has_durable_compacted_snapshot_replay = (
+                (
+                    bool(engine_snapshot_digest)
+                    and engine_snapshot_digest in engine_snapshot_digests
+                )
+                or (
+                    bool(session_end_snapshot_digest)
+                    and session_end_snapshot_digest in session_end_snapshot_digests
+                )
+            ) and (matches_sanitized_tail or matches_raw_tail)
             matches_visible_sanitized_tail = (
                 filtered_candidate_placeholders
                 and bool(candidate_visible_prefix)
@@ -737,6 +935,7 @@ class ReconcileMixin:
                 or has_raw_full_replay
                 or has_scaffold_suffix_replay
                 or has_raw_cleanup_replay
+                or has_durable_compacted_snapshot_replay
             ):
                 return cursor
         return empty_prefix_cursor if allow_empty_prefix else None
@@ -801,7 +1000,12 @@ class ReconcileMixin:
             return False
         return stored_head[: len(incoming_identities)] == incoming_identities
 
-    def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
+    def _reconcile_ingest_cursor_from_store(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        allow_session_end_replay_proof: bool = False,
+    ) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
             return 0
@@ -861,6 +1065,7 @@ class ReconcileMixin:
             allow_empty_prefix=True,
             session_count=len(stored_tail),
             raw_session_count=session_count,
+            allow_session_end_replay_proof=allow_session_end_replay_proof,
         )
         if cursor is not None and cursor > 0:
             reason = (
