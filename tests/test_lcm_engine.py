@@ -408,6 +408,16 @@ def test_update_model_updates_runtime_metadata_and_context_window(engine):
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
 
 
+def test_codex_gpt54_honors_one_million_context_override(engine):
+    engine.update_model(
+        model="gpt-5.4",
+        provider="openai-codex",
+        context_length=1_000_000,
+    )
+
+    assert engine.context_length == 1_000_000
+
+
 def test_codex_gpt55_uses_route_cap_and_hermes_autoraise_threshold(tmp_path):
     config = LCMConfig(
         context_threshold=0.68,
