@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import sqlite3
 import sys
@@ -26,6 +27,8 @@ PACKAGE_NAME = "hermes_lcm"
 
 def _ensure_local_package_importable() -> None:
     """Make local plugin modules importable when this file is run directly."""
+    if str(PLUGIN_DIR) not in sys.path:
+        sys.path.insert(0, str(PLUGIN_DIR))
     if PACKAGE_NAME in sys.modules:
         return
     pkg = types.ModuleType(PACKAGE_NAME)
@@ -36,11 +39,18 @@ def _ensure_local_package_importable() -> None:
 
 _ensure_local_package_importable()
 
+_access_policy = importlib.import_module("hermes_lcm.access_policy")
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
+
+from hermes_lcm.access_context import AccessContextV1, Decision, DenialReason  # noqa: E402
 from hermes_lcm.config import LCMConfig  # noqa: E402
 from hermes_lcm.dag import build_nodes_fts_spec  # noqa: E402
-from hermes_lcm.db_bootstrap import ensure_external_content_fts  # noqa: E402
+from hermes_lcm.db_bootstrap import add_column_if_missing, ensure_external_content_fts  # noqa: E402
 from hermes_lcm.ingest_protection import protect_message_for_ingest  # noqa: E402
 from hermes_lcm.message_content import normalize_content_value  # noqa: E402
+from hermes_lcm.scope_storage import SCOPE_BEARING_TABLES  # noqa: E402
 from hermes_lcm.store import MessageStore, _normalize_source_value  # noqa: E402
 from hermes_lcm.tokens import count_message_tokens  # noqa: E402
 
@@ -167,6 +177,78 @@ class ImportResult:
 
 def _readonly_sqlite_uri(db_path: Path) -> str:
     return db_path.resolve().as_uri() + "?mode=ro"
+
+
+def _target_has_stamped_scope(target_path: Path) -> bool:
+    """Detect a Teams-scoped target before an uncarried apply can write it."""
+    if not target_path.is_file():
+        return False
+    try:
+        conn = sqlite3.connect(_readonly_sqlite_uri(target_path), uri=True)
+    except sqlite3.Error:
+        return True
+    try:
+        for table in SCOPE_BEARING_TABLES:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+                (table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            columns = {
+                str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")')
+            }
+            if "access_scope" not in columns:
+                continue
+            if conn.execute(
+                f'SELECT 1 FROM "{table}" WHERE access_scope IS NOT NULL LIMIT 1'
+            ).fetchone():
+                return True
+        return False
+    except sqlite3.Error:
+        return True
+    finally:
+        conn.close()
+
+
+def _authorize_import(
+    policy: Any,
+    access_context: Any,
+    expected_scope: dict[str, Any],
+    *,
+    target_path: Path,
+    apply: bool,
+    teams_enabled: bool,
+) -> None:
+    operation = "owner_only"
+    expected_scope["required_scope"] = operation
+    decision = policy.authorize_operation(access_context, operation, expected_scope)
+    policy.audit_decision(
+        access_context, operation, decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError("authorize_operation", decision.public().denial_reason)
+    if apply and _target_has_stamped_scope(target_path) and access_context is None:
+        missing = Decision.deny(DenialReason.CONTEXT_MISSING)
+        policy.audit_decision(
+            access_context, operation, missing.denial_reason, missing.public()
+        )
+        raise AuthorizationRequiredError("authorize_operation", missing.public().denial_reason)
+    if apply and teams_enabled and _access_scope_from_context(access_context) is None:
+        invalid = Decision.deny(DenialReason.CONTEXT_INVALID)
+        policy.audit_decision(
+            access_context, operation, invalid.denial_reason, invalid.public()
+        )
+        raise AuthorizationRequiredError("authorize_operation", invalid.public().denial_reason)
+
+
+def _access_scope_from_context(context: Any) -> str | None:
+    """Return the storage owner scope carried by an authorized host context."""
+
+    if not isinstance(context, AccessContextV1):
+        return None
+    value = context.session_owner_principal_id or context.principal_id
+    return str(value).strip() or None
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -731,6 +813,18 @@ def _ensure_summary_nodes_schema(conn: sqlite3.Connection) -> None:
         """
     )
     columns = _table_columns(conn, "summary_nodes")
+    if "scope" in columns and "access_scope" not in columns:
+        conn.execute(
+            "ALTER TABLE summary_nodes RENAME COLUMN scope TO access_scope"
+        )
+        columns.remove("scope")
+        columns.add("access_scope")
+    add_column_if_missing(
+        conn,
+        columns,
+        "access_scope",
+        "ALTER TABLE summary_nodes ADD COLUMN access_scope TEXT",
+    )
     if "earliest_at" not in columns:
         conn.execute("ALTER TABLE summary_nodes ADD COLUMN earliest_at REAL")
     if "latest_at" not in columns:
@@ -814,6 +908,7 @@ def _insert_summary_node(
     candidate: SummaryCandidate,
     source_ids: list[int],
     source_type: str,
+    access_scope: str | None,
 ) -> int:
     source_token_count = (
         candidate.descendant_token_count
@@ -826,8 +921,9 @@ def _insert_summary_node(
     cur = conn.execute(
         """INSERT INTO summary_nodes
            (session_id, depth, summary, token_count, source_token_count,
-            source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            source_ids, source_type, created_at, earliest_at, latest_at,
+            expand_hint, access_scope)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             candidate.target_session_id,
             depth,
@@ -840,6 +936,7 @@ def _insert_summary_node(
             candidate.earliest_at,
             candidate.latest_at,
             candidate.expand_hint,
+            access_scope,
         ),
     )
     node_id = int(cur.lastrowid)
@@ -879,6 +976,7 @@ def _process_summary_candidates(
     imported_messages: dict[int, int],
     imported_summaries: dict[str, int],
     dry_run: bool,
+    access_scope: str | None = None,
 ) -> SummaryImportStats:
     stats = SummaryImportStats(scanned=len(candidates))
     summary_to_node = dict(imported_summaries)
@@ -899,6 +997,7 @@ def _process_summary_candidates(
             candidate=candidate,
             source_ids=source_ids,
             source_type=source_type,
+            access_scope=access_scope,
         )
         summary_to_node[candidate.source_summary_id] = node_id
         stats.imported += 1
@@ -1033,6 +1132,7 @@ def _insert_import_candidate(
     candidate: ImportCandidate,
     protection_config: LCMConfig,
     target_path: Path,
+    access_scope: str | None,
 ) -> int:
     protected_msg = protect_message_for_ingest(
         _candidate_message(candidate),
@@ -1044,8 +1144,8 @@ def _insert_import_candidate(
     cur = conn.execute(
         """INSERT INTO messages
            (session_id, source, role, content, tool_call_id, tool_calls,
-            tool_name, timestamp, token_estimate, pinned)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+            tool_name, timestamp, token_estimate, pinned, access_scope)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
         (
             candidate.target_session_id,
             _normalize_source_value(candidate.source),
@@ -1056,6 +1156,7 @@ def _insert_import_candidate(
             protected_msg.get("tool_name"),
             candidate.timestamp,
             count_message_tokens(protected_msg),
+            access_scope,
         ),
     )
     store_id = int(cur.lastrowid)
@@ -1089,6 +1190,7 @@ def _process_import_candidates(
     apply: bool,
     summary_candidates: list[SummaryCandidate] | None = None,
     include_summaries: bool = False,
+    access_scope: str | None = None,
     invalid_rows: int = 0,
     warnings: list[str] | None = None,
 ) -> ImportResult:
@@ -1117,6 +1219,7 @@ def _process_import_candidates(
                 imported_messages=imported_message_map,
                 imported_summaries=_target_imported_summary_map(target_path, import_id),
                 dry_run=True,
+                access_scope=access_scope,
             )
         return ImportResult(
             source_db=source_label,
@@ -1149,6 +1252,7 @@ def _process_import_candidates(
             imported_messages=_target_imported_message_map(target_path, import_id),
             imported_summaries=_target_imported_summary_map(target_path, import_id),
             dry_run=True,
+            access_scope=access_scope,
         )
         summary_writes_planned = preflight_summary_stats.would_import > 0
 
@@ -1200,6 +1304,7 @@ def _process_import_candidates(
                 candidate=candidate,
                 protection_config=protection_config,
                 target_path=target_path,
+                access_scope=access_scope,
             )
             imported_message_map[candidate.source_message_id] = store_id
             imported += 1
@@ -1211,6 +1316,7 @@ def _process_import_candidates(
                 imported_messages=imported_message_map,
                 imported_summaries=_imported_summary_map_from_conn(conn, import_id),
                 dry_run=False,
+                access_scope=access_scope,
             )
         conn.commit()
     except Exception:
@@ -1251,9 +1357,28 @@ def import_lossless_claw(
     session_identity: str = "session_id",
     include_summaries: bool = False,
     apply: bool = False,
+    engine: object | None = None,
 ) -> ImportResult:
     source_path = Path(source_db)
     target_path = Path(target_db)
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    teams_enabled = bool(getattr(policy, "teams_enabled", False))
+    access_scope = _access_scope_from_context(access_context) if teams_enabled else None
+    expected_scope = {
+        "kind": "lossless_claw_import",
+        "source_db": str(source_path),
+        "target_db": str(target_path),
+        "apply": bool(apply),
+    }
+    _authorize_import(
+        policy,
+        access_context,
+        expected_scope,
+        target_path=target_path,
+        apply=apply,
+        teams_enabled=teams_enabled,
+    )
     resolved_import_id = import_id or _default_import_id(source_path)
     if session_identity not in VALID_SESSION_IDENTITIES:
         raise ValueError(
@@ -1290,6 +1415,7 @@ def import_lossless_claw(
         apply=apply,
         summary_candidates=summary_candidates,
         include_summaries=include_summaries,
+        access_scope=access_scope,
     )
 
 
@@ -3156,9 +3282,28 @@ def import_jsonl_sessions(
     agent: str = "unknown",
     import_id: str | None = None,
     apply: bool = False,
+    engine: object | None = None,
 ) -> ImportResult:
     source_files = [Path(path) for path in files]
     target_path = Path(target_db)
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    teams_enabled = bool(getattr(policy, "teams_enabled", False))
+    access_scope = _access_scope_from_context(access_context) if teams_enabled else None
+    expected_scope = {
+        "kind": "jsonl_import",
+        "source_files": tuple(str(path) for path in source_files),
+        "target_db": str(target_path),
+        "apply": bool(apply),
+    }
+    _authorize_import(
+        policy,
+        access_context,
+        expected_scope,
+        target_path=target_path,
+        apply=apply,
+        teams_enabled=teams_enabled,
+    )
     resolved_import_id = import_id or _default_jsonl_import_id(source_files)
     existing_tool_call_ids = _existing_tool_call_ids_by_source_session(
         target_path,
@@ -3193,6 +3338,7 @@ def import_jsonl_sessions(
         skipped_empty=skipped_empty,
         conversations=conversations,
         apply=apply,
+        access_scope=access_scope,
         invalid_rows=invalid_rows,
         warnings=warnings,
     )

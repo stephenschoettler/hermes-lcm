@@ -19,6 +19,13 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from .access_context import AccessContextV1, Decision, DenialReason, is_subset_of
+
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
+
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
@@ -380,6 +387,46 @@ class CompactionMixin:
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = "empty message list"
             return messages
+
+        # Resolve the write policy through the one documented seam before
+        # ingest, summary publication, or placeholder-ledger writes.  ``self``
+        # is the LCMEngine carrier for this mixin; do not infer policy from
+        # engine attributes here.
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {
+            "kind": "compaction",
+            "session_id": self._session_id,
+            "conversation_id": self._conversation_id,
+            "source_scope": access_context,
+            "derived_scope": access_context,
+        }
+        decision = policy.authorize_operation(access_context, "write", expected_scope)
+        policy.audit_decision(
+            access_context, "write", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
+        authorized_scope = policy.resolve_authorized_targets(
+            access_context, "write", expected_scope
+        )
+        if isinstance(authorized_scope, dict):
+            source_scope = authorized_scope.get("source_scope", access_context)
+            derived_scope = authorized_scope.get("derived_scope", access_context)
+            if (
+                isinstance(source_scope, AccessContextV1)
+                and isinstance(derived_scope, AccessContextV1)
+                and not is_subset_of(derived_scope, source_scope)
+            ):
+                mismatch = Decision.deny(DenialReason.SCOPE_MISMATCH)
+                policy.audit_decision(
+                    access_context, "write", mismatch.denial_reason, mismatch.public()
+                )
+                raise AuthorizationRequiredError(
+                    "authorize_operation", mismatch.public().denial_reason
+                )
 
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""

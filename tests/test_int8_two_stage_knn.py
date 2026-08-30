@@ -9,6 +9,7 @@ reported, and stage-1 recall@M meets the spec bar on a synthetic 5k set.
 from __future__ import annotations
 
 import sqlite3
+import struct
 
 import numpy as np
 import hermes_lcm.vector_store as vector_store_module
@@ -79,6 +80,25 @@ def test_int8_roundtrip_is_high_fidelity():
         worst = min(worst, cos)
     # symmetric per-vector int8 keeps cosine within a tiny quantization error.
     assert worst >= 0.999
+
+
+def test_float_matrix_quantization_matches_shipped_encoder_semantics():
+    matrix = np.asarray(
+        [
+            [0.6, 0.8, 0.0, 0.0],
+            [-0.5, 0.5, 0.25, -0.25],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    quantized, scales = VectorStore._quantize_float_matrix(np, matrix)
+
+    for index, vector in enumerate(matrix):
+        encoded = quantized[index].tobytes() + struct.pack(
+            "<f", float(scales[index])
+        )
+        assert encoded == _encode_int8_vector(vector.tolist())
 
 
 def test_int8_blob_layout_and_bad_length_rejected():
@@ -257,7 +277,7 @@ def test_chunk_deadline_bounds_a_synced_binary_prescreen(tmp_path, monkeypatch):
         assert unbounded.coverage == "full_approx"
         assert expired.coverage == "bounded"
         assert expired.scanned == 1
-        assert expired.total == 2
+        assert expired.total is None
     finally:
         vs.close()
 

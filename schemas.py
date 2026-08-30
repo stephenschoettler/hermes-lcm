@@ -377,7 +377,10 @@ LCM_COMPUTE = {
                                         "unknown",
                                     ],
                                 },
-                                "session_date": {"type": "string"},
+                                "session_date": {
+                                    "type": "string",
+                                    "maxLength": 64,
+                                },
                                 "precision": {"type": "string"},
                                 "policy_version": {"type": "string"},
                                 "reason": {"type": "string"},

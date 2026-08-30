@@ -80,20 +80,26 @@ def _start(
     engine: LCMEngine,
     *,
     question="Where did I travel?",
+    question_date=None,
     operation="evidence_only",
     minimum_refs=1,
     description="visited places",
     identity_changes=None,
 ):
     identity = _identity(operation=operation, **(identity_changes or {}))
-    return _call(
-        engine,
-        action="start",
-        question=question,
-        identity=identity,
-        requirements=_requirements(
+    args = {
+        "action": "start",
+        "question": question,
+        "identity": identity,
+        "requirements": _requirements(
             minimum_refs=minimum_refs, description=description
         ),
+    }
+    if question_date is not None:
+        args["question_date"] = question_date
+    return _call(
+        engine,
+        **args,
     )
 
 
@@ -272,6 +278,78 @@ def test_exact_slot_closure_compute_finish_and_warm_reuse(tmp_path):
         engine.shutdown()
 
 
+def test_low_trust_computation_persists_and_replays_temporal_trust(tmp_path):
+    engine = _engine(tmp_path)
+    try:
+        store_id = _append(
+            engine,
+            "I finished the kanban dashboard sprint 5 days ago.",
+            day="2024-03-20",
+        )
+        started = _start(
+            engine,
+            question="How long ago did I finish the kanban dashboard sprint?",
+            question_date="2024-03-20",
+            operation="date_interval",
+            identity_changes={
+                "time_mode": "relative",
+                "window_start": "2024-03-15",
+                "window_end": "2024-03-16",
+            },
+        )
+        searched = _search(engine, started["retrieval_id"], store_id)
+        evidence = searched["evidence"][0]
+        citation = evidence["citation"]
+        finished = _call(
+            engine,
+            action="finish",
+            retrieval_id=started["retrieval_id"],
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [citation],
+            }],
+            selected_refs=[citation],
+            computation={
+                "operands": [{
+                    "store_id": evidence["store_id"],
+                    "span_start": evidence["span_start"],
+                    "span_end": evidence["span_end"],
+                    "quote": evidence["quote"],
+                    "date": "2024-03-15",
+                    "occurrence_time": {
+                        "event_date": "2024-03-15",
+                        "event_time_source": "relative_to_session",
+                        "session_date": "2024-03-20",
+                    },
+                }]
+            },
+        )
+        fresh_trust = finished["computation"]["temporal_trust"]
+        assert fresh_trust["status"] == "low_trust"
+        assert fresh_trust["certified"] is False
+        assert finished["query_view"]["persistence"]["status"] == "published"
+
+        warm = _start(
+            engine,
+            question="When was that kanban dashboard sprint completed?",
+            question_date="2024-03-20",
+            operation="date_interval",
+            identity_changes={
+                "time_mode": "relative",
+                "window_start": "2024-03-15",
+                "window_end": "2024-03-16",
+            },
+        )
+        assert warm["status"] == "ready"
+        assert warm["query_view"]["status"] == "hit"
+        assert (
+            warm["query_view"]["cached_computation_trace"]["temporal_trust"]
+            == fresh_trust
+        )
+    finally:
+        engine.shutdown()
+
+
 def test_persisted_slot_refs_include_only_selected_evidence(tmp_path):
     engine = _engine(tmp_path)
     try:
@@ -308,6 +386,42 @@ def test_persisted_slot_refs_include_only_selected_evidence(tmp_path):
         assert warm["status"] == "ready"
         assert warm["query_view"]["status"] == "hit"
         assert [item["citation"] for item in warm["evidence"]] == [first_ref]
+    finally:
+        engine.shutdown()
+
+
+def test_query_view_cleanup_cannot_replace_the_build_failure(
+    tmp_path, monkeypatch
+):
+    engine = _engine(tmp_path)
+    try:
+        store_id = _append(engine, "I visited Paris.")
+        started = _start(engine)
+        found = _search(engine, started["retrieval_id"], store_id)
+        exact_ref = found["evidence"][0]["citation"]
+
+        def fail_publish(*args, **kwargs):
+            raise ValueError("publish failed")
+
+        def fail_cleanup(*args, **kwargs):
+            raise RuntimeError("cleanup failed")
+
+        monkeypatch.setattr(engine._query_views, "publish_ready", fail_publish)
+        monkeypatch.setattr(engine._query_views, "mark_failed", fail_cleanup)
+        finished = _call(
+            engine,
+            action="finish",
+            retrieval_id=started["retrieval_id"],
+            resolved_slots=[{
+                "slot_id": "visits",
+                "evidence_refs": [exact_ref],
+            }],
+            selected_refs=[exact_ref],
+        )
+
+        persistence = finished["query_view"]["persistence"]
+        assert persistence["status"] == "failed"
+        assert persistence["reason"] == "publish failed"
     finally:
         engine.shutdown()
 

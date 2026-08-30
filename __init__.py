@@ -15,6 +15,19 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _policy_api():
+    """Resolve the policy helpers lazily.
+
+    Deliberately not a module-level relative import: this file is loaded both
+    as a package and directly, and a bare relative import at module scope
+    breaks the direct path -- the same reason ``get_recall_policy`` defers its
+    import below.
+    """
+    from .access_policy import policy_access_context, policy_for_engine
+
+    return policy_for_engine, policy_access_context
+
+
 def get_recall_policy() -> str:
     """Load the canonical product policy without making bare imports package-dependent."""
     from .guidance import get_recall_policy as _get_recall_policy
@@ -88,6 +101,29 @@ def _ensure_engine_bound_to_session(
         )
 
 
+def _authorize_active_engine_resolution(
+    caller_engine: object,
+    *,
+    session_id: str,
+    conversation_id: str,
+    operation: str,
+) -> bool:
+    """Authorize a resolved session/lane before using its runtime clone."""
+    policy_for_engine, policy_access_context = _policy_api()
+    policy = policy_for_engine(caller_engine)
+    access_context = policy_access_context(caller_engine)
+    expected_scope = {
+        "kind": "active_engine_resolution",
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    decision = policy.authorize_operation(access_context, operation, expected_scope)
+    policy.audit_decision(
+        access_context, operation, decision.denial_reason, decision.public()
+    )
+    return bool(decision.allowed)
+
+
 def _hook_question_date(payload: dict) -> object:
     """Return an explicit turn anchor without inventing event time."""
     explicit = payload.get("question_date") or payload.get("question_as_of")
@@ -120,7 +156,13 @@ def _answer_ready_baseline(active_engine, question: str, payload: dict):
     """Return caller-supplied exact refs or create one bounded product baseline."""
     baseline_refs = payload.get("baseline_refs")
     if isinstance(baseline_refs, (list, tuple)):
-        return tuple(baseline_refs)
+        # Authorized in preanswer_evidence rather than here: tests/conftest.py
+        # registers this package WITHOUT executing __init__.py, so a gate living
+        # at this level cannot be reached by a test. Sitting next to the code
+        # that reads the spans is also where it belongs.
+        from .preanswer_evidence import authorize_supplied_baseline_refs
+
+        return authorize_supplied_baseline_refs(active_engine, baseline_refs)
     raw = active_engine.handle_tool_call(
         "lcm_recall",
         {
@@ -454,6 +496,18 @@ def register(ctx):
                     or payload.get("gateway_session_key")
                     or ""
                 )
+                caller_engine = (
+                    payload.get("context_compressor")
+                    or payload.get("context_engine")
+                    or engine
+                )
+                if not _authorize_active_engine_resolution(
+                    caller_engine,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    operation="read",
+                ):
+                    return None
                 active_engine = resolve_active_lcm_engine(
                     session_id=session_id,
                     conversation_id=conversation_id,
@@ -578,6 +632,15 @@ def register(ctx):
                 or ""
             )
             platform = str(kwargs.get("platform") or "")
+
+            caller_engine = active_engine or kwargs.get("context_engine") or engine
+            if not _authorize_active_engine_resolution(
+                caller_engine,
+                session_id=session_id,
+                conversation_id=conversation_id,
+                operation="write",
+            ):
+                return
 
             if active_engine is None:
                 active_engine = resolve_active_lcm_engine(

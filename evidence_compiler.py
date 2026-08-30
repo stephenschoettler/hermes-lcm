@@ -1230,6 +1230,8 @@ def compile_evidence(
             conflicted = len(validated) > 1
 
     expected = request.get("expected_cardinality")
+    # Caller-evidence certification uses exact_ref uniqueness; engine finite-scan
+    # certification uses dedupe_key uniqueness. These are intentionally different surfaces.
     finite_coverage = bool(
         request["exhaustive"]
         and isinstance(expected, int)

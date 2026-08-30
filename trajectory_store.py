@@ -627,13 +627,43 @@ class TrajectoryStore:
         return conn
 
     def _validate_existing_schema_version(self) -> None:
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'lcm_trajectory_corpora'"
+        ).fetchone()
+        if exists is None:
+            return
         try:
             row = self._conn.execute(
                 "SELECT schema_version FROM lcm_trajectory_corpora "
                 "WHERE singleton = 1"
             ).fetchone()
         except sqlite3.OperationalError:
+            # Two very different tables reach this branch, and only one of them
+            # should be tolerated:
+            #
+            #   LEGACY   -- a corpora table written before the ``schema_version``
+            #               column existed. It still carries the core identity
+            #               columns, and failing the open on it would brick a
+            #               store that is merely old. Treat it as unversioned,
+            #               the same way the table-absent branch above does.
+            #   MALFORMED -- a table that is missing the core columns as well.
+            #               Nothing can be recovered from it, and swallowing the
+            #               error here lets the open continue until some later
+            #               INSERT fails on an arbitrary column, reporting the
+            #               wrong cause and doing so AFTER FTS repair has run.
+            #
+            # Distinguish them by a column the legacy table certainly has.
+            columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(lcm_trajectory_corpora)"
+                )
+            }
+            if "identity_digest" not in columns:
+                raise
             return
+
         if row is not None and int(row["schema_version"]) != TRAJECTORY_SCHEMA_VERSION:
             raise CorpusIdentityError(
                 "trajectory database corpus identity does not match requested identity"
@@ -1497,39 +1527,171 @@ class TrajectoryStore:
 
     def _ensure_state_semantic_schema(self) -> None:
         self._require_writable()
-        self._conn.executescript(
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lcm_trajectory_state_embedding_profiles (
+                        profile_digest TEXT PRIMARY KEY,
+                        provider TEXT NOT NULL,
+                        model_name TEXT NOT NULL,
+                        dim INTEGER NOT NULL CHECK(dim > 0),
+                        document_version TEXT NOT NULL,
+                        source_manifest_digest TEXT NOT NULL,
+                        state_count INTEGER NOT NULL CHECK(state_count >= 0),
+                        active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+                        created_at REAL NOT NULL
+                    )
+                    """
+                )
+                self._conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    lcm_trajectory_state_embedding_one_active
+                    ON lcm_trajectory_state_embedding_profiles(active)
+                    WHERE active = 1
+                    """
+                )
+                self._migrate_state_semantic_embeddings_to_profile_scope()
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lcm_trajectory_state_embeddings (
+                        state_id INTEGER NOT NULL
+                            REFERENCES lcm_trajectory_states(state_id)
+                            ON DELETE CASCADE,
+                        profile_digest TEXT NOT NULL
+                            REFERENCES lcm_trajectory_state_embedding_profiles(
+                                profile_digest
+                            )
+                            ON DELETE CASCADE,
+                        document_sha256 TEXT NOT NULL,
+                        vector BLOB NOT NULL,
+                        embedded_at REAL NOT NULL,
+                        PRIMARY KEY(profile_digest, state_id)
+                    )
+                    """
+                )
+                self._conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    lcm_trajectory_state_embeddings_profile
+                    ON lcm_trajectory_state_embeddings(profile_digest, state_id)
+                    """
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _migrate_state_semantic_embeddings_to_profile_scope(self) -> None:
+        """Replace the legacy ``state_id`` primary key with a profile-scoped key.
+
+        Legacy rows belong to the active profile only when every stored digest
+        matches it. If there is no active profile, a sole stored digest is
+        unambiguous and is adopted. Any mixed digests describe an interrupted
+        legacy rebuild whose overwritten vectors cannot be reconstructed, so the
+        migration fails closed instead of assigning mixed vectors to a profile.
+
+        The caller owns the transaction. Detecting the composite primary key
+        makes repeat calls idempotent.
+        """
+        table_exists = self._conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS lcm_trajectory_state_embedding_profiles (
-                profile_digest TEXT PRIMARY KEY,
-                provider TEXT NOT NULL,
-                model_name TEXT NOT NULL,
-                dim INTEGER NOT NULL CHECK(dim > 0),
-                document_version TEXT NOT NULL,
-                source_manifest_digest TEXT NOT NULL,
-                state_count INTEGER NOT NULL CHECK(state_count >= 0),
-                active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
-                created_at REAL NOT NULL
-            );
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'lcm_trajectory_state_embeddings'
+            """
+        ).fetchone()
+        if table_exists is None:
+            return
 
-            CREATE UNIQUE INDEX IF NOT EXISTS lcm_trajectory_state_embedding_one_active
-            ON lcm_trajectory_state_embedding_profiles(active) WHERE active = 1;
+        table_info = self._conn.execute(
+            "PRAGMA table_info(lcm_trajectory_state_embeddings)"
+        ).fetchall()
+        primary_key = tuple(
+            str(row[1])
+            for row in sorted(table_info, key=lambda row: int(row[5]))
+            if int(row[5]) > 0
+        )
+        if primary_key == ("profile_digest", "state_id"):
+            return
+        if primary_key != ("state_id",):
+            raise TrajectoryStoreError(
+                "unsupported state embedding primary key: "
+                f"{primary_key!r}"
+            )
 
-            CREATE TABLE IF NOT EXISTS lcm_trajectory_state_embeddings (
-                state_id INTEGER PRIMARY KEY
+        active = self._conn.execute(
+            """
+            SELECT profile_digest
+            FROM lcm_trajectory_state_embedding_profiles
+            WHERE active = 1
+            """
+        ).fetchone()
+        stored_digests = [
+            str(row[0])
+            for row in self._conn.execute(
+                """
+                SELECT DISTINCT profile_digest
+                FROM lcm_trajectory_state_embeddings
+                ORDER BY profile_digest
+                """
+            ).fetchall()
+        ]
+        adopted_digest = str(active[0]) if active is not None else None
+        if adopted_digest is None and len(stored_digests) == 1:
+            adopted_digest = stored_digests[0]
+        if adopted_digest is None and len(stored_digests) > 1:
+            raise TrajectoryStoreError(
+                "cannot migrate legacy state embeddings with multiple profile "
+                "digests and no active profile; discard the legacy state "
+                "embeddings and run a fresh backfill to recover"
+            )
+        if adopted_digest is not None and any(
+            digest != adopted_digest for digest in stored_digests
+        ):
+            raise TrajectoryStoreError(
+                "cannot migrate because legacy state embeddings do not all "
+                "match the active profile; discard the legacy state embeddings "
+                "and run a fresh backfill to recover"
+            )
+
+        self._conn.execute(
+            """
+            CREATE TABLE lcm_trajectory_state_embeddings_profile_scoped (
+                state_id INTEGER NOT NULL
                     REFERENCES lcm_trajectory_states(state_id) ON DELETE CASCADE,
                 profile_digest TEXT NOT NULL
-                    REFERENCES lcm_trajectory_state_embedding_profiles(profile_digest)
+                    REFERENCES lcm_trajectory_state_embedding_profiles(
+                        profile_digest
+                    )
                     ON DELETE CASCADE,
                 document_sha256 TEXT NOT NULL,
                 vector BLOB NOT NULL,
-                embedded_at REAL NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS lcm_trajectory_state_embeddings_profile
-            ON lcm_trajectory_state_embeddings(profile_digest, state_id);
+                embedded_at REAL NOT NULL,
+                PRIMARY KEY(profile_digest, state_id)
+            )
             """
         )
-        self._conn.commit()
+        if adopted_digest is not None:
+            self._conn.execute(
+                """
+                INSERT INTO lcm_trajectory_state_embeddings_profile_scoped(
+                    state_id, profile_digest, document_sha256, vector, embedded_at
+                )
+                SELECT state_id, ?, document_sha256, vector, embedded_at
+                FROM lcm_trajectory_state_embeddings
+                """,
+                (adopted_digest,),
+            )
+        self._conn.execute("DROP TABLE lcm_trajectory_state_embeddings")
+        self._conn.execute(
+            """
+            ALTER TABLE lcm_trajectory_state_embeddings_profile_scoped
+            RENAME TO lcm_trajectory_state_embeddings
+            """
+        )
+        self._state_semantic_cache = None
 
     def _state_semantic_profile_exists(self) -> bool:
         return self._conn.execute(
@@ -1655,15 +1817,17 @@ class TrajectoryStore:
         """Resumable per-state embedding backfill (issue #142).
 
         Embeds one vector per state (``states.text``) into
-        ``lcm_trajectory_state_embeddings`` under an active profile keyed by
-        provider/model/dim/document_version/source_manifest_digest. Requests are
-        packed to ``batch_max_items`` items / ``batch_token_budget`` tokens; a
-        state whose document exceeds ``document_token_budget`` is split into
-        token windows, each embedded, and the pieces mean-pooled + normalized
-        into a single state vector (same billed tokens, more requests).
+        ``lcm_trajectory_state_embeddings`` under a profile keyed by
+        provider/model/dim/document_version/source_manifest_digest. A new profile
+        remains inactive while staging, then becomes active only after every
+        state is present. Requests are packed to ``batch_max_items`` items /
+        ``batch_token_budget`` tokens; a state whose document exceeds
+        ``document_token_budget`` is split into token windows, each embedded,
+        and the pieces mean-pooled + normalized into a single state vector
+        (same billed tokens, more requests).
 
         Resumable + idempotent: with ``resume=True`` (default) states that
-        already carry a row under the active profile are skipped, so a re-run
+        already carry a row under the target profile are skipped, so a re-run
         after an interruption embeds only the remainder and a fully-embedded
         store makes ZERO provider calls. ``progress_callback`` is invoked after
         each dispatched request with a cumulative-stats dict (for a live ledger).
@@ -1717,6 +1881,38 @@ class TrajectoryStore:
         ).fetchall()
         total_states = len(all_states)
 
+        if not resume:
+            # Reject an in-place rebuild before a provider probe can incur cost
+            # or turn a deterministic local refusal into a provider failure.
+            # Prefer the caller's resolved dimension; only infer from the
+            # serving profile when the requested dimension is genuinely
+            # unknown, so a distinct-dimension rebuild is not falsely refused.
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    serving_profile = self.active_state_semantic_profile()
+                    if serving_profile is not None:
+                        requested_digest = self._state_semantic_profile_digest(
+                            provider_name,
+                            model_name,
+                            int(dim) if dim is not None
+                            else int(serving_profile["dim"]),
+                            source_manifest_digest,
+                        )
+                        if (
+                            str(serving_profile["profile_digest"])
+                            == requested_digest
+                        ):
+                            raise TrajectoryStoreError(
+                                "cannot rebuild the active state semantic profile "
+                                "in place; use a distinct profile identity so the "
+                                "serving vectors remain intact"
+                            )
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
+
         if dim is None:
             if not all_states:
                 raise ValueError("trajectory corpus has no states to index")
@@ -1740,17 +1936,21 @@ class TrajectoryStore:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                # Deactivate the serving profile BEFORE staging: the vector
-                # upsert below conflicts on state_id alone, so a staged rebuild
-                # progressively overwrites the previous profile's vectors — an
-                # "active" predecessor would keep serving a mixed index.
-                # Availability-during-rebuild needs profile-scoped embeddings
-                # ((profile_digest, state_id) identity) first; tracked in the
-                # fork issue for the next train.
-                self._conn.execute(
-                    "UPDATE lcm_trajectory_state_embedding_profiles "
-                    "SET active = 0 WHERE active = 1",
-                )
+                serving_profile = self.active_state_semantic_profile()
+                if (
+                    not resume
+                    and serving_profile is not None
+                    and str(serving_profile["profile_digest"]) == profile_digest
+                ):
+                    raise TrajectoryStoreError(
+                        "cannot rebuild the active state semantic profile in place; "
+                        "use a distinct profile identity so the serving vectors "
+                        "remain intact"
+                    )
+                # The profile-scoped embedding key keeps the serving profile
+                # complete and untouched while this inactive profile is staged.
+                # Readers remain on the predecessor until the atomic flag flip
+                # after every state for this profile has been persisted.
                 self._conn.execute(
                     """
                     INSERT INTO lcm_trajectory_state_embedding_profiles(
@@ -1835,13 +2035,25 @@ class TrajectoryStore:
             with self._lock:
                 self._conn.execute("BEGIN IMMEDIATE")
                 try:
+                    target = self._conn.execute(
+                        """
+                        SELECT active
+                        FROM lcm_trajectory_state_embedding_profiles
+                        WHERE profile_digest = ?
+                        """,
+                        (profile_digest,),
+                    ).fetchone()
+                    if target is not None and int(target["active"]) == 1:
+                        raise TrajectoryStoreError(
+                            "state semantic profile became active during backfill; "
+                            "refusing to rewrite serving vectors"
+                        )
                     self._conn.executemany(
                         """
                         INSERT INTO lcm_trajectory_state_embeddings(
                             state_id, profile_digest, document_sha256, vector, embedded_at
                         ) VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(state_id) DO UPDATE SET
-                            profile_digest = excluded.profile_digest,
+                        ON CONFLICT(profile_digest, state_id) DO UPDATE SET
                             document_sha256 = excluded.document_sha256,
                             vector = excluded.vector,
                             embedded_at = excluded.embedded_at
@@ -1947,13 +2159,25 @@ class TrajectoryStore:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 self._conn.execute(
-                    "UPDATE lcm_trajectory_state_embedding_profiles "
-                    "SET active = 0 WHERE active = 1"
-                )
-                self._conn.execute(
-                    "UPDATE lcm_trajectory_state_embedding_profiles "
-                    "SET active = 1 WHERE profile_digest = ?",
-                    (profile_digest,),
+                    """
+                    INSERT INTO lcm_trajectory_state_embedding_profiles(
+                        profile_digest, provider, model_name, dim,
+                        document_version, source_manifest_digest,
+                        state_count, active, created_at
+                    )
+                    SELECT
+                        profile_digest, provider, model_name, dim,
+                        document_version, source_manifest_digest,
+                        state_count,
+                        CASE WHEN profile_digest = ? THEN 1 ELSE 0 END,
+                        created_at
+                    FROM lcm_trajectory_state_embedding_profiles
+                    WHERE active = 1 OR profile_digest = ?
+                    ORDER BY CASE WHEN profile_digest = ? THEN 1 ELSE 0 END
+                    ON CONFLICT(profile_digest) DO UPDATE SET
+                        active = excluded.active
+                    """,
+                    (profile_digest, profile_digest, profile_digest),
                 )
                 self._conn.commit()
             except Exception:
@@ -2145,30 +2369,31 @@ class TrajectoryStore:
         tuples for a pure-Python fallback -- the state vectors were normalized at
         backfill, so a query-vector dot product is cosine similarity either way.
         """
-        freshness_row = self._conn.execute(
-            """
-            SELECT COUNT(*), COALESCE(MAX(embedded_at), 0.0)
-            FROM lcm_trajectory_state_embeddings
-            WHERE profile_digest = ?
-            """,
-            (profile_digest,),
-        ).fetchone()
-        freshness = (int(freshness_row[0]), float(freshness_row[1]))
-        cache = self._state_semantic_cache
-        if (
-            cache is not None
-            and cache[0] == profile_digest
-            and cache[1] == freshness
-        ):
-            return cache[2], cache[3]
-        rows = self._conn.execute(
-            """
-            SELECT state_id, vector FROM lcm_trajectory_state_embeddings
-            WHERE profile_digest = ?
-            ORDER BY state_id
-            """,
-            (profile_digest,),
-        ).fetchall()
+        with self._lock:
+            freshness_row = self._conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(MAX(embedded_at), 0.0)
+                FROM lcm_trajectory_state_embeddings
+                WHERE profile_digest = ?
+                """,
+                (profile_digest,),
+            ).fetchone()
+            freshness = (int(freshness_row[0]), float(freshness_row[1]))
+            cache = self._state_semantic_cache
+            if (
+                cache is not None
+                and cache[0] == profile_digest
+                and cache[1] == freshness
+            ):
+                return cache[2], cache[3]
+            rows = self._conn.execute(
+                """
+                SELECT state_id, vector FROM lcm_trajectory_state_embeddings
+                WHERE profile_digest = ?
+                ORDER BY state_id
+                """,
+                (profile_digest,),
+            ).fetchall()
         state_ids = [int(row["state_id"]) for row in rows]
         try:
             import numpy as _np
@@ -3598,15 +3823,15 @@ class TrajectoryStore:
             int(row["state_id"]): candidate_score[int(row["state_id"])]
             for row in selected
         }
+        selected_per_trajectory: dict[str, int] = {}
+        for row in selected:
+            trajectory_id = str(row["trajectory_id"])
+            selected_per_trajectory[trajectory_id] = (
+                selected_per_trajectory.get(trajectory_id, 0) + 1
+            )
 
         if include_adjacent and selected and len(selected) < limit:
             nucleus_rows = list(selected)
-            selected_per_trajectory: dict[str, int] = {}
-            for row in selected:
-                trajectory_id = str(row["trajectory_id"])
-                selected_per_trajectory[trajectory_id] = (
-                    selected_per_trajectory.get(trajectory_id, 0) + 1
-                )
             adjacent_by_nucleus: list[list[sqlite3.Row]] = []
             for nucleus in nucleus_rows:
                 adjacent_rows = self._conn.execute(
@@ -3655,6 +3880,30 @@ class TrajectoryStore:
                         break
                 if not made_progress:
                     break
+
+        # The adjacency reserve is a priority carve-out, not a quota. Return
+        # any unused slots to the ranked pool in its existing order.
+        if include_adjacent and len(selected) < limit:
+            for row in rows:
+                if len(selected) >= limit:
+                    break
+                state_id = int(row["state_id"])
+                if state_id in selected_ids:
+                    continue
+                trajectory_id = str(row["trajectory_id"])
+                if (
+                    diversity_cap > 0
+                    and selected_per_trajectory.get(trajectory_id, 0)
+                    >= diversity_cap
+                ):
+                    continue
+                selected.append(row)
+                selected_ids.add(state_id)
+                selected_per_trajectory[trajectory_id] = (
+                    selected_per_trajectory.get(trajectory_id, 0) + 1
+                )
+                match_kind_by_id[state_id] = candidate_kind.get(state_id, "fts")
+                score_by_id[state_id] = candidate_score[state_id]
 
         adaptive_active = (
             adaptive_excerpt

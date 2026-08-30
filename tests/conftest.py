@@ -4,7 +4,7 @@ Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
 import sys
-import importlib
+import importlib.util
 from pathlib import Path
 
 # Make the repo root importable (for agent.context_engine etc.)
@@ -47,3 +47,11 @@ if pkg_name not in sys.modules:
                 sub_spec.loader.exec_module(sub_mod)
             except Exception:
                 pass  # some modules may fail (e.g. engine needs agent)
+
+
+def load_cli():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "lcm_longmemeval.py"
+    spec = importlib.util.spec_from_file_location("lcm_longmemeval_test_cli", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module

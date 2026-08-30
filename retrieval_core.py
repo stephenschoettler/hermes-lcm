@@ -25,6 +25,12 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+resolve_policy = _access_policy.resolve_policy
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
+
 if TYPE_CHECKING:
     from .engine import LCMEngine
 
@@ -247,6 +253,32 @@ def run_knn(
     corpus (the lcm_recall contract), optionally capped by ``scan_max_rows`` /
     ``scan_budget_s`` — both 0 (no early stop) by default.
     """
+    # One documented seam (access_policy.policy_for_engine) rather than reading
+    # the engine here: guessing attribute names silently yields a permissive
+    # policy when one is renamed, which is exactly the unscoped fallback #473
+    # forbids -- and nothing would fail to tell us.
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {
+        "conversation_ids": conversation_ids,
+        "source": source,
+    }
+    decision = policy.authorize_operation(access_context, "read", expected_scope)
+    policy.audit_decision(
+        access_context, "read", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError(
+            "authorize_operation", decision.public().denial_reason
+        )
+    authorized_scope = policy.resolve_authorized_targets(
+        access_context, "read", expected_scope
+    )
+    conversation_ids = authorized_scope.get("conversation_ids", conversation_ids)
+    source = authorized_scope.get("source", source)
+    # The owner predicate the policy narrowed with. Absent for every non-Teams
+    # caller, so the query is unchanged by default.
+    access_scope = authorized_scope.get("access_scope")
     if time.monotonic() >= deadline:
         raise TimeoutError("semantic vector search deadline exhausted")
     return _run_pooled_knn(
@@ -267,6 +299,7 @@ def run_knn(
             scan_max_rows=scan_max_rows,
             scan_budget_s=scan_budget_s,
             deadline=deadline,
+            access_scope=access_scope,
         ),
     )
 
@@ -296,6 +329,29 @@ def run_chunk_knn(
     ``knn_chunks`` instead of ``knn``. Returns the store's coverage contract
     (full|bounded|none) so the caller degrades identically to the summary arm.
     """
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {
+        "conversation_ids": conversation_ids,
+        "source": source,
+        "corpus": "chunks",
+    }
+    decision = policy.authorize_operation(access_context, "read", expected_scope)
+    policy.audit_decision(
+        access_context, "read", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError(
+            "authorize_operation", decision.public().denial_reason
+        )
+    authorized_scope = policy.resolve_authorized_targets(
+        access_context, "read", expected_scope
+    )
+    conversation_ids = authorized_scope.get("conversation_ids", conversation_ids)
+    source = authorized_scope.get("source", source)
+    # The owner predicate the policy narrowed with. Absent for every non-Teams
+    # caller, so the query is unchanged by default.
+    access_scope = authorized_scope.get("access_scope")
     if time.monotonic() >= deadline:
         raise TimeoutError("chunk vector search deadline exhausted")
     return _run_pooled_knn(
@@ -316,6 +372,7 @@ def run_chunk_knn(
             scan_max_rows=scan_max_rows,
             scan_budget_s=scan_budget_s,
             deadline=deadline,
+            access_scope=access_scope,
         ),
     )
 
@@ -337,6 +394,12 @@ def hydrate_chunk_hits(
     ``store_id`` so RRF fuses it against an FTS raw hit for the same message.
     """
     conn: sqlite3.Connection | None = None
+    # One documented seam (access_policy.policy_for_engine) rather than reading
+    # the engine here: guessing attribute names silently yields a permissive
+    # policy when one is renamed, which is exactly the unscoped fallback #473
+    # forbids -- and nothing would fail to tell us.
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
 
     def require_remaining(stage: str) -> float:
         remaining = deadline - time.monotonic()
@@ -379,25 +442,68 @@ def hydrate_chunk_hits(
         if not ordered_ids:
             return []
         rows_by_id: dict[str, sqlite3.Row] = {}
-        # Chunk in bounded batches so the IN(...) placeholder list stays well
-        # under SQLite's variable limit even for a large knn_limit.
         batch_size = 500
         for start in range(0, len(ordered_ids), batch_size):
             require_remaining("chunk lookup")
             batch = ordered_ids[start:start + batch_size]
             placeholders = ",".join("?" for _ in batch)
-            for row in conn.execute(
-                f"""
-                SELECT cm.chunk_id, cm.store_id, cm.chunk_index, cm.char_start,
-                       cm.char_end, m.session_id, m.source, m.role, m.timestamp,
-                       m.content
-                FROM lcm_chunk_meta cm
-                JOIN messages m ON m.store_id = cm.store_id
-                WHERE cm.chunk_id IN ({placeholders}) AND cm.archived = 0
-                """,
-                batch,
-            ):
-                rows_by_id.setdefault(str(row["chunk_id"]), row)
+            try:
+                for row in conn.execute(
+                    f"""
+                    SELECT cm.chunk_id, cm.store_id, cm.chunk_index, cm.char_start,
+                           cm.char_end, m.session_id, m.source, m.role, m.timestamp,
+                           m.content, m.access_scope
+                    FROM lcm_chunk_meta cm
+                    JOIN messages m ON m.store_id = cm.store_id
+                    WHERE cm.chunk_id IN ({placeholders}) AND cm.archived = 0
+                    """,
+                    batch,
+                ):
+                    rows_by_id.setdefault(str(row["chunk_id"]), row)
+            except sqlite3.OperationalError:
+                # Older/default-off databases may not yet carry the additive
+                # scope column; the policy still receives an explicit NULL.
+                if not list(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type IN ('table', 'view') AND name='lcm_chunk_meta'"
+                    )
+                ):
+                    continue
+                for row in conn.execute(
+                    f"""
+                    SELECT cm.chunk_id, cm.store_id, cm.chunk_index, cm.char_start,
+                           cm.char_end, m.session_id, m.source, m.role, m.timestamp,
+                           m.content
+                    FROM lcm_chunk_meta cm
+                    JOIN messages m ON m.store_id = cm.store_id
+                    WHERE cm.chunk_id IN ({placeholders}) AND cm.archived = 0
+                    """,
+                    batch,
+                ):
+                    rows_by_id.setdefault(str(row["chunk_id"]), row)
+        for chunk_id in ordered_ids:
+            row = rows_by_id.get(chunk_id)
+            try:
+                stored_scope = row["access_scope"] if row is not None else None
+            except (IndexError, KeyError):
+                stored_scope = None
+            decision = policy.authorize_stored_scope(
+                access_context,
+                "read",
+                {
+                    "target_id": chunk_id,
+                    "kind": "chunk",
+                    "access_scope": stored_scope,
+                },
+            )
+            policy.audit_decision(
+                access_context, "read", decision.denial_reason, decision.public()
+            )
+            if not decision.allowed:
+                raise AuthorizationRequiredError(
+                    "authorize_stored_scope", decision.public().denial_reason
+                )
         hydrated: list[tuple[dict[str, Any], float]] = []
         for cid in ordered_ids:  # preserve KNN rank order
             row = rows_by_id.get(cid)
@@ -438,6 +544,12 @@ def hydrate_semantic_nodes(
 ) -> list[tuple[Any, float]]:
     """Hydrate ranked vector hits into summary nodes on a read-only connection."""
     conn: sqlite3.Connection | None = None
+    # One documented seam (access_policy.policy_for_engine) rather than reading
+    # the engine here: guessing attribute names silently yields a permissive
+    # policy when one is renamed, which is exactly the unscoped fallback #473
+    # forbids -- and nothing would fail to tell us.
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
 
     def require_remaining(stage: str) -> float:
         remaining = deadline - time.monotonic()
@@ -472,6 +584,35 @@ def hydrate_semantic_nodes(
         read_dag._conn = conn
         read_dag._db_lock = threading.RLock()
         require_remaining("DAG setup")
+        summary_ids: list[int] = []
+        for embedded_id, _score, kind in ranked_rows:
+            if kind != "summary":
+                continue
+            try:
+                summary_ids.append(int(embedded_id))
+            except (TypeError, ValueError):
+                continue
+            if len(summary_ids) >= knn_limit:
+                break
+        scopes_by_id: dict[int, object] = {}
+        batch_size = 500
+        for start in range(0, len(summary_ids), batch_size):
+            require_remaining("summary scope lookup")
+            batch = summary_ids[start:start + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            try:
+                for row in conn.execute(
+                    f"SELECT node_id, access_scope FROM summary_nodes "
+                    f"WHERE node_id IN ({placeholders})",
+                    batch,
+                ):
+                    try:
+                        stored_scope = row["access_scope"]
+                    except (IndexError, KeyError):
+                        stored_scope = None
+                    scopes_by_id[int(row["node_id"])] = stored_scope
+            except sqlite3.OperationalError:
+                pass
         hydrated: list[tuple[Any, float]] = []
         for embedded_id, score, kind in ranked_rows:
             require_remaining("node lookup")
@@ -482,6 +623,22 @@ def hydrate_semantic_nodes(
             except (TypeError, ValueError):
                 continue
             require_remaining("node lookup")
+            decision = policy.authorize_stored_scope(
+                access_context,
+                "read",
+                {
+                    "target_id": str(embedded_id),
+                    "kind": "summary",
+                    "access_scope": scopes_by_id.get(node_id),
+                },
+            )
+            policy.audit_decision(
+                access_context, "read", decision.denial_reason, decision.public()
+            )
+            if not decision.allowed:
+                raise AuthorizationRequiredError(
+                    "authorize_stored_scope", decision.public().denial_reason
+                )
             node = read_dag.get_node(node_id)
             require_remaining("node lookup")
             if node is not None:

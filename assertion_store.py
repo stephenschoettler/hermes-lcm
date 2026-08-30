@@ -790,9 +790,24 @@ class AssertionStore:
         assertion_id: str | None = None,
         as_of: float | None = None,
         include_invalidated: bool = False,
+        access_scope: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Query source-valid assertions with bitemporal historical filtering."""
+        """Query source-valid assertions with bitemporal historical filtering.
+
+        ``access_scope`` is the per-principal owner predicate. Absent -- which is
+        every default-off and non-Teams caller -- the query is byte-identical to
+        what it was before.
+
+        An assertion is DERIVED from a source message and carries that message's
+        text in ``source_quote``, so it inherits the source's owner. The
+        assertion tables carry no ``access_scope`` column of their own, but they
+        do not need one here: ``messages`` is already joined on
+        ``source_store_id``, so the owner is one predicate away. Without it,
+        ``lcm_query_state`` returned assertions extracted from EVERY principal's
+        messages, each carrying the source quote verbatim plus the foreign
+        session_id and store_id.
+        """
         version = _validated_version(extraction_version)
         bounded_limit = int(limit)
         if not 1 <= bounded_limit <= _MAX_BATCH_SOURCES:
@@ -816,6 +831,14 @@ class AssertionStore:
         if source_store_id is not None:
             where.append("a.source_store_id = ?")
             args.append(int(source_store_id))
+        if access_scope is not None:
+            # The owner of the SOURCE message owns what was derived from it.
+            # `messages` is LEFT JOINed, so this also excludes an assertion
+            # whose source row has gone -- the fail-closed direction, and the
+            # right one for a scoped read: an orphaned assertion still carries
+            # its source_quote verbatim.
+            where.append("m.access_scope = ?")
+            args.append(str(access_scope))
         if assertion_id is not None:
             normalized_assertion_id = str(assertion_id).strip().lower()
             if not _is_sha256_hex(normalized_assertion_id):
@@ -885,6 +908,7 @@ class AssertionStore:
         relation_types: Iterable[str] | None = None,
         as_of: float | None = None,
         include_invalidated: bool = False,
+        access_scope: str | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         version = _validated_version(extraction_version)
@@ -893,6 +917,18 @@ class AssertionStore:
             raise ValueError(f"limit must be between 1 and {_MAX_BATCH_SOURCES}")
         where = ["r.extraction_version = ?"]
         args: list[Any] = [version]
+        if access_scope is not None:
+            # A relation discloses BOTH endpoints -- the projection returns
+            # `from_source_quote` and `to_source_quote` verbatim -- so all three
+            # joined source messages must belong to the acting principal.
+            # Filtering only the relation's own source would still hand over a
+            # foreign quote whenever a relation points across the boundary.
+            where.extend([
+                "relation_message.access_scope = ?",
+                "from_message.access_scope = ?",
+                "to_message.access_scope = ?",
+            ])
+            args.extend([str(access_scope)] * 3)
         if not include_invalidated:
             where.extend([
                 "s.invalidated_at IS NULL",

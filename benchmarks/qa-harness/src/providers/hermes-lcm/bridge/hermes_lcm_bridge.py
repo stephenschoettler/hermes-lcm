@@ -156,12 +156,16 @@ class Bridge:
     def _config(self, db_path: Path):
         from hermes_lcm.config import LCMConfig
 
-        return LCMConfig(
-            database_path=str(db_path),
-            embeddings_enabled=True,
-            embedding_provider=self.provider_name,
-            embedding_model=self.model,
-        )
+        # The experiment flag and its token budget are environment-controlled.
+        # Building a bare LCMConfig here silently discarded those overrides, so
+        # the real bridge could never exercise the same treatment as direct
+        # lcm_recall fixtures.
+        config = LCMConfig.from_env()
+        config.database_path = str(db_path)
+        config.embeddings_enabled = True
+        config.embedding_provider = self.provider_name
+        config.embedding_model = self.model
+        return config
 
     # -- ingest ---------------------------------------------------------------
 
@@ -273,6 +277,7 @@ class Bridge:
 
         db_path = self._db_path(container_tag)
         config = self._config(db_path)
+        dates = self._load_dates(container_tag)
         store = MessageStore(str(db_path), ingest_protection_config=config)
         dag = SummaryDAG(str(db_path))
         vector_store = VectorStore(str(db_path), config=config)  # noqa: F841 (keeps db warm)
@@ -287,12 +292,22 @@ class Bridge:
                 _dag=dag,
                 _hermes_home=str(self.workdir),
                 current_session_id=fresh_session,
+                _session_occurrence_dates=dates,
             )
             cache_key = (self.provider_name.strip().lower(), str(self.embedder.model_id).strip())
             engine._lcm_embedding_provider_cache = (cache_key, self.embedder)
 
+            recall_request = {
+                "query": query,
+                "limit": limit,
+            }
+            if config.session_expand_v1:
+                recall_request["detail"] = "answer_ready"
             payload = json.loads(
-                lcm_tools.lcm_recall({"query": query, "limit": limit}, engine=engine)
+                lcm_tools.lcm_recall(
+                    recall_request,
+                    engine=engine,
+                )
             )
         finally:
             vector_store.close()
@@ -302,7 +317,6 @@ class Bridge:
         if "error" in payload:
             raise RuntimeError(f"lcm_recall error: {payload['error']}")
 
-        dates = self._load_dates(container_tag)
         results: list[dict[str, Any]] = []
         for hit in payload.get("hits", []):
             session_id = hit.get("session_id")
@@ -313,6 +327,11 @@ class Bridge:
                 "score": hit.get("score"),
                 "arms": hit.get("arms"),
                 "from_current_session": hit.get("from_current_session"),
+                "role": hit.get("role"),
+                "session_expanded": bool(hit.get("session_expanded")),
+                "exact_ref": hit.get("exact_ref"),
+                "content_offset": hit.get("content_offset"),
+                "content_returned_chars": hit.get("content_returned_chars"),
             }
             if hit.get("kind") == "summary":
                 metadata["node_id"] = hit.get("node_id")
@@ -320,11 +339,23 @@ class Bridge:
                 metadata["store_id"] = hit.get("store_id")
                 if hit.get("chunk_span"):
                     metadata["chunk_span"] = hit.get("chunk_span")
-            results.append({"content": hit.get("snippet") or "", "metadata": metadata})
+            results.append({
+                "content": hit.get("content") or hit.get("snippet") or "",
+                "metadata": metadata,
+            })
 
         return {
             "ok": True,
-            "results": results[:limit],
+            # ``limit`` bounds the ranked tier. Stage-2 additions intentionally
+            # follow that prefix, so slicing here would erase the treatment at
+            # the wire seam before the answer prompt sees it.
+            "results": results,
+            "ranked_limit": limit,
+            "delivered_result_count": len(results),
+            "delivered_additional_result_count": sum(
+                bool(result["metadata"].get("session_expanded"))
+                for result in results
+            ),
             "degraded": payload.get("degraded", False),
             "degraded_reason": payload.get("degraded_reason"),
         }

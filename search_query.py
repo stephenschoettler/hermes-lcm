@@ -23,14 +23,52 @@ _EMOJI_RE = re.compile(
     r"]"
 )
 _QUOTED_PHRASE_RE = re.compile(r'"([^"]+)"')
+_CURLY_QUOTED_PHRASE_RE = re.compile(r"“([^”]+)”")
 _BOOLEAN_OPERATORS = {"AND", "OR", "NOT", "NEAR"}
 _RISKY_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9][\-:/][A-Za-z0-9]")
 _SPLIT_PUNCT_RE = re.compile(r"[-:/]+")
 _STRIP_EDGE_PUNCT = "\"'()[]{}.,;"
+_TRAILING_SENTENCE_PUNCT = "?!"
+_PROSE_TERM_LIMIT = 12
+_PROSE_SYMBOL_SLOTS = 2
+_PROSE_STOPWORDS = frozenset({
+    "a", "about", "an", "and", "are", "as", "at", "be", "been", "but", "by",
+    "can", "could", "did", "do", "does", "find", "for", "from", "had", "has",
+    "have", "how", "i", "in", "is", "it", "me",
+    "my", "near", "not", "of", "on", "or", "our", "please", "recall", "remember",
+    "s", "say", "said", "should", "tell", "that", "the", "their", "them", "there",
+    "these", "they", "this", "those", "to", "us", "was", "we", "were", "what",
+    "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
+})
+_PROSE_LEAD_WORDS = frozenset({
+    "can", "could", "did", "do", "does", "find", "how", "please", "recall",
+    "remember", "tell", "what", "when", "where", "which", "who", "why", "would",
+})
+# Tokenizer debris from possessives and contractions ("dog's" -> [dog, s],
+# "didn't" -> [didn, t]). None of these is ever a subject term, and none may
+# inflate classification counts. The n't stems are the closed set of tokens
+# that are not standalone English words.
+_PROSE_FRAGMENTS = frozenset({
+    "s", "t", "d", "m", "ll", "ve", "re",
+    "didn", "doesn", "isn", "wasn", "aren", "weren", "hasn", "haven", "hadn",
+    "wouldn", "couldn", "shouldn", "needn", "mustn", "mightn", "shan", "oughtn",
+})
+# Stopwords that can never be the SUBJECT of a memory search (pronouns,
+# articles, prepositions, verbs of asking). The subject-fallback may return a
+# stopword like ``will`` (a noun in possessive-heavy queries) but never one of
+# these — a lone framing token as the sole disjunction term broadens recall to
+# any row containing a common word.
+_PROSE_NEVER_SUBJECT = frozenset({
+    "a", "an", "and", "about", "are", "as", "at", "be", "been", "but",
+    "by", "for", "from", "had", "has", "have", "i", "in", "is", "it", "me",
+    "my", "near", "not", "of", "on", "or", "our", "say", "said", "that",
+    "the", "their", "them", "there", "these", "they", "this", "those", "to",
+    "us", "was", "we", "were", "with", "you", "your",
+})
 # Characters that are special in FTS5 QUERY SYNTAX (as opposed to characters
 # FTS5 simply cannot spell in a bareword). Only these have to go on the LIKE
 # path, which has no query grammar of its own.
-_FTS5_SPECIAL_CHARS = frozenset('"()*^-:{}.')
+_FTS5_SPECIAL_CHARS = frozenset('"()*^-:{}.')  # FTS5 query grammar
 
 
 def _like_safe_char(char: str) -> str:
@@ -117,6 +155,152 @@ def sanitize_fts5_query(query: str, *, allow_operators: bool = False) -> str:
     return sanitized if allow_operators else _neutralize_bare_operators(sanitized)
 
 
+def should_use_fts_prose_mode(
+    query: str,
+    sanitized: str | None = None,
+) -> bool:
+    """Distinguish conversational prose from compact keyword query shapes."""
+    raw = query or ""
+    safe = sanitize_fts5_query(raw) if sanitized is None else sanitized
+    # A retained ASCII phrase or a balanced smart-quoted phrase is an explicit
+    # precision signal. Keep it conjunctive even when the query ends in "?".
+    # BALANCED-ONLY by contract (both quote styles): a lone curly quote is far
+    # more often a typing accident inside a real question than precision
+    # intent, so it must not force a prose-shaped query onto the narrow route.
+    if (
+        _QUOTED_PHRASE_RE.search(safe)
+        or _CURLY_QUOTED_PHRASE_RE.search(raw)
+    ):
+        return False
+
+    # Classification retains ordinary lowercase conjunctions. The scoring
+    # extractor intentionally drops boolean-looking tokens, which previously
+    # hid "and"/"or" from the prose stopword threshold.
+    # Possessive/contraction debris ("s", "didn", "t") is not a word for
+    # classification counts.
+    terms = [
+        term
+        for term in _WORD_RE.findall(safe)
+        if term.casefold() not in _PROSE_FRAGMENTS
+    ]
+    # unicode61 drops these symbols, but in a raw prose request they can be the
+    # subject itself (``Find ©?``). Count them for classification without
+    # putting them into the FTS query; the prose LIKE extractor retains them.
+    terms.extend(
+        char
+        for char in raw
+        if contains_unindexed_unicode_symbol(char)
+    )
+    if len(terms) < 2:
+        return False
+    lowered = [term.casefold() for term in terms]
+    stopword_count = sum(term in _PROSE_STOPWORDS for term in lowered)
+    starts_like_prose = lowered[0] in _PROSE_LEAD_WORDS
+    return (
+        (
+            "?" in raw
+            and (
+                stopword_count >= 1
+                or starts_like_prose
+                or len(terms) >= 6
+            )
+        )
+        or starts_like_prose
+        or (len(terms) >= 6 and stopword_count >= 2)
+    )
+
+
+def _extract_bounded_prose_terms(sanitized: str) -> List[str]:
+    """Drop conversational framing while retaining one subject fallback."""
+    candidates = extract_search_terms(
+        sanitized,
+        normalize_sentence_punctuation=True,
+    )
+    eligible_terms: list[str] = []
+    seen: set[str] = set()
+    for term in candidates:
+        folded = term.casefold()
+        if (
+            folded in _PROSE_STOPWORDS
+            or folded in _PROSE_FRAGMENTS
+            or folded in seen
+        ):
+            continue
+        seen.add(folded)
+        eligible_terms.append(term)
+
+    # Reserve a bounded number of slots for the unindexable routing signals
+    # that sent the query to LIKE. When the ordinary cap is full, the first
+    # symbols evict the lowest-priority (latest) ordinary terms.
+    symbol_terms = [
+        term
+        for term in eligible_terms
+        if contains_unindexed_unicode_symbol(term)
+    ][:_PROSE_SYMBOL_SLOTS]
+    ordinary_limit = _PROSE_TERM_LIMIT - len(symbol_terms)
+    ordinary_terms = [
+        term
+        for term in eligible_terms
+        if not contains_unindexed_unicode_symbol(term)
+    ][:ordinary_limit]
+    selected = set(ordinary_terms) | set(symbol_terms)
+    prose_terms = [term for term in eligible_terms if term in selected]
+
+    if prose_terms:
+        return prose_terms
+
+    # A broad stoplist can also contain the grammatical subject (for example,
+    # ``will``). Prefer the last token that could plausibly BE a subject —
+    # never a lead word, tokenizer fragment, or pure framing word. If nothing
+    # but framing survives, return no terms: build_fts5_match_query then falls
+    # back to the sanitized conjunctive form instead of broadening recall on a
+    # lone framing token.
+    for term in reversed(candidates):
+        folded = term.casefold()
+        if (
+            folded not in _PROSE_LEAD_WORDS
+            and folded not in _PROSE_FRAGMENTS
+            and folded not in _PROSE_NEVER_SUBJECT
+        ):
+            return [term]
+    return []
+
+
+def extract_prose_search_terms(query: str, sanitized: str | None = None) -> List[str]:
+    """Return the bounded signal terms shared by FTS and LIKE prose routes."""
+    safe = sanitize_fts5_query(query) if sanitized is None else sanitized
+    return _extract_bounded_prose_terms(safe)
+
+
+def build_fts5_match_query(
+    query: str,
+    *,
+    allow_operators: bool = False,
+    prose_mode: bool = False,
+) -> str:
+    """Build the query passed to FTS5 while preserving the default byte path.
+
+    Flag-off and caller-composed queries are exactly the existing sanitized
+    form. Flag-on raw prose drops conversational framing, deduplicates terms,
+    caps work at ``_PROSE_TERM_LIMIT``, and lets FTS5/BM25 rank a disjunction.
+    Compact keyword queries and balanced quoted queries remain conjunctive.
+    """
+    sanitized = sanitize_fts5_query(query, allow_operators=allow_operators)
+    if (
+        not prose_mode
+        or allow_operators
+        or not should_use_fts_prose_mode(query, sanitized)
+    ):
+        return sanitized
+
+    prose_terms = extract_prose_search_terms(query, sanitized)
+    if not prose_terms:
+        # An empty disjunction would be an FTS5 MATCH syntax error; keep the
+        # pre-prose sanitized form as the fallback exactly as flag-off does.
+        return sanitized
+    return " OR ".join(prose_terms)
+
+
 def sanitize_like_query(query: str) -> str:
     """Strip FTS5 syntax operators, preserving every other character.
 
@@ -170,6 +354,20 @@ def contains_emoji(text: str) -> bool:
     return bool(_EMOJI_RE.search(text or ""))
 
 
+def contains_unindexed_unicode_symbol(text: str) -> bool:
+    """Whether raw text carries a non-ASCII symbol unicode61 will not index.
+
+    ASCII punctuation keeps the established tokenizer-parity path (notably
+    hyphens and ``$`` in prose). This catches the sibling finding's stripped
+    Unicode signal such as ©, €, and ™ without broadening ordinary punctuation
+    back onto the full-table LIKE scan.
+    """
+    return any(
+        ord(char) > 0x7F and unicodedata.category(char).startswith("S")
+        for char in (text or "")
+    )
+
+
 def contains_risky_fts_ascii(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
@@ -180,7 +378,12 @@ def contains_risky_fts_ascii(text: str) -> bool:
     return bool(_RISKY_FTS_TOKEN_RE.search(text_without_phrases))
 
 
-def requires_like_fallback(query: str, sanitized: str | None = None) -> bool:
+def requires_like_fallback(
+    query: str,
+    sanitized: str | None = None,
+    *,
+    preserve_unicode_symbols: bool = True,
+) -> bool:
     """Whether ``query`` must be answered by the LIKE scan instead of the index.
 
     The test is what SANITIZATION LOSES, not what the FTS5 query grammar cannot
@@ -191,22 +394,38 @@ def requires_like_fallback(query: str, sanitized: str | None = None) -> bool:
     check therefore runs against the SANITIZED form, which is what actually
     reaches ``MATCH``.
 
-    Genuine losses stay on LIKE: unicode61 does not segment CJK, it drops emoji
-    from the index entirely, and a query that sanitizes to nothing has no terms
-    left to match. Those two character classes are tested against the RAW query
-    because sanitization is exactly what removes them.
+    Genuine losses stay on LIKE: unicode61 does not segment CJK; it drops emoji
+    and non-ASCII Unicode symbols from the index entirely; and a query that
+    sanitizes to nothing has no terms left to match. Those character classes
+    are tested against the RAW query because sanitization is exactly what
+    removes them.
     """
     raw = query or ""
     safe = sanitize_fts5_query(raw) if sanitized is None else (sanitized or "")
     if not safe.strip():
         return True
-    if contains_cjk(raw) or contains_emoji(raw):
+    if (
+        contains_cjk(raw)
+        or contains_emoji(raw)
+        or (
+            preserve_unicode_symbols
+            and contains_unindexed_unicode_symbol(raw)
+        )
+    ):
         return True
     return contains_risky_fts_ascii(safe)
 
 
-def _token_variants(token: str) -> List[str]:
+def _token_variants(
+    token: str,
+    *,
+    normalize_sentence_punctuation: bool = False,
+) -> List[str]:
     cleaned = (token or "").strip().strip(_STRIP_EDGE_PUNCT)
+    if normalize_sentence_punctuation:
+        without_sentence_punct = cleaned.strip(_TRAILING_SENTENCE_PUNCT)
+        if without_sentence_punct:
+            cleaned = without_sentence_punct
     if not cleaned:
         return []
     if cleaned.upper() in _BOOLEAN_OPERATORS:
@@ -227,7 +446,11 @@ def _token_variants(token: str) -> List[str]:
     return deduped
 
 
-def extract_search_terms(query: str) -> List[str]:
+def extract_search_terms(
+    query: str,
+    *,
+    normalize_sentence_punctuation: bool = False,
+) -> List[str]:
     text = (query or "").strip()
     if not text:
         return []
@@ -240,7 +463,12 @@ def extract_search_terms(query: str) -> List[str]:
 
     text_without_phrases = _QUOTED_PHRASE_RE.sub(" ", text)
     for token in text_without_phrases.split():
-        terms.extend(_token_variants(token))
+        terms.extend(
+            _token_variants(
+                token,
+                normalize_sentence_punctuation=normalize_sentence_punctuation,
+            )
+        )
 
     if not terms:
         fallback_text = text.strip().strip(_STRIP_EDGE_PUNCT)
@@ -375,6 +603,24 @@ def normalize_search_sort(sort: str | None) -> str:
     """Normalize sort parameter to one of: recency, relevance, hybrid."""
     normalized = (sort or "recency").strip().lower()
     return normalized if normalized in {"recency", "relevance", "hybrid"} else "recency"
+
+
+def resolve_prose_sort(
+    sort: str | None,
+    fts_prose_mode: bool,
+    query: str,
+    *,
+    allow_operators: bool = False,
+) -> str | None:
+    """Promote implicit prose searches to relevance without changing defaults."""
+    if (
+        sort is None
+        and fts_prose_mode
+        and not allow_operators
+        and should_use_fts_prose_mode(query)
+    ):
+        return "relevance"
+    return sort
 
 
 def build_snippet(text: str, terms: List[str], width: int = 80) -> str:

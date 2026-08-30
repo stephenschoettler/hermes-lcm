@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 import sqlite3
 import threading
@@ -273,22 +274,42 @@ def test_hit_confirmation_rechecks_generation_after_source_mutation(
     dependency = _dependency(views, store_id, content)
     identity = _identity()
     _publish(views, identity, [dependency])
+    published_snapshot = views.corpus_snapshot()
     original_snapshot = views.corpus_snapshot
+    original_write_transaction = views._write_transaction
+    snapshot_calls = 0
+    hit_confirmation_hook_reached = False
 
-    def snapshot_then_mutate():
-        snapshot = original_snapshot()
-        messages._conn.execute(
-            "UPDATE messages SET content='I prefer coffee.' WHERE store_id=?",
-            (store_id,),
-        )
-        messages._conn.commit()
-        return snapshot
+    def tracked_snapshot():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return original_snapshot()
 
-    monkeypatch.setattr(views, "corpus_snapshot", snapshot_then_mutate)
+    @contextmanager
+    def mutate_during_hit_confirmation():
+        nonlocal hit_confirmation_hook_reached
+        # The initial negative-space snapshot completed and found the view
+        # current. Mutate only as the hit-confirmation transaction begins.
+        assert snapshot_calls == 1
+        hit_confirmation_hook_reached = True
+        _append(messages, "I prefer coffee.")
+        with original_write_transaction():
+            yield
+
+    monkeypatch.setattr(views, "corpus_snapshot", tracked_snapshot)
+    monkeypatch.setattr(
+        views,
+        "_write_transaction",
+        mutate_during_hit_confirmation,
+    )
     result = views.lookup(identity)
 
+    assert hit_confirmation_hook_reached is True
+    assert snapshot_calls == 2
     assert result.status == "delta_required"
+    assert result.reason == "corpus advanced during hit confirmation"
     assert result.view["status"] == "stale"
+    assert result.view["corpus_generation"] == published_snapshot.generation
     assert result.view["hit_count"] == 0
 
 

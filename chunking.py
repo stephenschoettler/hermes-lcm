@@ -15,6 +15,7 @@ chunk is always index 0, an error chunk keeps the window index it fell on.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator
@@ -26,8 +27,28 @@ from .tokens import count_tokens
 # single chunk; larger messages split at sentence boundaries near this size.
 _CHUNK_TARGET_TOKENS = 600
 # ``conversational`` skips pure-acknowledgment turns; keep it simple and skip
-# anything below this token estimate unconditionally, embed the rest.
-_MIN_CONVERSATIONAL_TOKENS = 40
+# anything below this token estimate unconditionally, embed the rest. Stores
+# dominated by short chat turns can lower it (0 embeds everything) — at the
+# default, substantive short turns never enter the semantic arm at all.
+# INGEST-TIME ONLY, like every chunk-eligibility knob (LCM_EMBED_CONTENT_POLICY
+# included): changing it neither backfills newly-eligible turns nor archives
+# newly-ineligible chunks already in lcm_chunk_meta. A store built under one
+# value is a different corpus from one built under another — rebuild to change it.
+MIN_CONVERSATIONAL_TOKENS_ENV = "LCM_CHUNK_MIN_CONVERSATIONAL_TOKENS"
+_DEFAULT_MIN_CONVERSATIONAL_TOKENS = 40
+
+
+def _min_conversational_tokens() -> int:
+    raw = os.environ.get(MIN_CONVERSATIONAL_TOKENS_ENV)
+    if raw is None:
+        return _DEFAULT_MIN_CONVERSATIONAL_TOKENS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MIN_CONVERSATIONAL_TOKENS
+    if value < 0:
+        return _DEFAULT_MIN_CONVERSATIONAL_TOKENS
+    return value
 # ``full`` bounds a single message at voyage-context-4's per-chunk cap; a message
 # larger than this is reduced to head + error chunks rather than fully windowed.
 _FULL_PER_MESSAGE_TOKEN_CAP = 32_000
@@ -224,13 +245,13 @@ def chunk_message(
     total_tokens = count_tokens(text)
 
     if policy == "conversational":
-        if not is_conversational_role or total_tokens < _MIN_CONVERSATIONAL_TOKENS:
+        if not is_conversational_role or total_tokens < _min_conversational_tokens():
             return []
         return _full_chunks(store_id, text)
 
     if policy == "heads":
         if is_conversational_role:
-            if total_tokens < _MIN_CONVERSATIONAL_TOKENS:
+            if total_tokens < _min_conversational_tokens():
                 return []
             return _full_chunks(store_id, text)
         if is_tool_role:

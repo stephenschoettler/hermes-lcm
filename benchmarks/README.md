@@ -368,11 +368,34 @@ portable local win is the DB-template reuse, not embed batching.
 
 The dataset is downloaded **once** by an explicit operator command, never during
 a run. The canonical source is the Hugging Face dataset `xiaowu0162/longmemeval`,
-file `longmemeval_s` (~278 MB, 500 questions), pinned to revision
+with small file `longmemeval_s` (~278 MB, 500 questions) and medium file
+`longmemeval_m`, both pinned to revision
 `2ec2a557f339b6c0369619b1ed5793734cc87533`:
 
 ```bash
 python scripts/lcm_longmemeval.py fetch --output /path/to/longmemeval-data
+```
+
+The medium tier uses the streaming prepared format so the multi-gigabyte corpus
+is never fully materialized in memory. Fetch, prepare, then run it as three
+explicit operator steps. The prepare step requires `ijson`; the command below
+supplies it with `uv run --with ijson`, or you can first run
+`python -m pip install ijson` and invoke the script with `python` instead:
+
+```bash
+python scripts/lcm_longmemeval.py fetch \
+  --dataset-label m \
+  --output /path/to/longmemeval-data
+uv run --with ijson python scripts/lcm_longmemeval.py prepare \
+  --dataset /path/to/longmemeval-data/longmemeval_m \
+  --dataset-label m \
+  --prepared-dir /path/to/longmemeval-prepared \
+  --allow-external-output
+python scripts/lcm_longmemeval.py run \
+  --prepared-dir /path/to/longmemeval-prepared \
+  --dataset-label m \
+  --provider stub --limit 5 \
+  --output benchmarks/runs/longmemeval-medium-stub
 ```
 
 Deterministic plumbing proof (offline, `<60s`, scores are meaningless with the

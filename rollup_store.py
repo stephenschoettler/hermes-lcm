@@ -117,6 +117,23 @@ class RollupStore:
             datetime.now(timezone.utc) + timedelta(seconds=_BUILD_LEASE_SECONDS)
         ).isoformat()
 
+    def _access_scope_for_partition(self, scope: str) -> str | None:
+        """Copy the owner scope from a source row in this rollup partition."""
+
+        for table in ("summary_nodes", "messages"):
+            try:
+                row = self._conn.execute(
+                    f"SELECT access_scope FROM {table} "
+                    "WHERE session_id = ? AND access_scope IS NOT NULL "
+                    "ORDER BY rowid LIMIT 1",
+                    (str(scope),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            if row is not None:
+                return str(row[0])
+        return None
+
     def _row_to_rollup(self, row: sqlite3.Row | None) -> dict[str, object] | None:
         if row is None:
             return None
@@ -177,15 +194,17 @@ class RollupStore:
         did not re-stale, letting the in-flight build publish deleted-node
         content as ``ready`` (maintainer #387 A2).
         """
+        access_scope = self._access_scope_for_partition(scope)
         with self._write_transaction():
             self._conn.execute(
                 """
                 INSERT INTO lcm_rollups(
-                    period_kind, period_start, scope, status, built_at,
+                    period_kind, period_start, scope, access_scope, status, built_at,
                     lease_expires_at, lease_nonce
                 )
-                VALUES(?, ?, ?, 'building', ?, ?, ?)
+                VALUES(?, ?, ?, ?, 'building', ?, ?, ?)
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                    access_scope = COALESCE(excluded.access_scope, lcm_rollups.access_scope),
                     status = 'building',
                     generation = lcm_rollups.generation + 1,
                     built_at = excluded.built_at,
@@ -196,7 +215,7 @@ class RollupStore:
                     error = NULL
                 """,
                 (
-                    period_kind, period_start, scope, self._now(),
+                    period_kind, period_start, scope, access_scope, self._now(),
                     self._lease_deadline(), uuid.uuid4().hex,
                 ),
             )
@@ -419,21 +438,29 @@ class RollupStore:
         yet exist are seeded as ``stale`` so maintenance builds them.
         """
         day_start, week_start, month_start = self._period_starts_for_day(day)
+        access_scope = self._access_scope_for_partition(scope)
         with self._write_transaction():
             cur = self._conn.execute(
                 """
-                INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
+                INSERT INTO lcm_rollups(
+                    period_kind, period_start, scope, access_scope, status
+                )
                 VALUES
-                    ('day', ?, ?, 'stale'),
-                    ('week', ?, ?, 'stale'),
-                    ('month', ?, ?, 'stale')
+                    ('day', ?, ?, ?, 'stale'),
+                    ('week', ?, ?, ?, 'stale'),
+                    ('month', ?, ?, ?, 'stale')
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                    access_scope = COALESCE(excluded.access_scope, lcm_rollups.access_scope),
                     status = 'stale',
                     generation = lcm_rollups.generation + 1,
                     lease_expires_at = NULL,
                     lease_nonce = ''
                 """,
-                (day_start, scope, week_start, scope, month_start, scope),
+                (
+                    day_start, scope, access_scope,
+                    week_start, scope, access_scope,
+                    month_start, scope, access_scope,
+                ),
             )
         return int(cur.rowcount or 0)
 
@@ -446,20 +473,24 @@ class RollupStore:
         superseded.
         """
         _day_start, week_start, month_start = self._period_starts_for_day(day)
+        access_scope = self._access_scope_for_partition(scope)
         with self._write_transaction():
             cur = self._conn.execute(
                 """
-                INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
+                INSERT INTO lcm_rollups(
+                    period_kind, period_start, scope, access_scope, status
+                )
                 VALUES
-                    ('week', ?, ?, 'stale'),
-                    ('month', ?, ?, 'stale')
+                    ('week', ?, ?, ?, 'stale'),
+                    ('month', ?, ?, ?, 'stale')
                 ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                    access_scope = COALESCE(excluded.access_scope, lcm_rollups.access_scope),
                     status = 'stale',
                     generation = lcm_rollups.generation + 1,
                     lease_expires_at = NULL,
                     lease_nonce = ''
                 """,
-                (week_start, scope, month_start, scope),
+                (week_start, scope, access_scope, month_start, scope, access_scope),
             )
         return int(cur.rowcount or 0)
 
@@ -475,18 +506,22 @@ class RollupStore:
         with self._write_transaction():
             affected = 0
             for target_kind, target_start, target_scope in targets:
+                access_scope = self._access_scope_for_partition(target_scope)
                 cur = self._conn.execute(
                     """
-                    INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
-                    VALUES(?, ?, ?, 'stale')
+                    INSERT INTO lcm_rollups(
+                        period_kind, period_start, scope, access_scope, status
+                    )
+                    VALUES(?, ?, ?, ?, 'stale')
                     ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                        access_scope = COALESCE(excluded.access_scope, lcm_rollups.access_scope),
                         status = 'stale',
                         generation = lcm_rollups.generation + 1,
                         lease_expires_at = NULL,
                         lease_nonce = ''
                     WHERE lcm_rollups.status != 'building'
                     """,
-                    (target_kind, target_start, target_scope),
+                    (target_kind, target_start, target_scope, access_scope),
                 )
                 affected += int(cur.rowcount or 0)
         return affected
@@ -511,7 +546,10 @@ class RollupStore:
         return expanded
 
     def upsert_stale_many(
-        self, targets: Sequence[tuple[str, str, str]]
+        self,
+        targets: Sequence[tuple[str, str, str]],
+        *,
+        authorized_access_scope: str | None = None,
     ) -> int:
         """Durably seed several ``stale`` rows in ONE transaction (all-or-nothing).
 
@@ -528,21 +566,31 @@ class RollupStore:
         rows = self._expand_stale_targets(targets)
         if not rows:
             return 0
+        if authorized_access_scope is not None and not str(authorized_access_scope).strip():
+            raise ValueError("authorized_access_scope must be non-empty when provided")
         affected = 0
         with self._write_transaction():
             for period_kind, period_start, scope in rows:
+                access_scope = (
+                    str(authorized_access_scope)
+                    if authorized_access_scope is not None
+                    else self._access_scope_for_partition(scope)
+                )
                 cur = self._conn.execute(
                     """
-                    INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
-                    VALUES(?, ?, ?, 'stale')
+                    INSERT INTO lcm_rollups(
+                        period_kind, period_start, scope, access_scope, status
+                    )
+                    VALUES(?, ?, ?, ?, 'stale')
                     ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                        access_scope = COALESCE(excluded.access_scope, lcm_rollups.access_scope),
                         status = 'stale',
                         generation = lcm_rollups.generation + 1,
                         lease_expires_at = NULL,
                         lease_nonce = ''
                     WHERE lcm_rollups.status != 'building'
                     """,
-                    (period_kind, period_start, scope),
+                    (period_kind, period_start, scope, access_scope),
                 )
                 affected += int(cur.rowcount or 0)
         return affected
@@ -660,7 +708,7 @@ class RollupStore:
         with self._write_transaction():
             rows = self._conn.execute(
                 """
-                SELECT event_id, scope, covered_start, covered_end, next_day
+                SELECT event_id, scope, access_scope, covered_start, covered_end, next_day
                 FROM lcm_rollup_invalidations
                 ORDER BY event_id
                 LIMIT ?
@@ -691,19 +739,20 @@ class RollupStore:
                     self._conn.execute(
                         """
                         INSERT INTO lcm_rollups(
-                            period_kind, period_start, scope, status
+                            period_kind, period_start, scope, access_scope, status
                         ) VALUES
-                            ('day', ?, ?, 'stale'),
-                            ('week', ?, ?, 'stale'),
-                            ('month', ?, ?, 'stale')
+                            ('day', ?, ?, ?, 'stale'),
+                            ('week', ?, ?, ?, 'stale'),
+                            ('month', ?, ?, ?, 'stale')
                         ON CONFLICT(period_kind, period_start, scope) DO UPDATE SET
+                            access_scope = COALESCE(excluded.access_scope, lcm_rollups.access_scope),
                             status='stale', generation=lcm_rollups.generation + 1,
                             lease_expires_at=NULL, lease_nonce=''
                         """,
                         (
-                            day_start, str(row["scope"]),
-                            week_start, str(row["scope"]),
-                            month_start, str(row["scope"]),
+                            day_start, str(row["scope"]), row["access_scope"],
+                            week_start, str(row["scope"]), row["access_scope"],
+                            month_start, str(row["scope"]), row["access_scope"],
                         ),
                     )
                     current += timedelta(days=1)
@@ -761,16 +810,20 @@ class RollupStore:
         *,
         built_at: str | None = None,
     ) -> None:
+        access_scope = self._access_scope_for_partition(scope)
         with self._write_transaction():
             self._conn.execute(
                 """
-                INSERT INTO lcm_rollup_state(period_kind, scope, last_build_cursor, last_built_at)
-                VALUES(?, ?, ?, ?)
+                INSERT INTO lcm_rollup_state(
+                    period_kind, scope, access_scope, last_build_cursor, last_built_at
+                )
+                VALUES(?, ?, ?, ?, ?)
                 ON CONFLICT(period_kind, scope) DO UPDATE SET
+                    access_scope = COALESCE(excluded.access_scope, lcm_rollup_state.access_scope),
                     last_build_cursor = excluded.last_build_cursor,
                     last_built_at = excluded.last_built_at
                 """,
-                (period_kind, scope, cursor, built_at or self._now()),
+                (period_kind, scope, access_scope, cursor, built_at or self._now()),
             )
 
     def purge_rollups_for_sources(self, node_ids: Sequence[int]) -> int:

@@ -16,6 +16,13 @@ import time
 from typing import Any
 import uuid
 
+from .access_context import AccessContextV1, Decision, DenialReason, is_subset_of
+
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
+
 from .db_bootstrap import (
     check_external_content_fts_integrity,
     external_content_fts_needs_repair,
@@ -25,6 +32,7 @@ from .db_bootstrap import (
     remediate_interim_schema_stamp,
     repair_external_content_fts,
 )
+from .scope_storage import teams_enabled as storage_teams_enabled, verify_scope_storage
 from .diagnostics import (
     _has_lifecycle_fragmentation,
     _state_db_path_for_engine,
@@ -973,6 +981,7 @@ def _doctor_repair_text(engine) -> str:
 
 
 def _doctor_repair_apply_text(engine) -> str:
+    _authorize_doctor_command(engine)
     backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
@@ -1126,6 +1135,7 @@ def _doctor_repair_schema_stamp_apply_text(engine) -> str:
             _schema_stamp_note(plan),
         ])
 
+    _authorize_doctor_command(engine)
     backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
@@ -1232,6 +1242,7 @@ def _doctor_source_apply_text(engine) -> str:
             "note: no legacy blank-source rows needed normalization",
         ])
 
+    _authorize_doctor_command(engine)
     backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
@@ -1289,6 +1300,25 @@ def _doctor_text(engine) -> str:
     schema_core_status = "error" if schema_health.get("error") else "missing" if schema_missing_tables else "ok"
     if schema_missing_tables or schema_health.get("error"):
         issues.append("schema_core_tables")
+
+    try:
+        scope_storage = verify_scope_storage(
+            store_conn,
+            teams_enabled=storage_teams_enabled(engine),
+        )
+    except Exception as exc:  # pragma: no cover - defensive doctor boundary
+        scope_storage = {
+            "status": "fail",
+            "message": str(exc),
+            "tables": {},
+            "observed_rows": 0,
+        }
+    if scope_storage.get("status") == "fail":
+        issues.append("scope_storage")
+    elif scope_storage.get("status") == "nothing-to-verify":
+        recommended_actions.append(
+            "enable Teams before relying on per-item scope verification"
+        )
 
     def _safe_count(conn, query: str, issue_key: str) -> int | str:
         try:
@@ -1466,6 +1496,16 @@ def _doctor_text(engine) -> str:
     else:
         observations.append("schema_core_tables: ok")
 
+    observations.append(
+        "scope_storage: "
+        f"status={scope_storage.get('status')} "
+        f"observed_rows={scope_storage.get('observed_rows', 0)}"
+    )
+    for table, counts in (scope_storage.get("tables") or {}).items():
+        observations.append(
+            f"scope_counts:{table} stamped={counts.get('stamped', 0)} "
+            f"unstamped={counts.get('unstamped', 0)}"
+        )
     if debt_rows:
         first = debt_rows[0]
         observations.append(
@@ -1622,6 +1662,8 @@ def _doctor_text(engine) -> str:
         triage_checks.append({"check": "database_integrity", "status": "fail", "detail": integrity})
     if schema_health.get("error") or schema_missing_tables:
         triage_checks.append({"check": "schema_core_tables", "status": "fail", "detail": schema_health})
+    if scope_storage.get("status") == "fail":
+        triage_checks.append({"check": "scope_storage", "status": "fail", "detail": scope_storage})
     if store_fts != "ok":
         triage_checks.append({
             "check": "messages_fts_integrity",
@@ -1752,6 +1794,25 @@ def _doctor_text(engine) -> str:
     else:
         lines.append("- none")
     return "\n".join(lines)
+
+
+def _authorize_doctor_command(engine) -> None:
+    """Require admin authority before slash-command scope diagnostics run."""
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {
+        "kind": "slash_command",
+        "command": "doctor",
+        "required_scope": "admin",
+    }
+    decision = policy.authorize_operation(access_context, "admin", expected_scope)
+    policy.audit_decision(
+        access_context, "admin", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError(
+            "authorize_operation", decision.public().denial_reason
+        )
 
 
 def _doctor_clean_text(engine) -> str:
@@ -1999,6 +2060,7 @@ def _doctor_clean_apply_text(engine) -> str:
             "note: nothing was deleted",
         ])
 
+    _authorize_doctor_command(engine)
     backup = backup_database(engine)
     if not backup["ok"]:
         return "\n".join([
@@ -2416,6 +2478,72 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
         target_date = datetime.now(timezone.utc).date()
 
     scope = engine.current_session_id
+
+    # RollupStore/build_day have no carrier. Authorize at this engine-side
+    # caller before acquiring the operator lease or opening the write store.
+    # The access scope is the context returned by policy_access_context; the
+    # later ``scope`` value is only the rollup/DAG partition key.
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {
+        "kind": "rollup",
+        "period_kind": kind,
+        "period_date": target_date.isoformat(),
+        # The SAME partition under two names, deliberately, because two
+        # different consumers read two different keys:
+        #
+        #   partition_scope -- the NARROWING contract. The caller re-reads it
+        #                      from the resolver's result below and rejects a
+        #                      mismatch, so it must keep this name.
+        #   partition_key   -- what TeamsPolicy actually decides on. Only
+        #                      `partition_scope` was passed before, and the
+        #                      policy reads neither that nor anything else here,
+        #                      so the gate ran, audited, and permitted every
+        #                      principal regardless of whose partition was
+        #                      named. Same defect as #218: a gate asking a
+        #                      question the policy has no rule for is answered
+        #                      "yes".
+        "partition_scope": scope,
+        "partition_key": scope,
+        "source_scope": access_context,
+        "derived_scope": access_context,
+    }
+    decision = policy.authorize_operation(access_context, "write", expected_scope)
+    policy.audit_decision(
+        access_context, "write", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError(
+            "authorize_operation", decision.public().denial_reason
+        )
+    authorized_scope = policy.resolve_authorized_targets(
+        access_context, "write", expected_scope
+    )
+    if isinstance(authorized_scope, dict):
+        resolved_partition = authorized_scope.get("partition_scope", scope)
+        if str(resolved_partition) != str(scope):
+            mismatch = Decision.deny(DenialReason.SCOPE_MISMATCH)
+            policy.audit_decision(
+                access_context, "write", mismatch.denial_reason, mismatch.public()
+            )
+            raise AuthorizationRequiredError(
+                "authorize_operation", mismatch.public().denial_reason
+            )
+        source_scope = authorized_scope.get("source_scope", access_context)
+        derived_scope = authorized_scope.get("derived_scope", access_context)
+        if (
+            isinstance(source_scope, AccessContextV1)
+            and isinstance(derived_scope, AccessContextV1)
+            and not is_subset_of(derived_scope, source_scope)
+        ):
+            mismatch = Decision.deny(DenialReason.SCOPE_MISMATCH)
+            policy.audit_decision(
+                access_context, "write", mismatch.denial_reason, mismatch.public()
+            )
+            raise AuthorizationRequiredError(
+                "authorize_operation", mismatch.public().denial_reason
+            )
+
     targets = _rollup_period_targets(kind, target_date)
     limit = max(0, int(engine._config.rollup_builds_per_pass))
     lease_key = engine.try_acquire_rollup_operator_lease(scope)
@@ -2443,7 +2571,13 @@ def _rollups_rebuild_text(tokens: list[str], engine) -> str:
             [
                 (period_kind, period_start.isoformat(), scope)
                 for period_kind, period_start in targets
-            ]
+            ],
+            authorized_access_scope=(
+                str(access_context.session_owner_principal_id or access_context.principal_id)
+                if bool(getattr(policy, "teams_enabled", False))
+                and isinstance(access_context, AccessContextV1)
+                else None
+            ),
         )
 
         builders = {
@@ -2571,6 +2705,42 @@ def _parse_assertion_rebuild_args(tokens: list[str]) -> tuple[bool, int] | str:
     return apply, limit
 
 
+def _authorize_apply_mutation(engine, *, kind: str, entry_point: str) -> None:
+    """Gate an apply-mode subcommand before it mutates the database.
+
+    These three handlers reached `rebuild_assertions` / the embedding and chunk
+    backfills with NO policy_for_engine anywhere in their call chain, so under
+    Teams any principal could rewrite assertions and embeddings derived from
+    every principal's memory. The other apply-mode subcommands get this
+    transitively through maintenance.py; these did not, and nothing failed --
+    the completeness test only sees handlers that already call the seam.
+
+    Deliberately NOT paired with a database backup. The review finding said
+    these lacked "the backup every other apply-mode subcommand makes", but the
+    three handlers that actually back up -- rotate, doctor repair, doctor repair
+    schema stamp -- are destructive REPAIRS. These three are idempotent,
+    incremental, additive rebuilds of DERIVED state: re-running restores what a
+    bad run damaged, so a full-database copy before every batch would cost real
+    money on a large store and buy nothing.
+    """
+
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {
+        "kind": kind,
+        "entry_point": entry_point,
+        "required_scope": "owner_only",
+    }
+    decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+    policy.audit_decision(
+        access_context, "owner_only", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError(
+            "authorize_operation", decision.public().denial_reason
+        )
+
+
 def _assertions_rebuild_text(tokens: list[str], engine) -> str:
     if not bool(getattr(engine._config, "assertions_enabled", False)):
         return "\n".join([
@@ -2600,6 +2770,14 @@ def _assertions_rebuild_text(tokens: list[str], engine) -> str:
             "error: no structured assertion extractor is configured",
             "note: no provider call or database write was attempted",
         ])
+
+    if apply:
+        # Authorize BEFORE the writable store is used, and back up before any
+        # row changes -- the two things every other apply-mode handler does and
+        # this one did not.
+        _authorize_apply_mutation(
+            engine, kind="assertions_rebuild", entry_point="rebuild_assertions"
+        )
 
     reader: AssertionStore | None = None
     try:
@@ -3880,6 +4058,12 @@ def _embedding_backfill_summary_text(
     lease_lost = False
     identity_superseded = False
     budget_exhausted = False
+    # Authorize before the writable store is opened. This path rewrites
+    # embeddings derived from every principal's summaries, and reached the
+    # VectorStore with no policy_for_engine anywhere in its chain.
+    _authorize_apply_mutation(
+        engine, kind="embedding_backfill", entry_point="embedding_backfill_summary"
+    )
     try:
         store = VectorStore(db_path, config=engine._config)
         conn = store.connection
@@ -4662,6 +4846,12 @@ def _chunk_backfill_text(
     lease_lost = False
     identity_superseded = False
     budget_exhausted = False
+    # Same gate for the chunk corpus. Its discovery query scans EVERY row of
+    # `messages` with no WHERE clause at all, so an ungated run rewrites chunk
+    # vectors derived from every principal's raw messages.
+    _authorize_apply_mutation(
+        engine, kind="chunk_backfill", entry_point="embedding_backfill_chunks"
+    )
     try:
         store = VectorStore(db_path, config=engine._config)
         store.ensure_chunk_schema()
@@ -5006,6 +5196,7 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
 
     if head == "doctor":
         if not rest:
+            _authorize_doctor_command(engine)
             return _doctor_text(engine)
         if len(rest) == 1 and rest[0].lower() == "clean":
             return _doctor_clean_text(engine)

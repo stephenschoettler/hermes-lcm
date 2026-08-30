@@ -65,6 +65,7 @@ class TestChunkSchema:
             "token_estimate",
             "embedded_at",
             "archived",
+            "access_scope",
         ]
 
     def test_partial_index_predicate_is_present(self):

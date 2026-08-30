@@ -24,6 +24,11 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
+
 
 # --- Explicit subagent lineage (WS5.7) --------------------------------------
 #
@@ -163,6 +168,18 @@ class AuxiliarySessionMixin:
         *,
         preserve_foreground_reuse_marker: bool = False,
     ) -> bool:
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {"kind": "auxiliary_session", "session_id": session_id}
+        expected_scope["required_scope"] = "owner_only"
+        decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+        policy.audit_decision(
+            access_context, "owner_only", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         generation = self._in_process_auxiliary_caller_generation(session_id)
         with self._auxiliary_session_lock:
             previous_generation = self._auxiliary_session_generations.get(session_id)
@@ -233,6 +250,18 @@ class AuxiliarySessionMixin:
         )
 
     def _deactivate_auxiliary_session(self, session_id: str, *, generation: int = 0) -> bool:
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {"kind": "auxiliary_session", "session_id": session_id}
+        expected_scope["required_scope"] = "owner_only"
+        decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+        policy.audit_decision(
+            access_context, "owner_only", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         if not session_id:
             return False
         with self._auxiliary_session_lock:
@@ -300,6 +329,27 @@ class AuxiliarySessionMixin:
         preserve_old_session: bool = False,
         preserve_old_foreground_marker: bool = False,
     ) -> None:
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {
+            "kind": "auxiliary_session_handoff",
+            "session_id": new_session_id,
+            # The session being RETIRED is presented under `source_session_id`,
+            # which is the key the policy reads for "the other session in a
+            # rollover". It was `old_session_id`, a name nothing consults, so
+            # only the incoming session was ever owner-checked and a handoff
+            # could name someone else's session as the one it retires.
+            "source_session_id": old_session_id,
+        }
+        expected_scope["required_scope"] = "owner_only"
+        decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+        policy.audit_decision(
+            access_context, "owner_only", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         generation = self._in_process_auxiliary_caller_generation(new_session_id)
         if generation and self._auxiliary_generation_is_retired(new_session_id, generation):
             with self._auxiliary_session_lock:
@@ -469,6 +519,18 @@ class AuxiliarySessionMixin:
         *,
         suppress_as_foreground_reuse: bool = True,
     ) -> None:
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {"kind": "auxiliary_session", "session_id": session_id}
+        expected_scope["required_scope"] = "owner_only"
+        decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+        policy.audit_decision(
+            access_context, "owner_only", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         with self._auxiliary_session_lock:
             self._auxiliary_session_ids.discard(session_id)
             if suppress_as_foreground_reuse and session_id in self._auxiliary_lineage_session_ids:

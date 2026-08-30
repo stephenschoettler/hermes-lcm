@@ -1,0 +1,431 @@
+{
+  "targets": [
+    {
+      "table": "_lcm_id_scratch_*",
+      "class": "infra",
+      "reason": "Per-call TEMP id staging table with a generated suffix; it contains only bounded query/purge ids."
+    },
+    {
+      "table": "idx_*",
+      "class": "infra",
+      "reason": "SQLite index objects are schema infrastructure and do not own principal rows."
+    },
+    {
+      "table": "lcm_aggregate_source_ids",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded rollup source ids."
+    },
+    {
+      "table": "lcm_assertion_message_delete",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates assertion provenance after message deletion."
+    },
+    {
+      "table": "lcm_assertion_message_update",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates assertion provenance after message changes."
+    },
+    {
+      "table": "lcm_assertion_relation_insert_guard",
+      "class": "infra",
+      "reason": "Schema trigger enforcing assertion-relation scope invariants."
+    },
+    {
+      "table": "lcm_assertion_relations",
+      "class": "principal_data",
+      "reason": "Derived assertion relationships preserve principal-scoped memory claims."
+    },
+    {
+      "table": "lcm_assertion_row_insert_guard",
+      "class": "infra",
+      "reason": "Schema trigger enforcing assertion-row scope invariants."
+    },
+    {
+      "table": "lcm_assertion_source_delete",
+      "class": "infra",
+      "reason": "Schema trigger that removes orphaned assertion rows and relations."
+    },
+    {
+      "table": "lcm_assertion_source_insert_guard",
+      "class": "infra",
+      "reason": "Schema trigger enforcing assertion-source invariants."
+    },
+    {
+      "table": "lcm_assertion_sources",
+      "class": "principal_data",
+      "reason": "Assertion provenance points to principal-scoped source messages."
+    },
+    {
+      "table": "lcm_assertions",
+      "class": "principal_data",
+      "reason": "Extracted assertions are derived from principal-scoped message content."
+    },
+    {
+      "table": "lcm_chunk_binary",
+      "class": "principal_data",
+      "reason": "Binary chunk embeddings are derived from principal-scoped raw messages."
+    },
+    {
+      "table": "lcm_chunk_meta",
+      "class": "principal_data",
+      "reason": "Chunk metadata identifies principal-scoped raw-message spans."
+    },
+    {
+      "table": "lcm_chunk_vectors",
+      "class": "principal_data",
+      "reason": "Chunk vectors are derived from principal-scoped raw messages."
+    },
+    {
+      "table": "lcm_delete_session_scope",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded session deletion."
+    },
+    {
+      "table": "lcm_embedding_backfill_inflight",
+      "class": "infra",
+      "reason": "Lease and dispatch bookkeeping for embedding backfill workers."
+    },
+    {
+      "table": "lcm_embedding_backfill_inflight_legacy",
+      "class": "infra",
+      "reason": "Short-lived schema-repair staging copy of embedding backfill bookkeeping."
+    },
+    {
+      "table": "lcm_embedding_backfill_predecessor_batch",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging for predecessor lease maintenance."
+    },
+    {
+      "table": "lcm_embedding_binary",
+      "class": "principal_data",
+      "reason": "Binary summary embeddings are derived from principal-scoped summaries."
+    },
+    {
+      "table": "lcm_embedding_meta",
+      "class": "principal_data",
+      "reason": "Embedding metadata identifies principal-scoped summary nodes."
+    },
+    {
+      "table": "lcm_embedding_profile",
+      "class": "infra",
+      "reason": "Provider/model identity and cache-version bookkeeping, not memory content."
+    },
+    {
+      "table": "lcm_embedding_vectors",
+      "class": "principal_data",
+      "reason": "Summary vectors are derived from principal-scoped summaries."
+    },
+    {
+      "table": "lcm_imported_messages",
+      "class": "principal_data",
+      "reason": "Import receipts identify principal-scoped imported messages."
+    },
+    {
+      "table": "lcm_imported_summaries",
+      "class": "principal_data",
+      "reason": "Import receipts identify principal-scoped imported summaries."
+    },
+    {
+      "table": "lcm_lifecycle_state",
+      "class": "infra",
+      "reason": "Conversation/session lifecycle control state, explicitly separated from memory rows."
+    },
+    {
+      "table": "lcm_lineage_current",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded lineage traversal."
+    },
+    {
+      "table": "lcm_lineage_frontier",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded lineage traversal."
+    },
+    {
+      "table": "lcm_lineage_seen",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded lineage traversal."
+    },
+    {
+      "table": "lcm_migration_state",
+      "class": "infra",
+      "reason": "Append-only schema migration completion markers."
+    },
+    {
+      "table": "lcm_query_corpus_events",
+      "class": "principal_data",
+      "reason": "Corpus-change events track mutations to principal-scoped query material."
+    },
+    {
+      "table": "lcm_query_corpus_message_delete",
+      "class": "infra",
+      "reason": "Schema trigger that records principal-scoped query-corpus deletion events."
+    },
+    {
+      "table": "lcm_query_corpus_message_insert",
+      "class": "infra",
+      "reason": "Schema trigger that records principal-scoped query-corpus insertion events."
+    },
+    {
+      "table": "lcm_query_corpus_message_update",
+      "class": "infra",
+      "reason": "Schema trigger that records principal-scoped query-corpus update events."
+    },
+    {
+      "table": "lcm_query_corpus_state",
+      "class": "principal_data",
+      "reason": "Query-corpus generations summarize principal-scoped memory state."
+    },
+    {
+      "table": "lcm_query_view_sources",
+      "class": "principal_data",
+      "reason": "Query-view provenance points to principal-scoped source material."
+    },
+    {
+      "table": "lcm_query_view_versions",
+      "class": "principal_data",
+      "reason": "Versioned query-view content is derived from principal-scoped memory."
+    },
+    {
+      "table": "lcm_query_views",
+      "class": "principal_data",
+      "reason": "Materialized query views are derived from principal-scoped memory."
+    },
+    {
+      "table": "lcm_recent_frontier_ids",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded recent-node traversal."
+    },
+    {
+      "table": "lcm_resident_chunk_archive",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates the resident chunk matrix on archive."
+    },
+    {
+      "table": "lcm_resident_chunk_meta_delete",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates the resident chunk matrix after chunk-meta deletion."
+    },
+    {
+      "table": "lcm_resident_chunk_vector_delete",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates the resident chunk matrix after chunk-vector deletion."
+    },
+    {
+      "table": "lcm_resident_message_delete",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates the resident int8 matrix after message deletion."
+    },
+    {
+      "table": "lcm_resident_summary_delete",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates the resident int8 matrix after summary deletion."
+    },
+    {
+      "table": "lcm_resident_summary_suppress",
+      "class": "infra",
+      "reason": "Schema trigger that invalidates the resident int8 matrix when a summary is suppressed."
+    },
+    {
+      "table": "lcm_rollup_invalidations",
+      "class": "principal_data",
+      "reason": "Invalidation rows identify principal-scoped summary changes."
+    },
+    {
+      "table": "lcm_rollup_node_delete",
+      "class": "infra",
+      "reason": "Schema trigger that maintains principal-scoped rollup invalidations."
+    },
+    {
+      "table": "lcm_rollup_node_insert",
+      "class": "infra",
+      "reason": "Schema trigger that maintains principal-scoped rollup invalidations."
+    },
+    {
+      "table": "lcm_rollup_node_update",
+      "class": "infra",
+      "reason": "Schema trigger that maintains principal-scoped rollup invalidations."
+    },
+    {
+      "table": "lcm_rollup_publish_sources",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded rollup publication."
+    },
+    {
+      "table": "lcm_rollup_purge_nodes",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded rollup purges."
+    },
+    {
+      "table": "lcm_rollup_sources",
+      "class": "principal_data",
+      "reason": "Rollup provenance points to principal-scoped summary nodes."
+    },
+    {
+      "table": "lcm_rollup_state",
+      "class": "principal_data",
+      "reason": "Rollup cursor state is partitioned by principal-scoped memory scope."
+    },
+    {
+      "table": "lcm_rollups",
+      "class": "principal_data",
+      "reason": "Rollup content is derived from principal-scoped summaries."
+    },
+    {
+      "table": "lcm_scope_frontier_ids",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging table for bounded scope traversal."
+    },
+    {
+      "table": "lcm_teams_audit",
+      "class": "infra",
+      "reason": "Authorization decision audit log owned by the Teams control plane."
+    },
+    {
+      "table": "lcm_teams_collections",
+      "class": "infra",
+      "reason": "Teams control-plane collection registry: id, tenant and own/shared kind. Names a collection; stores none of its contents."
+    },
+    {
+      "table": "lcm_teams_memberships",
+      "class": "infra",
+      "reason": "Teams control-plane grant edges: which principal may act on which collection. Authorization metadata, not principal memory."
+    },
+    {
+      "table": "lcm_teams_principals",
+      "class": "infra",
+      "reason": "Teams control-plane identity: principal id, tenant and active/suspended status. Holds no memory content -- a principal's MEMORY lives in messages/summary_nodes under its access_scope stamp, and suspension deliberately leaves those untouched."
+    },
+    {
+      "table": "lcm_teams_requests",
+      "class": "infra",
+      "reason": "Connector idempotency ledger: request id, payload DIGEST and the prior result envelope. It records that a management request happened, never any principal's memory content."
+    },
+    {
+      "table": "lcm_teams_revisions",
+      "class": "infra",
+      "reason": "Tenant policy, membership, and revocation revision counters."
+    },
+    {
+      "table": "lcm_trajectory_*",
+      "class": "principal_data",
+      "reason": "All trajectory-family content and derived state belongs to principal-scoped corpora."
+    },
+    {
+      "table": "messages",
+      "class": "principal_data",
+      "reason": "Canonical raw principal-scoped conversation messages."
+    },
+    {
+      "table": "messages_fts",
+      "class": "principal_data",
+      "reason": "FTS materialization derived from principal-scoped messages."
+    },
+    {
+      "table": "messages_fts_config",
+      "class": "principal_data",
+      "reason": "FTS shadow state belonging to the principal-scoped messages index."
+    },
+    {
+      "table": "messages_fts_data",
+      "class": "principal_data",
+      "reason": "FTS shadow data derived from principal-scoped messages."
+    },
+    {
+      "table": "messages_fts_docsize",
+      "class": "principal_data",
+      "reason": "FTS shadow document state derived from principal-scoped messages."
+    },
+    {
+      "table": "messages_fts_idx",
+      "class": "principal_data",
+      "reason": "FTS shadow index derived from principal-scoped messages."
+    },
+    {
+      "table": "metadata",
+      "class": "infra",
+      "reason": "Schema, migration, feature, and maintenance control metadata."
+    },
+    {
+      "table": "msg_fts_delete",
+      "class": "infra",
+      "reason": "Schema trigger that maintains the principal-scoped messages FTS table."
+    },
+    {
+      "table": "msg_fts_insert",
+      "class": "infra",
+      "reason": "Schema trigger that maintains the principal-scoped messages FTS table."
+    },
+    {
+      "table": "msg_fts_update",
+      "class": "infra",
+      "reason": "Schema trigger that maintains the principal-scoped messages FTS table."
+    },
+    {
+      "table": "nodes_fts",
+      "class": "principal_data",
+      "reason": "FTS materialization derived from principal-scoped summary nodes."
+    },
+    {
+      "table": "nodes_fts_config",
+      "class": "principal_data",
+      "reason": "FTS shadow state belonging to the principal-scoped node index."
+    },
+    {
+      "table": "nodes_fts_data",
+      "class": "principal_data",
+      "reason": "FTS shadow data derived from principal-scoped summary nodes."
+    },
+    {
+      "table": "nodes_fts_delete",
+      "class": "infra",
+      "reason": "Schema trigger that maintains the principal-scoped summary-node FTS table."
+    },
+    {
+      "table": "nodes_fts_docsize",
+      "class": "principal_data",
+      "reason": "FTS shadow document state derived from principal-scoped summary nodes."
+    },
+    {
+      "table": "nodes_fts_idx",
+      "class": "principal_data",
+      "reason": "FTS shadow index derived from principal-scoped summary nodes."
+    },
+    {
+      "table": "nodes_fts_insert",
+      "class": "infra",
+      "reason": "Schema trigger that maintains the principal-scoped summary-node FTS table."
+    },
+    {
+      "table": "summary_nodes",
+      "class": "principal_data",
+      "reason": "Canonical principal-scoped summary DAG nodes."
+    },
+    {
+      "table": "temp_lcm_delete_lifecycle_scope",
+      "class": "infra",
+      "reason": "Connection-local TEMP staging for bounded lifecycle deletion."
+    }
+  ],
+  "handler_waivers": [
+    {
+      "module": "command.py",
+      "handler": "_doctor_repair_text",
+      "reason": "Read-only FTS diagnosis issues an integrity-check INSERT inside a SAVEPOINT and always rolls it back before returning."
+    },
+    {
+      "module": "command.py",
+      "handler": "_doctor_repair_schema_stamp_text",
+      "reason": "Read-only schema-stamp planning calls remediation with apply=False; the mutation branch is unreachable for this handler."
+    },
+    {
+      "module": "command.py",
+      "handler": "_doctor_text",
+      "reason": "Read-only aggregate diagnostics reach only the savepoint-rolled-back FTS integrity probe."
+    },
+    {
+      "module": "tools.py",
+      "handler": "lcm_doctor",
+      "reason": "Read-only diagnostics reach only the savepoint-rolled-back FTS integrity probe."
+    }
+  ]
+}

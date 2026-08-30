@@ -8,9 +8,12 @@ import json
 import sqlite3
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from hermes_lcm.access_policy import AuthorizationRequiredError
+from hermes_lcm.access_context.fixtures import load_context
 from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.store import MessageStore
 
@@ -341,6 +344,70 @@ def test_dry_run_does_not_create_target_db(tmp_path: Path):
     assert result.skipped_existing == 0
     assert result.backup_path is None
     assert not target_db.exists()
+
+
+def test_apply_scoped_target_requires_a_carrier(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "teams-target.db"
+    create_lossless_source(source_db)
+    target_store = MessageStore(target_db)
+    target_store.append(
+        "existing-session",
+        {"role": "user", "content": "scoped target"},
+        token_estimate=2,
+        access_scope="principal-owner",
+    )
+    target_store.close()
+
+    with pytest.raises(AuthorizationRequiredError, match="context_missing"):
+        importer.import_lossless_claw(
+            source_db=source_db,
+            target_db=target_db,
+            import_id="scoped-target",
+            apply=True,
+        )
+
+
+def test_teams_apply_stamps_imported_messages_and_summaries(tmp_path: Path):
+    importer = load_importer_module()
+    source_db = tmp_path / "lossless.db"
+    target_db = tmp_path / "teams-target.db"
+    create_lossless_source(source_db)
+    add_lossless_summaries(source_db)
+    context = load_context(REPO_ROOT / "tests/fixtures/access_context_v1/positive/human.json")
+    assert context is not None
+    engine = SimpleNamespace(
+        lcm_teams_enabled=True,
+        get_lcm_access_context=lambda: context,
+    )
+
+    result = importer.import_lossless_claw(
+        source_db=source_db,
+        target_db=target_db,
+        namespace="openclaw-lcm",
+        agent="sammy",
+        import_id="teams-import",
+        include_summaries=True,
+        apply=True,
+        engine=engine,
+    )
+
+    assert result.imported == 2
+    conn = sqlite3.connect(target_db)
+    try:
+        assert {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT access_scope FROM messages"
+            )
+        } == {"principal-human"}
+        assert {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT access_scope FROM summary_nodes"
+            )
+        } == {"principal-human"}
+    finally:
+        conn.close()
 
 
 def test_dry_run_handles_uri_reserved_source_db_path(tmp_path: Path):

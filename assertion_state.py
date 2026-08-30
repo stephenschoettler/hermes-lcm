@@ -94,9 +94,16 @@ def query_assertion_state(
     scope_key: str | None = None,
     speaker_role: str | None = None,
     as_of: float | None = None,
+    access_scope: str | None = None,
     limit: int = 100,
 ) -> AssertionStateResult:
-    """Return explicit lifecycle state without recency-based conflict erasure."""
+    """Return explicit lifecycle state without recency-based conflict erasure.
+
+    ``access_scope`` is the per-principal owner predicate, forwarded to both
+    queries. Absent -- every default-off and non-Teams caller -- the behaviour
+    is unchanged. It has to reach BOTH: assertions carry their source quote and
+    relations carry the quotes of both endpoints.
+    """
 
     normalized_subject = str(subject_key or "").strip()
     if not normalized_subject:
@@ -108,11 +115,14 @@ def query_assertion_state(
         scope_key=scope_key,
         speaker_role=speaker_role,
         as_of=as_of,
+        access_scope=access_scope,
         limit=limit,
     )
     ids = [str(row["assertion_id"]) for row in rows]
     raw_relations = (
-        store.query_relations(assertion_ids=ids, as_of=as_of, limit=500)
+        store.query_relations(
+            assertion_ids=ids, as_of=as_of, access_scope=access_scope, limit=500
+        )
         if ids
         else []
     )

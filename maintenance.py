@@ -14,6 +14,11 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
+
 
 def flush_engine_connections(engine) -> None:
     """Commit pending writes on every SQLite connection the engine owns.
@@ -39,6 +44,18 @@ def flush_engine_connections(engine) -> None:
 
 
 def backup_database(engine) -> dict[str, Any]:
+    # Authorize before checking the database path or creating a backup so a
+    # denied principal gets no maintenance target or filesystem disclosure.
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {"kind": "backup", "operation": "backup_database"}
+    expected_scope["required_scope"] = "owner_only"
+    decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+    policy.audit_decision(
+        access_context, "owner_only", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError("authorize_operation", decision.public().denial_reason)
     db_path = Path(engine._store.db_path)
     if not db_path.exists():
         return {
@@ -83,6 +100,18 @@ def rotate_backup_database(engine) -> dict[str, Any]:
     ``backup_database`` which produces timestamped files, this overwrites a
     single rolling slot so disk usage stays bounded across repeated rotates.
     """
+    # Rotation is the same owner-scoped maintenance surface as a timestamped
+    # backup; gate it before resolving paths or touching disk.
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {"kind": "backup", "operation": "rotate_backup_database"}
+    expected_scope["required_scope"] = "owner_only"
+    decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+    policy.audit_decision(
+        access_context, "owner_only", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError("authorize_operation", decision.public().denial_reason)
     db_path = Path(engine._store.db_path)
     if not db_path.exists():
         return {

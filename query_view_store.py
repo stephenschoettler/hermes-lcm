@@ -65,6 +65,7 @@ _ALLOWED_TRACE_KEYS = frozenset({
     "entities",
     "evidence_dates",
     "steps",
+    "temporal_trust",
 })
 
 
@@ -1101,19 +1102,36 @@ class QueryViewStore:
             )
         if record_hit:
             with self._write_transaction():
-                cur = self._conn.execute(
-                    "UPDATE lcm_query_views SET hit_count=hit_count+1, "
-                    "promotion_status=CASE WHEN hit_count+1 >= 2 THEN 'promoted' "
-                    "ELSE promotion_status END, updated_at=? "
-                    "WHERE view_id=? AND status='ready' AND current_version=? "
-                    "AND generation=?",
-                    (current_time, view_id, version, generation),
+                confirmation_corpus = self.corpus_snapshot()
+                confirmation_stale = (
+                    confirmation_corpus.generation != covered_generation
                 )
+                if confirmation_stale:
+                    self._conn.execute(
+                        "UPDATE lcm_query_views SET status='stale', "
+                        "generation=generation+1, "
+                        "stale_reason='corpus advanced during hit confirmation', "
+                        "build_nonce='', lease_expires_at=NULL, updated_at=? "
+                        "WHERE view_id=? AND status='ready' AND current_version=? "
+                        "AND generation=?",
+                        (current_time, view_id, version, generation),
+                    )
+                    hit_updated = False
+                else:
+                    cur = self._conn.execute(
+                        "UPDATE lcm_query_views SET hit_count=hit_count+1, "
+                        "promotion_status=CASE WHEN hit_count+1 >= 2 THEN 'promoted' "
+                        "ELSE promotion_status END, updated_at=? "
+                        "WHERE view_id=? AND status='ready' AND current_version=? "
+                        "AND generation=?",
+                        (current_time, view_id, version, generation),
+                    )
+                    hit_updated = int(cur.rowcount or 0) == 1
             row = self._conn.execute(
                 "SELECT * FROM lcm_query_views WHERE view_id=?", (view_id,)
             ).fetchone()
             confirmed = (
-                int(cur.rowcount or 0) == 1
+                hit_updated
                 and row is not None
                 and str(row["status"]) == "ready"
                 and int(row["current_version"]) == version

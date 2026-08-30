@@ -11,7 +11,12 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Dict, Mapping, TYPE_CHECKING
+
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
 
 from .externalize import (
     _inspect_top_level_json_string_fields_before_content as _externalized_top_level_fields_before_content,
@@ -35,6 +40,7 @@ from .db_bootstrap import (
     inspect_lcm_schema_health,
     load_integrity_failed,
 )
+from .scope_storage import teams_enabled as storage_teams_enabled, verify_scope_storage
 from .extraction import sanitize_pre_compaction_content
 from .ingest_protection import (
     externalized_payload_stats,
@@ -52,9 +58,10 @@ from .reasoning import (
     execute_plan,
     ground_evidence,
     question_date_as_of_epoch,
+    temporal_trust_wire,
     validate_selector_alignment,
     verify_final_answer,
-    resolve_occurrence_time,
+    resolve_occurrence_time_with_trust,
 )
 from .presets import preset_status_payload
 from .rollup_periods import (
@@ -78,7 +85,11 @@ from .retrieval_core import (
     run_knn,
 )
 from .rollup_store import RollupStore
-from .search_query import AGE_DECAY_RATE, normalize_search_sort
+from .search_query import (
+    AGE_DECAY_RATE,
+    normalize_search_sort,
+    resolve_prose_sort,
+)
 from .session_patterns import build_session_match_keys, compile_session_pattern
 from .sqlite_util import _sqlite_savepoint
 from .store import build_message_fts_spec
@@ -276,6 +287,8 @@ _LCM_RECALL_LIMIT_CAP = 25
 _LCM_RECALL_DEFAULT_SCOPE_BIAS = 0.5
 _LCM_RECALL_SNIPPET_CHARS = 300
 _LCM_RECALL_RESPONSE_CHAR_CAP = 64_000
+_LCM_RECALL_SESSION_EXPAND_V1_RESPONSE_CHAR_HARD_CAP = 512_000
+_LCM_RECALL_SESSION_EXPAND_V1_PAGE_ROWS = 12
 _LCM_QUERY_STATE_DEFAULT_LIMIT = 25
 _LCM_QUERY_STATE_LIMIT_CAP = 50
 _LCM_QUERY_STATE_RESPONSE_CHAR_CAP = 64_000
@@ -295,6 +308,7 @@ _LCM_RECALL_SUMMARY_SOURCE_PER_NODE = 4
 # read per candidate it has to skip.
 _LCM_RECALL_STRICT_READ_WAVE = 32
 _LCM_RECALL_ANSWER_READY_CONTENT_CHARS = 2_400
+_LCM_RECALL_SESSION_EXPAND_V1_TOP_SESSIONS = 3
 # Recency boost half-life (30 days) and its floor: a memory's rank_score is
 # multiplied by 2**(-age/half_life), clamped so age never zeroes an otherwise
 # strong hit — it only nudges toward newer memories.
@@ -419,6 +433,20 @@ def lcm_query_state(args: Dict[str, Any], **kwargs) -> str:
     requested_limit = parsed_limit
     limit = min(requested_limit, _LCM_QUERY_STATE_LIMIT_CAP)
 
+    # The owner predicate comes from the POLICY, never from `args` -- this tool
+    # addresses assertions by `subject_key`, which names no row, so the
+    # tool-boundary gate has nothing to attach an owner to and allows. Without
+    # this, the query returned assertions extracted from EVERY principal's
+    # messages, each carrying the source quote verbatim plus the foreign
+    # session_id and store_id.
+    _state_policy = policy_for_engine(engine)
+    _state_scope = _state_policy.resolve_authorized_targets(
+        policy_access_context(engine), "read", {}
+    )
+    _state_access_scope = (
+        _state_scope.get("access_scope") if isinstance(_state_scope, Mapping) else None
+    )
+
     try:
         result = query_assertion_state(
             store,
@@ -428,6 +456,7 @@ def lcm_query_state(args: Dict[str, Any], **kwargs) -> str:
             scope_key=scope_key,
             speaker_role=speaker_role,
             as_of=as_of,
+            access_scope=_state_access_scope,
             limit=limit,
         )
     except (TypeError, ValueError, sqlite3.Error) as exc:
@@ -701,6 +730,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
             assertions=getattr(engine, "_assertions", None),
             as_of=as_of,
             session_dates=getattr(engine, "_session_occurrence_dates", None),
+            engine=engine,
         )
     except (TypeError, ValueError, sqlite3.Error) as exc:
         grounding = None
@@ -752,6 +782,9 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
                 )
             },
         })
+    # Tri-state contract: None means temporal certification is not applicable,
+    # False means temporal evidence is uncertified, and True means certified.
+    # Preserve those values through JSON as null/false/true; never bool-coerce.
     stages["selector"] = _compute_stage(
         "host_tool_arguments",
         selector_started,
@@ -760,6 +793,7 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         status="validated",
         evidence_complete=bool(args.get("evidence_complete") is True),
         operand_count=len(grounding.operands),
+        temporal_certified=grounding.temporal_certified,
     )
 
     executor_started = time.perf_counter()
@@ -837,6 +871,11 @@ def lcm_compute(args: Dict[str, Any], **kwargs) -> str:
         "trace": trace.as_dict(),
         "answer": answer,
         "candidate_verification": verification_payload,
+        "temporal_trust": temporal_trust_wire(
+            grounding.temporal_trust,
+            grounding.temporal_certified,
+            grounding.notes,
+        ),
         "provenance": {
             "runtime_inputs": ["question", "question_date", "exact_retrieved_evidence"],
             "stages": stages,
@@ -886,6 +925,51 @@ def lcm_compile_evidence(args: Dict[str, Any], **kwargs) -> str:
     mode = str(args.get("mode") or "proposal").strip().casefold()
     if mode not in {"proposal", "auto"}:
         return json.dumps({"error": "mode must be one of: proposal, auto"})
+    if mode == "proposal" and args.get("persist_view") is True:
+        # The persisted query view is principal-scoped data. Keep the write
+        # decision beside the branch that can materialize it so direct handler
+        # calls cannot bypass the engine's ordinary tool-boundary gate.
+        policy = policy_for_engine(engine)
+        access_context = policy_access_context(engine)
+        target_scope = {
+            key: args[key]
+            for key in ("baseline_refs", "proposal")
+            if key in args
+        }
+        expected_scope = {
+            "kind": "tool_call",
+            "tool_name": "lcm_compile_evidence",
+            "caller_session_id": engine._session_id,
+            "caller_conversation_id": engine._conversation_id,
+            "target_scope": target_scope,
+            **target_scope,
+            "required_scope": "write",
+        }
+        decision = policy.authorize_operation(
+            access_context, "write", expected_scope
+        )
+        policy.audit_decision(
+            access_context, "write", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
+        authorized_scope = policy.resolve_authorized_targets(
+            access_context, "write", expected_scope
+        )
+        if isinstance(authorized_scope, Mapping):
+            resolved_target_scope = authorized_scope.get(
+                "target_scope", authorized_scope
+            )
+            if isinstance(resolved_target_scope, Mapping):
+                narrowed_args = dict(args)
+                for key in ("baseline_refs", "proposal"):
+                    if key in resolved_target_scope:
+                        narrowed_args[key] = resolved_target_scope[key]
+                    else:
+                        narrowed_args.pop(key, None)
+                args = narrowed_args
     if mode == "auto":
         result = compile_preanswer_evidence(
             args.get("question"),
@@ -2378,7 +2462,15 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     requested_limit = parsed_limit
     limit_cap = int(kwargs.get("_limit_cap", _LCM_GREP_HARD_LIMIT_CAP))
     limit = min(requested_limit, limit_cap)
-    sort = normalize_search_sort(args.get("sort"))
+    fts_prose_mode = bool(engine._config.fts_prose_mode)
+    requested_sort = args.get("sort")
+    # allow_operators is pinned False here to mirror the downstream store/dag
+    # searches (their kwargs omit it); the two promotion sites must agree.
+    sort = normalize_search_sort(
+        resolve_prose_sort(
+            requested_sort, fts_prose_mode, query, allow_operators=False
+        )
+    )
     source_limit = max(limit * 4, limit, 20)
 
     content_scope = str(args.get("content_scope") or "history").strip().lower()
@@ -2408,6 +2500,10 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
                 externalized_refs.append(ref)
 
     requested_session_scope = str(args.get("session_scope", "current")).lower()
+    # The OWNER predicate a Teams policy narrows with. Absent (default-off and
+    # every non-Teams caller) it stays None and the query is byte-identical to
+    # what it was before.
+    requested_access_scope = args.get("access_scope")
     raw_session_id_arg = args.get("session_id")
     explicit_session_id = (
         str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
@@ -2486,16 +2582,27 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
 
     if content_scope in {"history", "both"}:
         try:
+            message_search_kwargs = {
+                "session_id": search_session_id,
+                "limit": source_limit,
+                "sort": sort,
+                "source": source,
+                "conversation_id": conversation_id,
+                "role": role,
+                "time_from": time_from,
+                "time_to": time_to,
+                # SECURITY: the per-principal owner predicate. It lives in this
+                # dict because upstream refactored the call to `**kwargs`, and
+                # the refactor's dict did not carry it -- taking that side
+                # verbatim silently unscopes message search and every principal
+                # reads every other principal's memory, with all tests green.
+                "access_scope": requested_access_scope,
+            }
+            if fts_prose_mode:
+                message_search_kwargs["fts_prose_mode"] = True
             msg_hits = engine._store.search(
                 query,
-                session_id=search_session_id,
-                limit=source_limit,
-                sort=sort,
-                source=source,
-                conversation_id=conversation_id,
-                role=role,
-                time_from=time_from,
-                time_to=time_to,
+                **message_search_kwargs,
             )
             for hit in msg_hits:
                 results.append(
@@ -2515,12 +2622,17 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     # sessions via lcm_expand(store_id=...).
     if content_scope in {"history", "both"} and session_scope == "current" and not raw_message_filter_active:
         try:
+            node_search_kwargs = {
+                "session_id": search_session_id,
+                "limit": source_limit,
+                "sort": sort,
+                "source": source,
+            }
+            if fts_prose_mode:
+                node_search_kwargs["fts_prose_mode"] = True
             node_hits = engine._dag.search(
                 query,
-                session_id=search_session_id,
-                limit=source_limit,
-                sort=sort,
-                source=source,
+                **node_search_kwargs,
             )
             for node in node_hits:
                 results.append(_shape_summary_hit(node))
@@ -3069,6 +3181,15 @@ def _lcm_grep_semantic(
     knn_limit = candidate_limit if candidate_limit is not None else limit
 
     requested_session_scope = str(args.get("session_scope", "current")).lower()
+    # NOTE: this arm deliberately does NOT read an `access_scope` ARGUMENT.
+    # The owner predicate is resolved from the POLICY inside `run_knn`
+    # (retrieval_core.py: `access_scope = authorized_scope.get("access_scope")`),
+    # which is authoritative and cannot be steered by model-authored tool
+    # arguments. An earlier version assigned `requested_access_scope` here and
+    # never used it, which reads like missing enforcement -- hence this note:
+    # the scoping is real, it just does not come from `args` on this path.
+    # The `degraded()` fallback forwards `dict(args)` to the FTS arm, which
+    # takes its predicate from args in the ordinary way.
     raw_session_id_arg = args.get("session_id")
     explicit_session_id = (
         str(raw_session_id_arg).strip() if raw_session_id_arg is not None else ""
@@ -4163,6 +4284,481 @@ def _lcm_recall_exact_ref(hit: dict[str, Any], hydrated: dict[str, Any] | None) 
     return f"lcm:{int(store_id)}:{start}-{end}"
 
 
+def _lcm_recall_session_expand_v1_date(
+    engine: "LCMEngine", row: dict[str, Any]
+) -> str | None:
+    """Resolve a source-backed date without consulting a model."""
+    session_id = str(row.get("session_id") or "")
+    session_dates = getattr(engine, "_session_occurrence_dates", {}) or {}
+    session_date = session_dates.get(session_id)
+    if session_date:
+        return str(session_date)
+    # Benchmark rows are stamped when the bridge ingests them; that wall-clock
+    # value is not the source session's date. If the harness did not provide a
+    # sidecar date, preserve the unknown instead of fabricating one.
+    if str(row.get("source") or "") == "benchmark":
+        return None
+    raw_timestamp = row.get("observed_at")
+    if raw_timestamp is None:
+        raw_timestamp = row.get("timestamp")
+    try:
+        timestamp = float(raw_timestamp or 0)
+    except (TypeError, ValueError, OverflowError):
+        timestamp = 0
+    if timestamp <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(
+            timestamp, tz=timezone.utc
+        ).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _lcm_recall_session_expand_v1_response_char_hard_ceiling(
+    configured_cap: int,
+) -> int:
+    """Clamp the operator ceiling between historical and absolute bounds."""
+    return min(
+        _LCM_RECALL_SESSION_EXPAND_V1_RESPONSE_CHAR_HARD_CAP,
+        max(_LCM_RECALL_RESPONSE_CHAR_CAP, int(configured_cap)),
+    )
+
+
+def _lcm_recall_session_expand_v1_candidate(
+    engine: "LCMEngine",
+    row: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Shape one whole-message candidate for reference-strict admission.
+
+    ``snippet`` deliberately carries the WHOLE candidate until the strict
+    selector has verified it at offset zero. The published copy truncates the
+    preview only after that proof succeeds; ``content`` and its exact span stay
+    whole.
+    """
+    content = str(row.get("content") or "")
+    if not content:
+        return None
+    store_id = int(row["store_id"])
+    returned_chars = len(content)
+    return {
+        "kind": "message_excerpt",
+        "session_id": row.get("session_id"),
+        "date": _lcm_recall_session_expand_v1_date(engine, row),
+        "timestamp": row.get("timestamp") or 0,
+        "snippet": content,
+        "score": 0.0,
+        "expand_hint": f"lcm_expand(store_id={store_id}, content_offset=0)",
+        "from_current_session": False,
+        "arms": ["session_expand_v1"],
+        "store_id": store_id,
+        "role": row.get("role"),
+        "source": row.get("source") or "",
+        "content": content,
+        "content_source": "message",
+        "content_chars": returned_chars,
+        "content_offset": 0,
+        "content_returned_chars": returned_chars,
+        "content_truncated": False,
+        "exact_ref": f"lcm:{store_id}:0-{returned_chars}",
+        "chunk_span": {
+            "chunk_index": 0,
+            "char_start": 0,
+            "char_end": returned_chars,
+        },
+        "session_expanded": True,
+    }
+
+
+def _lcm_recall_session_expand_v1_is_containment_duplicate(
+    store_id: int,
+    content: str,
+    delivered_text_by_store: dict[int, list[str]],
+) -> bool:
+    """True when this row would repeat an already-delivered span of itself."""
+    for delivered in delivered_text_by_store.get(store_id, []):
+        if delivered and (delivered in content or content in delivered):
+            return True
+    return False
+
+
+def _lcm_recall_session_expand_v1(
+    engine: "LCMEngine",
+    ranked_hits: list[dict[str, Any]],
+    *,
+    per_session_token_budget: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Append citable, contiguous windows without rewriting ranked evidence.
+
+    Ranking and reference-strict selection are complete when this runs. The
+    ranked prefix is copied byte-for-byte; only additional whole-message hits
+    may be appended. Each session grows from its highest-ranked resolvable
+    anchor through adjacent rows only. A row that does not fit closes that side
+    of the window instead of letting the selector hop over it.
+
+    Appended candidates then pass through ``_LcmRecallStrictSelector`` with
+    hydration disabled, forcing the exact bytes to verify at offset zero against
+    a fresh store read. This is the #174 citable-delivery backstop, not a parallel
+    lookalike check.
+    """
+    from .tokens import count_tokens
+
+    ranked_store_ids = [
+        int(hit["store_id"])
+        for hit in ranked_hits
+        if hit.get("store_id") is not None
+    ]
+    stored_by_id = engine._store.get_batch(ranked_store_ids)
+    delivered_text_by_store: dict[int, list[str]] = {}
+    for hit in ranked_hits:
+        raw_store_id = hit.get("store_id")
+        if raw_store_id is None:
+            continue
+        delivered = hit.get("content")
+        if delivered is None:
+            delivered = hit.get("snippet")
+        delivered = str(delivered or "")
+        if delivered:
+            delivered_text_by_store.setdefault(int(raw_store_id), []).append(
+                delivered
+            )
+
+    top_sessions: list[str] = []
+    anchors_by_session: dict[str, list[int]] = {}
+    current_by_session: dict[str, bool] = {}
+    for hit in ranked_hits:
+        raw_store_id = hit.get("store_id")
+        row = (
+            stored_by_id.get(int(raw_store_id))
+            if raw_store_id is not None
+            else None
+        )
+        session_id = str(
+            hit.get("session_id") or (row or {}).get("session_id") or ""
+        )
+        if not session_id:
+            continue
+        if row is not None:
+            anchors_by_session.setdefault(session_id, []).append(
+                int(row["store_id"])
+            )
+        current_by_session.setdefault(
+            session_id, bool(hit.get("from_current_session"))
+        )
+        if (
+            session_id not in top_sessions
+            and len(top_sessions) < _LCM_RECALL_SESSION_EXPAND_V1_TOP_SESSIONS
+        ):
+            top_sessions.append(session_id)
+
+    token_budget = max(0, int(per_session_token_budget))
+    candidate_records: list[dict[str, Any]] = []
+    session_state: dict[str, dict[str, Any]] = {}
+    containment_dropped = 0
+    for session_id in top_sessions:
+        anchor_store_ids = anchors_by_session.get(session_id, [])
+        if not anchor_store_ids:
+            session_state[session_id] = {
+                "session_id": session_id,
+                "token_budget": token_budget,
+                "primary_anchor_store_id": None,
+                "primary_anchor_index": None,
+                "baseline_indices": set(),
+                "budget_skipped_count": 0,
+                "containment_duplicate_dropped_count": 0,
+                "reason": "no_resolvable_anchor",
+            }
+            continue
+
+        primary_anchor_store_id = anchor_store_ids[0]
+        snapshot_tail = engine._store.get_session_tail(session_id, limit=1)
+        snapshot_max_store_id = (
+            int(snapshot_tail[-1]["store_id"])
+            if snapshot_tail
+            else primary_anchor_store_id
+        )
+        initial_rows = engine._store.load_session_window(
+            session_id,
+            anchor_store_id=primary_anchor_store_id,
+            before=_LCM_RECALL_SESSION_EXPAND_V1_PAGE_ROWS,
+            after=_LCM_RECALL_SESSION_EXPAND_V1_PAGE_ROWS,
+        )
+        side_rows = {
+            "left": list(
+                reversed(
+                    [
+                        row
+                        for row in initial_rows
+                        if int(row["store_id"]) < primary_anchor_store_id
+                    ]
+                )
+            ),
+            "right": [
+                row
+                for row in initial_rows
+                if primary_anchor_store_id
+                < int(row["store_id"])
+                <= snapshot_max_store_id
+            ],
+        }
+        side_cursor = {
+            "left": primary_anchor_store_id,
+            "right": primary_anchor_store_id,
+        }
+        side_exhausted = {
+            side: len(rows) < _LCM_RECALL_SESSION_EXPAND_V1_PAGE_ROWS
+            for side, rows in side_rows.items()
+        }
+        baseline_indices = {0}
+        anchor_store_id_set = set(anchor_store_ids)
+        remaining_tokens = token_budget
+        budget_skipped = 0
+        containment_for_session = 0
+        side_next = {"left": -1, "right": 1}
+        side_open = {"left": True, "right": True}
+        while side_open["left"] or side_open["right"]:
+            made_progress = False
+            for side, step in (("left", -1), ("right", 1)):
+                if not side_open[side]:
+                    continue
+                if not side_rows[side] and not side_exhausted[side]:
+                    cursor = side_cursor[side]
+                    page = engine._store.load_session_window(
+                        session_id,
+                        anchor_store_id=cursor,
+                        before=(
+                            _LCM_RECALL_SESSION_EXPAND_V1_PAGE_ROWS
+                            if side == "left"
+                            else 0
+                        ),
+                        after=(
+                            _LCM_RECALL_SESSION_EXPAND_V1_PAGE_ROWS
+                            if side == "right"
+                            else 0
+                        ),
+                    )
+                    if side == "left":
+                        page = list(
+                            reversed(
+                                [
+                                    row
+                                    for row in page
+                                    if int(row["store_id"]) < cursor
+                                ]
+                            )
+                        )
+                    else:
+                        page = [
+                            row
+                            for row in page
+                            if cursor
+                            < int(row["store_id"])
+                            <= snapshot_max_store_id
+                        ]
+                    side_rows[side].extend(page)
+                    side_exhausted[side] = (
+                        len(page) < _LCM_RECALL_SESSION_EXPAND_V1_PAGE_ROWS
+                    )
+                if not side_rows[side]:
+                    side_open[side] = False
+                    continue
+                index = side_next[side]
+                row = side_rows[side].pop(0)
+                store_id = int(row["store_id"])
+                side_cursor[side] = store_id
+                side_next[side] += step
+                if store_id in anchor_store_id_set:
+                    baseline_indices.add(index)
+                content = str(row.get("content") or "")
+                if not content:
+                    side_open[side] = False
+                    continue
+                if _lcm_recall_session_expand_v1_is_containment_duplicate(
+                    store_id, content, delivered_text_by_store
+                ):
+                    containment_dropped += 1
+                    containment_for_session += 1
+                    made_progress = True
+                    continue
+                content_tokens = count_tokens(content)
+                if content_tokens > remaining_tokens:
+                    budget_skipped += 1
+                    side_open[side] = False
+                    continue
+                candidate = _lcm_recall_session_expand_v1_candidate(engine, row)
+                if candidate is None:
+                    side_open[side] = False
+                    continue
+                candidate["from_current_session"] = current_by_session.get(
+                    session_id, False
+                )
+                candidate_records.append(
+                    {
+                        "session_id": session_id,
+                        "index": index,
+                        "tokens": content_tokens,
+                        "entry": {
+                            "hit": candidate,
+                            "ranks": {},
+                            "_final_score": 0.0,
+                        },
+                    }
+                )
+                remaining_tokens -= content_tokens
+                made_progress = True
+            if not made_progress:
+                break
+
+        session_state[session_id] = {
+            "session_id": session_id,
+            "token_budget": token_budget,
+            "primary_anchor_store_id": primary_anchor_store_id,
+            "primary_anchor_index": 0,
+            "baseline_indices": baseline_indices,
+            "budget_skipped_count": budget_skipped,
+            "containment_duplicate_dropped_count": containment_for_session,
+            "anchor_store_ids": anchor_store_ids,
+        }
+
+    records_by_session_index = {
+        (record["session_id"], record["index"]): record
+        for record in candidate_records
+    }
+    candidate_entries = [record["entry"] for record in candidate_records]
+    strict_selector = _LcmRecallStrictSelector(
+        candidate_entries,
+        engine=engine,
+        # The Stage-2 per-session token budget already bounds this appended tier.
+        # The ranked tier's density rule ran before expansion and is unchanged.
+        per_session_limit=max(1, len(candidate_entries)),
+        # Zero forces verification of the candidate's own whole-message bytes;
+        # it cannot be admitted merely because a row with that id exists.
+        expanded_limit=0,
+    )
+    strict_entries = strict_selector.take(len(candidate_entries))
+    strict_entry_ids = {id(entry) for entry in strict_entries}
+
+    kept_entry_ids: set[int] = set()
+    contiguity_dropped = 0
+    for session_id, state in session_state.items():
+        anchor = state["primary_anchor_index"]
+        if anchor is None:
+            continue
+        accepted_indices = {
+            record["index"]
+            for record in candidate_records
+            if record["session_id"] == session_id
+            and id(record["entry"]) in strict_entry_ids
+        }
+        baseline_indices = state["baseline_indices"]
+        for step in (-1, 1):
+            index = anchor + step
+            while True:
+                if index in baseline_indices:
+                    index += step
+                    continue
+                record = records_by_session_index.get((session_id, index))
+                if record is None or index not in accepted_indices:
+                    break
+                kept_entry_ids.add(id(record["entry"]))
+                index += step
+        dropped_here = len(accepted_indices) - sum(
+            1
+            for index in accepted_indices
+            if id(records_by_session_index[(session_id, index)]["entry"])
+            in kept_entry_ids
+        )
+        contiguity_dropped += max(0, dropped_here)
+
+    additional_hits: list[dict[str, Any]] = []
+    delivered_tokens_by_session: dict[str, int] = {}
+    delivered_count_by_session: dict[str, int] = {}
+    for entry in strict_entries:
+        if id(entry) not in kept_entry_ids:
+            strict_selector.release(entry)
+
+    session_order = {
+        session_id: index for index, session_id in enumerate(top_sessions)
+    }
+    kept_records = sorted(
+        (
+            record
+            for record in candidate_records
+            if id(record["entry"]) in strict_entry_ids
+            and id(record["entry"]) in kept_entry_ids
+        ),
+        key=lambda record: (
+            session_order[record["session_id"]],
+            record["index"],
+        ),
+    )
+    for record in kept_records:
+        entry = record["entry"]
+        hit = entry["hit"]
+        expected_span = (0, len(str(hit.get("content") or "")))
+        if entry.get("_strict_span") != expected_span:
+            strict_selector.release(entry)
+            continue
+        strict_selector.deliver(entry)
+        item = dict(hit)
+        item["snippet"] = str(item["content"])[:_LCM_RECALL_SNIPPET_CHARS]
+        additional_hits.append(item)
+        session_id = record["session_id"]
+        delivered_tokens_by_session[session_id] = (
+            delivered_tokens_by_session.get(session_id, 0) + record["tokens"]
+        )
+        delivered_count_by_session[session_id] = (
+            delivered_count_by_session.get(session_id, 0) + 1
+        )
+
+    session_metrics: list[dict[str, Any]] = []
+    for session_id in top_sessions:
+        state = session_state[session_id]
+        metrics_item = {
+            key: value
+            for key, value in state.items()
+            if key != "baseline_indices"
+        }
+        metrics_item["tokens_used"] = delivered_tokens_by_session.get(
+            session_id, 0
+        )
+        metrics_item["additional_hit_count"] = delivered_count_by_session.get(
+            session_id, 0
+        )
+        session_metrics.append(metrics_item)
+
+    metrics = {
+        "enabled": True,
+        "policy_version": "session_expand_v1",
+        "top_session_limit": _LCM_RECALL_SESSION_EXPAND_V1_TOP_SESSIONS,
+        "per_session_token_budget": token_budget,
+        "selected_session_count": len(top_sessions),
+        "expanded_session_count": sum(
+            bool(delivered_count_by_session.get(session_id))
+            for session_id in top_sessions
+        ),
+        "candidate_additional_hit_count": len(candidate_entries),
+        "additional_hit_count": len(additional_hits),
+        "strict_uncitable_dropped_count": strict_selector.unreferenced_dropped,
+        "contiguity_dropped_after_strict_count": contiguity_dropped,
+        "dropped_containment_duplicate_hit_count": containment_dropped,
+        "dedup_policy": (
+            "per-store byte containment: drop when the ranked excerpt is inside "
+            "the whole message or the whole message is inside the ranked text"
+        ),
+        "window_policy": (
+            "single highest-ranked resolvable anchor per session; grow left and "
+            "right through adjacent rows only; a non-fitting row closes that side"
+        ),
+        "citable_delivery_policy": (
+            "every appended whole message passes the #174 reference-strict "
+            "selector against a fresh row read before delivery"
+        ),
+        "sessions": session_metrics,
+    }
+    return list(ranked_hits) + additional_hits, metrics
+
+
 def _lcm_recall_bounded_reason(
     arm: str, scanned: int | None, total: int | None
 ) -> str:
@@ -4204,13 +4800,61 @@ def _lcm_recall_fts_arm(
     engine: "LCMEngine", query: str, *, candidate_limit: int, deadline: float
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """FTS arm: raw messages across ALL sessions (no conversation filter)."""
+    policy = policy_for_engine(engine)
+    access_context = policy_access_context(engine)
+    expected_scope = {
+        "kind": "recall_corpus",
+        "tool_name": "lcm_recall",
+        "arm": "fts",
+        "session_scope": "all",
+        "session_id": None,
+        "conversation_ids": None,
+        "source": None,
+    }
+    decision = policy.authorize_operation(access_context, "read", expected_scope)
+    policy.audit_decision(
+        access_context, "read", decision.denial_reason, decision.public()
+    )
+    if not decision.allowed:
+        raise AuthorizationRequiredError(
+            "authorize_operation", decision.public().denial_reason
+        )
+    authorized_scope = policy.resolve_authorized_targets(
+        access_context, "read", expected_scope
+    )
+    if isinstance(authorized_scope, Mapping):
+        authorized_scope = authorized_scope.get("target_scope", authorized_scope)
+    fts_args = {
+        "query": query,
+        "mode": "recall",
+        "session_scope": "all",
+        "limit": candidate_limit,
+    }
+    if isinstance(authorized_scope, Mapping):
+        # The resolved mapping is authoritative for the target dimension: a key
+        # the policy OMITS is a target it did not authorize, so the permissive
+        # default is REMOVED rather than left standing. Keeping the hard-coded
+        # session_scope="all" meant a policy narrowing the corpus to a single
+        # session -- or authorizing nothing at all -- still searched every
+        # session. Dropping the key degrades to this tool's own "current"
+        # default, which is the narrowest scope it offers.
+        for key in ("session_scope", "session_id", "source", "conversation_id"):
+            if key in authorized_scope:
+                fts_args[key] = authorized_scope[key]
+            else:
+                fts_args.pop(key, None)
+        # The owner predicate is ADDED, never removed by the loop above: a
+        # policy that scopes to a principal must be able to say so in a term
+        # the stored rows actually carry.
+        if authorized_scope.get("access_scope"):
+            fts_args["access_scope"] = authorized_scope["access_scope"]
+        # A resolved session_id with no scope is incoherent for this tool
+        # ("session_id is only valid with session_scope=session"), so name the
+        # scope the policy's own narrowing implies instead of erroring out.
+        if "session_id" in fts_args and "session_scope" not in authorized_scope:
+            fts_args["session_scope"] = "session"
     payload = _lcm_grep_full_text_with_deadline(
-        {
-            "query": query,
-            "mode": "recall",
-            "session_scope": "all",
-            "limit": candidate_limit,
-        },
+        fts_args,
         engine=engine,
         deadline=deadline,
         limit_cap=_LCM_GREP_HYBRID_CANDIDATE_CAP,
@@ -5056,13 +5700,21 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         ).date().isoformat()
                     except (TypeError, ValueError, OverflowError, OSError):
                         session_date = None
-                occurrence = resolve_occurrence_time(
+                occurrence, resolved_trust = resolve_occurrence_time_with_trust(
                     (hydrated or {}).get("content") or hit.get("snippet") or "",
                     observed_at=source_observed_at or 0,
                     session_date=session_date,
+                    engine=engine,
+                    session_id=hit.get("session_id"),
                 )
                 occurrence["stored_at"] = source_row.get("ingested_at") or source_row.get("timestamp")
                 item["occurrence_time"] = occurrence
+                trust_note = str(resolved_trust.get("trust_note") or "").strip()
+                item["temporal_trust"] = temporal_trust_wire(
+                    resolved_trust.get("anchor_trust"),
+                    resolved_trust.get("temporal_certified"),
+                    (trust_note,) if trust_note else (),
+                )
                 item["observation_time"] = {
                     "observed_at": occurrence.get("observed_at") or None,
                     "ingested_at": source_row.get("ingested_at") or source_row.get("timestamp"),
@@ -5100,6 +5752,76 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         hits_out.append(item)
         if len(hits_out) >= limit:
             break
+
+    session_expand_metrics: dict[str, Any] | None = None
+    response_char_cap = _LCM_RECALL_RESPONSE_CHAR_CAP
+    if (
+        detail == "answer_ready"
+        and bool(getattr(engine._config, "session_expand_v1", False))
+    ):
+        ranked_hit_count = len(hits_out)
+        ranked_content_hit_count = sum("content" in hit for hit in hits_out)
+        hits_out, session_expand_metrics = _lcm_recall_session_expand_v1(
+            engine,
+            hits_out,
+            per_session_token_budget=max(
+                0,
+                int(
+                    getattr(
+                        engine._config,
+                        "session_expand_v1_per_session_tokens",
+                        3_500,
+                    )
+                ),
+            ),
+        )
+        session_expand_metrics["ranked_hit_count"] = ranked_hit_count
+        session_expand_metrics[
+            "ranked_content_hit_count"
+        ] = ranked_content_hit_count
+        # The historical 64k cap remains byte-identical when the flag is off.
+        # The treatment is bounded by three explicit token budgets, so size the
+        # response envelope to carry those bounded additional hits whole.
+        calculated_response_char_cap = max(
+            _LCM_RECALL_RESPONSE_CHAR_CAP,
+            sum(
+                len(json.dumps(hit, ensure_ascii=False))
+                for hit in hits_out
+            )
+            + min(len(query), 4_096)
+            + 16_384,
+        )
+        configured_response_char_cap = int(
+            getattr(
+                engine._config,
+                "session_expand_v1_response_char_cap",
+                _LCM_RECALL_SESSION_EXPAND_V1_RESPONSE_CHAR_HARD_CAP,
+            )
+        )
+        response_char_hard_ceiling = (
+            _lcm_recall_session_expand_v1_response_char_hard_ceiling(
+                configured_response_char_cap
+            )
+        )
+        response_char_cap = min(
+            calculated_response_char_cap,
+            response_char_hard_ceiling,
+        )
+        session_expand_metrics["response_char_cap_configured"] = (
+            configured_response_char_cap
+        )
+        session_expand_metrics["response_char_cap_calculated"] = (
+            calculated_response_char_cap
+        )
+        session_expand_metrics["response_char_cap_hard_ceiling"] = (
+            response_char_hard_ceiling
+        )
+        session_expand_metrics["response_char_cap_configuration_clamped"] = (
+            response_char_hard_ceiling != configured_response_char_cap
+        )
+        session_expand_metrics["response_char_cap_clamped"] = (
+            response_char_cap < calculated_response_char_cap
+        )
 
     degraded = bool(degraded_reasons)
     response: dict[str, Any] = {
@@ -5147,7 +5869,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             "diversity_dropped_count": diversity_dropped,
             "per_hit_char_cap": _LCM_RECALL_ANSWER_READY_CONTENT_CHARS,
             "snippet_char_cap": _LCM_RECALL_SNIPPET_CHARS,
-            "response_char_cap": _LCM_RECALL_RESPONSE_CHAR_CAP,
+            "response_char_cap": response_char_cap,
             "response_policy": (
                 "rank-preserving session diversity, then exact-ref hydration; "
                 "whole hits only when enforcing the response cap"
@@ -5175,6 +5897,13 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
         response["detail"] = detail
         response["provenance"]["detail"] = detail
         response["provenance"]["answer_ready"] = expansion
+        if session_expand_metrics is not None:
+            expansion["session_expand_v1"] = session_expand_metrics
+            expansion["expanded_hit_count_semantics"] = (
+                "all delivered answer_ready hits carrying hydrated content; "
+                "treatment-only additions are counted separately under "
+                "session_expand_v1.additional_hit_count"
+            )
         if delta_requested:
             novel_refs = [hit["exact_ref"] for hit in hits_out if hit.get("exact_ref")]
             response["delta"] = {
@@ -5193,12 +5922,12 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             }
 
         encoded = json.dumps(response, ensure_ascii=False)
-        if len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP:
+        if len(encoded) > response_char_cap:
             original_query = response["query"]
             response["query"] = original_query[:4_096]
             expansion["query_truncated"] = len(response["query"]) < len(original_query)
             encoded = json.dumps(response, ensure_ascii=False)
-        while len(encoded) > _LCM_RECALL_RESPONSE_CHAR_CAP and (
+        while len(encoded) > response_char_cap and (
             response["hits"] or expansion.get("summary_leads")
         ):
             if response["hits"]:
@@ -5226,6 +5955,11 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
                         None if novel_refs else "no_novel_exact_ref"
                     ),
                 }
+            )
+            encoded = json.dumps(response, ensure_ascii=False)
+        if session_expand_metrics is not None:
+            session_expand_metrics["delivered_additional_hit_count"] = sum(
+                bool(hit.get("session_expanded")) for hit in response["hits"]
             )
             encoded = json.dumps(response, ensure_ascii=False)
         return encoded
@@ -5547,8 +6281,15 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             if node is not None:
                 nodes.append(node)
     elif query:
-        nodes = engine._dag.search(query, session_id=engine.current_session_id, limit=max_results)
-        raw_results = engine._store.search(query, session_id=engine.current_session_id, limit=max_results)
+        fts_prose_mode = bool(engine._config.fts_prose_mode)
+        search_kwargs = {
+            "session_id": engine.current_session_id,
+            "limit": max_results,
+        }
+        if fts_prose_mode:
+            search_kwargs["fts_prose_mode"] = True
+        nodes = engine._dag.search(query, **search_kwargs)
+        raw_results = engine._store.search(query, **search_kwargs)
     else:
         return json.dumps({"error": "Provide either query or node_ids"})
 
@@ -6568,6 +7309,36 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
     except Exception as e:
         checks.append({
             "check": "database_integrity",
+            "status": "fail",
+            "detail": str(e),
+        })
+
+    # Per-item scope staging is intentionally Teams-aware: legacy NULLs are
+    # expected while Teams is off, but an enabled store must have checked every
+    # observed row. Static writer coverage belongs to the test suite because
+    # it describes the source tree, not this database.
+    try:
+        scope_storage = verify_scope_storage(
+            engine._store.connection,
+            teams_enabled=storage_teams_enabled(engine),
+        )
+        scope_status = str(scope_storage.get("status"))
+        checks.append({
+            "check": "scope_storage",
+            "status": (
+                # stamped-without-marker is a FAILURE, not a variety of
+                # not-enabled: real per-owner stamps with no recorded decision.
+                # The previous mapping was an else-pass, so this state -- the
+                # one worth running a doctor for -- reported green.
+                "fail" if scope_status in {"fail", "stamped-without-marker"}
+                else "warn" if scope_status == "nothing-to-verify"
+                else "pass"
+            ),
+            "detail": scope_storage,
+        })
+    except Exception as e:
+        checks.append({
+            "check": "scope_storage",
             "status": "fail",
             "detail": str(e),
         })

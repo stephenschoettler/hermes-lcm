@@ -2,9 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Long-lived feature branches need CI too. Until this was added, a branch
+    # with no PR against main matched NEITHER trigger, and `teams/lcm-teams-v1`
+    # accumulated 85 commits with zero CI runs -- which was misread for days as
+    # "Actions is degraded" when in fact no job had ever been queued.
+    #
+    # A PR is not a sufficient substitute: for `pull_request` events GitHub
+    # builds `refs/pull/N/merge`, so a CONFLICTING PR produces no run at all --
+    # silently giving zero coverage exactly when a branch has drifted furthest
+    # and needs it most. Push events have no such dependency.
+    branches: [main, 'teams/**']
   pull_request:
     branches: [main]
+  # Any branch, on demand.
+  workflow_dispatch:
 
 permissions:
   contents: read

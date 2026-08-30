@@ -14,6 +14,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import hermes_lcm.search_query as search_query_module
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.tokens import count_tokens, count_message_tokens, count_messages_tokens
 from hermes_lcm.store import MessageStore
@@ -29,7 +30,16 @@ from hermes_lcm.db_bootstrap import (
     SCHEMA_VERSION,
     ensure_external_content_fts,
 )
-from hermes_lcm.search_query import sanitize_fts5_query
+from hermes_lcm.search_query import (
+    build_fts5_match_query,
+    compute_directness_score,
+    extract_prose_search_terms,
+    extract_search_terms,
+    resolve_prose_sort,
+    sanitize_fts5_query,
+    sanitize_like_query,
+    should_use_fts_prose_mode,
+)
 from hermes_lcm.session_patterns import (
     build_session_match_keys,
     compile_session_pattern,
@@ -605,6 +615,7 @@ class TestConfig:
         assert c.expansion_context_tokens == 32_000
         assert c.summary_timeout_ms == 60_000
         assert c.expansion_timeout_ms == 120_000
+        assert c.fts_prose_mode is False
 
     def test_from_env(self, monkeypatch):
         monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "32")
@@ -642,6 +653,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED", "true")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUB_THRESHOLD_TOKENS", "8192")
         monkeypatch.setenv("LCM_LARGE_OUTPUT_TRANSCRIPT_GC_ENABLED", "true")
+        monkeypatch.setenv("LCM_FTS_PROSE_MODE", "true")
         c = LCMConfig.from_env()
         assert c.fresh_tail_count == 32
         assert c.fresh_tail_max_tokens == 12_000
@@ -682,6 +694,7 @@ class TestConfig:
         assert c.large_output_active_replay_stubbing_enabled is True
         assert c.large_output_active_replay_stub_threshold_tokens == 8192
         assert c.large_output_transcript_gc_enabled is True
+        assert c.fts_prose_mode is True
 
     def test_from_env_invalid_numeric_values_fall_back_to_defaults(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-hermes-home"))
@@ -1903,6 +1916,240 @@ class TestMessageStore:
         assert len(results) == 1
         assert results[0]["content"] == "budget revenue q3 totals recorded"
 
+    def test_search_prose_mode_restores_bounded_disjunctive_recall(self, store):
+        """Issue #172: flag-on prose recovers a relevant row implicit AND loses."""
+        target = store.append(
+            "sess1",
+            {"role": "user", "content": "the dog vet appointment is Friday"},
+        )
+        dog_distractor = store.append(
+            "sess1",
+            {"role": "user", "content": "dog grooming supplies are in the hall"},
+        )
+        appointment_distractor = store.append(
+            "sess1",
+            {"role": "user", "content": "the project appointment calendar changed"},
+        )
+        query = "What did I say about my dog's vet appointment?"
+
+        assert store.search(query, session_id="sess1") == []
+
+        results = store.search(
+            query,
+            session_id="sess1",
+            limit=3,
+            fts_prose_mode=True,
+        )
+
+        ranked_ids = [row["store_id"] for row in results]
+        assert ranked_ids[0] == target
+        assert set(ranked_ids[1:]) == {
+            dog_distractor,
+            appointment_distractor,
+        }
+
+    def test_search_prose_mode_keeps_keyword_and_operator_semantics(self, store):
+        assert (
+            build_fts5_match_query(
+                "What did I say about my dog's vet appointment?",
+                prose_mode=True,
+            )
+            == "dog OR vet OR appointment"
+        )
+        assert (
+            build_fts5_match_query("docker deploy notes", prose_mode=True)
+            == "docker deploy notes"
+        )
+        assert (
+            build_fts5_match_query(
+                "cats and dogs are common pets today",
+                prose_mode=True,
+            )
+            == "cats OR dogs OR common OR pets OR today"
+        )
+        assert (
+            build_fts5_match_query(
+                "alpha OR beta",
+                allow_operators=True,
+                prose_mode=True,
+            )
+            == "alpha OR beta"
+        )
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "docker deploy?",
+            "api timeout?",
+            "error 500?",
+            "port 8080?",
+        ],
+    )
+    def test_search_prose_mode_keeps_compact_question_keywords_conjunctive(
+        self,
+        query,
+    ):
+        assert should_use_fts_prose_mode(query) is False
+        assert build_fts5_match_query(query, prose_mode=True) == sanitize_fts5_query(
+            query
+        )
+
+    def test_search_prose_symbol_subject_changes_only_symbol_query_classification(self):
+        assert should_use_fts_prose_mode("Find ©?") is True
+        assert should_use_fts_prose_mode("docker deploy?") is False
+
+    def test_search_prose_mode_keeps_conversational_question_disjunctive(self):
+        query = "What did I say about the deploy?"
+
+        assert should_use_fts_prose_mode(query) is True
+        assert build_fts5_match_query(query, prose_mode=True) == "deploy"
+
+    def test_search_prose_sort_promotion_is_centralized(self):
+        query = "What did I say about the deploy?"
+
+        assert resolve_prose_sort(None, True, query) == "relevance"
+        assert resolve_prose_sort(None, False, query) is None
+        assert resolve_prose_sort("recency", True, query) == "recency"
+        assert resolve_prose_sort(None, True, "docker deploy?") is None
+
+    def test_search_prose_classifier_ignores_possessive_s_tokens(self):
+        assert (
+            should_use_fts_prose_mode(
+                "dog's vet's appointment records today"
+            )
+            is False
+        )
+
+    def test_search_prose_disjunction_drops_contraction_fragments(self):
+        """Round-4 finding: "didn't" must not leak `didn OR t` into the
+        disjunction — fragments are never subject terms."""
+        terms = extract_prose_search_terms("What didn't we deploy?")
+        assert terms == ["deploy"]
+
+    def test_search_flag_off_emoji_literal_keeps_trailing_question_mark(self):
+        """Round-5 regression: default LIKE extraction remains byte-identical
+        to the merge-base behavior for emoji-adjacent punctuation."""
+        assert extract_search_terms(
+            sanitize_like_query("launch 🚀?")
+        ) == ["launch", "🚀?"]
+
+    def test_search_prose_all_framing_query_falls_back_to_conjunctive(self):
+        """Round-4 finding: when nothing but framing survives, the MATCH
+        query must fall back to the sanitized conjunctive form, not a lone
+        framing token disjunction."""
+        match = build_fts5_match_query(
+            "Can you tell me about that?", prose_mode=True
+        )
+        assert " OR " not in match
+        assert match  # non-empty sanitized fallback
+
+    def test_search_prose_term_cap_preserves_unicode_symbol_signal(self):
+        """Round-4 finding: the routing-signal symbol must survive the
+        total term cap on the LIKE route."""
+        keywords = " ".join(f"keyword{i}" for i in range(12))
+        terms = extract_prose_search_terms(
+            f"What did I say about {keywords} ©?",
+            sanitize_like_query(f"What did I say about {keywords} ©?"),
+        )
+        assert len(terms) == search_query_module._PROSE_TERM_LIMIT
+        assert any("©" in term for term in terms)
+
+    def test_search_prose_mode_preserves_stoplisted_subject_signal(self, store):
+        target = store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "my will is stored in the blue safe",
+            },
+        )
+
+        results = store.search(
+            "What did I say about my will?",
+            session_id="sess1",
+            fts_prose_mode=True,
+        )
+
+        assert [row["store_id"] for row in results] == [target]
+
+    @pytest.mark.parametrize("lead_word", ["find", "please", "recall", "remember"])
+    def test_search_prose_mode_drops_conversational_lead_words(self, lead_word):
+        assert (
+            build_fts5_match_query(
+                f"Can you {lead_word} my PIN?",
+                prose_mode=True,
+            )
+            == "PIN"
+        )
+
+    def test_search_prose_mode_treats_curly_quoted_phrase_as_precision_signal(self):
+        assert (
+            build_fts5_match_query(
+                "What did I say about “vet appointment”?",
+                prose_mode=True,
+            )
+            == "What did I say about vet appointment"
+        )
+
+    def test_search_prose_mode_operator_glue_contributes_zero_score(self):
+        """Injected MATCH syntax is never a relevance-scoring search term."""
+        match_query = build_fts5_match_query(
+            "What did I say about my dog's vet appointment?",
+            prose_mode=True,
+        )
+        terms = extract_search_terms(match_query)
+
+        assert terms == ["dog", "vet", "appointment"]
+        assert compute_directness_score("or hall or", terms) == 0.0
+
+    def test_search_prose_mode_caps_disjunctive_terms(self):
+        query = "What did we say about " + " ".join(
+            f"keyword{index}" for index in range(20)
+        )
+
+        match_query = build_fts5_match_query(query, prose_mode=True)
+        terms = extract_search_terms(match_query)
+        like_query = f"{query} ©?"
+        like_terms = extract_prose_search_terms(
+            like_query,
+            sanitize_like_query(like_query),
+        )
+
+        assert len(terms) <= search_query_module._PROSE_TERM_LIMIT
+        assert len(like_terms) <= search_query_module._PROSE_TERM_LIMIT
+        symbol_like_terms = [
+            term
+            for term in like_terms
+            if search_query_module.contains_unindexed_unicode_symbol(term)
+        ]
+        assert 1 <= len(symbol_like_terms) <= search_query_module._PROSE_SYMBOL_SLOTS
+
+    def test_search_prose_many_symbols_stays_bounded_and_avoids_sqlite_limit(
+        self,
+        store,
+    ):
+        symbols = [
+            chr(codepoint)
+            for codepoint in range(0xA0, 0x10000)
+            if unicodedata.category(chr(codepoint)).startswith("S")
+        ][:1100]
+        query = "Find " + " ".join(symbols) + "?"
+        terms = extract_prose_search_terms(query, sanitize_like_query(query))
+        target = store.append(
+            "sess1",
+            {"role": "user", "content": f"archive {symbols[0]} record"},
+        )
+
+        results = store.search(
+            query,
+            session_id="sess1",
+            fts_prose_mode=True,
+        )
+
+        assert len(symbols) == 1100
+        assert len(terms) <= search_query_module._PROSE_TERM_LIMIT
+        assert len(terms) == search_query_module._PROSE_SYMBOL_SLOTS
+        assert target in {row["store_id"] for row in results}
+
     def test_search_keeps_hyphenated_compound_on_the_fts_path(self, store):
         """Review finding 1: a compound token sanitizes to ordinary terms, so it
         must NOT be routed to the full-table LIKE scan (6 of the 50 fixed Phase
@@ -1926,6 +2173,100 @@ class TestMessageStore:
 
         assert requires_like_fallback("東京") is True
         assert requires_like_fallback("launch \U0001F680") is True
+
+    @pytest.mark.parametrize("symbol", ["©", "€", "™"])
+    def test_search_preserves_non_ascii_symbol_signal(self, store, symbol):
+        """Issue #172 sibling: stripped Unicode symbols retain ranking signal."""
+        target = store.append(
+            "sess1",
+            {"role": "user", "content": f"licensed {symbol} archive"},
+        )
+        store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": "What did I say about licensed material",
+            },
+        )
+
+        results = store.search(
+            f"What did I say about licensed {symbol}?",
+            session_id="sess1",
+            limit=1,
+            fts_prose_mode=True,
+        )
+
+        assert [row["store_id"] for row in results] == [target]
+
+    def test_search_prose_mode_retrieves_symbol_only_subject(self, store):
+        target = store.append(
+            "sess1",
+            {"role": "user", "content": "copyright © archive"},
+        )
+
+        results = store.search(
+            "Find ©?",
+            session_id="sess1",
+            fts_prose_mode=True,
+        )
+
+        assert [row["store_id"] for row in results] == [target]
+
+    def test_search_prose_like_ranks_distinct_terms_above_repetition(self, store):
+        target = store.append(
+            "sess1",
+            {"role": "user", "content": "licensed © archive"},
+        )
+        store.append(
+            "sess1",
+            {"role": "user", "content": "licensed licensed licensed"},
+        )
+
+        results = store.search(
+            "Find licensed © archive?",
+            session_id="sess1",
+            limit=1,
+            fts_prose_mode=True,
+        )
+
+        assert [row["store_id"] for row in results] == [target]
+
+    def test_search_flag_off_keeps_unicode_symbols_on_historical_fts_route(self, store):
+        store.append(
+            "sess1",
+            {"role": "user", "content": "licensed © archive"},
+        )
+        store._search_like = lambda *args, **kwargs: pytest.fail(
+            "flag-off Unicode-symbol query escaped to LIKE"
+        )
+
+        results = store.search(
+            "licensed ©",
+            session_id="sess1",
+            fts_prose_mode=False,
+        )
+
+        assert results
+
+    def test_search_flag_on_compact_symbol_query_keeps_flag_off_route(self, store):
+        """Round-3 finding: symbol preservation keys on prose CLASSIFICATION,
+        not the flag alone — a compact classifier-negative query must keep the
+        historical FTS route (and its conjunctive semantics) even flag-on."""
+        store.append(
+            "sess1",
+            {"role": "user", "content": "licensed © archive"},
+        )
+        store._search_like = lambda *args, **kwargs: pytest.fail(
+            "flag-on compact classifier-negative query escaped to LIKE"
+        )
+
+        results = store.search(
+            "licensed ©",
+            session_id="sess1",
+            fts_prose_mode=True,
+        )
+
+        assert results
 
     def test_search_matches_a_decomposed_accent_against_the_index(self, store):
         """Review finding 6: unicode61 folds `naïve` to `naive`, so a decomposed
@@ -1957,11 +2298,18 @@ class TestMessageStore:
         beta = store.append("sess1", {"role": "user", "content": "beta only here"})
 
         deliberate = store.search(
-            "alpha OR beta", session_id="sess1", allow_operators=True
+            "alpha OR beta",
+            session_id="sess1",
+            allow_operators=True,
+            fts_prose_mode=True,
         )
         assert {row["store_id"] for row in deliberate} == {alpha, beta}
 
-        raw = store.search("alpha OR beta", session_id="sess1")
+        raw = store.search(
+            "alpha OR beta",
+            session_id="sess1",
+            fts_prose_mode=True,
+        )
         assert raw == []  # conjunction of alpha, or, beta — nothing has all three
 
     def test_search_survives_a_leading_boolean_operator(self, store):
@@ -3485,6 +3833,126 @@ class TestSummaryDAG:
         ))
         results = dag.search("Docker", session_id="s1")
         assert len(results) >= 1
+
+    def test_search_prose_mode_restores_bounded_disjunctive_recall(self, dag):
+        target = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="the dog vet appointment is Friday",
+            token_count=6, source_ids=[1], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="dog grooming supplies are in the hall",
+            token_count=7, source_ids=[2], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="the project appointment calendar changed",
+            token_count=5, source_ids=[3], source_type="messages",
+        ))
+        query = "What did I say about my dog's vet appointment?"
+        dag._search_like = lambda *args, **kwargs: pytest.fail(
+            "ASCII prose query left the FTS route"
+        )
+
+        assert dag.search(query, session_id="s1") == []
+
+        results = dag.search(
+            query,
+            session_id="s1",
+            limit=3,
+            fts_prose_mode=True,
+        )
+
+        assert results[0].node_id == target
+
+    def test_search_flag_off_keeps_unicode_symbols_on_historical_fts_route(self, dag):
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="licensed © archive",
+            token_count=4, source_ids=[1], source_type="messages",
+        ))
+        dag._search_like = lambda *args, **kwargs: pytest.fail(
+            "flag-off Unicode-symbol query escaped to LIKE"
+        )
+
+        results = dag.search(
+            "licensed ©",
+            session_id="s1",
+            fts_prose_mode=False,
+        )
+
+        assert results
+
+    def test_search_prose_mode_filters_summary_symbol_like_terms(self, dag):
+        target = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="licensed © archive",
+            token_count=4, source_ids=[1], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="What did I say about licensed material",
+            token_count=7, source_ids=[2], source_type="messages",
+        ))
+
+        results = dag.search(
+            "What did I say about licensed ©?",
+            session_id="s1",
+            limit=1,
+            fts_prose_mode=True,
+        )
+
+        assert [node.node_id for node in results] == [target]
+
+    def test_search_summary_prose_like_ranks_distinct_terms_above_repetition(
+        self,
+        dag,
+    ):
+        target = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="licensed © archive",
+            token_count=3, source_ids=[1], source_type="messages",
+        ))
+        dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="licensed licensed licensed",
+            token_count=3, source_ids=[2], source_type="messages",
+        ))
+
+        results = dag.search(
+            "Find licensed © archive?",
+            session_id="s1",
+            limit=1,
+            fts_prose_mode=True,
+        )
+
+        assert [node.node_id for node in results] == [target]
+
+    def test_search_summary_like_scans_past_first_batch_for_best_match(self, dag):
+        """Round-3 finding: the unordered LIKE batch SQL must scan the whole
+        bounded candidate set before truncating to `limit`, or the best match
+        sitting past the first fetch batch is silently dropped."""
+        for i in range(20):
+            dag.add_node(SummaryNode(
+                session_id="s1", depth=0,
+                summary=f"generic © note {i}",
+                token_count=4, source_ids=[i + 1], source_type="messages",
+            ))
+        target = dag.add_node(SummaryNode(
+            session_id="s1", depth=0,
+            summary="licensed © archive",
+            token_count=4, source_ids=[21], source_type="messages",
+        ))
+
+        results = dag.search(
+            "What did I say about licensed ©?",
+            session_id="s1",
+            limit=1,
+            fts_prose_mode=True,
+        )
+
+        assert [node.node_id for node in results] == [target]
 
     def test_search_empty_session_id_does_not_search_all_sessions(self, dag):
         dag.add_node(SummaryNode(

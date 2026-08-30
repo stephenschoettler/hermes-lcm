@@ -421,6 +421,18 @@ def test_upsert_stale_seeds_missing_rows_and_leaves_building_alone(rollup_store)
     assert rollup_store.get_rollup("day", "2026-07-15", scope)["status"] == "building"
 
 
+def test_upsert_stale_many_carries_authorized_scope_for_empty_partition(rollup_store):
+    scope = "session-without-sources"
+    assert rollup_store.upsert_stale_many(
+        [("day", "2026-07-15", scope)],
+        authorized_access_scope="principal-a",
+    ) == 3
+    rows = rollup_store.connection.execute(
+        "SELECT access_scope FROM lcm_rollups WHERE scope=?", (scope,)
+    ).fetchall()
+    assert {row[0] for row in rows} == {"principal-a"}
+
+
 def test_stale_aggregates_for_day_targets_week_and_month_only(rollup_store):
     scope = "conversation:conv-1"
     day_id = _ready_rollup(rollup_store, "day", "2026-07-15", scope)

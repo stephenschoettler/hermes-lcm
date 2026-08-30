@@ -2,10 +2,10 @@
 
 These exercise the semantic-"magnet" pathology on a synthetic corpus: a cluster
 of semantic-top distractor trajectories monopolises the fused nucleus and
-displaces the strongest pure-lexical winner (a SOURCE_MISS). Policy A
-(``lexical_floor``) and Policy D (``arm_quota``) must re-admit the lexical
-winner, while the defaults must reproduce the displaced (pre-repair) delivery
-byte-for-byte.
+initially displaces the strongest pure-lexical winner (a SOURCE_MISS).
+D-ARCH-2's default adjacency-reserve backfill re-admits that winner, while
+Policy A (``lexical_floor``) and Policy D (``arm_quota``) still change how the
+winner is protected within the composed delivery.
 """
 
 from __future__ import annotations
@@ -123,35 +123,43 @@ def _delivered_trajectories(hits):
     return [hit.trajectory_id for hit in hits]
 
 
-def test_default_reproduces_the_magnet_displacement(tmp_path: Path):
-    # Baseline (byte-compat): the fused nucleus is monopolised by the semantic-top
-    # distractors and the pure-lexical winner is displaced out of delivery.
+def test_default_backfill_readmits_the_magnet_displacement(tmp_path: Path):
+    # D-ARCH-2: unused adjacency reserve backfills the displaced lexical winner
+    # after the fused nucleus, preserving the fused rank order.
     store = _build_magnet_store(tmp_path)
     default_hits = store.query(_QUERY, limit=16, image_limit=0)
     default_refs = [hit.exact_ref for hit in default_hits]
+    default_trajectories = _delivered_trajectories(default_hits)
 
-    assert "target" not in _delivered_trajectories(default_hits)
+    assert default_trajectories[-1] == "target"
+    assert all(t.startswith("distractor-") for t in default_trajectories[:-1])
     # The default kwargs are byte-identical to the explicit no-op knob values.
     assert [h.exact_ref for h in store.query(_QUERY, limit=16, image_limit=0, lexical_floor=0)] == default_refs
     assert [h.exact_ref for h in store.query(_QUERY, limit=16, image_limit=0, arm_quota=None)] == default_refs
 
 
-def test_policy_a_lexical_floor_readmits_the_displaced_winner(tmp_path: Path):
+def test_policy_a_lexical_floor_promotes_the_backfilled_winner(tmp_path: Path):
+    # D-ARCH-2 already re-admits the winner by default; Policy A still protects
+    # it as the first delivered lexical incumbent rather than a tail backfill.
     store = _build_magnet_store(tmp_path)
-    assert "target" not in _delivered_trajectories(store.query(_QUERY, limit=16, image_limit=0))
+    default = _delivered_trajectories(store.query(_QUERY, limit=16, image_limit=0))
+    assert default[-1] == "target"
 
     floored = store.query(_QUERY, limit=16, image_limit=0, lexical_floor=1)
-    assert "target" in _delivered_trajectories(floored)
+    assert _delivered_trajectories(floored)[0] == "target"
     assert len({hit.exact_ref for hit in floored}) == len(floored)  # no duplicates
 
 
-def test_policy_d_arm_quota_readmits_the_displaced_winner(tmp_path: Path):
+def test_policy_d_arm_quota_promotes_the_backfilled_winner(tmp_path: Path):
+    # D-ARCH-2 already re-admits the winner by default; Policy D still promotes
+    # it through the lexical arm while retaining the semantic arm.
     store = _build_magnet_store(tmp_path)
-    assert "target" not in _delivered_trajectories(store.query(_QUERY, limit=16, image_limit=0))
+    default = _delivered_trajectories(store.query(_QUERY, limit=16, image_limit=0))
+    assert default[-1] == "target"
 
     union = store.query(_QUERY, limit=16, image_limit=0, arm_quota=(6, 5))
     trajectories = _delivered_trajectories(union)
-    assert "target" in trajectories
+    assert trajectories[0] == "target"
     # The semantic arm is still represented (quota union, not lexical-only).
     assert any(t.startswith("distractor-") for t in trajectories)
     assert len({hit.exact_ref for hit in union}) == len(union)
@@ -197,16 +205,17 @@ def test_merge_arms_hybrid_floor_reserves_lexical_incumbents_first():
         arm_lex, arm_sem, limit=6, q_lex=2, q_sem=2, floor_k=0)] == pure_d
 
 
-def test_hybrid_floor_plus_quota_readmits_winner_and_composes(tmp_path: Path):
-    # The A+D hybrid composes: the lexical floor protects the displaced winner
-    # while the arm quota keeps the semantic arm represented; arm_quota with
-    # lexical_floor=0 is byte-identical to the pure Policy D delivery.
+def test_hybrid_floor_plus_quota_promotes_winner_and_composes(tmp_path: Path):
+    # D-ARCH-2 backfills the winner by default; the A+D hybrid composes by
+    # protecting it first while the arm quota keeps the semantic arm represented.
+    # arm_quota with lexical_floor=0 stays byte-identical to pure Policy D.
     store = _build_magnet_store(tmp_path)
-    assert "target" not in _delivered_trajectories(store.query(_QUERY, limit=16, image_limit=0))
+    default = _delivered_trajectories(store.query(_QUERY, limit=16, image_limit=0))
+    assert default[-1] == "target"
 
     hybrid = store.query(_QUERY, limit=16, image_limit=0, lexical_floor=1, arm_quota=(6, 5))
     trajectories = _delivered_trajectories(hybrid)
-    assert "target" in trajectories  # lexical incumbent protected by the floor
+    assert trajectories[0] == "target"  # lexical incumbent protected by the floor
     assert any(t.startswith("distractor-") for t in trajectories)  # semantic arm kept
     assert len({hit.exact_ref for hit in hybrid}) == len(hybrid)
 

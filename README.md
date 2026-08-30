@@ -281,6 +281,15 @@ outside the LCM database.
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, frontier/fresh-tail metadata, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. Returns metadata only; use retrieval tools for content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
 
+### KNN residency and scoring
+
+Eligible full-corpus KNN scans use a default 128 MiB resident-matrix budget.
+For float32 corpora this may use disclosed int8-quantized scoring; the F44 gate
+measured net-zero recall change at 185k vectors. Each response reports
+`scoring="int8_quantized"` or `scoring="float32_exact"` so callers can observe
+the selected arithmetic. Set `LCM_KNN_RESIDENT_MAX_MB=0` to disable residency
+and retain the exact streaming path.
+
 ## Recall skill and policy
 
 Hermes-LCM ships `skills/hermes-lcm/SKILL.md` plus progressive-disclosure
@@ -387,6 +396,7 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
 | `LCM_FTS_INTEGRITY_CHECK_INTERVAL_HOURS` | `24` | Minimum hours between startup FTS5 deep integrity-checks (O(index size)). `0` checks every startup; a negative value never checks on startup. Structural checks always run regardless. |
+| `LCM_FTS_PROSE_MODE` | `false` | Opt raw natural-language queries into a bounded disjunctive FTS form; compact keyword and caller-composed operator queries keep their current semantics |
 | `LCM_ENABLE_SLASH_COMMAND` | `false` | Enable the optional `/lcm` operator command surface |
 
 When `LCM_FRESH_TAIL_MAX_TOKENS` is enabled, the protected suffix must satisfy

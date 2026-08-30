@@ -27,6 +27,7 @@ from .query_view_store import (
     QueryViewIdentity,
     QueryViewStore,
 )
+from .reasoning import temporal_trust_wire
 from .tokens import count_tokens
 
 
@@ -1219,6 +1220,14 @@ class AdaptiveRetrievalRegistry:
                     )
                     if key in raw_trace
                 }
+                raw_trust = computation.get("temporal_trust")
+                if isinstance(raw_trust, Mapping):
+                    raw_notes = raw_trust.get("notes")
+                    trace["temporal_trust"] = temporal_trust_wire(
+                        raw_trust.get("status"),
+                        raw_trust.get("certified"),
+                        raw_notes if isinstance(raw_notes, list) else (),
+                    )
             selected_refs = {item.citation for item in selected}
             manifest = {
                 "closed_slots": sorted(state.slot_refs),

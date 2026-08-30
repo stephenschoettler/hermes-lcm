@@ -14,12 +14,21 @@ import re
 import sqlite3
 import threading
 import time
+import weakref
 from collections import deque
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from agent.context_engine import ContextEngine
+
+from .access_context import AccessContextV1, Decision, DenialReason, is_subset_of
+from .access_context.inventory import load_inventory
+
+from . import access_policy as _access_policy
+AuthorizationRequiredError = _access_policy.AuthorizationRequiredError
+policy_for_engine = _access_policy.policy_for_engine
+policy_access_context = _access_policy.policy_access_context
 
 from .codex_routing import (
     _codex_oauth_context_cap,
@@ -139,6 +148,16 @@ from .sqlite_util import (
     _temporary_sqlite_busy_timeout,
 )
 from .store import MessageStore
+from .scope_storage import (
+    ACCESS_SCOPE_COLUMN,
+    mark_teams_enabled,
+    persist_teams_enabled,
+    preflight_teams_scope,
+    resolve_startup_teams_state,
+    setup_teams_scope,
+    teams_enabled as storage_teams_enabled,
+)
+from .teams import ensure_teams_catalog
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -360,6 +379,64 @@ _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
+
+# The tool boundary must authorize the object named by the caller, not just the
+# engine's currently bound session.  Keep this table explicit: each entry is
+# derived from the corresponding handler body in ``tools.py``.  ``target_free``
+# is deliberately explicit for handlers whose data is restricted to the
+# caller-bound scope (or whose nested target calls re-enter this boundary).
+LCM_TOOL_TARGET_BINDINGS: Dict[str, Dict[str, Any]] = {
+    "lcm_query_state": {"args": ("subject_key", "scope_key")},
+    "lcm_compute": {"args": ("operands",)},
+    "lcm_evidence_pack": {"args": ("baseline_refs",)},
+    "lcm_compile_evidence": {"args": ("baseline_refs", "proposal")},
+    "lcm_retrieve": {"args": ("identity", "tool_args", "selected_refs", "computation")},
+    "lcm_recent": {
+        "args": (),
+        "target_free": True,
+        "reason": "The handler reads only the active conversation; period and limit are not targets.",
+    },
+    "lcm_load_session": {"args": ("session_id",)},
+    "lcm_grep": {
+        "args": ("session_scope", "session_id", "source", "conversation_id", "externalized_refs"),
+    },
+    "lcm_recall": {
+        "args": (),
+        "target_free": True,
+        "reason": "The handler has no caller-supplied target; its retrieval arms re-authorize corpus targets.",
+    },
+    "lcm_describe": {"args": ("node_id", "externalized_ref")},
+    "lcm_expand": {"args": ("node_id", "externalized_ref", "store_id")},
+    "lcm_expand_query": {"args": ("node_ids",)},
+    "lcm_status": {
+        "args": (),
+        "target_free": True,
+        "reason": "The handler reports the engine's current session and accepts no target argument.",
+    },
+    "lcm_inspect": {
+        "args": (),
+        "target_free": True,
+        "reason": "The handler inspects the engine's current session and accepts only a limit.",
+    },
+    "lcm_doctor": {
+        "args": (),
+        "target_free": True,
+        "reason": "The handler diagnoses the engine's current session and accepts no target argument.",
+    },
+}
+
+_AUTHORITY_OPERATION_BY_REQUIREMENT = {
+    "read_scoped": "read",
+    "write_scoped": "write",
+    "owner_only": "owner_only",
+    "admin_only": "admin",
+    "none_required": "none",
+}
+LCM_TOOL_AUTHORITY_OPERATIONS = {
+    entry.entry_point: _AUTHORITY_OPERATION_BY_REQUIREMENT[entry.authority_requirement]
+    for entry in load_inventory()
+    if entry.module == "tools.py" and entry.entry_point.startswith("lcm_")
+}
 
 
 def _normalize_total_compactions(value: Any) -> int:
@@ -646,6 +723,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         clone.api_key = self.api_key
         clone.provider = self.provider
         clone.api_mode = self.api_mode
+        for wiring_name in (
+            _access_policy.TEAMS_ENABLED_ATTR,
+            _access_policy.ACCESS_CONTEXT_ACCESSOR,
+        ):
+            # Only per-INSTANCE wiring is copied, and a callable bound to the
+            # prototype is rebound to the clone. A class-defined accessor is
+            # already inherited and rebinds through the descriptor protocol;
+            # copying getattr(self, name) would hand every clone a method bound
+            # to the PROTOTYPE, so each agent clone would read the prototype's
+            # context and authorize as the wrong principal.
+            if wiring_name not in vars(self):
+                continue
+            wiring_value = vars(self)[wiring_name]
+            if getattr(wiring_value, "__self__", None) is self:
+                wiring_value = wiring_value.__func__.__get__(clone, type(clone))
+            setattr(clone, wiring_name, wiring_value)
         if self._context_length_source:
             clone._set_context_length(
                 self.raw_context_length,
@@ -696,13 +789,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._query_views = None
         self._adaptive_retrieval = None
         self._assertion_extractor = None
+        engine_ref = weakref.ref(self)
+
+        def access_scope_provider(session_id: str) -> str | None:
+            engine = engine_ref()
+            if engine is None:
+                return None
+            return engine._access_scope_for_storage_session(session_id)
+
         try:
             self._store = MessageStore(
                 db_path,
                 ingest_protection_config=self._config,
                 hermes_home=hermes_home,
+                access_scope_provider=access_scope_provider,
             )
-            self._dag = SummaryDAG(db_path)
+            self._dag = SummaryDAG(
+                db_path,
+                access_scope_provider=access_scope_provider,
+            )
             if self._config.temporal_rollups_enabled:
                 # Install the transaction-coupled summary mutation triggers before
                 # this engine can publish or delete a DAG node.
@@ -735,9 +840,152 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     model=self._assertion_extraction_model(),
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
+            self._restore_persisted_teams_state()
         except Exception:
             self._close_storage()
             raise
+
+    def _restore_persisted_teams_state(self) -> None:
+        """Recover the Teams decision from the store before any read or write.
+
+        Enablement used to live only on this object, so every restart silently
+        dropped it while the per-owner stamps stayed in the database -- a
+        permissive policy over scoped data, reported as healthy by doctor.
+        Reading the durable record here, inside _bind_storage, puts it back
+        before any path can consult the flag.
+        """
+
+        connection = getattr(self._store, "connection", None)
+        if connection is None:
+            return
+        enabled, reason = resolve_startup_teams_state(connection)
+        self._teams_state_reason = reason
+        if enabled:
+            mark_teams_enabled(self)
+        else:
+            # Explicitly cleared rather than left alone: rebinding to a
+            # different store must not inherit the previous store's answer.
+            if hasattr(self, _access_policy.TEAMS_ENABLED_ATTR):
+                delattr(self, _access_policy.TEAMS_ENABLED_ATTR)
+
+    def _access_scope_for_storage_session(self, session_id: str) -> str | None:
+        """Return the Teams owner scope for a writer's session, if enabled."""
+
+        if not storage_teams_enabled(self):
+            return None
+        resolver = getattr(self, "resolve_lcm_session_owner", None)
+        if callable(resolver):
+            resolved = resolver(session_id)
+            if resolved:
+                return str(resolved)
+        context = policy_access_context(self)
+        if context is not None and context.session_id == session_id:
+            resolved = str(
+                context.session_owner_principal_id
+                or context.principal_id
+                or ""
+            )
+            if resolved:
+                return resolved
+        raise ValueError(f"Teams scope owner is unresolved for session_id={session_id}")
+
+    def _preteams_owner_for_session(self, session_id: str) -> str:
+        """Resolve the ratified legacy owner attribution for setup/backfill."""
+
+        resolver = getattr(self, "resolve_lcm_session_owner", None)
+        if callable(resolver):
+            resolved = resolver(session_id)
+            if resolved:
+                return str(resolved)
+        context = policy_access_context(self)
+        if context is not None and context.session_id == session_id:
+            resolved = context.session_owner_principal_id or context.principal_id
+            if resolved:
+                return str(resolved)
+        raise ValueError(f"pre-Teams owner is unresolved for session_id={session_id}")
+
+    def enable_teams(
+        self,
+        owner_for_session: Callable[[str], str | None] | None = None,
+        *,
+        batch_size: int = 256,
+        overrides: Mapping[str, str] | None = None,
+        fallback_owner: str | None = None,
+    ) -> dict[str, object]:
+        """Set up Teams scope storage and stamp all historical LCM rows.
+
+        This is intentionally explicit: ordinary schema startup never calls
+        the backfill, so a store that never enables Teams remains unstamped.
+        The flag is published only after the setup transaction has completed.
+        """
+
+        result = setup_teams_scope(
+            self._store.connection,
+            owner_for_session or self._preteams_owner_for_session,
+            batch_size=batch_size,
+            overrides=overrides,
+            fallback_owner=fallback_owner,
+        )
+        # After the backfill, so a store whose stamping failed does not acquire
+        # catalog tables it never gets to use.
+        result["catalog"] = ensure_teams_catalog(self._store.connection)
+        # An incomplete backfill raises ScopeBackfillIncompleteError out of
+        # setup_teams_scope, so control never reaches the lines below and the
+        # marker stays unset -- leaving the store stamped-without-marker, which
+        # fails closed until the operator supplies the missing owners and
+        # re-runs. The backfill is idempotent, so re-running resumes.
+        #
+        # Durable BEFORE in-process, so a crash between the two lands on
+        # "enabled" rather than on stamps with no recorded decision.
+        persist_teams_enabled(self._store.connection, True)
+        mark_teams_enabled(self)
+        self._teams_state_reason = "enabled"
+        return result
+
+    def preflight_teams(
+        self,
+        owner_for_session: Callable[[str], str | None] | None = None,
+        *,
+        overrides: Mapping[str, str] | None = None,
+        fallback_owner: str | None = None,
+    ) -> dict[str, object]:
+        """Report every owner an enable would need, without writing anything.
+
+        Run this before :meth:`enable_teams` on any store that matters. It
+        answers the one question that can strand an enable half-done -- which
+        sessions cannot be attributed -- while the store is still untouched.
+        """
+
+        return preflight_teams_scope(
+            self._store.connection,
+            owner_for_session or self._preteams_owner_for_session,
+            overrides=overrides,
+            fallback_owner=fallback_owner,
+        )
+
+    def disable_teams(self) -> dict[str, object]:
+        """Record that Teams is off, without unstamping anything.
+
+        Additive-only by design: the access_scope values stay exactly as they
+        are. Stripping them would destroy the attribution a later re-enable
+        depends on, and would be the one genuinely irreversible operation in
+        this feature. Disable is a decision, not a migration.
+
+        Because the stamps remain, the durable ``false`` matters -- it is what
+        distinguishes "an operator turned this off" from "an enable died
+        partway", which :func:`resolve_startup_teams_state` must treat very
+        differently.
+        """
+
+        persist_teams_enabled(self._store.connection, False)
+        if hasattr(self, _access_policy.TEAMS_ENABLED_ATTR):
+            delattr(self, _access_policy.TEAMS_ENABLED_ATTR)
+        self._teams_state_reason = "disabled"
+        return {"teams_enabled": False, "stamps_retained": True}
+
+    # Host adapters may use either verb; both routes share the same idempotent
+    # setup/backfill implementation and do not alter the default-off path.
+    setup_teams = enable_teams
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
@@ -839,7 +1087,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if store is not None:
                 store._hermes_home = hermes_home
             self._reset_profile_runtime_state()
-            logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
+            # This relabels the home; it does NOT switch the file, because an
+            # explicit `database_path` is an operator override that outranks the
+            # profile. That is right for a single-profile deployment and is an
+            # ISOLATION HAZARD under a multiplexed gateway, where it silently
+            # collapses every routed profile onto one lcm.db.
+            #
+            # It used to log this at INFO as "rebound", which is the one thing it
+            # is not -- an operator grepping for a mis-binding would read that
+            # line as confirmation the switch happened. Say what actually
+            # occurred, and say it loudly enough to find.
+            logger.warning(
+                "LCM did NOT switch stores for Hermes home %s: an explicit "
+                "database_path (%s) pins the file, so this profile shares the "
+                "configured store. Under a multiplexed gateway every routed "
+                "profile shares it. Unset database_path for per-profile memory.",
+                hermes_home,
+                self._config.database_path,
+            )
             return True
 
         db_path = self._resolve_db_path(hermes_home)
@@ -1756,6 +2021,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _schedule_rollup_maintenance(self, scope: str) -> None:
         """Enqueue one best-effort rollup pass using private SQLite helpers."""
         try:
+            # The scheduler owns one long-lived process-wide worker. Resolve
+            # and authorize on this caller thread, then carry the immutable
+            # decision into the job; a worker-thread lookup would have no
+            # caller ContextVar and could inherit another principal's state.
+            policy = policy_for_engine(self)
+            access_context = policy_access_context(self)
+            expected_scope = {
+                "kind": "rollup",
+                "partition_key": scope,
+                "source_scope": access_context,
+                "derived_scope": access_context,
+            }
+            decision = policy.authorize_operation(
+                access_context, "write", expected_scope
+            )
+            policy.audit_decision(
+                access_context, "write", decision.denial_reason, decision.public()
+            )
+            if not decision.allowed:
+                raise AuthorizationRequiredError(
+                    "authorize_operation", decision.public().denial_reason
+                )
+            authorized_scope = policy.resolve_authorized_targets(
+                access_context, "write", expected_scope
+            )
+            if isinstance(authorized_scope, dict):
+                resolved_partition = authorized_scope.get("partition_key")
+                if resolved_partition is not None:
+                    scope = str(resolved_partition)
+                source_scope = authorized_scope.get("source_scope", access_context)
+                derived_scope = authorized_scope.get("derived_scope", access_context)
+                if (
+                    isinstance(source_scope, AccessContextV1)
+                    and isinstance(derived_scope, AccessContextV1)
+                    and not is_subset_of(derived_scope, source_scope)
+                ):
+                    mismatch = Decision.deny(DenialReason.SCOPE_MISMATCH)
+                    policy.audit_decision(
+                        access_context, "write", mismatch.denial_reason, mismatch.public()
+                    )
+                    raise AuthorizationRequiredError(
+                        "authorize_operation", mismatch.public().denial_reason
+                    )
+            captured_decision = decision
             raw_database_path = str(self._dag.db_path)
             if raw_database_path == ":memory:":
                 logger.warning(
@@ -1770,6 +2079,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             spend_guard = self._summary_spend_guard
 
             def maintain() -> None:
+                # The decision was captured before enqueue on the caller's
+                # thread. Never resolve policy on this shared worker.
+                if not captured_decision.allowed:
+                    raise AuthorizationRequiredError(
+                        "authorize_operation", captured_decision.public().denial_reason
+                    )
                 private_dag = SummaryDAG(database_path)
                 try:
                     run_rollup_maintenance(
@@ -2590,11 +2905,39 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        # Authorize before ``hermes_home`` can rebind the engine's storage.
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        boundary_reason = str(kwargs.get("boundary_reason") or "")
+        old_session_id = str(kwargs.get("old_session_id") or "")
+        expected_scope = {
+            "kind": "session_start",
+            "session_id": session_id,
+            "conversation_id": kwargs.get("conversation_id"),
+        }
+        # A compression rollover READS the source session's lifecycle and DAG
+        # and can reassign its summary nodes into the destination. The source
+        # is caller-supplied and may name another principal's durable session,
+        # so it has to be presented to the policy BEFORE any rollover lookup --
+        # authorizing only the destination asked about the wrong session.
+        if (
+            boundary_reason == "compression"
+            and old_session_id
+            and old_session_id != session_id
+        ):
+            expected_scope["source_session_id"] = old_session_id
+        decision = policy.authorize_operation(access_context, "write", expected_scope)
+        policy.audit_decision(
+            access_context, "write", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
-        boundary_reason = str(kwargs.get("boundary_reason") or "")
-        old_session_id = str(kwargs.get("old_session_id") or "")
+        # boundary_reason / old_session_id are read above, before authorization.
         previous_session_id = self._session_id
         previous_conversation_id = self._conversation_id
         requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
@@ -3197,6 +3540,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             kept.append(msg)
         if not kept:
             return []
+        # MessageStore has no carrier; authorize at this engine-side caller
+        # before ingest protection can externalize a sidecar or the batch can
+        # reach the durable store.
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {
+            "kind": "message_store",
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+        }
+        decision = policy.authorize_operation(access_context, "write", expected_scope)
+        policy.audit_decision(
+            access_context, "write", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         protected_messages = protect_messages_for_ingest(
             kept,
             session_id=session_id,
@@ -3212,6 +3573,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        # Gate the callback before inspecting messages or mutating auxiliary
+        # and lifecycle state.
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {
+            "kind": "session_end",
+            "session_id": session_id,
+            "conversation_id": self._conversation_id,
+        }
+        decision = policy.authorize_operation(access_context, "write", expected_scope)
+        policy.audit_decision(
+            access_context, "write", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
         active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
         if (
@@ -3541,6 +3919,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
 
     def on_session_reset(self) -> None:
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {
+            "kind": "session_reset",
+            "session_id": self._session_id,
+            "conversation_id": self._conversation_id,
+            "required_scope": "owner_only",
+        }
+        decision = policy.authorize_operation(access_context, "owner_only", expected_scope)
+        policy.audit_decision(
+            access_context, "owner_only", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         if self._host_fallback_compressor is not None:
             compressor = self._host_fallback_compressor
             on_session_reset = getattr(compressor, "on_session_reset", None)
@@ -3759,7 +4153,201 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_DOCTOR,
         ]
 
+    _TARGET_OWNER_LOOKUPS = (
+        ("store_id", "messages", "store_id"),
+        ("node_id", "summary_nodes", "node_id"),
+    )
+
+    # Targets naming rows by EXACT REFERENCE (``lcm:<store_id>:<start>-<end>``)
+    # rather than by bare id, in either scalar or list form.
+    #
+    # The scalar loop below matches `WHERE store_id = ?` against the raw value,
+    # so a reference STRING could never match a row, and it skips list values
+    # outright -- so none of these attached a `target_access_scopes`, leaving
+    # TeamsPolicy with nothing to decide on and the gate unconditionally
+    # allowing. The identical store_id passed as a scalar int (lcm_expand)
+    # resolved and denied, which is what makes this a target-SHAPE gap rather
+    # than a policy gap.
+    #
+    # All four were found at once by the structural test in
+    # tests/test_teams_target_shapes.py; fixing only the reported one
+    # (baseline_refs) would have left three siblings open.
+    _TARGET_REF_LOOKUPS = (
+        ("baseline_refs", "messages", "store_id"),       # evidence_pack, compile_evidence
+        ("externalized_refs", "messages", "store_id"),   # lcm_grep
+        ("externalized_ref", "messages", "store_id"),    # lcm_describe, lcm_expand (scalar)
+        ("selected_refs", "messages", "store_id"),       # lcm_retrieve
+    )
+
+    # Targets naming rows by a LIST of bare ids.
+    _TARGET_ID_LIST_LOOKUPS = (
+        ("node_ids", "summary_nodes", "node_id"),        # lcm_expand_query
+    )
+
+    @staticmethod
+    def _store_id_from_exact_ref(value: Any) -> int | None:
+        """The store_id inside an ``lcm:<store_id>:<start>-<end>`` reference.
+
+        Callers pass either the bare string or a mapping carrying it under
+        ``exact_ref``; both shapes reach the authorization boundary. The regex
+        is imported from its canonical home rather than restated, so the two
+        cannot drift into disagreeing about what a reference looks like.
+        """
+
+        from .preanswer_evidence import _EXACT_REF_RE
+
+        if isinstance(value, Mapping):
+            value = value.get("exact_ref")
+        match = _EXACT_REF_RE.match(str(value or "").strip())
+        return int(match.group("store_id")) if match else None
+
+    def _stored_access_scopes_for_targets(
+        self, target_scope: Mapping[str, Any]
+    ) -> tuple[str, ...]:
+        """Return the distinct owner stamps of the rows a call names.
+
+        Empty when Teams is off, when nothing addressable was named, or when a
+        target does not resolve -- an absent row is not an ownership claim, and
+        reporting one would turn a miss into a denial that leaks existence.
+        """
+
+        if not storage_teams_enabled(self):
+            return ()
+        connection = getattr(self._store, "connection", None)
+        if connection is None:
+            return ()
+        owners: set[str] = set()
+        for key, table, column in self._TARGET_OWNER_LOOKUPS:
+            raw = target_scope.get(key)
+            if raw is None or isinstance(raw, (dict, list, tuple, set)):
+                continue
+            try:
+                row = connection.execute(
+                    f'SELECT {ACCESS_SCOPE_COLUMN} FROM "{table}" WHERE {column} = ?',
+                    (raw,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                continue
+            if row is not None and row[0] is not None:
+                owners.add(str(row[0]))
+
+        # Reference and list targets, resolved element by element. An
+        # unparseable or unresolved element is skipped for the same reason a
+        # missing scalar row is: an absent row is not an ownership claim, and
+        # reporting one would turn a miss into a denial that leaks existence.
+        def _resolve(table: str, column: str, value: Any) -> None:
+            try:
+                row = connection.execute(
+                    f'SELECT {ACCESS_SCOPE_COLUMN} FROM "{table}" WHERE {column} = ?',
+                    (value,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return
+            if row is not None and row[0] is not None:
+                owners.add(str(row[0]))
+
+        def _elements(raw: Any) -> tuple[Any, ...]:
+            """Scalar and list targets differ only in shape, never in authority."""
+            if raw is None:
+                return ()
+            if isinstance(raw, (list, tuple, set)):
+                return tuple(raw)
+            return (raw,)
+
+        for key, table, column in self._TARGET_REF_LOOKUPS:
+            for element in _elements(target_scope.get(key)):
+                store_id = self._store_id_from_exact_ref(element)
+                if store_id is not None:
+                    _resolve(table, column, store_id)
+
+        for key, table, column in self._TARGET_ID_LIST_LOOKUPS:
+            for element in _elements(target_scope.get(key)):
+                if isinstance(element, (dict, list, tuple, set)):
+                    continue
+                try:
+                    _resolve(table, column, int(element))
+                except (TypeError, ValueError):
+                    continue
+
+        return tuple(sorted(owners))
+
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+        # This callback is a bypass around individual tool handlers. Authorize
+        # before current-turn ingest or dispatch can disclose or mutate state.
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        binding = LCM_TOOL_TARGET_BINDINGS.get(name)
+        target_args = tuple(binding.get("args", ())) if binding else ()
+        target_scope = {
+            key: args[key]
+            for key in target_args
+            if isinstance(args, Mapping) and key in args
+        }
+        if binding and binding.get("target_free"):
+            target_scope = {
+                "session_id": self.current_session_id,
+                "conversation_id": self.current_conversation_id,
+            }
+        expected_scope = {
+            "kind": "tool_call",
+            "tool_name": name,
+            "caller_session_id": self._session_id,
+            "caller_conversation_id": self._conversation_id,
+            "target_scope": target_scope,
+        }
+        expected_scope.update(target_scope)
+        # Raw identifiers -- store_id, node_id -- name a row without saying who
+        # owns it, so a policy asked to authorize them has nothing to decide
+        # against and must either guess or let them through. Resolving the
+        # stored owner HERE keeps the policy pure (no database handle, still
+        # unit-testable) and puts the answer in the scope the policy already
+        # receives. Reads only; the row itself is not disclosed.
+        owners = self._stored_access_scopes_for_targets(target_scope)
+        if owners:
+            expected_scope["target_access_scopes"] = owners
+        operation = LCM_TOOL_AUTHORITY_OPERATIONS.get(name, "read")
+        expected_scope["required_scope"] = operation
+        decision = policy.authorize_operation(access_context, operation, expected_scope)
+        policy.audit_decision(
+            access_context, operation, decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
+        authorized_scope = policy.resolve_authorized_targets(
+            access_context, operation, expected_scope
+        )
+        # A policy may narrow a target before dispatch.  Apply the resolved
+        # values to the handler arguments so the body cannot continue with the
+        # caller's original, wider target.  The inert default policy returns
+        # the requested mapping unchanged.
+        handler_args = dict(args) if isinstance(args, Mapping) else args
+        if isinstance(authorized_scope, Mapping):
+            resolved_target_scope = authorized_scope.get("target_scope", authorized_scope)
+            if isinstance(resolved_target_scope, Mapping):
+                for key in target_args:
+                    if key in resolved_target_scope:
+                        handler_args[key] = resolved_target_scope[key]
+                    else:
+                        handler_args.pop(key, None)
+            # The owner predicate is propagated OUTSIDE the target_args loop,
+            # because it is an authorization OUTPUT rather than a caller-supplied
+            # target: it appears in no tool's binding, so the loop above cannot
+            # carry it and the handler never saw it. That is exactly how
+            # `lcm_grep session_scope=all` kept returning every principal's rows
+            # -- the policy narrowed correctly and nothing downstream was told.
+            #
+            # Taken from the top-level resolved mapping, not from target_scope,
+            # and a caller-supplied value is never trusted: it is overwritten
+            # when the policy resolved one, and stripped when it did not.
+            resolved_owner = None
+            if isinstance(authorized_scope, Mapping):
+                resolved_owner = authorized_scope.get("access_scope")
+            if resolved_owner:
+                handler_args["access_scope"] = resolved_owner
+            elif isinstance(handler_args, dict):
+                handler_args.pop("access_scope", None)
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 
@@ -3795,7 +4383,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         handler = handlers.get(name)
         if handler:
-            return handler(args, engine=self)
+            return handler(handler_args, engine=self)
         return json.dumps({"error": f"Unknown LCM tool: {name}"})
 
     def _database_path_source(self) -> str:
@@ -4525,6 +5113,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             externalize_messages[idx] = not ignored_original_messages[idx]
         for idx in range(0, scan_start):
             prefer_existing_externalized[idx] = not ignored_original_messages[idx]
+        # MessageStore and externalize_ingest_payload have no carrier. Resolve
+        # once at this engine-side boundary before quarantine/protection can
+        # create a sidecar or before the protected batch is persisted.
+        policy = policy_for_engine(self)
+        access_context = policy_access_context(self)
+        expected_scope = {
+            "kind": "message_store",
+            "session_id": self._session_id,
+            "conversation_id": self._conversation_id,
+        }
+        decision = policy.authorize_operation(access_context, "write", expected_scope)
+        policy.audit_decision(
+            access_context, "write", decision.denial_reason, decision.public()
+        )
+        if not decision.allowed:
+            raise AuthorizationRequiredError(
+                "authorize_operation", decision.public().denial_reason
+            )
         replay_messages = quarantine_suspicious_assistant_messages(
             messages,
             session_id=self._session_id,
