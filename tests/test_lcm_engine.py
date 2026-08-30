@@ -622,6 +622,61 @@ def test_non_codex_gpt55_keeps_host_context_window(engine):
     assert engine.threshold_tokens == int(400_000 * engine._config.context_threshold)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "gpt-5.6-terra-900k",
+        "gpt-5.6-sol-900k",
+        "gpt-5.6-luna-900k",
+    ],
+)
+def test_exact_codex_900k_routes_cap_higher_host_context(engine, model):
+    engine.update_model(
+        model=model,
+        provider="openai-codex",
+        context_length=1_000_000,
+    )
+
+    assert engine.raw_context_length == 1_000_000
+    assert engine.context_length == 900_000
+    assert engine.effective_context_length_cap == 900_000
+    assert engine.effective_context_length_reason == "codex_oauth_context_cap"
+
+
+def test_exact_codex_900k_session_context_uses_lower_host_bound(tmp_path):
+    config = LCMConfig(database_path=str(tmp_path / "codex-900k-session.db"))
+    engine = LCMEngine(config=config)
+    try:
+        engine.on_session_start(
+            "codex-900k-high-session",
+            platform="cli",
+            model="gpt-5.6-sol-900k",
+            provider="openai-codex",
+            context_length=1_000_000,
+            conversation_id="codex-900k-high-conversation",
+        )
+
+        assert engine.raw_context_length == 1_000_000
+        assert engine.context_length == 900_000
+        assert engine.effective_context_length_cap == 900_000
+
+        engine.on_session_start(
+            "codex-900k-lower-session",
+            platform="cli",
+            model="gpt-5.6-sol-900k",
+            provider="openai-codex",
+            context_length=640_000,
+            conversation_id="codex-900k-lower-conversation",
+        )
+
+        assert engine.raw_context_length == 640_000
+        assert engine.context_length == 640_000
+        assert engine.effective_context_length_cap is None
+        assert engine.effective_context_length_reason == ""
+    finally:
+        engine.shutdown()
+
+
 def test_session_start_does_not_overwrite_update_model_context_length_with_stale_metadata(engine):
     engine.update_model(
         model="deepseek-v4-flash",
