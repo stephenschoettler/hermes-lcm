@@ -4259,6 +4259,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             copied_replay_messages.append(copied_message)
         return copied_replay_messages
 
+    def _persisted_prefix_len(self, messages: List[Dict[str, Any]]) -> Optional[int]:
+        """How much of ``messages`` still matches the last history ingest completed.
+
+        ``_last_active_replay_source_identities`` holds the replay identities of
+        the list the previous ingest processed to its end, so every row of that
+        list is accounted for: stored, or deliberately dropped by the ignore and
+        placeholder filters. The session stamp beside it keeps the proof from
+        crossing a rebind.
+
+        The returned length is the longest common prefix, which the caller reads
+        two ways. Longer than the cursor: rows the cursor calls new are already
+        accounted for, so it can advance. Shorter: the history changed inside the
+        range the cursor calls persisted, so the cursor indexes a list that no
+        longer exists and must be re-derived from the store.
+
+        Returns None when there is no usable proof (no cache, or another
+        session's).
+        """
+        cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
+        cached_session_id = str(getattr(self, "_last_active_replay_session_id", "") or "")
+        if not cached_source_identities or cached_session_id != self._session_id:
+            return None
+        prefix_len = min(len(cached_source_identities), len(messages))
+        for idx in range(prefix_len):
+            if self._message_replay_identity(messages[idx]) != cached_source_identities[idx]:
+                return idx
+        return prefix_len
+
     def _remember_active_replay_messages(
         self,
         original_messages: List[Dict[str, Any]],
@@ -4267,6 +4295,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_source_identities = [
             self._message_replay_identity(message) for message in original_messages
         ]
+        # Scope the identities above to their session. _persisted_prefix_len reads
+        # them as proof that ingest accounted for those rows, and nothing clears
+        # this cache when the engine rebinds to another session.
+        self._last_active_replay_session_id = self._session_id
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
             active_replay_messages
         )
@@ -4504,6 +4536,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._redact_active_replay_messages(messages)
 
         n = len(messages)
+        persisted_prefix_len = self._persisted_prefix_len(messages)
         cursor = min(max(self._ingest_cursor, 0), n)
         scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
@@ -4561,6 +4594,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
+        if persisted_prefix_len is not None and persisted_prefix_len > self._ingest_cursor:
+            # The host handed back a history this session already ingested to its
+            # end, extended or not. compress() lowers the cursor to the compacted
+            # length, and a host that then passes the PRE-compaction list to
+            # on_session_end (end-of-session extraction runs at the compaction
+            # boundary) would have every row past the lowered cursor look new, so
+            # the whole history is appended a second time.
+            logger.info(
+                "LCM ingest cursor advanced past the last persisted history: session=%s cursor=%d -> %d incoming=%d",
+                self._session_id,
+                self._ingest_cursor,
+                persisted_prefix_len,
+                n,
+            )
+            self._ingest_cursor = persisted_prefix_len
         cursor = min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
