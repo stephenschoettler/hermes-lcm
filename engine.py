@@ -125,7 +125,7 @@ from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
-from .compaction import CompactionMixin
+from .compaction import CompactionMixin, LCMCompressionCancelled
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -145,6 +145,13 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+
+_POST_COMPACTION_USER_GUIDANCE = (
+    "Post-compaction reminder: the verbatim text below is direct user guidance, "
+    "not a summary or inferred intent. Preserve its scope and meaning. Later "
+    "direct user messages override earlier ones. If exact wording or omitted "
+    "session guidance matters, use lcm_grep or lcm_expand before guessing."
+)
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -512,10 +519,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
-        # Host compatibility: LCM treats successful automatic compaction as
-        # silent maintenance. Manual /lcm diagnostics and warning/error paths
-        # remain explicit.
-        self.emit_automatic_compaction_status = False
+        # Host compatibility: LCM used to treat successful automatic compaction
+        # as silent maintenance. Interactive surfaces (desktop/TUI) rely on the
+        # lifecycle status to show a "Summarizing…" indicator instead of a
+        # silent timer, so emit it by default; LCM_EMIT_AUTOMATIC_COMPACTION_STATUS=0
+        # restores the silent behavior. Manual /lcm diagnostics and warning/error
+        # paths remain explicit either way.
+        self.emit_automatic_compaction_status = os.environ.get(
+            "LCM_EMIT_AUTOMATIC_COMPACTION_STATUS", "1"
+        ).lower() not in ("0", "false", "no")
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._summary_circuit_breaker = SummaryCircuitBreaker(
@@ -582,6 +594,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_active_replay_source_identities: list[tuple[Any, ...]] = []
         self._last_active_replay_messages: list[Dict[str, Any]] = []
         self._generated_ignored_active_replay_placeholder_message_ids: set[int] = set()
+        self._compression_cancelled_check: Callable[[], bool] | None = None
         self._logged_filter_config = False
         self._pending_reset_session_id: str = ""
         self._pending_reset_conversation_id: str = ""
@@ -1683,6 +1696,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         attempt_number = 0
 
         while attempt_chunk and attempt_number < max_attempts:
+            self._raise_if_compression_cancelled()
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
             serialized = self._serialize_messages(attempt_chunk)
@@ -1692,9 +1706,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             try:
                 timeout_seconds = self._config.summary_timeout_ms / 1000
                 if deadline is not None:
-                    remaining_seconds = deadline - time.monotonic()
-                    if remaining_seconds <= 0:
-                        raise TimeoutError("threshold full sweep time budget exhausted")
+                    remaining_seconds = max(0.0, deadline - time.monotonic())
                     timeout_seconds = min(timeout_seconds, remaining_seconds)
                 summary_text, level = summarize_with_escalation(
                     text=serialized,
@@ -1706,11 +1718,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     circuit_breaker=self._summary_circuit_breaker,
                     spend_guard=self._summary_spend_guard,
                     timeout=timeout_seconds,
+                    deadline=deadline,
                     l2_budget_ratio=self._config.l2_budget_ratio,
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
                     custom_instructions=self._config.custom_instructions,
                 )
+                self._raise_if_compression_cancelled()
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
                 if attempt_number >= max_attempts or not self._is_retry_worthy_leaf_summary_error(exc):
@@ -5550,6 +5564,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         focus_topic: Optional[str] = None,
         *,
+        deadline: Optional[float] = None,
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
         critical_budget_pressure: bool = False,
@@ -5575,6 +5590,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
+            self._raise_if_compression_cancelled()
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
@@ -5593,10 +5609,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
             # Take the first fanin nodes and condense
             to_condense = uncondensed[:fanin]
-            source_tokens, summary_tokens, level = self._condense_summary_nodes(
-                to_condense,
-                focus_topic=focus_topic,
-            )
+            try:
+                source_tokens, summary_tokens, level = self._condense_summary_nodes(
+                    to_condense,
+                    focus_topic=focus_topic,
+                    deadline=deadline,
+                )
+            except LCMCompressionCancelled:
+                return
             condensed_any = True
 
             logger.info(
@@ -5619,6 +5639,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         deadline: Optional[float] = None,
     ) -> tuple[int, int, int]:
         """Persist one same-depth condensation and return source/output tokens and level."""
+        self._raise_if_compression_cancelled()
         if not nodes:
             raise ValueError("condensation requires at least one summary node")
         depth = nodes[0].depth
@@ -5629,9 +5650,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         token_budget = max(1000, int(source_tokens * 0.40))
         timeout_seconds = self._config.summary_timeout_ms / 1000
         if deadline is not None:
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                raise TimeoutError("threshold full sweep time budget exhausted")
+            remaining_seconds = max(0.0, deadline - time.monotonic())
             timeout_seconds = min(timeout_seconds, remaining_seconds)
         summary_text, level = summarize_with_escalation(
             text=combined_text,
@@ -5643,11 +5662,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             circuit_breaker=self._summary_circuit_breaker,
             spend_guard=self._summary_spend_guard,
             timeout=timeout_seconds,
+            deadline=deadline,
             l2_budget_ratio=self._config.l2_budget_ratio,
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
         )
+        self._raise_if_compression_cancelled()
         earliest_at, latest_at = self._dag.get_source_time_window(
             [node.node_id for node in nodes]
         )
@@ -5731,6 +5752,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     focus_topic=focus_topic,
                     deadline=deadline,
                 )
+            except LCMCompressionCancelled:
+                return passes, "compression_cancelled"
             except Exception as exc:
                 logger.warning(
                     "LCM threshold full sweep condensation stopped after %d pass(es): %s",
@@ -5809,7 +5832,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             content,
             role=str(message.get("role") or "user"),
         )
-        return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
+        return (
+            f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n"
+            f"{_POST_COMPACTION_USER_GUIDANCE}\n\n"
+            f"{content}"
+        )
 
     def _latest_user_context_anchor(
         self,
@@ -6081,6 +6108,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             anchor_msg = {"role": summary_role, "content": anchor_part}
             if summary_budget is None or count_message_tokens(anchor_msg) <= summary_budget:
                 summary_parts.append(anchor_part)
+            else:
+                compact_anchor = anchor_part.replace(
+                    f"{_POST_COMPACTION_USER_GUIDANCE}\n\n",
+                    "",
+                    1,
+                )
+                compact_anchor_msg = {"role": summary_role, "content": compact_anchor}
+                if count_message_tokens(compact_anchor_msg) <= summary_budget:
+                    anchor_part = compact_anchor
+                    summary_parts.append(anchor_part)
 
         # Node ids placed in the summary prefix — used to dedupe proactive-recall
         # injection against summaries already visible in the active context.

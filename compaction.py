@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .escalation import _deterministic_truncate
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -28,9 +29,43 @@ logger = logging.getLogger(__name__)
 
 _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
+_PRE_COMPACTION_EXTRACTION_MAX_SECONDS = 5.0
+
+
+class LCMCompressionCancelled(Exception):
+    """Raised when the host cancels a cooperative compression pass."""
 
 
 class CompactionMixin:
+    def _compression_cancelled(self) -> bool:
+        cancelled_check = getattr(self, "_compression_cancelled_check", None)
+        if not callable(cancelled_check):
+            return False
+        try:
+            return bool(cancelled_check())
+        except Exception:
+            logger.debug("LCM compression cancellation check failed", exc_info=True)
+            return False
+
+    def _raise_if_compression_cancelled(self) -> None:
+        if self._compression_cancelled():
+            raise LCMCompressionCancelled()
+
+    def _finalize_cancelled_compression(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        ingest_cleanup_changed_active_context: bool = False,
+    ) -> List[Dict[str, Any]]:
+        self._last_compression_status = "noop"
+        self._last_compression_noop_reason = "compression cancelled by host"
+        if ingest_cleanup_changed_active_context:
+            self._ingest_cursor = len(messages)
+        return self._sanitize_active_context_messages(
+            messages,
+            insert_missing_tool_stubs=False,
+        )
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -384,6 +419,14 @@ class CompactionMixin:
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
+        _compress_started_monotonic = time.monotonic()
+        compaction_deadline = (
+            _compress_started_monotonic
+            + max(0.0, self._config.summary_timeout_ms / 1000)
+        )
+
+        if self._compression_cancelled():
+            return self._finalize_cancelled_compression(messages)
 
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
@@ -472,7 +515,10 @@ class CompactionMixin:
             and self.threshold_tokens > 0
             and estimated_active_tokens >= self.threshold_tokens
         )
-        sweep_deadline = time.monotonic() + _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        sweep_deadline = min(
+            compaction_deadline,
+            _compress_started_monotonic + _THRESHOLD_FULL_SWEEP_MAX_SECONDS,
+        )
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
         sweep_target_tokens = max(
             1,
@@ -528,6 +574,11 @@ class CompactionMixin:
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
+            if self._compression_cancelled():
+                return self._finalize_cancelled_compression(
+                    working_messages,
+                    ingest_cleanup_changed_active_context=ingest_cleanup_changed_active_context,
+                )
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
                 sweep_stop_reason = "time_budget_exhausted"
                 break
@@ -684,6 +735,7 @@ class CompactionMixin:
                 else:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
+                working_leaf_chunk_tokens = max(1, self._config.leaf_chunk_tokens)
                 if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
                     if not (deferred_maintenance_active and critical_budget_pressure):
                         noop_reason = (
@@ -700,6 +752,11 @@ class CompactionMixin:
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
+            oversized_singleton = (
+                len(selected_raw_chunk) == 1
+                and count_message_tokens(selected_raw_chunk[0])
+                > max(working_leaf_chunk_tokens, self._config.l3_truncate_tokens)
+            )
             if not summary_input_chunk:
                 compacted_chunk = selected_raw_chunk
                 source_tokens = count_messages_tokens(selected_raw_chunk)
@@ -709,18 +766,38 @@ class CompactionMixin:
                 )
                 _level = 0
                 _rescue_attempts = 0
+            elif oversized_singleton:
+                compacted_chunk = summary_input_chunk
+                source_tokens = count_messages_tokens(compacted_chunk)
+                summary_text = _deterministic_truncate(
+                    self._serialize_messages(compacted_chunk),
+                    self._config.l3_truncate_tokens,
+                )
+                _level = 3
+                _rescue_attempts = 0
             else:
                 # Pre-compaction extraction: best-effort, never blocks compaction.
                 # Use the same dependency-filtered view as summarization so ignored
                 # turns cannot leak through derived assistant/tool replies.
+                self._raise_if_compression_cancelled()
                 if self._config.extraction_enabled:
-                    extraction_timeout = None
-                    if threshold_full_sweep_active:
-                        extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
-                    self._run_pre_compaction_extraction(
-                        summary_input_chunk,
-                        timeout_seconds=extraction_timeout,
+                    effective_deadline = (
+                        sweep_deadline
+                        if threshold_full_sweep_active
+                        else compaction_deadline
                     )
+                    remaining_seconds = effective_deadline - time.monotonic()
+                    if remaining_seconds > 0:
+                        self._run_pre_compaction_extraction(
+                            summary_input_chunk,
+                            timeout_seconds=max(
+                                0.001,
+                                min(
+                                    remaining_seconds,
+                                    _PRE_COMPACTION_EXTRACTION_MAX_SECONDS,
+                                ),
+                            ),
+                        )
                 if bool(
                     getattr(
                         self._config,
@@ -731,9 +808,14 @@ class CompactionMixin:
                     self._schedule_pre_compaction_assertions(summary_input_chunk)
 
                 try:
-                    summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
-                    if threshold_full_sweep_active:
-                        summary_kwargs["deadline"] = sweep_deadline
+                    summary_kwargs: dict[str, Any] = {
+                        "focus_topic": focus_topic,
+                        "deadline": (
+                            sweep_deadline
+                            if threshold_full_sweep_active
+                            else compaction_deadline
+                        ),
+                    }
                     (
                         compacted_chunk,
                         source_tokens,
@@ -743,6 +825,12 @@ class CompactionMixin:
                     ) = self._summarize_leaf_chunk_with_rescue(
                         summary_input_chunk,
                         **summary_kwargs,
+                    )
+                    self._raise_if_compression_cancelled()
+                except LCMCompressionCancelled:
+                    return self._finalize_cancelled_compression(
+                        working_messages,
+                        ingest_cleanup_changed_active_context=ingest_cleanup_changed_active_context,
                     )
                 except Exception as exc:
                     if threshold_full_sweep_active and leaf_compacted_this_turn:
@@ -942,12 +1030,16 @@ class CompactionMixin:
                     )
                 )
         else:
-            self._maybe_condense(
-                focus_topic=focus_topic,
-                leaf_compacted_this_turn=True,
-                force_overflow=force_overflow,
-                critical_budget_pressure=critical_budget_pressure,
-            )
+            try:
+                self._maybe_condense(
+                    focus_topic=focus_topic,
+                    deadline=compaction_deadline,
+                    leaf_compacted_this_turn=True,
+                    force_overflow=force_overflow,
+                    critical_budget_pressure=critical_budget_pressure,
+                )
+            except LCMCompressionCancelled:
+                pass
 
         # Step 7: Assemble new active context
         self._refresh_raw_backlog_debt(

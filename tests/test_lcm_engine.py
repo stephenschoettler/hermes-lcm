@@ -3827,6 +3827,7 @@ class TestEngineABC:
         )
         combined_context = "\n".join(str(msg.get("content", "")) for msg in active_context)
         assert "Current user objective preserved" in combined_context
+        assert "direct user guidance, not a summary or inferred intent" in combined_context
         assert latest_request in combined_context
 
     def test_preserved_objective_anchor_externalizes_inline_payloads(self, tmp_path):
@@ -3852,6 +3853,28 @@ class TestEngineABC:
         assert expanded["kind"] == "ingest_payload"
         assert expanded["content"] == data_uri
         assert expanded["field_path"] == "preserved_objective.content"
+
+    def test_preserved_objective_anchor_marks_direct_user_words_as_authoritative(self, tmp_path):
+        engine = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "preserved-objective-guidance.db")),
+            hermes_home=str(tmp_path),
+        )
+        engine.on_session_start(
+            "preserved-objective-guidance-session",
+            platform="desktop",
+            conversation_id="preserved-objective-guidance-conversation",
+            context_length=200000,
+        )
+
+        exact_user_words = "متغيرش الـAPI وخلي التنفيذ على أصغر scope"
+        anchor = engine._build_preserved_objective_summary_part(
+            {"role": "user", "content": exact_user_words}
+        )
+
+        assert exact_user_words in anchor
+        assert "direct user guidance, not a summary or inferred intent" in anchor
+        assert "Later direct user messages override earlier ones" in anchor
+        assert "lcm_grep or lcm_expand" in anchor
 
     def test_existing_large_session_restart_reconciles_beyond_short_tail_window(self, tmp_path):
         db_path = tmp_path / "restart-large.db"
@@ -5607,6 +5630,7 @@ class TestMessageFiltering:
             {"role": "user", "content": "visible backlog objective " + "y" * 200},
             {"role": "assistant", "content": "fresh tail response"},
         ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(messages[1])
 
         engine.compress(messages, current_tokens=count_messages_tokens(messages))
 
@@ -5639,6 +5663,7 @@ class TestMessageFiltering:
             {"role": "user", "content": "visible backlog objective " + "y" * 200},
             {"role": "assistant", "content": "fresh tail response"},
         ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(messages[2])
 
         engine.compress(messages, current_tokens=count_messages_tokens(messages))
 
@@ -5713,6 +5738,7 @@ class TestMessageFiltering:
             {"role": "user", "content": "visible backlog objective " + "y" * 200},
             {"role": "assistant", "content": "fresh tail response"},
         ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(messages[1])
 
         engine.compress(messages, current_tokens=count_messages_tokens(messages))
 
@@ -5738,11 +5764,13 @@ class TestMessageFiltering:
             return "visible backlog summary\n[Expand for details: visible backlog]", 1
 
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_messages = [
+            {"role": "user", "content": "visible backlog objective " + "y" * 200},
+            {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+        ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(first_messages[0])
         first_result = engine.compress(
-            [
-                {"role": "user", "content": "visible backlog objective " + "y" * 200},
-                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
-            ],
+            first_messages,
             current_tokens=10_000,
         )
         first_result_text = "\n".join(str(msg.get("content", "")) for msg in first_result)
@@ -5801,11 +5829,13 @@ class TestMessageFiltering:
             return "visible backlog summary\n[Expand for details: visible backlog]", 1
 
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_messages = [
+            {"role": "user", "content": "first visible backlog " + "y" * 200},
+            {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+        ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(first_messages[0])
         first_result = engine.compress(
-            [
-                {"role": "user", "content": "first visible backlog " + "y" * 200},
-                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
-            ],
+            first_messages,
             current_tokens=10_000,
         )
         assert "LCM active replay placeholder: message ignored" in "\n".join(
@@ -5820,10 +5850,12 @@ class TestMessageFiltering:
             leaf_chunk_tokens=10,
         )
         captured.clear()
+        second_visible = {"role": "user", "content": "second visible backlog " + "z" * 200}
+        second._config.leaf_chunk_tokens = count_message_tokens(second_visible)
         second.compress(
             first_result
             + [
-                {"role": "user", "content": "second visible backlog " + "z" * 200},
+                second_visible,
                 {"role": "assistant", "content": "fresh tail response"},
             ],
             current_tokens=10_000,
@@ -6222,11 +6254,13 @@ class TestMessageFiltering:
             context_length=1000,
             conversation_id="conv-placeholder-rollover",
         )
+        first_messages = [
+            {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
+            {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
+        ]
+        first._config.leaf_chunk_tokens = count_message_tokens(first_messages[0])
         first_result = first.compress(
-            [
-                {"role": "user", "content": "visible backlog before rollover " + "v" * 200},
-                {"role": "user", "content": "api_key=sk-ignore...cdef ignored fresh tail"},
-            ],
+            first_messages,
             current_tokens=10_000,
         )
         first.shutdown()
@@ -6258,10 +6292,12 @@ class TestMessageFiltering:
                 boundary_reason="compression",
                 old_session_id="old-session",
             )
+            second_visible = {"role": "user", "content": "visible new backlog " + "z" * 200}
+            second._config.leaf_chunk_tokens = count_message_tokens(second_visible)
             second.compress(
                 first_result
                 + [
-                    {"role": "user", "content": "visible new backlog " + "z" * 200},
+                    second_visible,
                     {"role": "assistant", "content": "fresh tail response"},
                 ],
                 current_tokens=10_000,
@@ -7314,6 +7350,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible historical backlog " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail"},
             ]
+            second._config.leaf_chunk_tokens = count_message_tokens(messages[1])
             second.compress(messages, current_tokens=count_messages_tokens(messages))
 
             assert "visible historical backlog" in captured["text"]
@@ -7432,6 +7469,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
+            second._config.leaf_chunk_tokens = count_message_tokens(messages[1])
             second.compress(messages, current_tokens=count_messages_tokens(messages))
 
             rows = second._store.get_session_messages("session")
@@ -7533,6 +7571,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
+            second._config.leaf_chunk_tokens = count_message_tokens(messages[2])
             second.compress(messages, current_tokens=count_messages_tokens(messages))
 
             stored_after = second._store.get_session_messages("session")
@@ -7614,6 +7653,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
+            second._config.leaf_chunk_tokens = count_message_tokens(messages[1])
             second.compress(messages, current_tokens=count_messages_tokens(messages))
 
             assert "visible backlog objective" in captured["text"]
@@ -7990,12 +8030,14 @@ class TestMessageFiltering:
             return "visible summary\n[Expand for details: visible]", 1
 
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary)
+        first_messages = [
+            {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
+            {"role": "user", "content": "SECRET ignored turn"},
+            {"role": "assistant", "content": dependent_reply},
+        ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(first_messages[0])
         first_result = engine.compress(
-            [
-                {"role": "user", "content": "visible backlog before ignored turn " + "v" * 200},
-                {"role": "user", "content": "SECRET ignored turn"},
-                {"role": "assistant", "content": dependent_reply},
-            ],
+            first_messages,
             current_tokens=10_000,
         )
         assert dependent_reply in "\n".join(str(msg.get("content", "")) for msg in first_result)
@@ -8433,13 +8475,15 @@ class TestMessageFiltering:
             return "visible summary\n[Expand for details: visible]", 1
 
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        messages = [
+            {"role": "assistant", "content": "SECRET ignored assistant output"},
+            {"role": "assistant", "content": "assistant continuation derived from SECRET"},
+            {"role": "user", "content": "visible backlog " + "v" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(messages[2])
         engine.compress(
-            [
-                {"role": "assistant", "content": "SECRET ignored assistant output"},
-                {"role": "assistant", "content": "assistant continuation derived from SECRET"},
-                {"role": "user", "content": "visible backlog " + "v" * 200},
-                {"role": "assistant", "content": "fresh tail response"},
-            ],
+            messages,
             current_tokens=10_000,
         )
 
@@ -8608,16 +8652,19 @@ class TestMessageFiltering:
             return "visible summary\n[Expand for details: visible summary]", 1
 
         monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+        first_messages = [
+            {"role": "user", "content": "visible backlog before secret " + "v" * 200},
+            {"role": "user", "content": "SECRET ignored turn before fresh tail"},
+            {"role": "assistant", "content": "dependent assistant reply that must not summarize later"},
+            {"role": "user", "content": "fresh tail request"},
+        ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(first_messages[0])
         first_result = engine.compress(
-            [
-                {"role": "user", "content": "visible backlog before secret " + "v" * 200},
-                {"role": "user", "content": "SECRET ignored turn before fresh tail"},
-                {"role": "assistant", "content": "dependent assistant reply that must not summarize later"},
-                {"role": "user", "content": "fresh tail request"},
-            ],
+            first_messages,
             current_tokens=10_000,
         )
 
+        engine._config.leaf_chunk_tokens = count_message_tokens(first_messages[2])
         engine.compress(
             first_result + [{"role": "assistant", "content": "new fresh assistant response"}],
             current_tokens=10_000,
@@ -9398,6 +9445,7 @@ class TestMessageFiltering:
             {"role": "user", "content": "visible backlog objective " + "y" * 200},
             {"role": "user", "content": "SECRET ignored fresh tail must not become focus"},
         ]
+        engine._config.leaf_chunk_tokens = count_message_tokens(messages[0])
 
         engine.compress(messages, current_tokens=count_messages_tokens(messages))
 
@@ -11306,7 +11354,8 @@ class TestEngineCompress:
             token_pairs.append((last_pressure_tokens, count_messages_tokens(candidate_raw)))
             return candidate_raw[:1]
 
-        def fake_summary(chunk, focus_topic=None):
+        def fake_summary(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
             return chunk, count_messages_tokens(chunk), "Window summary.\nExpand for details about: current window", 1, 0
 
         monkeypatch.setattr(engine, "_working_leaf_chunk_tokens", record_working_leaf_chunk_tokens)
@@ -11393,6 +11442,122 @@ class TestEngineCompress:
 
         assert call_count == 1
         assert engine._dag.get_session_nodes("test-session") == []
+
+    def test_deferred_leaf_rescue_caps_pre_compaction_extraction(self, engine, monkeypatch):
+        engine._config.summary_timeout_ms = 100_000
+        engine._config.fresh_tail_count = 1
+        engine._config.leaf_chunk_tokens = 800
+        engine._config.dynamic_leaf_chunk_enabled = True
+        engine._config.dynamic_leaf_chunk_max = 800
+        engine._config.deferred_maintenance_enabled = True
+        engine._config.deferred_maintenance_max_passes = 2
+        engine._config.critical_budget_pressure_ratio = 0.90
+        engine._config.extraction_enabled = True
+        engine.on_session_start("deadline-debt-session", platform="cli", context_length=100)
+        engine._lifecycle.record_debt(
+            engine._conversation_id,
+            kind="raw_backlog",
+            size_estimate=1_000,
+        )
+
+        messages = [{"role": "system", "content": "system"}] + [
+            {"role": "user", "content": f"old-{index} " + ("chunk " * 250)}
+            for index in range(3)
+        ] + [{"role": "user", "content": "fresh tail"}]
+        candidate_raw = messages[1:-1]
+        initial_chunk = engine._select_oldest_leaf_chunk(candidate_raw, 800)
+        assert len(initial_chunk) == 2
+
+        now = [0.0]
+        extraction_timeouts: list[float | None] = []
+        summary_deadlines: list[float | None] = []
+        summary_timeouts: list[float] = []
+
+        def capture_extraction(_chunk, timeout_seconds=None):
+            extraction_timeouts.append(timeout_seconds)
+            if len(extraction_timeouts) == 1:
+                now[0] = 20.0
+
+        def flaky_summary(**kwargs):
+            summary_deadlines.append(kwargs.get("deadline"))
+            summary_timeouts.append(kwargs["timeout"])
+            if len(summary_timeouts) == 1:
+                now[0] = 40.0
+                raise RuntimeError("context length exceeded")
+            return "shared deadline summary", 1
+
+        import hermes_lcm.compaction as compaction_module
+
+        monkeypatch.setattr(compaction_module.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(engine, "_run_pre_compaction_extraction", capture_extraction)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", flaky_summary)
+
+        compressed = engine.compress(messages, current_tokens=90)
+
+        assert compressed
+        assert extraction_timeouts == pytest.approx([5.0, 5.0])
+        assert summary_deadlines == pytest.approx([100.0, 100.0, 100.0])
+        assert summary_timeouts == pytest.approx([80.0, 60.0, 60.0])
+        assert len(engine._dag.get_session_nodes("deadline-debt-session", depth=0)) == 2
+
+    def test_non_threshold_follow_on_condensation_uses_compaction_deadline(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            fresh_tail_count=1,
+            dynamic_leaf_chunk_enabled=False,
+            threshold_full_sweep_enabled=False,
+            condensation_fanin=2,
+            incremental_max_depth=1,
+            cache_friendly_condensation_enabled=False,
+            extraction_enabled=False,
+            summary_timeout_ms=100_000,
+            summary_model="primary-model",
+            summary_fallback_models=[],
+            database_path=str(tmp_path / "lcm_non_threshold_condensation_deadline.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="earlier leaf summary",
+                token_count=40,
+                source_token_count=80,
+                source_ids=[],
+                source_type="messages",
+                created_at=1.0,
+            )
+        )
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "new leaf source " + ("detail " * 80)},
+            {"role": "assistant", "content": "fresh tail"},
+        ]
+        instance._config.leaf_chunk_tokens = count_message_tokens(messages[1])
+        now = [0.0]
+        provider_calls: list[str] = []
+
+        def provider(prompt, max_tokens, model="", timeout=None):
+            del prompt, max_tokens, timeout
+            provider_calls.append(model)
+            if len(provider_calls) == 1:
+                now[0] = 100.0
+            return "provider leaf summary"
+
+        import hermes_lcm.compaction as compaction_module
+        import hermes_lcm.escalation as escalation_module
+
+        monkeypatch.setattr(compaction_module.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(escalation_module, "_call_llm_for_summary", provider)
+        try:
+            instance.compress(messages)
+
+            assert provider_calls == ["primary-model"]
+            assert len(instance._dag.get_session_nodes("test-session", depth=1)) == 1
+        finally:
+            instance.shutdown()
 
     def test_threshold_full_sweep_drains_chunked_prefix_and_publishes_once(self, tmp_path, monkeypatch):
         config = LCMConfig(
@@ -11611,7 +11776,7 @@ class TestEngineCompress:
     def test_threshold_full_sweep_publishes_persisted_progress_after_later_leaf_error(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,
-            leaf_chunk_tokens=1,
+            leaf_chunk_tokens=80,
             threshold_full_sweep_enabled=True,
             database_path=str(tmp_path / "lcm_threshold_sweep_partial.db"),
         )
@@ -11657,12 +11822,14 @@ class TestEngineCompress:
         instance = LCMEngine(config=config)
         instance._session_id = "test-session"
         observed_timeout = None
+        observed_deadline = None
 
         import hermes_lcm.engine as engine_module
 
         def capture_timeout(**kwargs):
-            nonlocal observed_timeout
+            nonlocal observed_deadline, observed_timeout
             observed_timeout = kwargs["timeout"]
+            observed_deadline = kwargs.get("deadline")
             return "bounded summary", 1
 
         monkeypatch.setattr(engine_module.time, "monotonic", lambda: 10.0)
@@ -11673,6 +11840,188 @@ class TestEngineCompress:
                 deadline=110.0,
             )
             assert observed_timeout == 100.0
+            assert observed_deadline == 110.0
+        finally:
+            instance.shutdown()
+
+    def test_leaf_summary_cancelled_after_provider_return_does_not_publish_node(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            database_path=str(tmp_path / "lcm_cancelled_leaf_summary.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        cancelled = {"value": False}
+        calls = 0
+
+        def cancelled_check():
+            return cancelled["value"]
+
+        def mock_summary(**kwargs):
+            del kwargs
+            nonlocal calls
+            calls += 1
+            cancelled["value"] = True
+            return "late leaf summary", 1
+
+        monkeypatch.setattr(instance, "_compression_cancelled_check", cancelled_check)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+        try:
+            messages = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "old source " + ("detail " * 20)},
+                {"role": "user", "content": "fresh request"},
+                {"role": "assistant", "content": "fresh answer"},
+            ]
+
+            result = instance.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            assert calls == 1
+            assert result == messages
+            assert instance._dag.get_session_nodes("test-session") == []
+            assert instance.last_compression_status == "noop"
+            assert instance.last_compression_noop_reason == "compression cancelled by host"
+        finally:
+            instance.shutdown()
+
+    def test_condensation_cancelled_after_provider_return_does_not_publish_parent(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            condensation_fanin=2,
+            incremental_max_depth=1,
+            database_path=str(tmp_path / "lcm_cancelled_condensation.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        cancelled = {"value": False}
+        calls = 0
+        for index in range(2):
+            instance._dag.add_node(
+                SummaryNode(
+                    session_id="test-session",
+                    depth=0,
+                    summary=f"leaf {index}",
+                    token_count=100,
+                    source_token_count=200,
+                    source_ids=[],
+                    source_type="messages",
+                    created_at=float(index),
+                )
+            )
+
+        def cancelled_check():
+            return cancelled["value"]
+
+        def mock_summary(**kwargs):
+            del kwargs
+            nonlocal calls
+            calls += 1
+            cancelled["value"] = True
+            return "late parent summary", 1
+
+        monkeypatch.setattr(instance, "_compression_cancelled_check", cancelled_check)
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+        try:
+            instance._maybe_condense()
+
+            assert calls == 1
+            assert instance._dag.get_session_nodes("test-session", depth=1) == []
+        finally:
+            instance.shutdown()
+
+    def test_threshold_full_sweep_uses_earlier_compaction_deadline(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1_000,
+            threshold_full_sweep_enabled=True,
+            summary_prefix_target_tokens=10_000,
+            summary_timeout_ms=30_000,
+            database_path=str(tmp_path / "lcm_threshold_sweep_earlier_deadline.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old raw " + ("detail " * 40)},
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": "fresh answer"},
+        ]
+        observed_deadlines: list[float | None] = []
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic
+            observed_deadlines.append(deadline)
+            return chunk, count_messages_tokens(chunk), "bounded leaf summary", 1, 0
+
+        import hermes_lcm.compaction as compaction_module
+
+        monkeypatch.setattr(compaction_module.time, "monotonic", lambda: 10.0)
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            assert observed_deadlines == [40.0]
+        finally:
+            instance.shutdown()
+
+    def test_oversized_singleton_uses_lossless_l3_without_calling_llm(self, tmp_path, monkeypatch):
+        from hermes_lcm.escalation import _L3_TRUNCATION_MARKER
+
+        config = LCMConfig(
+            fresh_tail_count=1,
+            leaf_chunk_tokens=100,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=100,
+            l3_truncate_tokens=80,
+            database_path=str(tmp_path / "lcm_oversized_singleton.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.context_length = 200_000
+        instance.threshold_tokens = int(200_000 * config.context_threshold)
+        raw_content = "oversized singleton raw evidence " * 700
+        raw_message = {"role": "user", "content": raw_content}
+        messages = [
+            {"role": "system", "content": "system"},
+            raw_message,
+            {"role": "user", "content": "fresh tail"},
+        ]
+
+        instance._ingest_messages(messages)
+        raw_before = next(
+            row
+            for row in instance._store.get_session_messages("test-session")
+            if row["content"] == raw_content
+        )
+
+        def fail_if_summarized(**_kwargs):
+            pytest.fail("oversized singleton must skip summarize_with_escalation")
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_if_summarized)
+        try:
+            compressed = instance.compress(messages)
+            nodes = instance._dag.get_session_nodes("test-session", depth=0)
+
+            assert compressed
+            assert len(nodes) == 1
+            node = nodes[0]
+            assert _L3_TRUNCATION_MARKER.strip() in node.summary
+            assert node.source_ids == [raw_before["store_id"]]
+            assert node.source_type == "messages"
+            assert node.source_token_count == count_message_tokens(raw_message)
+            assert instance._store.get(raw_before["store_id"]) == raw_before
+
+            expanded = json.loads(
+                lcm_tools.lcm_expand(
+                    {"node_id": node.node_id, "max_tokens": 100_000},
+                    engine=instance,
+                )
+            )
+            assert expanded["expanded"][0]["content"] == raw_content
         finally:
             instance.shutdown()
 

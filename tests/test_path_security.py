@@ -48,7 +48,7 @@ def test_configured_externalization_path_inside_allowed_base_accepted():
 
             path = get_large_output_storage_dir(FakeConfig(), "", create=False)
             assert path.is_absolute()
-            assert str(path).startswith(tmpdir)
+            assert str(path.resolve()).startswith(str(Path(tmpdir).resolve()))
         finally:
             del os.environ["LCM_HERMES_BASE_DIR"]
 

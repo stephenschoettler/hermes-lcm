@@ -58,9 +58,19 @@ def _replace_with_header_only_sqlite_db(e: LCMEngine) -> Path:
     return db_path
 
 
-def test_lcm_engine_declares_automatic_compaction_silent(engine):
-    assert engine.emit_automatic_compaction_status is False
+def test_lcm_engine_emits_automatic_compaction_status_by_default(engine):
+    # Interactive surfaces (desktop/TUI) show a "Summarizing…" indicator from
+    # the lifecycle status, so automatic compaction emits it by default.
+    assert engine.emit_automatic_compaction_status is True
     assert engine.quiet_mode is True
+
+
+def test_lcm_engine_automatic_compaction_status_env_opt_out(tmp_path, monkeypatch):
+    monkeypatch.setenv("LCM_EMIT_AUTOMATIC_COMPACTION_STATUS", "0")
+    config = LCMConfig()
+    config.database_path = str(tmp_path / "lcm_test.db")
+    e = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes_home"))
+    assert e.emit_automatic_compaction_status is False
 
 
 def test_lcm_status_default_reports_current_session(engine):

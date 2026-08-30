@@ -22,7 +22,7 @@ def test_path_containment_within_allowed_base(monkeypatch):
         # Should succeed without raising
         path = _state_db_path_for_engine(engine)
         assert path.is_absolute()
-        assert str(path).startswith(tmpdir)
+        assert str(path.resolve()).startswith(str(Path(tmpdir).resolve()))
 
 
 def test_path_containment_outside_allowed_base(monkeypatch):

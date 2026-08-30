@@ -401,6 +401,51 @@ class TestProviderPrefixedAuxiliaryCalls:
         assert level == 1
         assert calls == ["primary-model", "fallback-model"]
 
+    def test_summary_deadline_shrinks_across_routes_and_levels_then_uses_l3(self, monkeypatch):
+        from hermes_lcm import escalation
+        from hermes_lcm.escalation import _L3_TRUNCATION_MARKER
+
+        now = [0.0]
+        calls: list[tuple[str, float | None]] = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            del prompt, max_tokens
+            calls.append((model, timeout))
+            if len(calls) == 1:
+                now[0] = 30.0
+            elif len(calls) == 2:
+                now[0] = 70.0
+            elif len(calls) == 3:
+                now[0] = 100.0
+            else:
+                pytest.fail("provider call started after the shared deadline")
+            return None
+
+        monkeypatch.setattr(escalation.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(escalation, "_call_llm_for_summary", fake_summary_call)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 200,
+            source_tokens=400,
+            token_budget=100,
+            model="primary-model",
+            fallback_models=["fallback-model"],
+            timeout=100.0,
+            deadline=100.0,
+            l3_truncate_tokens=40,
+        )
+
+        assert level == 3
+        assert _L3_TRUNCATION_MARKER.strip() in summary
+        assert [model for model, _timeout in calls] == [
+            "primary-model",
+            "fallback-model",
+            "primary-model",
+        ]
+        assert [timeout for _model, timeout in calls] == pytest.approx(
+            [100.0, 70.0, 30.0]
+        )
+
 
     def test_summary_circuit_breaker_skips_temporarily_open_route(self, monkeypatch):
         from hermes_lcm import escalation
@@ -4391,6 +4436,17 @@ class TestEscalation:
         l2 = _build_l2_prompt("test", 500, custom_instructions="")
         assert "Additional instructions:" not in l1
         assert "Additional instructions:" not in l2
+
+    def test_summary_prompts_preserve_direct_user_authority(self):
+        from hermes_lcm.escalation import _build_l1_prompt, _build_l2_prompt
+
+        for prompt in (
+            _build_l1_prompt("test", 500, depth=0),
+            _build_l2_prompt("test", 500),
+        ):
+            assert "user-authored directives, corrections, constraints, and approvals" in prompt
+            assert "Quote the user's exact wording" in prompt
+            assert "Never turn assistant proposals into user decisions" in prompt
 
 
 class TestAssemblyBudgetSelection:
