@@ -766,9 +766,12 @@ Hermes host discovery/status mismatch, not an LCM storage or compaction failure.
 
 ### `/lcm status` looks unbound after restart
 
-After a fresh Hermes restart, `/lcm status` may show `session_id: (unbound)` or
-`threshold_tokens: (uninitialized)`. Send one normal Hermes message first, then
-run `lcm_status` or `/lcm status` again for live per-session fields.
+Compatible Hermes gateway hosts expose task-local lane metadata while
+dispatching `/lcm`. Once that lane has constructed an agent, `/lcm status`
+resolves the same active LCM runtime as `lcm_status`, including its foreground
+view while an ignored or stateless side channel is bound. Before the first
+normal message constructs an agent, or in a genuinely sessionless process,
+`session_id: (unbound)` and `threshold_tokens: (uninitialized)` remain expected.
 
 ## Architecture
 

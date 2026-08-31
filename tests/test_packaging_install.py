@@ -86,6 +86,54 @@ def _register_plugin_engine(module_name: str):
     return ctx.engine
 
 
+def _register_plugin_with_command(
+    monkeypatch,
+    tmp_path,
+    module_name: str,
+    session_values: dict[str, str],
+):
+    """Register the plugin against a host-shaped slash-command context."""
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    fake_session_context = types.SimpleNamespace(
+        get_session_env=lambda name, default="": session_values.get(name, default)
+    )
+    fake_gateway = types.SimpleNamespace(session_context=fake_session_context)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway)
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_session_context)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / module_name))
+    monkeypatch.setenv("LCM_ENABLE_SLASH_COMMAND", "1")
+
+    module = _load_plugin_entrypoint_module(module_name)
+
+    class _Ctx:
+        def __init__(self):
+            self.engine = None
+            self.commands = {}
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+        def register_command(self, name, handler, description=""):
+            self.commands[name] = handler
+
+    ctx = _Ctx()
+    module.register(ctx)
+    return ctx
+
+
+def _slash_status_fields(text: str) -> dict[str, str]:
+    return {
+        key.strip(): value.strip()
+        for line in text.splitlines()
+        if ":" in line
+        for key, value in [line.split(":", 1)]
+    }
+
+
 def test_standalone_install_scripts_exist_and_are_shell_scripts():
     repo_root = Path(__file__).resolve().parent.parent
 
@@ -1254,6 +1302,95 @@ def test_registered_tool_handler_forwards_messages_to_engine_handle_tool_call(mo
         assert kwargs["messages"] == test_messages, f"{name}: messages content mismatch"
 
 
+def test_slash_status_matches_active_tool_clone_after_rebind_and_side_channel(
+    monkeypatch,
+    tmp_path,
+):
+    session_values = {
+        "HERMES_SESSION_KEY": "agent:main:discord:dm:42",
+    }
+    monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "side-channel")
+    ctx = _register_plugin_with_command(
+        monkeypatch,
+        tmp_path,
+        "hermes_lcm_slash_active_clone",
+        session_values,
+    )
+    prototype = ctx.engine
+    clone = prototype.clone_for_agent()
+    try:
+        clone.update_model("gpt-active", 372000, provider="openai-codex")
+        clone.on_session_start(
+            "discord-session-a",
+            platform="discord",
+            conversation_id="agent:main:discord:dm:42",
+        )
+
+        tool_status = json.loads(clone.handle_tool_call("lcm_status", {}))
+        slash_status = _slash_status_fields(ctx.commands["lcm"]("status"))
+        assert slash_status["session_id"] == tool_status["session_id"]
+        assert (
+            slash_status["conversation_id"]
+            == tool_status["runtime_identity"]["conversation_id"]
+        )
+        assert slash_status["model"] == tool_status["model"]
+        assert slash_status["provider"] == tool_status["provider"]
+        assert int(slash_status["context_length"]) == tool_status["context_length"]
+        assert int(slash_status["threshold_tokens"]) == tool_status["threshold_tokens"]
+        assert prototype.current_session_id == ""
+
+        clone.on_session_start(
+            "discord-session-b",
+            platform="discord",
+            conversation_id="agent:main:discord:dm:84",
+        )
+        session_values.update({
+            "HERMES_SESSION_KEY": "agent:main:discord:dm:84",
+        })
+        rebound = _slash_status_fields(ctx.commands["lcm"]("status"))
+        assert rebound["session_id"] == "discord-session-b"
+        assert rebound["conversation_id"] == "agent:main:discord:dm:84"
+
+        clone.on_session_start(
+            "side-channel",
+            platform="cron",
+            conversation_id="agent:main:cron:tick:1",
+        )
+        assert clone.bound_session_id == "side-channel"
+        assert clone.current_session_id == "discord-session-b"
+        side_channel = _slash_status_fields(ctx.commands["lcm"]("status"))
+        assert side_channel["session_id"] == "discord-session-b"
+        assert side_channel["conversation_id"] == "agent:main:discord:dm:84"
+        assert side_channel["side_channel_active"] == "yes"
+    finally:
+        clone.shutdown()
+        prototype.shutdown()
+
+
+def test_slash_status_stays_unbound_until_lane_has_an_active_runtime(
+    monkeypatch,
+    tmp_path,
+):
+    session_values = {
+        "HERMES_SESSION_KEY": "agent:main:discord:dm:42",
+    }
+    ctx = _register_plugin_with_command(
+        monkeypatch,
+        tmp_path,
+        "hermes_lcm_slash_host_context",
+        session_values,
+    )
+    try:
+        cold = _slash_status_fields(ctx.commands["lcm"]("status"))
+        assert cold["session_id"] == "(unbound)"
+        assert cold["model"] == "(uninitialized)"
+        assert cold["context_length"] == "(uninitialized)"
+        assert cold["threshold_tokens"] == "(uninitialized)"
+        assert ctx.engine.current_session_id == ""
+    finally:
+        ctx.engine.shutdown()
+
+
 def test_post_llm_hook_resolves_registered_active_clone_without_host_context_compressor(monkeypatch, tmp_path):
     module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_registered_clone")
     manager = types.SimpleNamespace(_hooks={})
@@ -1307,6 +1444,60 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
     assert active_clone.current_session_id == "discord-session"
     assert active_clone.current_conversation_id == "agent:main:discord:thread:t:t"
     assert ctx.engine.current_session_id == ""
+    active_clone.shutdown()
+    ctx.engine.shutdown()
+
+
+def test_post_llm_hook_does_not_foreground_match_side_channel_clone(monkeypatch, tmp_path):
+    module = _load_plugin_entrypoint_module("hermes_lcm_post_hook_side_channel_clone")
+    manager = types.SimpleNamespace(_hooks={})
+    fake_plugins = types.SimpleNamespace(get_plugin_manager=lambda: manager)
+    fake_hermes_cli = types.SimpleNamespace(plugins=fake_plugins)
+    monkeypatch.setitem(sys.modules, "hermes_cli", fake_hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.plugins", fake_plugins)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+    monkeypatch.setenv("LCM_STATELESS_SESSION_PATTERNS", "side-channel")
+
+    class _CtxNoTool:
+        def __init__(self):
+            self.engine = None
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+
+    ctx = _CtxNoTool()
+    module.register(ctx)
+    assert ctx.engine is not None
+    active_clone = ctx.engine.clone_for_agent()
+    active_clone.on_session_start(
+        "foreground-session",
+        platform="discord",
+        conversation_id="agent:main:discord:dm:42",
+    )
+    active_clone.on_session_start(
+        "side-channel",
+        platform="cron",
+        conversation_id="agent:main:cron:tick:1",
+    )
+    assert active_clone.bound_session_id == "side-channel"
+    assert active_clone.current_session_id == "foreground-session"
+
+    clone_ingests = []
+    singleton_ingests = []
+    monkeypatch.setattr(active_clone, "ingest", lambda messages: clone_ingests.append(list(messages)))
+    monkeypatch.setattr(ctx.engine, "ingest", lambda messages: singleton_ingests.append(list(messages)))
+    history = [{"role": "user", "content": "foreground turn"}]
+
+    manager._hooks["post_llm_call"][-1](
+        session_id="foreground-session",
+        conversation_id="agent:main:discord:dm:42",
+        platform="discord",
+        conversation_history=history,
+    )
+
+    assert active_clone.bound_session_id == "side-channel"
+    assert clone_ingests == []
+    assert singleton_ingests == [history]
     active_clone.shutdown()
     ctx.engine.shutdown()
 
