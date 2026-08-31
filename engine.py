@@ -1686,6 +1686,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             attempt_number += 1
             source_tokens = count_messages_tokens(attempt_chunk)
             serialized = self._serialize_messages(attempt_chunk)
+            source_store_ids = sorted(dict.fromkeys(
+                self._get_store_ids_for_messages(attempt_chunk)
+            ))
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)
 
@@ -1710,6 +1713,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     l3_truncate_tokens=self._config.l3_truncate_tokens,
                     focus_topic=focus_topic or "",
                     custom_instructions=self._config.custom_instructions,
+                    source_provenance={
+                        "source_type": "messages",
+                        "session_id": self._session_id,
+                        "store_ids": source_store_ids,
+                        "message_count": len(attempt_chunk),
+                    },
                 )
                 return attempt_chunk, source_tokens, summary_text, level, attempt_number
             except Exception as exc:
@@ -5647,6 +5656,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             l3_truncate_tokens=self._config.l3_truncate_tokens,
             focus_topic=focus_topic or "",
             custom_instructions=self._config.custom_instructions,
+            source_provenance={
+                "source_type": "summary_nodes",
+                "session_id": self._session_id,
+                "node_ids": [node.node_id for node in nodes],
+                "source_depth": depth,
+            },
         )
         earliest_at, latest_at = self._dag.get_source_time_window(
             [node.node_id for node in nodes]

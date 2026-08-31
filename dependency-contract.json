@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "contract_version": "1.0.0",
+  "boundary": "host-owned",
+  "description": "Hermes-LCM is a source-installed Hermes Agent plugin. Hermes Agent owns the Python environment and dependency resolution; the plugin declares the host and optional feature imports it consumes without creating a second package installer or lock.",
+  "ownership": {
+    "dependency_resolver": "Hermes Agent host environment",
+    "update_owner": "Hermes-LCM maintainers",
+    "update_trigger": "Review and increment this contract when a scanned runtime import, supported Python or Hermes Agent version, or required imported API changes."
+  },
+  "supported_versions": {
+    "python": [
+      "3.11",
+      "3.12",
+      "3.13",
+      "3.14"
+    ],
+    "hermes_agent": ">=0.16,<1",
+    "optional_dependency_policy": "The supported version is the version resolved by a supported Hermes Agent host when the listed imported API is present. Hermes-LCM does not independently pin or install optional packages."
+  },
+  "runtime_scan": {
+    "globs": [
+      "*.py",
+      "benchmarking/**/*.py",
+      "scripts/**/*.py"
+    ],
+    "local_imports": [
+      "hermes_lcm"
+    ],
+    "excluded": [
+      "tests/**",
+      "benchmarks/**"
+    ]
+  },
+  "external_imports": {
+    "agent": {
+      "distribution": "hermes-agent",
+      "availability": "required",
+      "scope": "plugin-runtime",
+      "version_policy": "Hermes Agent >=0.16,<1",
+      "imported_api": [
+        "agent.context_engine.ContextEngine",
+        "agent.auxiliary_client",
+        "agent.context_compressor"
+      ]
+    },
+    "fastembed": {
+      "distribution": "fastembed",
+      "availability": "optional",
+      "scope": "fastembed embedding provider",
+      "version_policy": "host-resolved; supported when fastembed.TextEmbedding accepts model_name, cache_dir, and local_files_only",
+      "imported_api": [
+        "fastembed.TextEmbedding"
+      ]
+    },
+    "gateway": {
+      "distribution": "hermes-agent",
+      "availability": "optional",
+      "scope": "task-local slash-command session metadata",
+      "version_policy": "Hermes Agent >=0.16,<1; falls back to environment metadata when the module is absent",
+      "imported_api": [
+        "gateway.session_context.get_session_env"
+      ]
+    },
+    "hermes_cli": {
+      "distribution": "hermes-agent",
+      "availability": "optional",
+      "scope": "host home, provider routing, and plugin hook integration",
+      "version_policy": "Hermes Agent >=0.16,<1; each compatibility path has an explicit fallback",
+      "imported_api": [
+        "hermes_cli.auth.PROVIDER_REGISTRY",
+        "hermes_cli.config.get_hermes_home",
+        "hermes_cli.plugins.get_plugin_manager",
+        "hermes_cli.runtime_provider._get_named_custom_provider"
+      ]
+    },
+    "huggingface_hub": {
+      "distribution": "huggingface-hub",
+      "availability": "optional",
+      "scope": "LongMemEval dataset fetch command only",
+      "version_policy": "host-resolved; supported when huggingface_hub.hf_hub_download accepts repo_id, filename, repo_type, revision, and local_dir",
+      "imported_api": [
+        "huggingface_hub.hf_hub_download"
+      ]
+    },
+    "numpy": {
+      "distribution": "numpy",
+      "availability": "optional",
+      "scope": "vector acceleration with pure-Python fallback",
+      "version_policy": "host-resolved; supported when numpy provides frombuffer, zeros, asarray, argpartition, and packbits",
+      "imported_api": [
+        "numpy.frombuffer",
+        "numpy.zeros",
+        "numpy.asarray",
+        "numpy.argpartition",
+        "numpy.packbits"
+      ]
+    },
+    "regex": {
+      "distribution": "regex",
+      "availability": "optional",
+      "scope": "bounded regular-expression matching",
+      "version_policy": "host-resolved; supported when compiled Pattern.search accepts timeout",
+      "imported_api": [
+        "regex.compile",
+        "regex.Pattern.search(timeout=...)"
+      ]
+    },
+    "tiktoken": {
+      "distribution": "tiktoken",
+      "availability": "optional",
+      "scope": "token counting with character-estimate fallback",
+      "version_policy": "host-resolved; supported when tiktoken.get_encoding('cl100k_base') is available",
+      "imported_api": [
+        "tiktoken.get_encoding"
+      ]
+    },
+    "yaml": {
+      "distribution": "PyYAML",
+      "availability": "optional",
+      "scope": "YAML configuration and benchmark policies",
+      "version_policy": "host-resolved; supported when yaml.safe_load and yaml.safe_dump are available",
+      "imported_api": [
+        "yaml.safe_load",
+        "yaml.safe_dump"
+      ]
+    }
+  },
+  "evidence": {
+    "python_ci_matrix": ".github/workflows/ci.yml",
+    "operator_contract": "docs/dependency-assurance.md",
+    "validator": "scripts/validate_dependency_contract.py",
+    "validation_command": "python scripts/validate_dependency_contract.py --report-environment"
+  }
+}

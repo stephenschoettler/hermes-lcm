@@ -10,9 +10,44 @@ formatting, and the store/dag/lifecycle connection handling lives in one place.
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any
+
+
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
+    for artifact in (
+        db_path,
+        *(db_path.with_name(db_path.name + suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES),
+    ):
+        try:
+            artifact.chmod(0o600)
+        except FileNotFoundError:
+            continue
+
+
+def _prepare_private_backup_directory(path: Path) -> None:
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    path.chmod(0o700)
+
+
+def _prepare_private_sqlite_file(path: Path) -> None:
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # pragma: no cover - Windows fallback
+            path.chmod(0o600)
+    finally:
+        os.close(fd)
+    _restrict_existing_sqlite_artifacts(path)
 
 
 def flush_engine_connections(engine) -> None:
@@ -52,7 +87,8 @@ def backup_database(engine) -> dict[str, Any]:
     backup_path = backup_dir / f"{db_path.stem}-{timestamp}.sqlite3"
 
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        _prepare_private_backup_directory(backup_dir)
+        _prepare_private_sqlite_file(backup_path)
         flush_engine_connections(engine)
 
         dest = sqlite3.connect(str(backup_path))
@@ -60,6 +96,7 @@ def backup_database(engine) -> dict[str, Any]:
             engine._store.backup(dest)
         finally:
             dest.close()
+        _restrict_existing_sqlite_artifacts(backup_path)
     except (OSError, sqlite3.Error) as exc:
         return {
             "ok": False,
@@ -96,18 +133,22 @@ def rotate_backup_database(engine) -> dict[str, Any]:
     tmp_path = backup_path.with_name(backup_path.name + ".tmp")
 
     try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        _prepare_private_backup_directory(backup_dir)
+        _restrict_existing_sqlite_artifacts(backup_path)
         flush_engine_connections(engine)
 
         if tmp_path.exists():
             tmp_path.unlink()
+        _prepare_private_sqlite_file(tmp_path)
         dest = sqlite3.connect(str(tmp_path))
         try:
             engine._store.backup(dest)
         finally:
             dest.close()
+        _restrict_existing_sqlite_artifacts(tmp_path)
         # Atomic replace so the rolling slot is never half-written.
         tmp_path.replace(backup_path)
+        _restrict_existing_sqlite_artifacts(backup_path)
     except (OSError, sqlite3.Error) as exc:
         # Best-effort cleanup of the tmp file if something failed midway.
         try:
