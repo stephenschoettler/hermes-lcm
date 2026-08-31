@@ -257,6 +257,44 @@ def test_reassignment_preserves_content_and_atomic_replacement(payload_store):
     assert list(storage_dir.glob("*.tmp")) == []
 
 
+def test_reassignment_post_read_store_directory_swap_does_not_escape(payload_store, tmp_path, monkeypatch):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "reassign.json"
+    original = _write_payload(payload_path)
+    held_storage_dir = tmp_path / "held-externalized"
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_path = outside_dir / payload_path.name
+    _write_payload(outside_path, session_id="outside-session", content="outside sentinel")
+    outside_bytes = outside_path.read_bytes()
+    real_replace = externalize_module._replace_externalized_payload
+    swapped = False
+
+    def swapping_replace(path, payload, *args, **kwargs):
+        nonlocal swapped
+        assert path == payload_path
+        storage_dir.rename(held_storage_dir)
+        storage_dir.symlink_to(outside_dir, target_is_directory=True)
+        swapped = True
+        return real_replace(path, payload, *args, **kwargs)
+
+    monkeypatch.setattr(externalize_module, "_replace_externalized_payload", swapping_replace)
+
+    moved = reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    )
+
+    assert swapped is True
+    assert outside_path.read_bytes() == outside_bytes
+    held_payload = json.loads((held_storage_dir / payload_path.name).read_text(encoding="utf-8"))
+    assert moved in {0, 1}
+    assert held_payload["session_id"] == ("new-session" if moved == 1 else original["session_id"])
+    assert held_payload["content"] == original["content"]
+    assert list(held_storage_dir.glob("*.tmp")) == []
+
+
 def test_reassignment_reader_rejects_symlink(payload_store, tmp_path):
     storage_dir, config = payload_store
     outside_path = tmp_path / "outside-reassign.json"
