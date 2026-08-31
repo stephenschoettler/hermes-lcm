@@ -88,8 +88,8 @@ def backup_database(engine) -> dict[str, Any]:
 
     try:
         _prepare_private_backup_directory(backup_dir)
-        _prepare_private_sqlite_file(backup_path)
         flush_engine_connections(engine)
+        _prepare_private_sqlite_file(backup_path)
 
         dest = sqlite3.connect(str(backup_path))
         try:

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_lcm.maintenance as maintenance_module
 from hermes_lcm.maintenance import backup_database, rotate_backup_database
 from hermes_lcm.store import MessageStore
 
@@ -84,12 +85,28 @@ def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path)
             store = MessageStore(db_path)
             try:
                 assert store.connection.execute("SELECT value FROM legacy").fetchone()[0] == "retained"
-                assert _mode(db_dir) == 0o700
+                assert _mode(db_dir) == 0o755
                 _assert_private_sqlite_artifacts(db_path)
             finally:
                 store.close()
     finally:
         existing.close()
+
+
+def test_message_store_preserves_sqlite_memory_sentinel_and_cwd_permissions(tmp_path, monkeypatch):
+    tmp_path.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+
+    store = MessageStore(":memory:")
+    try:
+        store.append("session", {"role": "user", "content": "memory-only"})
+        store.commit()
+        assert store.connection.execute("SELECT content FROM messages").fetchone()[0] == "memory-only"
+    finally:
+        store.close()
+
+    assert _mode(tmp_path) == 0o755
+    assert not (tmp_path / ":memory:").exists()
 
 
 def test_maintenance_creates_private_backups_and_tightens_existing_slot(tmp_path):
@@ -173,5 +190,30 @@ def test_rotate_backup_failure_preserves_existing_atomic_slot(tmp_path, monkeypa
         assert _mode(backup_dir) == 0o700
         assert _mode(rotate_path) == 0o600
         assert not rotate_path.with_name(rotate_path.name + ".tmp").exists()
+    finally:
+        store.close()
+
+
+def test_timestamped_backup_flush_failure_leaves_no_empty_artifact(tmp_path, monkeypatch):
+    db_path = tmp_path / "database" / "lcm.db"
+    store = MessageStore(db_path)
+    backup_dir = tmp_path / "backups"
+    engine = SimpleNamespace(
+        _store=store,
+        _dag=SimpleNamespace(_conn=store.connection),
+        _lifecycle=None,
+        backup_dir=lambda: backup_dir,
+    )
+
+    def fail_flush(_engine):
+        raise sqlite3.OperationalError("synthetic flush failure")
+
+    monkeypatch.setattr(maintenance_module, "flush_engine_connections", fail_flush)
+    try:
+        result = backup_database(engine)
+
+        assert result["ok"] is False
+        assert result["error"] == "synthetic flush failure"
+        assert list(backup_dir.glob("*.sqlite3")) == []
     finally:
         store.close()

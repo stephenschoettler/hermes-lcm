@@ -198,11 +198,34 @@ def _write_externalized_payload_at(name: str, payload: Dict[str, Any], *, dir_fd
             os.close(fd)
 
 
-def _replace_externalized_payload(path: Path, payload: Dict[str, Any], *, dir_fd: int | None = None) -> None:
+def _revalidate_payload_name(
+    name: str,
+    *,
+    dir_fd: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != expected_identity:
+        raise OSError("externalized payload directory entry changed before replacement")
+
+
+def _replace_externalized_payload(
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    dir_fd: int | None = None,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
     if dir_fd is not None:
         try:
             _write_externalized_payload_at(tmp_path.name, payload, dir_fd=dir_fd)
+            if expected_identity is not None:
+                _revalidate_payload_name(
+                    path.name,
+                    dir_fd=dir_fd,
+                    expected_identity=expected_identity,
+                )
             os.replace(tmp_path.name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             os.fsync(dir_fd)
         except (OSError, TypeError, NotImplementedError):
@@ -590,19 +613,18 @@ def _has_single_link(file_stat) -> bool:
     return getattr(file_stat, "st_nlink", 1) == 1
 
 
-def _read_legacy_externalized_payload_json_with_directory(
+def _open_legacy_externalized_payload(
     path: Path,
     *,
     storage_dir: Path,
-) -> tuple[Dict[str, Any], int] | None:
-    """Read one legacy sidecar through a bounded, directory-relative descriptor.
+) -> tuple[int, int, os.stat_result] | None:
+    """Open one legacy sidecar through verified directory-relative descriptors.
 
     The pre-open ``stat`` and post-open ``fstat`` identity check closes the
     regular-file-to-symlink replacement window even where ``O_NOFOLLOW`` is not
     available. Opening relative to the already verified directory descriptor
-    keeps the object lookup contained to the configured payload store. On
-    success, ownership of the verified directory descriptor passes to the
-    caller so descriptor-relative follow-up operations can remain contained.
+    keeps the object lookup contained to the configured payload store. The
+    caller owns both returned descriptors.
     """
     if path.parent != storage_dir or not path.name or Path(path.name).name != path.name:
         return None
@@ -628,8 +650,7 @@ def _read_legacy_externalized_payload_json_with_directory(
         ):
             return None
 
-        max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
-        if expected_payload.st_size < 0 or expected_payload.st_size > max_bytes:
+        if expected_payload.st_size < 0:
             return None
 
         payload_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -642,8 +663,35 @@ def _read_legacy_externalized_payload_json_with_directory(
             or not _same_owner(opened_payload, opened_dir)
             or not _has_single_link(opened_payload)
             or opened_payload.st_size < 0
-            or opened_payload.st_size > max_bytes
         ):
+            return None
+
+        result = (payload_fd, dir_fd, opened_payload)
+        payload_fd = -1
+        dir_fd = -1
+        return result
+    except (OSError, TypeError, NotImplementedError):
+        return None
+    finally:
+        if payload_fd >= 0:
+            os.close(payload_fd)
+        if dir_fd >= 0:
+            os.close(dir_fd)
+
+
+def _read_legacy_externalized_payload_json_with_directory(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> tuple[Dict[str, Any], int, os.stat_result] | None:
+    """Read one legacy sidecar fully, subject to the allocation ceiling."""
+    opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
+    if opened is None:
+        return None
+    payload_fd, dir_fd, opened_payload = opened
+    try:
+        max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
+        if opened_payload.st_size > max_bytes:
             return None
 
         with os.fdopen(payload_fd, "rb") as handle:
@@ -654,7 +702,7 @@ def _read_legacy_externalized_payload_json_with_directory(
         decoded = json.loads(raw.decode("utf-8"))
         if not isinstance(decoded, dict):
             return None
-        result = (decoded, dir_fd)
+        result = (decoded, dir_fd, opened_payload)
         dir_fd = -1
         return result
     except (OSError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError, NotImplementedError):
@@ -674,7 +722,7 @@ def _read_legacy_externalized_payload_json(
     opened = _read_legacy_externalized_payload_json_with_directory(path, storage_dir=storage_dir)
     if opened is None:
         return None
-    payload, dir_fd = opened
+    payload, dir_fd, _payload_stat = opened
     try:
         return payload
     finally:
@@ -1021,6 +1069,151 @@ def read_externalized_payload_search_prefix(
     }
 
 
+def _parse_externalized_payload_metadata_tail(raw: bytes) -> Dict[str, Any] | None:
+    """Decode the bounded metadata suffix emitted after ``content``."""
+    matches = list(re.finditer(rb',\s*"content_chars"\s*:', raw))
+    for match in reversed(matches):
+        try:
+            decoded = json.loads(b"{" + raw[match.start() + 1 :])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(decoded, dict):
+            return decoded
+    return None
+
+
+def _read_oversize_externalized_payload_metadata(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> Dict[str, Any] | None:
+    """Read only bounded header/tail metadata from an oversized sidecar."""
+    opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
+    if opened is None:
+        return None
+    payload_fd, dir_fd, payload_stat = opened
+    try:
+        max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
+        if payload_stat.st_size <= max_bytes:
+            return None
+        with os.fdopen(payload_fd, "rb") as handle:
+            payload_fd = -1
+            _prefix, fields, content_key_seen, prefix_truncated = (
+                _read_externalized_payload_metadata_prefix_from_handle(
+                    handle,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+            )
+            if not content_key_seen or prefix_truncated:
+                return None
+            handle.seek(max(0, payload_stat.st_size - _EXTERNALIZED_SEARCH_TAIL_BYTES))
+            tail = handle.read(_EXTERNALIZED_SEARCH_TAIL_BYTES)
+        suffix = _parse_externalized_payload_metadata_tail(tail)
+        if suffix is None:
+            return None
+        return {**fields, **suffix}
+    except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
+        return None
+    finally:
+        if payload_fd >= 0:
+            os.close(payload_fd)
+        os.close(dir_fd)
+
+
+def _replace_session_id_in_metadata_prefix(
+    prefix: str,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+) -> str | None:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'"session_id"\s*:\s*', prefix):
+        try:
+            value, end = decoder.raw_decode(prefix, match.end())
+        except json.JSONDecodeError:
+            continue
+        if value != old_session_id:
+            continue
+        replacement = json.dumps(new_session_id, ensure_ascii=False)
+        return prefix[: match.end()] + replacement + prefix[end:]
+    return None
+
+
+def _reassign_oversize_externalized_payload(
+    path: Path,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    storage_dir: Path,
+) -> bool:
+    """Rewrite only the bounded session-id prefix and stream the payload body."""
+    opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
+    if opened is None:
+        return False
+    payload_fd, dir_fd, payload_stat = opened
+    tmp_name = f"{path.name}.{time.time_ns():x}.tmp"
+    tmp_fd = -1
+    try:
+        max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
+        if payload_stat.st_size <= max_bytes:
+            return False
+        with os.fdopen(payload_fd, "rb") as source:
+            payload_fd = -1
+            prefix, fields, content_key_seen, prefix_truncated = (
+                _read_externalized_payload_metadata_prefix_from_handle(
+                    source,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+            )
+            if (
+                not content_key_seen
+                or prefix_truncated
+                or fields.get("session_id") != old_session_id
+            ):
+                return False
+            rewritten_prefix = _replace_session_id_in_metadata_prefix(
+                prefix,
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
+            )
+            if rewritten_prefix is None:
+                return False
+
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+            with os.fdopen(tmp_fd, "wb") as destination:
+                tmp_fd = -1
+                prefix_bytes = prefix.encode("utf-8")
+                destination.write(rewritten_prefix.encode("utf-8"))
+                source.seek(len(prefix_bytes))
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    destination.write(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+
+        _revalidate_payload_name(
+            path.name,
+            dir_fd=dir_fd,
+            expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
+        )
+        os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.fsync(dir_fd)
+        return True
+    except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
+        _unlink_partial_payload_at(tmp_name, dir_fd=dir_fd)
+        raise
+    finally:
+        if tmp_fd >= 0:
+            os.close(tmp_fd)
+        if payload_fd >= 0:
+            os.close(payload_fd)
+        os.close(dir_fd)
+
+
 def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, hermes_home: str = "") -> bool:
     if not ref or Path(ref).name != ref:
         return False
@@ -1029,6 +1222,8 @@ def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, he
         return False
     path = storage_dir / ref
     payload = _read_legacy_externalized_payload_json(path, storage_dir=storage_dir)
+    if payload is None:
+        payload = _read_oversize_externalized_payload_metadata(path, storage_dir=storage_dir)
     if payload is None:
         return False
     if payload.get("kind", "tool_result") != "tool_result":
@@ -1054,14 +1249,29 @@ def reassign_externalized_payloads(
     for path in storage_dir.glob("*.json"):
         opened = _read_legacy_externalized_payload_json_with_directory(path, storage_dir=storage_dir)
         if opened is None:
+            try:
+                if _reassign_oversize_externalized_payload(
+                    path,
+                    old_session_id=old_session_id,
+                    new_session_id=new_session_id,
+                    storage_dir=storage_dir,
+                ):
+                    moved += 1
+            except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError) as exc:
+                logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
             continue
-        payload, dir_fd = opened
+        payload, dir_fd, payload_stat = opened
         try:
             if (payload.get("session_id") or "") != old_session_id:
                 continue
             payload["session_id"] = new_session_id
             try:
-                _replace_externalized_payload(path, payload, dir_fd=dir_fd)
+                _replace_externalized_payload(
+                    path,
+                    payload,
+                    dir_fd=dir_fd,
+                    expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
+                )
             except (OSError, TypeError, NotImplementedError) as exc:
                 logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
                 continue

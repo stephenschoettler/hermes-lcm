@@ -203,17 +203,46 @@ def test_marker_reader_rejects_foreign_owned_payload(payload_store, monkeypatch)
     ) is False
 
 
-def test_marker_reader_rejects_oversize_before_decode(payload_store, monkeypatch):
+def test_marker_reader_decodes_only_bounded_metadata_for_oversize_payload(payload_store, monkeypatch):
     storage_dir, config = payload_store
     payload_path = storage_dir / "marker.json"
     _write_payload(payload_path, content="x" * 1024)
     monkeypatch.setattr(externalize_module, "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES", 64, raising=False)
-    monkeypatch.setattr(externalize_module.json, "loads", _fail_if_json_decoded)
+    real_loads = json.loads
+    decoded_sizes = []
+
+    def bounded_loads(value):
+        decoded_sizes.append(len(value))
+        assert len(value) <= externalize_module._EXTERNALIZED_SEARCH_TAIL_BYTES + 1
+        return real_loads(value)
+
+    monkeypatch.setattr(externalize_module.json, "loads", bounded_loads)
 
     assert externalized_tool_result_has_persisted_output_marker(
         payload_path.name,
         config=config,
-    ) is False
+    ) is True
+    assert decoded_sizes
+
+
+def test_oversize_marker_and_reassignment_use_bounded_metadata_path(payload_store, monkeypatch):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "large-marker.json"
+    _write_payload(payload_path, content="x" * 1024)
+    monkeypatch.setattr(externalize_module, "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES", 64, raising=False)
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
+    reassigned = json.loads(payload_path.read_text(encoding="utf-8"))
+    assert reassigned["session_id"] == "new-session"
+    assert reassigned["content"] == "x" * 1024
 
 
 def test_legacy_readers_fail_closed_when_descriptor_relative_stat_is_unsupported(payload_store, monkeypatch):
@@ -293,6 +322,44 @@ def test_reassignment_post_read_store_directory_swap_does_not_escape(payload_sto
     assert held_payload["session_id"] == ("new-session" if moved == 1 else original["session_id"])
     assert held_payload["content"] == original["content"]
     assert list(held_storage_dir.glob("*.tmp")) == []
+
+
+def test_reassignment_revalidates_payload_identity_immediately_before_replace(
+    payload_store,
+    tmp_path,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "reassign.json"
+    original = _write_payload(payload_path)
+    held_original = tmp_path / "held-original.json"
+    replacement_path = tmp_path / "replacement.json"
+    replacement = _write_payload(
+        replacement_path,
+        session_id="replacement-session",
+        content="replacement sentinel",
+    )
+    real_replace = externalize_module._replace_externalized_payload
+    swapped = False
+
+    def swapping_replace(path, payload, *args, **kwargs):
+        nonlocal swapped
+        payload_path.replace(held_original)
+        replacement_path.replace(payload_path)
+        swapped = True
+        return real_replace(path, payload, *args, **kwargs)
+
+    monkeypatch.setattr(externalize_module, "_replace_externalized_payload", swapping_replace)
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    assert swapped is True
+    assert json.loads(payload_path.read_text(encoding="utf-8")) == replacement
+    assert json.loads(held_original.read_text(encoding="utf-8")) == original
+    assert list(storage_dir.glob("*.tmp")) == []
 
 
 def test_reassignment_reader_rejects_symlink(payload_store, tmp_path):
@@ -380,11 +447,23 @@ def test_reassignment_reader_rejects_foreign_owned_payload(payload_store, monkey
     ) == 0
 
 
-def test_reassignment_reader_rejects_oversize_before_decode(payload_store, monkeypatch):
+def test_reassignment_streams_oversize_without_full_json_decode(payload_store, monkeypatch):
     storage_dir, config = payload_store
     _write_payload(storage_dir / "reassign.json", content="x" * 1024)
     monkeypatch.setattr(externalize_module, "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES", 64, raising=False)
     monkeypatch.setattr(externalize_module.json, "loads", _fail_if_json_decoded)
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
+
+
+def test_reassignment_skips_malformed_oversize_payload(payload_store, monkeypatch):
+    storage_dir, config = payload_store
+    (storage_dir / "malformed.json").write_bytes(b"\xff" * 1024)
+    monkeypatch.setattr(externalize_module, "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES", 64, raising=False)
 
     assert reassign_externalized_payloads(
         "old-session",

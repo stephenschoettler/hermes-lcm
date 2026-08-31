@@ -55,11 +55,6 @@ def collect_external_imports(
     """Return non-stdlib, non-local top-level imports and source references."""
     local_modules = set(local_imports)
     local_modules.update(path.stem for path in repo_root.glob("*.py"))
-    local_modules.update(
-        path.name
-        for path in repo_root.iterdir()
-        if path.is_dir() and (path / "__init__.py").is_file()
-    )
     external: dict[str, set[str]] = {}
     for path in _python_files(repo_root, globs):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
