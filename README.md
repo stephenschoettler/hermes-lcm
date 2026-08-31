@@ -133,6 +133,11 @@ token estimates. `regex` is used if available to apply timeouts to message ignor
 patterns; without it, message-level regex filtering is disabled with a warning
 rather than running unbounded stdlib `re` matches.
 
+The versioned [host-owned dependency contract](docs/dependency-assurance.md)
+lists every shipped runtime import, supported host/Python versions, ownership,
+and the mechanical validation command. It is an assurance boundary, not a claim
+that the host's resolved environment is free of known vulnerabilities.
+
 ### Install the plugin
 
 Canonical install path: clone `hermes-lcm` as a general user plugin.
