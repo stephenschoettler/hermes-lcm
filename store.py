@@ -12,6 +12,7 @@ row identity (`store_id`) for DAG/source lookup.
 import json
 import logging
 import math
+import os
 import sqlite3
 import threading
 import time
@@ -63,6 +64,37 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
+    for artifact in (
+        db_path,
+        *(db_path.with_name(db_path.name + suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES),
+    ):
+        try:
+            artifact.chmod(0o600)
+        except FileNotFoundError:
+            continue
+
+
+def _prepare_private_sqlite_storage(db_path: Path) -> None:
+    """Create or tighten one SQLite database path before SQLite opens it."""
+    db_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    db_path.parent.chmod(0o700)
+
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(db_path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # pragma: no cover - Windows fallback
+            db_path.chmod(0o600)
+    finally:
+        os.close(fd)
+    _restrict_existing_sqlite_artifacts(db_path)
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -264,7 +296,7 @@ class MessageStore:
 
     def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_private_sqlite_storage(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
@@ -291,6 +323,7 @@ class MessageStore:
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
+        _restrict_existing_sqlite_artifacts(self.db_path)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
