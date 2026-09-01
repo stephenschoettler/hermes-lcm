@@ -1687,7 +1687,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens = count_messages_tokens(attempt_chunk)
             serialized = self._serialize_messages(attempt_chunk)
             source_store_ids = sorted(dict.fromkeys(
-                self._get_store_ids_for_messages(attempt_chunk)
+                self._current_compress_store_ids_by_message_id[id(message)]
+                for message in attempt_chunk
+                if id(message) in self._current_compress_store_ids_by_message_id
             ))
             token_budget = max(2000, int(source_tokens * 0.20))
             token_budget = min(token_budget, 12000)

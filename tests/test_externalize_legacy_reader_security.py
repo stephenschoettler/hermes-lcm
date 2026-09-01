@@ -206,7 +206,7 @@ def test_marker_reader_rejects_foreign_owned_payload(payload_store, monkeypatch)
 def test_marker_reader_decodes_only_bounded_metadata_for_oversize_payload(payload_store, monkeypatch):
     storage_dir, config = payload_store
     payload_path = storage_dir / "marker.json"
-    _write_payload(payload_path, content="x" * 1024)
+    _write_payload(payload_path, content=("x" * 1024) + '\n"\\é')
     monkeypatch.setattr(externalize_module, "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES", 64, raising=False)
     real_loads = json.loads
     decoded_sizes = []
@@ -223,6 +223,30 @@ def test_marker_reader_decodes_only_bounded_metadata_for_oversize_payload(payloa
         config=config,
     ) is True
     assert decoded_sizes
+
+
+def test_marker_reader_rejects_corrupted_oversize_content_between_valid_metadata(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "corrupted-marker.json"
+    _write_payload(payload_path, content="x" * 1024)
+    raw = payload_path.read_bytes()
+    content_start = raw.index(b'"content": "') + len(b'"content": "')
+    corrupt_at = content_start + 512
+    payload_path.write_bytes(raw[:corrupt_at] + b"\x00" + raw[corrupt_at + 1 :])
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
 
 
 def test_oversize_marker_and_reassignment_use_bounded_metadata_path(payload_store, monkeypatch):

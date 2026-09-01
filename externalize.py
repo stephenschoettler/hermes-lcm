@@ -1069,7 +1069,9 @@ def read_externalized_payload_search_prefix(
     }
 
 
-def _parse_externalized_payload_metadata_tail(raw: bytes) -> Dict[str, Any] | None:
+def _parse_externalized_payload_metadata_tail(
+    raw: bytes,
+) -> tuple[Dict[str, Any], int] | None:
     """Decode the bounded metadata suffix emitted after ``content``."""
     matches = list(re.finditer(rb',\s*"content_chars"\s*:', raw))
     for match in reversed(matches):
@@ -1078,8 +1080,56 @@ def _parse_externalized_payload_metadata_tail(raw: bytes) -> Dict[str, Any] | No
         except (UnicodeDecodeError, json.JSONDecodeError):
             continue
         if isinstance(decoded, dict):
-            return decoded
+            return decoded, match.start()
     return None
+
+
+def _validate_externalized_payload_content_string(
+    handle: BinaryIO,
+    *,
+    content_start: int,
+    suffix_start: int,
+) -> bool:
+    """Stream-validate the JSON string between bounded metadata fragments."""
+    if content_start < 0 or suffix_start <= content_start:
+        return False
+
+    handle.seek(content_start)
+    remaining = suffix_start - content_start
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    escaped = False
+    unicode_digits_remaining = 0
+    closed = False
+
+    while remaining > 0:
+        chunk = handle.read(min(64 * 1024, remaining))
+        if not chunk:
+            return False
+        decoder.decode(chunk, final=False)
+        for byte in chunk:
+            if closed:
+                if byte not in b" \t\n\r":
+                    return False
+            elif unicode_digits_remaining:
+                if byte not in b"0123456789abcdefABCDEF":
+                    return False
+                unicode_digits_remaining -= 1
+            elif escaped:
+                if byte == ord("u"):
+                    unicode_digits_remaining = 4
+                elif byte not in b'"\\/bfnrt':
+                    return False
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                closed = True
+            elif byte < 0x20:
+                return False
+        remaining -= len(chunk)
+
+    decoder.decode(b"", final=True)
+    return closed and not escaped and unicode_digits_remaining == 0
 
 
 def _read_oversize_externalized_payload_metadata(
@@ -1098,7 +1148,7 @@ def _read_oversize_externalized_payload_metadata(
             return None
         with os.fdopen(payload_fd, "rb") as handle:
             payload_fd = -1
-            _prefix, fields, content_key_seen, prefix_truncated = (
+            prefix, fields, content_key_seen, prefix_truncated = (
                 _read_externalized_payload_metadata_prefix_from_handle(
                     handle,
                     max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
@@ -1106,12 +1156,20 @@ def _read_oversize_externalized_payload_metadata(
             )
             if not content_key_seen or prefix_truncated:
                 return None
-            handle.seek(max(0, payload_stat.st_size - _EXTERNALIZED_SEARCH_TAIL_BYTES))
+            tail_start = max(0, payload_stat.st_size - _EXTERNALIZED_SEARCH_TAIL_BYTES)
+            handle.seek(tail_start)
             tail = handle.read(_EXTERNALIZED_SEARCH_TAIL_BYTES)
-        suffix = _parse_externalized_payload_metadata_tail(tail)
-        if suffix is None:
-            return None
-        return {**fields, **suffix}
+            parsed_suffix = _parse_externalized_payload_metadata_tail(tail)
+            if parsed_suffix is None:
+                return None
+            suffix, relative_suffix_start = parsed_suffix
+            if not _validate_externalized_payload_content_string(
+                handle,
+                content_start=len(prefix.encode("utf-8")),
+                suffix_start=tail_start + relative_suffix_start,
+            ):
+                return None
+            return {**fields, **suffix}
     except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
         return None
     finally:

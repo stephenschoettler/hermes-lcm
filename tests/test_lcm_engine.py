@@ -10083,7 +10083,7 @@ class TestEngineCompress:
             messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
         return messages
 
-    def test_leaf_summary_provider_payload_omits_session_id_and_keeps_ordering(
+    def test_leaf_summary_provider_payload_reuses_current_store_map_without_session_id(
         self,
         engine,
         monkeypatch,
@@ -10104,15 +10104,23 @@ class TestEngineCompress:
             "_call_llm_for_summary",
             fake_summary_call,
         )
-        monkeypatch.setattr(
-            engine,
-            "_get_store_ids_for_messages",
-            lambda _messages: [42, 17],
-        )
         messages = [
             {"role": "user", "content": "first durable source"},
             {"role": "assistant", "content": "second durable source"},
         ]
+        engine._current_compress_store_ids_by_message_id = {
+            id(messages[0]): 42,
+            id(messages[1]): 17,
+        }
+
+        def fail_on_reconciliation(_messages):
+            raise AssertionError("leaf provenance rescanned the durable store")
+
+        monkeypatch.setattr(
+            engine,
+            "_get_store_ids_for_messages",
+            fail_on_reconciliation,
+        )
 
         summarized_chunk, _, summary, _, _ = engine._summarize_leaf_chunk_with_rescue(
             messages
