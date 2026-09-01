@@ -389,6 +389,9 @@ def _summary_source(
         }
     else:
         provenance = dict(source_provenance)
+    # Session identifiers remain in the local DAG lineage. They are not needed
+    # for summarization and can contain stable platform or account identifiers.
+    provenance.pop("session_id", None)
     return {"provenance": provenance, "content": text}
 
 

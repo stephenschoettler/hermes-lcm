@@ -96,7 +96,10 @@ def _load_contract(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
 
 def _validate_python_matrix(repo_root: Path, contract: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    versions = contract.get("supported_versions", {}).get("python")
+    supported_versions = contract.get("supported_versions")
+    if not isinstance(supported_versions, dict):
+        return []
+    versions = supported_versions.get("python")
     if not isinstance(versions, list) or not versions or not all(
         isinstance(version, str) and re.fullmatch(r"3\.\d+", version)
         for version in versions

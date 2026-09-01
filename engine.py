@@ -1715,7 +1715,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     custom_instructions=self._config.custom_instructions,
                     source_provenance={
                         "source_type": "messages",
-                        "session_id": self._session_id,
                         "store_ids": source_store_ids,
                         "message_count": len(attempt_chunk),
                     },
@@ -5658,7 +5657,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             custom_instructions=self._config.custom_instructions,
             source_provenance={
                 "source_type": "summary_nodes",
-                "session_id": self._session_id,
                 "node_ids": [node.node_id for node in nodes],
                 "source_depth": depth,
             },

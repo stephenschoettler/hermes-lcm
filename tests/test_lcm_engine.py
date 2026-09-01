@@ -1538,7 +1538,7 @@ class TestEscalationStripReasoning:
         assert "</think>" not in result
         assert "We discussed the docker rollout plan" in result
 
-    def test_adversarial_summary_round_trip_keeps_node_lineage_and_prompt_boundary(
+    def test_adversarial_summary_round_trip_keeps_node_lineage_local_and_prompt_boundary(
         self,
         tmp_path,
         monkeypatch,
@@ -1620,9 +1620,9 @@ class TestEscalationStripReasoning:
             assert envelope["sources"][0]["content"] == (
                 adversarial + "\n\n---\n\n" + second_summary
             )
+            assert session_id not in messages[1]["content"]
             assert envelope["sources"][0]["provenance"] == {
                 "source_type": "summary_nodes",
-                "session_id": session_id,
                 "node_ids": [first_node_id, second_node_id],
                 "source_depth": 0,
             }
@@ -1632,6 +1632,7 @@ class TestEscalationStripReasoning:
             ]
             assert len(persisted) == 1
             assert persisted[0].summary == "Grounded persisted condensation."
+            assert persisted[0].session_id == session_id
             assert persisted[0].source_ids == [first_node_id, second_node_id]
         finally:
             second.shutdown()
@@ -10081,6 +10082,53 @@ class TestEngineCompress:
             messages.append({"role": "user", "content": f"Question {i}: " + "x" * 200})
             messages.append({"role": "assistant", "content": f"Answer {i}: " + "y" * 200})
         return messages
+
+    def test_leaf_summary_provider_payload_omits_session_id_and_keeps_ordering(
+        self,
+        engine,
+        monkeypatch,
+    ):
+        import hermes_lcm.escalation as escalation_module
+
+        session_id = "agent:main:telegram:private:123456789"
+        engine._session_id = session_id
+        provider_prompts = []
+
+        def fake_summary_call(prompt, max_tokens, model="", timeout=None):
+            del max_tokens, model, timeout
+            provider_prompts.append(prompt)
+            return "Grounded leaf summary.\nExpand for details about: durable source"
+
+        monkeypatch.setattr(
+            escalation_module,
+            "_call_llm_for_summary",
+            fake_summary_call,
+        )
+        monkeypatch.setattr(
+            engine,
+            "_get_store_ids_for_messages",
+            lambda _messages: [42, 17],
+        )
+        messages = [
+            {"role": "user", "content": "first durable source"},
+            {"role": "assistant", "content": "second durable source"},
+        ]
+
+        summarized_chunk, _, summary, _, _ = engine._summarize_leaf_chunk_with_rescue(
+            messages
+        )
+
+        assert summarized_chunk == messages
+        assert summary.startswith("Grounded leaf summary.")
+        assert len(provider_prompts) == 1
+        provider_prompt = provider_prompts[0]
+        assert isinstance(provider_prompt, list)
+        assert session_id not in provider_prompt[1]["content"]
+        envelope = json.loads(provider_prompt[1]["content"])
+        provenance = envelope["sources"][0]["provenance"]
+        assert provenance["source_type"] == "messages"
+        assert provenance["store_ids"] == [17, 42]
+        assert provenance["message_count"] == 2
 
     def test_compression_serialization_skips_empty_assistant_and_heartbeat_noise(self, engine):
         messages = [

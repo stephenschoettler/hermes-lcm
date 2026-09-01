@@ -7,6 +7,7 @@ import sys
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_PATH = REPO_ROOT / "dependency-contract.json"
+ASSURANCE_DOC_PATH = REPO_ROOT / "docs" / "dependency-assurance.md"
 VALIDATOR_PATH = REPO_ROOT / "scripts" / "validate_dependency_contract.py"
 
 
@@ -34,6 +35,35 @@ def test_dependency_contract_validator_accepts_repository():
     assert result.returncode == 0, result.stderr
     assert "dependency contract valid: version 1.0.1" in result.stdout
     assert "9 external imports declared" in result.stdout
+
+
+def test_dependency_assurance_documentation_matches_contract_version():
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    assurance_doc = ASSURANCE_DOC_PATH.read_text(encoding="utf-8")
+
+    assert f"`{contract['contract_version']}` supports:" in assurance_doc
+
+
+def test_dependency_contract_validator_rejects_non_object_supported_versions(tmp_path):
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract["supported_versions"] = ["3.11"]
+    malformed_contract_path = tmp_path / "dependency-contract.json"
+    malformed_contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(VALIDATOR_PATH), "--contract", str(malformed_contract_path)],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert (
+        "dependency contract error: supported_versions must be an object"
+        in result.stderr
+    )
+    assert "Traceback" not in result.stderr
 
 
 def test_dependency_scanner_fails_closed_on_static_and_literal_dynamic_imports(tmp_path):
