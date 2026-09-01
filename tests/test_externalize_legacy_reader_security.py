@@ -216,6 +216,75 @@ def test_marker_reader_avoids_full_json_decode_for_oversize_payload(payload_stor
     ) is True
 
 
+@pytest.mark.parametrize("invalid_kind", [None, 0, [], {}])
+def test_oversize_marker_reader_rejects_non_string_kind(
+    payload_store,
+    monkeypatch,
+    invalid_kind,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "invalid-kind-marker.json"
+    payload = _payload(content="x" * 1024)
+    payload["kind"] = invalid_kind
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
+
+
+def test_oversize_marker_reader_preserves_missing_kind_legacy_default(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "missing-kind-marker.json"
+    payload = _payload(content="x" * 1024)
+    payload.pop("kind")
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+
+
+def test_oversize_marker_reader_rejects_non_string_kind_after_content(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "suffix-kind-marker.json"
+    payload = _payload(content="x" * 1024)
+    payload.pop("kind")
+    payload["kind"] = None
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
+
+
 def test_marker_reader_rejects_corrupted_oversize_content_between_valid_metadata(
     payload_store,
     monkeypatch,

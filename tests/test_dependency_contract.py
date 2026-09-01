@@ -33,7 +33,7 @@ def test_dependency_contract_validator_accepts_repository():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "dependency contract valid: version 1.0.1" in result.stdout
+    assert "dependency contract valid: version 1.0.2" in result.stdout
     assert "9 external imports declared" in result.stdout
 
 
@@ -107,11 +107,35 @@ def test_dependency_scanner_does_not_treat_generated_host_stub_as_local(tmp_path
     assert imports["agent"] == ["sample.py:1"]
 
 
+def test_dependency_contract_validator_rejects_imported_api_drift(tmp_path, monkeypatch):
+    validator = _load_validator()
+    (tmp_path / "sample.py").write_text(
+        "from fastembed import NewEmbedding\n",
+        encoding="utf-8",
+    )
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract["runtime_scan"] = {
+        "globs": ["*.py"],
+        "local_imports": [],
+        "excluded": [],
+    }
+    contract["external_imports"] = {
+        "fastembed": contract["external_imports"]["fastembed"],
+    }
+    monkeypatch.setattr(validator, "_validate_python_matrix", lambda *_args: [])
+
+    errors = validator.validate_contract(tmp_path, contract)
+
+    assert errors == [
+        "undeclared imported API 'fastembed.NewEmbedding': sample.py:1"
+    ]
+
+
 def test_contract_records_host_ownership_versions_and_update_owner():
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert contract["schema_version"] == 1
-    assert contract["contract_version"] == "1.0.1"
+    assert contract["contract_version"] == "1.0.2"
     assert contract["boundary"] == "host-owned"
     assert contract["ownership"]["dependency_resolver"] == "Hermes Agent host environment"
     assert contract["ownership"]["update_owner"] == "Hermes-LCM maintainers"

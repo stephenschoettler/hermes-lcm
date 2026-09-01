@@ -12,7 +12,6 @@ row identity (`store_id`) for DAG/source lookup.
 import json
 import logging
 import math
-import os
 import sqlite3
 import threading
 import time
@@ -50,7 +49,11 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
-from .sqlite_util import _temporary_sqlite_busy_timeout
+from .sqlite_util import (
+    _prepare_private_sqlite_file,
+    _restrict_existing_sqlite_artifacts,
+    _temporary_sqlite_busy_timeout,
+)
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -64,20 +67,6 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
-_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
-
-
-def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
-    for artifact in (
-        db_path,
-        *(db_path.with_name(db_path.name + suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES),
-    ):
-        try:
-            artifact.chmod(0o600)
-        except FileNotFoundError:
-            continue
-
-
 def _prepare_private_sqlite_storage(db_path: Path) -> None:
     """Create or tighten one SQLite database path before SQLite opens it."""
     try:
@@ -87,18 +76,7 @@ def _prepare_private_sqlite_storage(db_path: Path) -> None:
     else:
         db_path.parent.chmod(0o700)
 
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    fd = os.open(db_path, flags, 0o600)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        else:  # pragma: no cover - Windows fallback
-            db_path.chmod(0o600)
-    finally:
-        os.close(fd)
-    _restrict_existing_sqlite_artifacts(db_path)
+    _prepare_private_sqlite_file(db_path)
 
 
 def _legacy_blank_source_clause(column: str) -> str:

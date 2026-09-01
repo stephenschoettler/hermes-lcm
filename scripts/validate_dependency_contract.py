@@ -82,6 +82,51 @@ def collect_external_imports(
     }
 
 
+def collect_external_imported_apis(
+    repo_root: Path,
+    globs: Iterable[str],
+    *,
+    local_imports: set[str],
+) -> dict[str, dict[str, list[str]]]:
+    """Return external modules and directly imported symbols by package root."""
+    local_modules = set(local_imports)
+    local_modules.update(path.stem for path in repo_root.glob("*.py"))
+    external: dict[str, dict[str, set[str]]] = {}
+    for path in _python_files(repo_root, globs):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        relative_path = path.relative_to(repo_root)
+        for node in ast.walk(tree):
+            imported_apis: list[str] = []
+            if isinstance(node, ast.Import):
+                imported_apis.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                for alias in node.names:
+                    imported_apis.append(
+                        node.module if alias.name == "*" else f"{node.module}.{alias.name}"
+                    )
+            elif isinstance(node, ast.Call):
+                dynamic_import = _literal_dynamic_import(node)
+                if dynamic_import:
+                    imported_apis.append(dynamic_import)
+            for imported_api in imported_apis:
+                top_level = imported_api.split(".", 1)[0]
+                if top_level in sys.stdlib_module_names or top_level in local_modules:
+                    continue
+                reference = f"{relative_path}:{getattr(node, 'lineno', 0)}"
+                external.setdefault(top_level, {}).setdefault(imported_api, set()).add(reference)
+    return {
+        module: {
+            imported_api: sorted(references)
+            for imported_api, references in sorted(imported_apis.items())
+        }
+        for module, imported_apis in sorted(external.items())
+    }
+
+
+def _imported_api_is_declared(observed: str, declared: set[str]) -> bool:
+    return observed in declared or any(api.startswith(observed + ".") for api in declared)
+
+
 def _load_contract(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     try:
         content = json.loads(path.read_text(encoding="utf-8"))
@@ -214,6 +259,27 @@ def validate_contract(repo_root: Path, contract: dict[str, Any]) -> list[str]:
             )
         for module in stale:
             errors.append(f"declared external import {module!r} is not observed")
+        observed_apis = collect_external_imported_apis(
+            repo_root,
+            globs,
+            local_imports=set(local_imports),
+        )
+        for module in sorted(set(observed_apis) & set(declared)):
+            dependency = declared[module]
+            if not isinstance(dependency, dict):
+                continue
+            imported_api = dependency.get("imported_api")
+            if not isinstance(imported_api, list) or not all(
+                isinstance(api, str) and api for api in imported_api
+            ):
+                continue
+            declared_apis = set(imported_api)
+            for observed_api, references in observed_apis[module].items():
+                if _imported_api_is_declared(observed_api, declared_apis):
+                    continue
+                errors.append(
+                    f"undeclared imported API {observed_api!r}: {', '.join(references)}"
+                )
     return errors
 
 

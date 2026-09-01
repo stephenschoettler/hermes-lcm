@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_lcm.maintenance as maintenance_module
+import hermes_lcm.sqlite_util as sqlite_util_module
 from hermes_lcm.maintenance import backup_database, rotate_backup_database
 from hermes_lcm.store import MessageStore
 
@@ -91,6 +92,71 @@ def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path)
                 store.close()
     finally:
         existing.close()
+
+
+@pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
+def test_message_store_refuses_symlinked_sidecar_before_chmod(tmp_path, suffix):
+    db_path = tmp_path / "lcm.db"
+    target = tmp_path / "unrelated.txt"
+    target.write_text("shared", encoding="utf-8")
+    target.chmod(0o644)
+    db_path.with_name(db_path.name + suffix).symlink_to(target)
+
+    with pytest.raises(OSError, match="SQLite artifact"):
+        MessageStore(db_path)
+
+    assert _mode(target) == 0o644
+
+
+@pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
+def test_message_store_refuses_hardlinked_sidecar_before_chmod(tmp_path, suffix):
+    db_path = tmp_path / "lcm.db"
+    target = tmp_path / "unrelated.txt"
+    target.write_text("shared", encoding="utf-8")
+    target.chmod(0o644)
+    os.link(target, db_path.with_name(db_path.name + suffix))
+
+    with pytest.raises(OSError, match="SQLite artifact"):
+        MessageStore(db_path)
+
+    assert _mode(target) == 0o644
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_message_store_refuses_sidecar_link_swap_before_chmod(
+    tmp_path,
+    monkeypatch,
+    link_kind,
+):
+    db_path = tmp_path / "lcm.db"
+    sidecar = db_path.with_name(db_path.name + "-wal")
+    sidecar.write_text("replace me", encoding="utf-8")
+    target = tmp_path / "unrelated.txt"
+    target.write_text("shared", encoding="utf-8")
+    target.chmod(0o644)
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped and dir_fd is not None and path == sidecar.name:
+            swapped = True
+            sidecar.unlink()
+            if link_kind == "symlink":
+                sidecar.symlink_to(target)
+            else:
+                os.link(target, sidecar)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sqlite_util_module.os, "open", swapping_open)
+
+    with pytest.raises(OSError):
+        MessageStore(db_path)
+
+    assert swapped is True
+    assert _mode(target) == 0o644
 
 
 def test_message_store_preserves_sqlite_memory_sentinel_and_cwd_permissions(tmp_path, monkeypatch):

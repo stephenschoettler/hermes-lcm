@@ -10,45 +10,19 @@ formatting, and the store/dag/lifecycle connection handling lives in one place.
 from __future__ import annotations
 
 from datetime import datetime
-import os
 from pathlib import Path
 import sqlite3
 from typing import Any
 
-
-_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
-
-
-def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
-    for artifact in (
-        db_path,
-        *(db_path.with_name(db_path.name + suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES),
-    ):
-        try:
-            artifact.chmod(0o600)
-        except FileNotFoundError:
-            continue
+from .sqlite_util import (
+    _prepare_private_sqlite_file,
+    _restrict_existing_sqlite_artifacts,
+)
 
 
 def _prepare_private_backup_directory(path: Path) -> None:
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
     path.chmod(0o700)
-
-
-def _prepare_private_sqlite_file(path: Path) -> None:
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    fd = os.open(path, flags, 0o600)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        else:  # pragma: no cover - Windows fallback
-            path.chmod(0o600)
-    finally:
-        os.close(fd)
-    _restrict_existing_sqlite_artifacts(path)
-
 
 def flush_engine_connections(engine) -> None:
     """Commit pending writes on every SQLite connection the engine owns.

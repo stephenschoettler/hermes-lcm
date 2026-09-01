@@ -841,9 +841,9 @@ def _normalized_content_size(value: int | float | None) -> int | None:
     return normalized if normalized >= 0 else None
 
 
-def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], int | None]:
+def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, Any], int | None]:
     decoder = json.JSONDecoder()
-    fields: dict[str, str] = {}
+    fields: dict[str, Any] = {}
     length = len(text)
     index = 0
 
@@ -884,6 +884,10 @@ def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[
             return fields, None
         if isinstance(value, str):
             fields[key] = value
+        elif key == "kind":
+            # Preserve an explicitly invalid kind so oversized readers cannot
+            # mistake it for the supported missing-kind legacy shape.
+            fields[key] = value
         elif key == "session_id":
             fields.pop(key, None)
         index = skip_json_whitespace(index)
@@ -897,7 +901,7 @@ def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[
         return fields, None
 
 
-def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
+def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, Any], bool]:
     fields, content_quote_index = _parse_top_level_json_string_fields_before_content(text)
     return fields, content_quote_index is not None
 
@@ -906,14 +910,14 @@ def _read_externalized_payload_metadata_prefix_from_handle(
     handle: BinaryIO,
     *,
     max_read_bytes: int,
-) -> tuple[str, dict[str, str], bool, bool]:
+) -> tuple[str, dict[str, Any], bool, bool]:
     """Read through the opening quote of the top-level content string."""
     prefix = bytearray()
     text_parts: list[str] = []
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     prefix_truncated = False
     read_limit = max(1, int(max_read_bytes))
-    fields: dict[str, str] = {}
+    fields: dict[str, Any] = {}
 
     while len(prefix) < read_limit:
         chunk = handle.read(min(4096, read_limit - len(prefix)))
@@ -1392,6 +1396,12 @@ def _stream_externalized_payload_suffix_metadata(
                     *range(ord("0"), ord("9") + 1),
                 ):
                     metadata[key] = _stream_json_read_number(reader)
+                elif key == "kind":
+                    if reader.peek() == ord('"'):
+                        metadata[key] = _stream_json_read_string(reader, capture_limit=256)
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
                 else:
                     _stream_json_skip_value(reader, depth=1)
                 _stream_json_skip_whitespace(reader)

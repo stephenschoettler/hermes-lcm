@@ -8,7 +8,7 @@ or install packages to make an assurance tool pass.
 
 The authoritative, versioned contract is
 [`dependency-contract.json`](../dependency-contract.json). Contract version
-`1.0.1` supports:
+`1.0.2` supports:
 
 - Hermes Agent `>=0.16,<1`
 - Python 3.11, 3.12, 3.13, and 3.14 (the CI matrix)

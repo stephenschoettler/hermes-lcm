@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.1",
+  "contract_version": "1.0.2",
   "boundary": "host-owned",
   "description": "Hermes-LCM is a source-installed Hermes Agent plugin. Hermes Agent owns the Python environment and dependency resolution; the plugin declares the host and optional feature imports it consumes without creating a second package installer or lock.",
   "ownership": {
@@ -41,7 +41,7 @@
       "version_policy": "Hermes Agent >=0.16,<1",
       "imported_api": [
         "agent.context_engine.ContextEngine",
-        "agent.auxiliary_client",
+        "agent.auxiliary_client.call_llm",
         "agent.context_compressor"
       ]
     },
