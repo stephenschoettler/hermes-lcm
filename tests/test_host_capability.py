@@ -182,6 +182,9 @@ class TestRegistrationGating:
         finally:
             if late_clone is not None:
                 late_clone.shutdown()
+        if db_path.exists():
+            db_path.unlink()
+        assert not db_path.exists()
 
 
 class TestHermesAgentRegression:
