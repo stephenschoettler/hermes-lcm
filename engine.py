@@ -413,11 +413,19 @@ class _EngineShutdownGroup:
                 self._condition.notify_all()
         return False
 
-    def abort_clone(self, engine: "LCMEngine | None") -> None:
+    def abort_clone(
+        self,
+        engine: "LCMEngine | None",
+        *,
+        initialized: bool,
+    ) -> None:
         """Release a failed clone reservation after closing opened resources."""
         try:
             if engine is not None:
-                engine.shutdown(wait_for_background_work=True)
+                if initialized:
+                    engine.shutdown(wait_for_background_work=True)
+                else:
+                    engine._close_failed_initialization()
         finally:
             with self._condition:
                 self._clones_in_flight -= 1
@@ -773,12 +781,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if not shutdown_group.begin_clone():
             raise RuntimeError("Cannot clone LCM engine while plugin is unloading")
         clone = None
+        initialized = False
         reservation_open = True
         try:
-            clone = type(self)(
+            clone_type = type(self)
+            clone = clone_type.__new__(clone_type)
+            clone_type.__init__(
+                clone,
                 config=copy.deepcopy(self._config),
                 hermes_home=self._hermes_home,
             )
+            initialized = True
             clone._shutdown_group.discard(clone)
             clone._shutdown_group = shutdown_group
             clone.model = self.model
@@ -815,7 +828,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return clone
         except BaseException:
             if reservation_open:
-                shutdown_group.abort_clone(clone)
+                shutdown_group.abort_clone(clone, initialized=initialized)
             raise
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
@@ -6818,6 +6831,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return result
 
     # -- Lifecycle ---------------------------------------------------------
+
+    def _close_failed_initialization(self) -> None:
+        """Best-effort cleanup for an object whose ``__init__`` raised."""
+        shutdown_group = getattr(self, "_shutdown_group", None)
+        if shutdown_group is not None:
+            shutdown_group.discard(self)
+        for name in (
+            "_adaptive_retrieval",
+            "_store",
+            "_dag",
+            "_lifecycle",
+            "_assertions",
+            "_query_views",
+        ):
+            resource = getattr(self, name, None)
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # pragma: no cover - defensive cleanup path
+                    logger.exception(
+                        "LCM failed to close %s after engine initialization error",
+                        name,
+                    )
+        if hasattr(self, "_primary_shutdown_complete"):
+            self._primary_shutdown_complete = True
 
     def shutdown_all_instances(self) -> None:
         """Close this plugin prototype and all live per-agent clones."""

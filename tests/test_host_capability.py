@@ -256,6 +256,58 @@ class TestRegistrationGating:
         db_path.unlink()
         assert not db_path.exists()
 
+    def test_failed_clone_initialization_closes_partial_engine(self, tmp_path, monkeypatch):
+        module = _load_plugin_module("hermes_lcm_unload_failed_clone")
+        callbacks = []
+        db_path = tmp_path / "lcm.db"
+        monkeypatch.setenv("LCM_DATABASE_PATH", str(db_path))
+
+        class _Ctx:
+            def register_context_engine(self, engine):
+                self.engine = engine
+
+            def on_unload(self, callback):
+                callbacks.append(callback)
+
+        ctx = _Ctx()
+        module.register(ctx)
+        engine_type = type(ctx.engine)
+        engine_module = sys.modules[engine_type.__module__]
+
+        def fail_after_storage_bind(*_args, **_kwargs):
+            raise RuntimeError("synthetic clone initialization failure")
+
+        monkeypatch.setattr(
+            engine_module,
+            "compile_session_patterns",
+            fail_after_storage_bind,
+        )
+        with pytest.raises(RuntimeError, match="synthetic clone initialization failure") as excinfo:
+            ctx.engine.clone_for_agent()
+
+        partial_engine = None
+        traceback = excinfo.value.__traceback__
+        while traceback is not None:
+            candidate = traceback.tb_frame.f_locals.get("self")
+            if isinstance(candidate, engine_type) and candidate is not ctx.engine:
+                partial_engine = candidate
+                break
+            traceback = traceback.tb_next
+        assert partial_engine is not None
+
+        callbacks[0]()
+        partial_closed = partial_engine._store._conn is None
+        if not partial_closed:
+            for name in ("_adaptive_retrieval", "_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
+                resource = getattr(partial_engine, name, None)
+                if resource is not None:
+                    resource.close()
+        if db_path.exists():
+            db_path.unlink()
+
+        assert partial_closed
+        assert not db_path.exists()
+
 
 class TestHermesAgentRegression:
     """Regression: Hermes Agent-shaped hosts must not shadow native LCM routing."""
