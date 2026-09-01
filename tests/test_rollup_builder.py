@@ -782,7 +782,7 @@ def test_rollup_background_failure_is_logged_without_breaking_bind(
         engine.shutdown()
 
 
-def test_engine_shutdown_does_not_wait_for_background_rollup_provider(
+def test_engine_shutdown_stays_nonblocking_but_plugin_unload_waits(
     tmp_path,
     monkeypatch,
 ):
@@ -817,6 +817,27 @@ def test_engine_shutdown_does_not_wait_for_background_rollup_provider(
         shutdown_elapsed = time.monotonic() - started_at
 
         assert shutdown_elapsed < 0.15
+
+        unload_done = threading.Event()
+        unload_errors = []
+
+        def unload_plugin():
+            try:
+                engine.shutdown_all_instances()
+            except BaseException as exc:  # captured for assertion in the main thread
+                unload_errors.append(exc)
+            finally:
+                unload_done.set()
+
+        unload_thread = threading.Thread(target=unload_plugin)
+        unload_thread.start()
+        unload_waited = not unload_done.wait(timeout=0.1)
+        release_maintenance.set()
+        unload_thread.join(timeout=3)
+
+        assert unload_waited
+        assert not unload_thread.is_alive()
+        assert unload_errors == []
     finally:
         release_maintenance.set()
         assert engine.drain_rollup_maintenance(timeout=2)

@@ -365,6 +365,8 @@ def test_plugin_unload_waits_for_background_assertion_worker(tmp_path, monkeypat
     engine._store.append("session-a", message)
     assert engine._schedule_pre_compaction_assertions([message]) is True
     assert worker_started.wait(timeout=1)
+    engine.shutdown()
+    assert engine._store._conn is None
 
     unload_done = threading.Event()
     unload_errors = []
