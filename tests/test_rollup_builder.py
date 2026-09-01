@@ -822,6 +822,59 @@ def test_engine_shutdown_does_not_wait_for_background_rollup_provider(
         assert engine.drain_rollup_maintenance(timeout=2)
 
 
+def test_plugin_unload_waits_for_background_rollup_provider(tmp_path, monkeypatch):
+    db_path = tmp_path / "unload-background-maintenance.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            temporal_rollups_enabled=True,
+        )
+    )
+    maintenance_started = threading.Event()
+    release_maintenance = threading.Event()
+
+    def blocking_maintenance(*_args, **_kwargs):
+        maintenance_started.set()
+        if not release_maintenance.wait(timeout=3):
+            raise AssertionError("test did not release background maintenance")
+        return 0
+
+    monkeypatch.setattr(
+        engine_module,
+        "run_rollup_maintenance",
+        blocking_maintenance,
+    )
+    engine.on_session_start(
+        "unload-maintenance-scope",
+        conversation_id="unload-maintenance-conversation",
+    )
+    assert maintenance_started.wait(timeout=1)
+
+    unload_done = threading.Event()
+    unload_errors = []
+
+    def unload_plugin():
+        try:
+            engine.shutdown_all_instances()
+        except BaseException as exc:  # captured for assertion in the main thread
+            unload_errors.append(exc)
+        finally:
+            unload_done.set()
+
+    unload_thread = threading.Thread(target=unload_plugin)
+    unload_thread.start()
+    unload_waited = not unload_done.wait(timeout=0.1)
+    release_maintenance.set()
+    unload_thread.join(timeout=3)
+    assert engine.drain_rollup_maintenance(timeout=2)
+
+    assert unload_waited
+    assert not unload_thread.is_alive()
+    assert unload_errors == []
+    db_path.unlink()
+    assert not db_path.exists()
+
+
 def test_pending_maintenance_query_uses_partial_index(rollup_parts):
     store, _dag, _config = rollup_parts
     store.mark_stale_for_day("2026-07-15", "query-plan")

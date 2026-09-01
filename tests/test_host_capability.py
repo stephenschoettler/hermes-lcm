@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -184,6 +185,75 @@ class TestRegistrationGating:
                 late_clone.shutdown()
         if db_path.exists():
             db_path.unlink()
+        assert not db_path.exists()
+
+    def test_unload_waits_for_clone_construction_already_in_flight(
+        self, tmp_path, monkeypatch
+    ):
+        module = _load_plugin_module("hermes_lcm_unload_inflight_clone")
+        callbacks = []
+        db_path = tmp_path / "lcm.db"
+        monkeypatch.setenv("LCM_DATABASE_PATH", str(db_path))
+
+        class _Ctx:
+            def register_context_engine(self, engine):
+                self.engine = engine
+
+            def on_unload(self, callback):
+                callbacks.append(callback)
+
+        ctx = _Ctx()
+        module.register(ctx)
+        engine_type = type(ctx.engine)
+        original_init = engine_type.__init__
+        clone_constructed = threading.Event()
+        release_clone = threading.Event()
+
+        def blocking_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            clone_constructed.set()
+            if not release_clone.wait(timeout=3):
+                raise AssertionError("test did not release clone construction")
+
+        monkeypatch.setattr(engine_type, "__init__", blocking_init)
+        clone_errors = []
+
+        def clone_engine():
+            try:
+                ctx.engine.clone_for_agent()
+            except BaseException as exc:  # captured for assertion in the main thread
+                clone_errors.append(exc)
+
+        clone_thread = threading.Thread(target=clone_engine)
+        clone_thread.start()
+        assert clone_constructed.wait(timeout=1)
+
+        unload_done = threading.Event()
+        unload_errors = []
+
+        def unload_plugin():
+            try:
+                callbacks[0]()
+            except BaseException as exc:  # captured for assertion in the main thread
+                unload_errors.append(exc)
+            finally:
+                unload_done.set()
+
+        unload_thread = threading.Thread(target=unload_plugin)
+        unload_thread.start()
+        unload_waited = not unload_done.wait(timeout=0.1)
+        release_clone.set()
+        clone_thread.join(timeout=3)
+        unload_thread.join(timeout=3)
+
+        assert unload_waited
+        assert not clone_thread.is_alive()
+        assert not unload_thread.is_alive()
+        assert unload_errors == []
+        assert len(clone_errors) == 1
+        assert isinstance(clone_errors[0], RuntimeError)
+        assert "unloading" in str(clone_errors[0])
+        db_path.unlink()
         assert not db_path.exists()
 
 

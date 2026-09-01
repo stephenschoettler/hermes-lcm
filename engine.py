@@ -374,30 +374,67 @@ class _EngineShutdownGroup:
     """Track one plugin prototype and every live agent clone it creates."""
 
     def __init__(self) -> None:
-        self._lock = threading.RLock()
+        self._condition = threading.Condition(threading.RLock())
         self._engines = weakref.WeakSet()
         self._closed = False
+        self._clones_in_flight = 0
 
     def add(self, engine: "LCMEngine") -> bool:
-        with self._lock:
+        with self._condition:
             if not self._closed:
                 self._engines.add(engine)
                 return True
-        engine.shutdown()
+        engine.shutdown(wait_for_background_work=True)
         return False
 
+    def begin_clone(self) -> bool:
+        """Reserve one clone construction before unload can take its snapshot."""
+        with self._condition:
+            if self._closed:
+                return False
+            self._clones_in_flight += 1
+            return True
+
+    def complete_clone(self, engine: "LCMEngine") -> bool:
+        """Publish a fully initialized clone, or close it after unload starts."""
+        with self._condition:
+            if not self._closed:
+                self._engines.add(engine)
+                self._clones_in_flight -= 1
+                self._condition.notify_all()
+                return True
+        try:
+            engine.shutdown(wait_for_background_work=True)
+        finally:
+            with self._condition:
+                self._clones_in_flight -= 1
+                self._condition.notify_all()
+        return False
+
+    def abort_clone(self, engine: "LCMEngine | None") -> None:
+        """Release a failed clone reservation after closing opened resources."""
+        try:
+            if engine is not None:
+                engine.shutdown(wait_for_background_work=True)
+        finally:
+            with self._condition:
+                self._clones_in_flight -= 1
+                self._condition.notify_all()
+
     def discard(self, engine: "LCMEngine") -> None:
-        with self._lock:
+        with self._condition:
             self._engines.discard(engine)
 
     def shutdown_all(self) -> None:
-        with self._lock:
+        with self._condition:
             self._closed = True
+            while self._clones_in_flight:
+                self._condition.wait()
             engines = list(self._engines)
         first_error: Exception | None = None
         for engine in engines:
             try:
-                engine.shutdown()
+                engine.shutdown(wait_for_background_work=True)
             except Exception as exc:  # pragma: no cover - defensive unload path
                 logger.exception("LCM engine shutdown failed during plugin unload")
                 if first_error is None:
@@ -429,6 +466,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._shutdown_group = _EngineShutdownGroup()
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._background_work_condition = threading.Condition(threading.RLock())
+        self._background_schedules_in_flight = 0
+        self._background_shutdown_started = False
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -676,40 +716,54 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         model and context-window metadata is copied so the clone is immediately
         budget-aware even before a compatible Hermes host calls update_model().
         """
-        clone = type(self)(
-            config=copy.deepcopy(self._config),
-            hermes_home=self._hermes_home,
-        )
-        clone._shutdown_group.discard(clone)
-        clone._shutdown_group = self._shutdown_group
-        if not self._shutdown_group.add(clone):
+        shutdown_group = self._shutdown_group
+        if not shutdown_group.begin_clone():
             raise RuntimeError("Cannot clone LCM engine while plugin is unloading")
-        clone.model = self.model
-        clone.base_url = self.base_url
-        clone.api_key = self.api_key
-        clone.provider = self.provider
-        clone.api_mode = self.api_mode
-        if self._context_length_source:
-            clone._set_context_length(
-                self.raw_context_length,
-                source=self._context_length_source,
-                model=self.model,
-                provider=self.provider,
+        clone = None
+        reservation_open = True
+        try:
+            clone = type(self)(
+                config=copy.deepcopy(self._config),
+                hermes_home=self._hermes_home,
             )
-        elif self.raw_context_length or self.context_length:
-            clone._set_context_length(
-                self.raw_context_length or self.context_length,
-                source="clone_for_agent",
-                model=self.model,
-                provider=self.provider,
-            )
-        # ``update_model()`` authority is a per-runtime lifecycle edge, not
-        # durable metadata.  Compatible hosts call update_model() on the clone
-        # before binding it; hosts that bind only through on_session_start()
-        # must still be able to replace the copied prototype route.
-        clone._update_model_pending_session_start = False
-        clone._lcm_current_start_allows_bypass_lineage = False
-        return clone
+            clone._shutdown_group.discard(clone)
+            clone._shutdown_group = shutdown_group
+            clone.model = self.model
+            clone.base_url = self.base_url
+            clone.api_key = self.api_key
+            clone.provider = self.provider
+            clone.api_mode = self.api_mode
+            if self._context_length_source:
+                clone._set_context_length(
+                    self.raw_context_length,
+                    source=self._context_length_source,
+                    model=self.model,
+                    provider=self.provider,
+                )
+            elif self.raw_context_length or self.context_length:
+                clone._set_context_length(
+                    self.raw_context_length or self.context_length,
+                    source="clone_for_agent",
+                    model=self.model,
+                    provider=self.provider,
+                )
+            # ``update_model()`` authority is a per-runtime lifecycle edge, not
+            # durable metadata.  Compatible hosts call update_model() on the clone
+            # before binding it; hosts that bind only through on_session_start()
+            # must still be able to replace the copied prototype route.
+            clone._update_model_pending_session_start = False
+            clone._lcm_current_start_allows_bypass_lineage = False
+            try:
+                accepted = shutdown_group.complete_clone(clone)
+            finally:
+                reservation_open = False
+            if not accepted:
+                raise RuntimeError("Cannot clone LCM engine while plugin is unloading")
+            return clone
+        except BaseException:
+            if reservation_open:
+                shutdown_group.abort_clone(clone)
+            raise
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
         """Copy the plugin runtime without pickling SQLite-backed helpers.
@@ -1796,7 +1850,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def release_rollup_operator_lease(self, key: tuple[str, str]) -> None:
         _ROLLUP_MAINTENANCE_SCHEDULER.release_exclusive(key)
 
+    def _begin_background_schedule(self) -> bool:
+        """Reserve scheduling work unless engine shutdown has started."""
+        with self._background_work_condition:
+            if self._background_shutdown_started:
+                return False
+            self._background_schedules_in_flight += 1
+            return True
+
+    def _end_background_schedule(self) -> None:
+        with self._background_work_condition:
+            self._background_schedules_in_flight -= 1
+            self._background_work_condition.notify_all()
+
     def _schedule_rollup_maintenance(self, scope: str) -> None:
+        if not self._begin_background_schedule():
+            return
+        try:
+            self._schedule_rollup_maintenance_active(scope)
+        finally:
+            self._end_background_schedule()
+
+    def _schedule_rollup_maintenance_active(self, scope: str) -> None:
         """Enqueue one best-effort rollup pass using private SQLite helpers."""
         try:
             raw_database_path = str(self._dag.db_path)
@@ -5045,6 +5120,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _schedule_pre_compaction_assertions(
         self, messages: List[Dict[str, Any]]
     ) -> bool:
+        if not self._begin_background_schedule():
+            return False
+        try:
+            return self._schedule_pre_compaction_assertions_active(messages)
+        finally:
+            self._end_background_schedule()
+
+    def _schedule_pre_compaction_assertions_active(
+        self, messages: List[Dict[str, Any]]
+    ) -> bool:
         """Queue exact persisted rows without blocking the compaction path."""
         if (
             not bool(getattr(self._config, "assertion_extraction_enabled", False))
@@ -6685,7 +6770,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Close this plugin prototype and all live per-agent clones."""
         self._shutdown_group.shutdown_all()
 
-    def shutdown(self):
+    def _stop_background_work(self, *, wait: bool) -> None:
+        """Reject new background jobs and optionally drain accepted work."""
+        with self._background_work_condition:
+            self._background_shutdown_started = True
+            while self._background_schedules_in_flight:
+                self._background_work_condition.wait()
+        if wait:
+            self.drain_rollup_maintenance()
+            self._assertion_extraction_idle.wait()
+
+    def shutdown(self, *, wait_for_background_work: bool = False):
+        self._stop_background_work(wait=wait_for_background_work)
         self._shutdown_group.discard(self)
         self._unregister_active_engine_binding()
         if self._adaptive_retrieval is not None:

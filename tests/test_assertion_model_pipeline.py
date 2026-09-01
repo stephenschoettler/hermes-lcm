@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 
 import pytest
 
@@ -333,3 +334,58 @@ def test_compression_hook_queues_exact_rows_without_waiting_for_assertion_public
     finally:
         assert engine._assertion_extraction_idle.wait(3)
         engine.shutdown()
+
+
+def test_plugin_unload_waits_for_background_assertion_worker(tmp_path, monkeypatch):
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def blocking_payload_call(prompt: str, _model: str, _timeout: float):
+        worker_started.set()
+        if not release_worker.wait(timeout=3):
+            raise AssertionError("test did not release assertion worker")
+        return _payload_from_prompt(prompt), 1, 1
+
+    monkeypatch.setattr(
+        extraction_module,
+        "_call_structured_assertion_llm",
+        blocking_payload_call,
+    )
+    db_path = tmp_path / "lcm.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            assertions_enabled=True,
+            assertion_extraction_enabled=True,
+            assertion_extraction_model="provider/model",
+        )
+    )
+    engine._session_id = "session-a"
+    message = {"role": "user", "content": "Remember this row."}
+    engine._store.append("session-a", message)
+    assert engine._schedule_pre_compaction_assertions([message]) is True
+    assert worker_started.wait(timeout=1)
+
+    unload_done = threading.Event()
+    unload_errors = []
+
+    def unload_plugin():
+        try:
+            engine.shutdown_all_instances()
+        except BaseException as exc:  # captured for assertion in the main thread
+            unload_errors.append(exc)
+        finally:
+            unload_done.set()
+
+    unload_thread = threading.Thread(target=unload_plugin)
+    unload_thread.start()
+    unload_waited = not unload_done.wait(timeout=0.1)
+    release_worker.set()
+    unload_thread.join(timeout=3)
+    assert engine._assertion_extraction_idle.wait(timeout=2)
+
+    assert unload_waited
+    assert not unload_thread.is_alive()
+    assert unload_errors == []
+    db_path.unlink()
+    assert not db_path.exists()
