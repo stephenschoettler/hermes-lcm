@@ -53,6 +53,21 @@ def _write_payload(path: Path, **overrides) -> dict:
     return payload
 
 
+def _write_payload_with_duplicate_marker(path: Path, final_marker_value) -> bytes:
+    payload = _payload(content="x" * 1024)
+    valid_markers = payload.pop("persisted_output_markers")
+    raw = (
+        json.dumps(payload)[:-1]
+        + ', "persisted_output_markers": '
+        + json.dumps(valid_markers)
+        + ', "persisted_output_markers": '
+        + json.dumps(final_marker_value)
+        + "}"
+    ).encode("utf-8")
+    path.write_bytes(raw)
+    return raw
+
+
 def _swap_payload_for_symlink_on_open(
     monkeypatch: pytest.MonkeyPatch,
     payload_path: Path,
@@ -335,6 +350,29 @@ def test_oversize_marker_reader_streams_metadata_beyond_fixed_tail(payload_store
     ) is True
 
 
+@pytest.mark.parametrize("final_marker_value", [[], "invalid-marker-value"])
+def test_oversize_marker_reader_honors_final_duplicate_marker_value(
+    payload_store,
+    monkeypatch,
+    final_marker_value,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "duplicate-marker.json"
+    raw = _write_payload_with_duplicate_marker(payload_path, final_marker_value)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert json.loads(raw)["persisted_output_markers"] == final_marker_value
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
+
+
 def test_oversize_marker_and_reassignment_use_bounded_metadata_path(payload_store, monkeypatch):
     storage_dir, config = payload_store
     payload_path = storage_dir / "large-marker.json"
@@ -448,6 +486,92 @@ def test_oversize_reassignment_requires_validation_before_temp_open(payload_stor
         config=config,
     ) == 0
     assert payload_path.read_bytes() == original
+    assert list(storage_dir.glob("*.tmp")) == []
+
+
+def test_oversize_reassignment_rejects_same_inode_mutation_after_validation(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "mutated-after-validation.json"
+    _write_payload(payload_path, content="x" * 1024)
+    malformed = bytearray(payload_path.read_bytes())
+    content_start = malformed.index(b'"content": "') + len(b'"content": "')
+    malformed[content_start + 512] = 0
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+    real_validate = externalize_module._stream_externalized_payload_suffix_metadata
+    validation_calls = 0
+
+    def mutate_after_first_validation(*args, **kwargs):
+        nonlocal validation_calls
+        result = real_validate(*args, **kwargs)
+        validation_calls += 1
+        if validation_calls == 1:
+            with payload_path.open("r+b") as handle:
+                handle.write(malformed)
+                handle.truncate()
+        return result
+
+    monkeypatch.setattr(
+        externalize_module,
+        "_stream_externalized_payload_suffix_metadata",
+        mutate_after_first_validation,
+    )
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    with pytest.raises((UnicodeDecodeError, json.JSONDecodeError)):
+        json.loads(payload_path.read_text(encoding="utf-8"))
+    assert list(storage_dir.glob("*.tmp")) == []
+
+
+def test_oversize_reassignment_rejects_append_after_validation(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "appended-after-validation.json"
+    _write_payload(payload_path, content="x" * 1024)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+    real_validate = externalize_module._stream_externalized_payload_suffix_metadata
+    validation_calls = 0
+
+    def append_after_first_validation(*args, **kwargs):
+        nonlocal validation_calls
+        result = real_validate(*args, **kwargs)
+        validation_calls += 1
+        if validation_calls == 1:
+            with payload_path.open("ab") as handle:
+                handle.write(b" appended-after-validation")
+        return result
+
+    monkeypatch.setattr(
+        externalize_module,
+        "_stream_externalized_payload_suffix_metadata",
+        append_after_first_validation,
+    )
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(payload_path.read_text(encoding="utf-8"))
     assert list(storage_dir.glob("*.tmp")) == []
 
 

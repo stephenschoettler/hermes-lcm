@@ -4482,6 +4482,47 @@ class TestEscalation:
             "'## Historical Pending User Asks' / '## Historical Remaining Work'"
         ) in system_prompt
 
+    def test_focus_topic_l2_preserves_stale_task_suppression(self):
+        from hermes_lcm.escalation import _build_l2_prompt
+
+        messages = _build_l2_prompt(
+            "old completed task and current release blocker",
+            500,
+            focus_topic="release blockers",
+        )
+        system_prompt = messages[0]["content"]
+
+        assert "STALE" in system_prompt
+        assert "must not act on them unless the latest user message explicitly" in system_prompt
+        assert "Reduce resolved topics to one-liners or drop" in system_prompt
+
+    def test_l1_failure_routes_focus_stale_suppression_to_l2(self, monkeypatch):
+        from hermes_lcm import escalation
+
+        prompts = []
+
+        def fake_invoke(prompt, *_args, **_kwargs):
+            prompts.append(prompt)
+            return None if len(prompts) == 1 else "compact release summary"
+
+        monkeypatch.setattr(escalation, "_invoke_summary_llm_chain", fake_invoke)
+
+        summary, level = escalation.summarize_with_escalation(
+            "source text " * 80,
+            source_tokens=200,
+            token_budget=50,
+            focus_topic="release blockers",
+        )
+
+        assert (summary, level) == ("compact release summary", 2)
+        assert len(prompts) == 2
+        assert [message["role"] for message in prompts[1]] == ["system", "user"]
+        l2_system_prompt = prompts[1][0]["content"]
+        assert "STALE" in l2_system_prompt
+        assert "must not act on them unless the latest user message explicitly" in l2_system_prompt
+        assert "Reduce resolved topics to one-liners or drop" in l2_system_prompt
+        assert json.loads(prompts[1][1]["content"])["request"]["focus_topic"] == "release blockers"
+
     def test_focus_topic_is_normalized_and_bounded_in_prompts(self):
         from hermes_lcm.escalation import _build_l1_prompt
         noisy_focus = "  migration\n\n" + ("very-long-topic " * 40)

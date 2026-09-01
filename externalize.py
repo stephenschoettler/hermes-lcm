@@ -1383,10 +1383,13 @@ def _stream_externalized_payload_suffix_metadata(
                 if reader.read() != ord(":"):
                     return None
                 _stream_json_skip_whitespace(reader)
-                if key == "persisted_output_markers" and reader.peek() == ord("["):
-                    marker = _stream_json_read_marker_array(reader)
-                    if marker is not None:
-                        metadata["persisted_output_markers"] = [marker]
+                if key == "persisted_output_markers":
+                    if reader.peek() == ord("["):
+                        marker = _stream_json_read_marker_array(reader)
+                        metadata[key] = [marker] if marker is not None else []
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
                 elif key == "persisted_output_source_path" and reader.peek() == ord('"'):
                     metadata[key] = _stream_json_read_string(reader)
                 elif key == "persisted_output_expected_chars" and reader.peek() == ord('"'):
@@ -1521,21 +1524,50 @@ def _reassign_oversize_externalized_payload(
             if rewritten_prefix is None:
                 return False
 
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
             flags |= getattr(os, "O_CLOEXEC", 0)
             tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
-            with os.fdopen(tmp_fd, "wb") as destination:
+            with os.fdopen(tmp_fd, "w+b") as destination:
                 tmp_fd = -1
                 prefix_bytes = prefix.encode("utf-8")
-                destination.write(rewritten_prefix.encode("utf-8"))
+                rewritten_prefix_bytes = rewritten_prefix.encode("utf-8")
+                destination.write(rewritten_prefix_bytes)
                 source.seek(len(prefix_bytes))
-                while True:
-                    chunk = source.read(1024 * 1024)
+                remaining = payload_stat.st_size - len(prefix_bytes)
+                if remaining < 0:
+                    raise ValueError("payload_changed_during_copy")
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
                     if not chunk:
-                        break
+                        raise ValueError("payload_changed_during_copy")
                     destination.write(chunk)
+                    remaining -= len(chunk)
+                if source.read(1):
+                    raise ValueError("payload_changed_during_copy")
                 destination.flush()
                 os.fsync(destination.fileno())
+
+                destination.seek(0)
+                (
+                    copied_prefix,
+                    copied_fields,
+                    copied_content_key_seen,
+                    copied_prefix_truncated,
+                ) = _read_externalized_payload_metadata_prefix_from_handle(
+                    destination,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+                if (
+                    not copied_content_key_seen
+                    or copied_prefix_truncated
+                    or copied_fields.get("session_id") != new_session_id
+                    or _stream_externalized_payload_suffix_metadata(
+                        destination,
+                        content_start=len(copied_prefix.encode("utf-8")),
+                    )
+                    is None
+                ):
+                    raise ValueError("copied_payload_validation_failed")
 
         _revalidate_payload_name(
             path.name,
