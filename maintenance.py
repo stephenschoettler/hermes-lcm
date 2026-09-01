@@ -22,11 +22,18 @@ from .sqlite_util import (
 )
 
 
+_FCHMOD = getattr(os, "fchmod", None)
+
+
 def _prepare_private_backup_directory(path: Path) -> None:
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
     expected = os.lstat(path)
     if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
         raise OSError(f"backup directory is not a real directory: {path}")
+
+    if os.name != "posix":  # pragma: no cover - Windows compatibility fallback
+        path.chmod(0o700)
+        return
 
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
@@ -37,10 +44,12 @@ def _prepare_private_backup_directory(path: Path) -> None:
             or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
         ):
             raise OSError(f"backup directory changed during validation: {path}")
-        fchmod = getattr(os, "fchmod", None)
-        if fchmod is None:
+        if callable(_FCHMOD):
+            _FCHMOD(fd, 0o700)
+        elif os.chmod in getattr(os, "supports_fd", ()):
+            os.chmod(fd, 0o700)
+        else:
             raise OSError("descriptor-based directory chmod is unavailable")
-        fchmod(fd, 0o700)
     finally:
         os.close(fd)
 

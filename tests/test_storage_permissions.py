@@ -63,6 +63,50 @@ def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp
             store.close()
 
 
+def test_message_store_refuses_created_directory_swap_before_chmod(tmp_path, monkeypatch):
+    shared_parent = tmp_path / "shared"
+    shared_parent.mkdir(mode=0o777)
+    shared_parent.chmod(0o777)
+    db_dir = shared_parent / "database"
+    db_path = db_dir / "lcm.db"
+    displaced_dir = shared_parent / "database-displaced"
+    unrelated_target = tmp_path / "unrelated-target"
+    unrelated_target.mkdir(mode=0o755)
+    unrelated_target.chmod(0o755)
+    real_open = os.open
+    real_path_chmod = Path.chmod
+    swapped = False
+
+    def swap_created_directory():
+        nonlocal swapped
+        if swapped or not db_dir.is_dir():
+            return
+        swapped = True
+        db_dir.rename(displaced_dir)
+        db_dir.symlink_to(unrelated_target, target_is_directory=True)
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and path == db_dir.name:
+            swap_created_directory()
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def swapping_path_chmod(path, mode, *, follow_symlinks=True):
+        if path == db_dir:
+            swap_created_directory()
+        return real_path_chmod(path, mode, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    monkeypatch.setattr(Path, "chmod", swapping_path_chmod)
+
+    with pytest.raises(OSError):
+        MessageStore(db_path)
+
+    assert swapped is True
+    assert _mode(unrelated_target) == 0o755
+
+
 def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path):
     db_dir = tmp_path / "existing"
     db_dir.mkdir(mode=0o755)
@@ -219,6 +263,46 @@ def test_maintenance_creates_private_backups_and_tightens_existing_slot(tmp_path
             with sqlite3.connect(backup_path) as restored:
                 assert restored.execute("PRAGMA quick_check").fetchone()[0] == "ok"
                 assert restored.execute("SELECT content FROM messages").fetchone()[0] == "backup"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("operation", ["timestamped", "rotate"])
+def test_maintenance_backups_work_without_fchmod(tmp_path, monkeypatch, operation):
+    db_path = tmp_path / "database" / "lcm.db"
+    store = MessageStore(db_path)
+    store.append("session", {"role": "user", "content": "backup"})
+    store.commit()
+    backup_dir = tmp_path / "backups"
+    rotate_path = backup_dir / "rotate-latest.sqlite3"
+    engine = SimpleNamespace(
+        _store=store,
+        _dag=SimpleNamespace(_conn=store.connection),
+        _lifecycle=None,
+        backup_dir=lambda: backup_dir,
+        rotate_backup_path=lambda: rotate_path,
+    )
+
+    if hasattr(maintenance_module, "_FCHMOD"):
+        monkeypatch.setattr(maintenance_module, "_FCHMOD", None)
+    else:  # RED control for the rejected head, which read os.fchmod directly.
+        class _OSWithoutFchmod:
+            fchmod = None
+
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+        monkeypatch.setattr(maintenance_module, "os", _OSWithoutFchmod())
+    try:
+        result = (
+            backup_database(engine)
+            if operation == "timestamped"
+            else rotate_backup_database(engine)
+        )
+
+        assert result["ok"] is True
+        assert _mode(backup_dir) == 0o700
+        _assert_private_sqlite_artifacts(result["backup_path"])
     finally:
         store.close()
 
