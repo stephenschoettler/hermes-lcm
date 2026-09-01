@@ -16,6 +16,7 @@ import threading
 import time
 from collections import deque
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -369,6 +370,36 @@ def _normalize_total_compactions(value: Any) -> int:
     return value
 
 
+class _EngineShutdownGroup:
+    """Track one plugin prototype and every live agent clone it creates."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._engines = weakref.WeakSet()
+
+    def add(self, engine: "LCMEngine") -> None:
+        with self._lock:
+            self._engines.add(engine)
+
+    def discard(self, engine: "LCMEngine") -> None:
+        with self._lock:
+            self._engines.discard(engine)
+
+    def shutdown_all(self) -> None:
+        with self._lock:
+            engines = list(self._engines)
+        first_error: Exception | None = None
+        for engine in engines:
+            try:
+                engine.shutdown()
+            except Exception as exc:  # pragma: no cover - defensive unload path
+                logger.exception("LCM engine shutdown failed during plugin unload")
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -389,6 +420,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
+        self._shutdown_group = _EngineShutdownGroup()
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
         self._assertion_extraction_metrics_lock = threading.RLock()
@@ -621,6 +653,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # The scheduler associates this identity only with outstanding work, so
         # diagnostic drains do not retain every historical session key forever.
         self._rollup_maintenance_owner = object()
+        self._shutdown_group.add(self)
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -641,6 +674,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
         )
+        clone._shutdown_group.discard(clone)
+        clone._shutdown_group = self._shutdown_group
+        self._shutdown_group.add(clone)
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key
@@ -6638,7 +6674,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Lifecycle ---------------------------------------------------------
 
+    def shutdown_all_instances(self) -> None:
+        """Close this plugin prototype and all live per-agent clones."""
+        self._shutdown_group.shutdown_all()
+
     def shutdown(self):
+        self._shutdown_group.discard(self)
         self._unregister_active_engine_binding()
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()

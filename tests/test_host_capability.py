@@ -163,11 +163,13 @@ class TestRegistrationGating:
 
         assert len(callbacks) == 1
         assert callbacks[0].__self__ is ctx.engine
+        clone = ctx.engine.clone_for_agent()
         assert db_path.is_file()
 
         callbacks[0]()
 
         assert ctx.engine._store._conn is None
+        assert clone._store._conn is None
         db_path.unlink()
         assert not db_path.exists()
 

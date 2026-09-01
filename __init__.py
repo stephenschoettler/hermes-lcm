@@ -399,7 +399,7 @@ def register(ctx):
     ctx.register_context_engine(engine)
     on_unload = getattr(ctx, "on_unload", None)
     if callable(on_unload):
-        on_unload(engine.shutdown)
+        on_unload(engine.shutdown_all_instances)
 
     # Ship the same recall contract through both Hermes plugin skill
     # registration (explicit qualified loads) and the installer's ordinary
