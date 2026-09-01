@@ -91,6 +91,7 @@ from .assertion_extraction import ModelAssertionExtractor
 from .assertion_store import AssertionStore, SourceSnapshot
 from .adaptive_retrieval import AdaptiveRetrievalRegistry
 from .query_view_store import QueryViewStore
+from .retrieval_core import _close_vector_store_pool
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -498,6 +499,7 @@ class _EngineShutdownGroup:
         for record in retired_background:
             self._drain_retired_background(record)
         join_background_integrity_scans()
+        _close_vector_store_pool()
         if first_error is not None:
             raise first_error
 

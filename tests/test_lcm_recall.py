@@ -1283,6 +1283,108 @@ def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeyp
         rc._reset_vector_store_pool()
 
 
+def test_plugin_unload_closes_pooled_vector_store(recall_engine, monkeypatch):
+    import hermes_lcm.retrieval_core as rc
+
+    rc._reset_vector_store_pool()
+    try:
+        node = _add_summary(
+            recall_engine,
+            "pooled unload cleanup",
+            session_id="session-a",
+            created_at=5.0,
+        )
+        _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+        _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+        key = (str(recall_engine._store.db_path), 25_000)
+        pooled = rc._vector_store_pool[key]["store"]
+
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        lifecycle_engine = LCMEngine(
+            config=LCMConfig(database_path=str(recall_engine._store.db_path))
+        )
+        lifecycle_engine.shutdown_all_instances()
+
+        assert not rc._vector_store_pool
+        assert pooled._conn is None
+        from hermes_lcm.vector_store import VectorStore
+
+        with pytest.raises(RuntimeError, match="closed during plugin unload"):
+            rc._acquire_vector_store(
+                recall_engine,
+                vector_store_cls=VectorStore,
+                scan_rows=25_000,
+            )
+    finally:
+        rc._reset_vector_store_pool()
+
+
+def test_plugin_unload_waits_for_active_pooled_query(recall_engine):
+    import threading
+
+    import hermes_lcm.retrieval_core as rc
+
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    errors = []
+
+    class BlockingStore:
+        _supports_pooling = True
+
+        def __init__(self, *_args, **_kwargs):
+            self._conn = None
+            self.was_closed = False
+
+        def close(self):
+            self.was_closed = True
+
+    def query(store):
+        started.set()
+        if not release.wait(2):
+            raise TimeoutError("test query was not released")
+        return store
+
+    def run_query():
+        try:
+            rc._run_pooled_knn(
+                recall_engine,
+                vector_store_cls=BlockingStore,
+                scan_rows=25_000,
+                deadline=time.monotonic() + 5,
+                query=query,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def close_pool():
+        rc._close_vector_store_pool()
+        closed.set()
+
+    rc._reset_vector_store_pool()
+    worker = threading.Thread(target=run_query)
+    closer = threading.Thread(target=close_pool)
+    try:
+        worker.start()
+        assert started.wait(2)
+        closer.start()
+        assert not closed.wait(0.1)
+        release.set()
+        worker.join(2)
+        closer.join(2)
+        assert not worker.is_alive()
+        assert not closer.is_alive()
+        assert not errors
+        assert closed.is_set()
+    finally:
+        release.set()
+        worker.join(2)
+        closer.join(2)
+        rc._reset_vector_store_pool()
+
+
 def test_matrix_cache_is_bounded_lru_not_cleared_on_miss():
     """sprint-opt-6: distinct candidate sets coexist in a bounded LRU rather than
     each miss clearing the whole cache."""

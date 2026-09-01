@@ -364,6 +364,7 @@ def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
+    from .retrieval_core import _open_vector_store_pool
     from .schemas import (
         LCM_GREP,
         LCM_RECALL,
@@ -382,6 +383,7 @@ def register(ctx):
         LCM_DOCTOR,
     )
 
+    _open_vector_store_pool()
     config = LCMConfig.from_env()
 
     # Resolve hermes_home for profile-scoped storage

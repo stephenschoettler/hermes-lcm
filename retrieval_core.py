@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from contextlib import nullcontext
+
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
@@ -42,17 +42,40 @@ _POOL_MAX_PATHS = 2
 _pool_lock = threading.Lock()
 # (db_path, bounded_scan_rows) -> {"store": VectorStore, "lock": RLock}
 _vector_store_pool: "OrderedDict[tuple[str, int], dict[str, Any]]" = OrderedDict()
+_pool_closed = False
 
 
-def _reset_vector_store_pool() -> None:
-    """Close and drop every pooled VectorStore (test hygiene / shutdown)."""
-    with _pool_lock:
-        while _vector_store_pool:
-            _, entry = _vector_store_pool.popitem()
+def _close_vector_store_entries_locked() -> None:
+    while _vector_store_pool:
+        _, entry = _vector_store_pool.popitem()
+        with entry["lock"]:
             try:
                 entry["store"].close()
             except Exception:  # pragma: no cover - defensive
                 pass
+
+
+def _reset_vector_store_pool() -> None:
+    """Close pooled stores and reopen the pool for test hygiene."""
+    global _pool_closed
+    with _pool_lock:
+        _pool_closed = False
+        _close_vector_store_entries_locked()
+
+
+def _open_vector_store_pool() -> None:
+    """Allow a freshly registered plugin instance to acquire pooled stores."""
+    global _pool_closed
+    with _pool_lock:
+        _pool_closed = False
+
+
+def _close_vector_store_pool() -> None:
+    """Stop new acquisitions and drain every pooled store during unload."""
+    global _pool_closed
+    with _pool_lock:
+        _pool_closed = True
+        _close_vector_store_entries_locked()
 
 
 def _acquire_vector_store(
@@ -64,15 +87,18 @@ def _acquire_vector_store(
     its matrix caches survive across calls; injected test doubles are constructed
     transiently and the caller closes them. The pool is an LRU bounded to
     ``_POOL_MAX_PATHS`` (db_path, scan_rows) keys and an evicted store is closed.
-    The returned lock MUST be held while querying: a pooled sqlite connection is
-    shared across callers and is not safe for concurrent use.
+    A returned pooled-store lock is already held. The caller MUST release it
+    after querying so unload cannot close a store between acquisition and use.
     """
     resolved_scan = int(scan_rows) if scan_rows is not None else -1
     key = (str(engine._store.db_path), resolved_scan)
     with _pool_lock:
+        if _pool_closed:
+            raise RuntimeError("LCM vector store pool is closed during plugin unload")
         entry = _vector_store_pool.get(key)
         if entry is not None:
             _vector_store_pool.move_to_end(key)
+            entry["lock"].acquire()
             return entry["store"], entry["lock"], False
         store = vector_store_cls(
             engine._store.db_path, config=engine._config, bounded_scan_rows=scan_rows
@@ -88,6 +114,7 @@ def _acquire_vector_store(
                     evicted["store"].close()
                 except Exception:  # pragma: no cover - defensive
                     pass
+        entry["lock"].acquire()
         return store, entry["lock"], False
 
 
@@ -109,20 +136,21 @@ def _run_pooled_knn(
         engine, vector_store_cls=vector_store_cls, scan_rows=scan_rows
     )
     try:
-        with (store_lock if store_lock is not None else nullcontext()):
-            vector_conn = getattr(store, "_conn", None)
+        vector_conn = getattr(store, "_conn", None)
+        if vector_conn is not None:
+            vector_conn.set_progress_handler(
+                lambda: 1 if time.monotonic() >= deadline else 0, 1000
+            )
+        try:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("semantic vector search deadline exhausted")
+            return query(store)
+        finally:
             if vector_conn is not None:
-                vector_conn.set_progress_handler(
-                    lambda: 1 if time.monotonic() >= deadline else 0, 1000
-                )
-            try:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("semantic vector search deadline exhausted")
-                return query(store)
-            finally:
-                if vector_conn is not None:
-                    vector_conn.set_progress_handler(None, 1000)
+                vector_conn.set_progress_handler(None, 1000)
     finally:
+        if store_lock is not None:
+            store_lock.release()
         if transient:
             store.close()
 
