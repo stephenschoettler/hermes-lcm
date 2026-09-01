@@ -640,6 +640,14 @@ Failure to durably externalize is fail-open: the provider receives the original
 inline payload. Results from `lcm_describe` and `lcm_expand` also stay inline so
 recovery does not recursively create another drilldown step.
 
+Payload files are flushed with `fsync` before publication on every supported
+platform. POSIX hosts also flush the parent directory after create or replace.
+Portable Python on Windows cannot open a directory descriptor for `fsync`, so
+Windows retains the file flush and same-volume atomic replace but has weaker
+power-loss durability for the directory entry itself. Windows confidentiality
+follows ACL inheritance from `HERMES_HOME`, not POSIX mode bits; review those
+ACLs before storing sensitive payloads.
+
 `lcm_grep` keeps history-only behavior by default. Operators and agents may opt
 into bounded active-session payload search with
 `content_scope='externalized'|'both'`; optional `externalized_refs` narrows the

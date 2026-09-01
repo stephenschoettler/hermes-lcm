@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import stat
@@ -722,7 +723,8 @@ def test_externalized_payload_reassignment_fsyncs_replacement(tmp_path, monkeypa
     )
 
     assert moved == 1
-    assert len(fsync_calls) >= 3
+    expected_minimum = 1 if os.name == "nt" else 3
+    assert len(fsync_calls) >= expected_minimum
     payload = json.loads(result["path"].read_text(encoding="utf-8"))
     assert payload["session_id"] == "new-session"
 
@@ -1263,6 +1265,7 @@ def test_ingest_preserves_inline_payload_when_externalization_fails(tmp_path, mo
     assert _externalized_files(tmp_path) == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows confidentiality uses inherited ACLs")
 def test_externalized_payload_files_are_private(tmp_path):
     engine = _engine(tmp_path)
 

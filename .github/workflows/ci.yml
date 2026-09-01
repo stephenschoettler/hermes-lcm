@@ -95,3 +95,28 @@ jobs:
           python -m py_compile scripts/import_lossless_claw.py
           bash -n scripts/install.sh scripts/update.sh
           git diff --check
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install pytest numpy
+
+      - name: Run Windows externalization and recovery tests
+        run: >
+          python -m pytest -q
+          tests/test_windows_portability.py
+          tests/test_ingest_protection.py
+
+      - name: Run static validation
+        run: |
+          python -m compileall -q .
+          python -m py_compile scripts/import_lossless_claw.py
+          git diff --check
