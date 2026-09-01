@@ -11,6 +11,7 @@ import stat
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -498,6 +499,38 @@ def test_externalized_payload_write_fsyncs_file_and_parent_directory(tmp_path, m
     assert result["path"].exists()
     assert file_fsync_calls
     assert result["path"].parent in fsynced_dirs
+
+
+def test_ingest_payload_names_do_not_depend_on_clock_uniqueness(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(externalize_module, "_fsync_directory", lambda _path: None)
+    monkeypatch.setattr(
+        externalize_module.time,
+        "time_ns",
+        lambda: pytest.fail("filename identity must not depend on clock resolution"),
+    )
+    suffixes = iter(("1" * 32, "2" * 32))
+    monkeypatch.setattr(
+        externalize_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=next(suffixes)),
+    )
+    kwargs = {
+        "role": "user",
+        "session_id": engine.current_session_id,
+        "field_path": "content",
+        "config": engine._config,
+        "hermes_home": str(tmp_path),
+    }
+
+    first = externalize_ingest_payload("same payload", **kwargs)
+    second = externalize_ingest_payload("same payload", **kwargs)
+
+    assert first is not None
+    assert second is not None
+    assert first["path"] != second["path"]
+    assert first["path"].stem.endswith("_" + "1" * 16)
+    assert second["path"].stem.endswith("_" + "2" * 16)
 
 
 def test_externalized_search_prefix_rejects_path_replaced_during_open(tmp_path, monkeypatch):

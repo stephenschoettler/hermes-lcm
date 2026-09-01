@@ -16,6 +16,7 @@ import pytest
 
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.tokens import count_tokens, count_message_tokens, count_messages_tokens
+import hermes_lcm.store as store_module
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.escalation import (
@@ -2681,13 +2682,14 @@ class TestMessageStore:
         # unlimited search — i.e. the sort order is deterministic.
         assert [result["store_id"] for result in short_results] == [result["store_id"] for result in long_results[:5]]
 
-    def test_append_batch_timestamps_are_unique_per_row(self, store):
+    def test_append_batch_timestamps_are_unique_per_row(self, store, monkeypatch):
         """Regression: each message in a batch must get its own timestamp.
 
         The old code called time.time() once before the loop, giving every
         message in the batch the same timestamp.  This broke date-based
         queries (journal entries, time-range filtering).
         """
+        monkeypatch.setattr(store_module.time, "time", lambda: 1234.0)
         n = 50
         ids = store.append_batch(
             "ts-sess",
