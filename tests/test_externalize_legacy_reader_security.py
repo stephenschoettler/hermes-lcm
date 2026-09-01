@@ -203,26 +203,17 @@ def test_marker_reader_rejects_foreign_owned_payload(payload_store, monkeypatch)
     ) is False
 
 
-def test_marker_reader_decodes_only_bounded_metadata_for_oversize_payload(payload_store, monkeypatch):
+def test_marker_reader_avoids_full_json_decode_for_oversize_payload(payload_store, monkeypatch):
     storage_dir, config = payload_store
     payload_path = storage_dir / "marker.json"
     _write_payload(payload_path, content=("x" * 1024) + '\n"\\é')
     monkeypatch.setattr(externalize_module, "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES", 64, raising=False)
-    real_loads = json.loads
-    decoded_sizes = []
-
-    def bounded_loads(value):
-        decoded_sizes.append(len(value))
-        assert len(value) <= externalize_module._EXTERNALIZED_SEARCH_TAIL_BYTES + 1
-        return real_loads(value)
-
-    monkeypatch.setattr(externalize_module.json, "loads", bounded_loads)
+    monkeypatch.setattr(externalize_module.json, "loads", _fail_if_json_decoded)
 
     assert externalized_tool_result_has_persisted_output_marker(
         payload_path.name,
         config=config,
     ) is True
-    assert decoded_sizes
 
 
 def test_marker_reader_rejects_corrupted_oversize_content_between_valid_metadata(
@@ -249,6 +240,32 @@ def test_marker_reader_rejects_corrupted_oversize_content_between_valid_metadata
     ) is False
 
 
+def test_oversize_marker_reader_streams_metadata_beyond_fixed_tail(payload_store, monkeypatch):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "long-marker-metadata.json"
+    payload = _payload(content="x" * 1024)
+    payload["persisted_output_markers"] = [
+        {
+            "source_path": f"/tmp/hermes-results/{index:04d}-{'m' * 80}.txt",
+            "expected_chars": index + 1,
+        }
+        for index in range(1024)
+    ]
+    payload_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert payload_path.stat().st_size > externalize_module._EXTERNALIZED_SEARCH_TAIL_BYTES
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+
+
 def test_oversize_marker_and_reassignment_use_bounded_metadata_path(payload_store, monkeypatch):
     storage_dir, config = payload_store
     payload_path = storage_dir / "large-marker.json"
@@ -267,6 +284,102 @@ def test_oversize_marker_and_reassignment_use_bounded_metadata_path(payload_stor
     reassigned = json.loads(payload_path.read_text(encoding="utf-8"))
     assert reassigned["session_id"] == "new-session"
     assert reassigned["content"] == "x" * 1024
+
+
+def test_oversize_reassignment_rejects_truncated_payload_before_temp_creation(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "truncated-reassign.json"
+    original = (
+        b'{"kind":"tool_result","session_id":"old-session","content":"'
+        + (b"x" * 1024)
+    )
+    payload_path.write_bytes(original)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    assert payload_path.read_bytes() == original
+    assert list(storage_dir.glob("*.tmp")) == []
+
+
+def test_oversize_reassignment_rejects_sparse_malformed_payload_without_copy(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "sparse-reassign.json"
+    prefix = b'{"kind":"tool_result","session_id":"old-session","content":"'
+    with payload_path.open("wb") as handle:
+        handle.write(prefix)
+        handle.seek((1024 * 1024) - 1)
+        handle.write(b"\x00")
+    original_stat = payload_path.stat()
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    current_stat = payload_path.stat()
+    assert (current_stat.st_dev, current_stat.st_ino, current_stat.st_size) == (
+        original_stat.st_dev,
+        original_stat.st_ino,
+        original_stat.st_size,
+    )
+    assert payload_path.read_bytes()[: len(prefix)] == prefix
+    assert list(storage_dir.glob("*.tmp")) == []
+
+
+def test_oversize_reassignment_requires_validation_before_temp_open(payload_store, monkeypatch):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "unverified-reassign.json"
+    _write_payload(payload_path, content="x" * 1024)
+    original = payload_path.read_bytes()
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        externalize_module,
+        "_stream_externalized_payload_suffix_metadata",
+        lambda *_args, **_kwargs: None,
+    )
+    real_open = os.open
+
+    def reject_temp_open(path, flags, mode=0o777, *, dir_fd=None):
+        assert not str(path).endswith(".tmp")
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(externalize_module.os, "open", reject_temp_open)
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    assert payload_path.read_bytes() == original
+    assert list(storage_dir.glob("*.tmp")) == []
 
 
 def test_legacy_readers_fail_closed_when_descriptor_relative_stat_is_unsupported(payload_store, monkeypatch):

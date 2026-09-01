@@ -1617,11 +1617,14 @@ class TestEscalationStripReasoning:
             assert adversarial not in messages[0]["content"]
             envelope = json.loads(messages[1]["content"])
             assert envelope["operation"] == "lcm_summary_l1"
-            assert envelope["sources"][0]["content"] == (
-                adversarial + "\n\n---\n\n" + second_summary
-            )
+            bounded_source = envelope["sources"][0]
+            original_source = adversarial + "\n\n---\n\n" + second_summary
+            assert bounded_source["content"].startswith(adversarial[:12])
+            assert bounded_source["content"].endswith(second_summary[-16:])
+            assert bounded_source["content_truncated"] is True
+            assert bounded_source["original_content_chars"] == len(original_source)
             assert session_id not in messages[1]["content"]
-            assert envelope["sources"][0]["provenance"] == {
+            assert bounded_source["provenance"] == {
                 "source_type": "summary_nodes",
                 "node_ids": [first_node_id, second_node_id],
                 "source_depth": 0,

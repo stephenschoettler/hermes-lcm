@@ -1069,67 +1069,343 @@ def read_externalized_payload_search_prefix(
     }
 
 
-def _parse_externalized_payload_metadata_tail(
-    raw: bytes,
-) -> tuple[Dict[str, Any], int] | None:
-    """Decode the bounded metadata suffix emitted after ``content``."""
-    matches = list(re.finditer(rb',\s*"content_chars"\s*:', raw))
-    for match in reversed(matches):
-        try:
-            decoded = json.loads(b"{" + raw[match.start() + 1 :])
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if isinstance(decoded, dict):
-            return decoded, match.start()
-    return None
+class _StreamingJSONReader:
+    """Small bounded-memory byte reader for validating oversized sidecars."""
+
+    def __init__(self, handle: BinaryIO, *, start: int) -> None:
+        handle.seek(start)
+        self._handle = handle
+        self._buffer = b""
+        self._index = 0
+
+    def peek(self) -> int | None:
+        if self._index >= len(self._buffer):
+            self._buffer = self._handle.read(64 * 1024)
+            self._index = 0
+            if not self._buffer:
+                return None
+        return self._buffer[self._index]
+
+    def read(self) -> int | None:
+        byte = self.peek()
+        if byte is not None:
+            self._index += 1
+        return byte
 
 
-def _validate_externalized_payload_content_string(
-    handle: BinaryIO,
+def _stream_json_skip_whitespace(reader: _StreamingJSONReader) -> None:
+    while (byte := reader.peek()) is not None and byte in b" \t\n\r":
+        reader.read()
+
+
+def _stream_json_is_digit(byte: int | None) -> bool:
+    return byte is not None and ord("0") <= byte <= ord("9")
+
+
+def _stream_json_read_string(
+    reader: _StreamingJSONReader,
     *,
-    content_start: int,
-    suffix_start: int,
-) -> bool:
-    """Stream-validate the JSON string between bounded metadata fragments."""
-    if content_start < 0 or suffix_start <= content_start:
-        return False
+    capture_limit: int = 4096,
+) -> str | None:
+    if reader.read() != ord('"'):
+        raise ValueError("invalid_json_string")
+    raw = bytearray()
+    truncated = False
+    escaped = False
+    unicode_digits_remaining = 0
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    while True:
+        byte = reader.read()
+        if byte is None:
+            raise ValueError("truncated_json_string")
+        if unicode_digits_remaining:
+            if byte not in b"0123456789abcdefABCDEF":
+                raise ValueError("invalid_json_unicode_escape")
+            unicode_digits_remaining -= 1
+        elif escaped:
+            if byte == ord("u"):
+                unicode_digits_remaining = 4
+            elif byte not in b'"\\/bfnrt':
+                raise ValueError("invalid_json_escape")
+            escaped = False
+        elif byte == ord("\\"):
+            escaped = True
+        elif byte == ord('"'):
+            decoder.decode(b"", final=True)
+            if truncated:
+                return None
+            value, end = json.JSONDecoder().raw_decode(
+                (b'"' + bytes(raw) + b'"').decode("utf-8")
+            )
+            if end != len(raw) + 2 or not isinstance(value, str):
+                raise ValueError("invalid_json_string")
+            return value
+        elif byte < 0x20:
+            raise ValueError("invalid_json_control_character")
+        decoder.decode(bytes((byte,)), final=False)
+        if len(raw) < capture_limit:
+            raw.append(byte)
+        else:
+            truncated = True
 
+
+def _stream_json_read_number(reader: _StreamingJSONReader) -> str | None:
+    captured = bytearray()
+    truncated = False
+
+    def consume() -> int:
+        nonlocal truncated
+        byte = reader.read()
+        if byte is None:
+            raise ValueError("truncated_json_number")
+        if len(captured) < 128:
+            captured.append(byte)
+        else:
+            truncated = True
+        return byte
+
+    if reader.peek() == ord("-"):
+        consume()
+    first = reader.peek()
+    if first == ord("0"):
+        consume()
+        if _stream_json_is_digit(reader.peek()):
+            raise ValueError("invalid_json_number")
+    elif first is not None and ord("1") <= first <= ord("9"):
+        consume()
+        while _stream_json_is_digit(reader.peek()):
+            consume()
+    else:
+        raise ValueError("invalid_json_number")
+    if reader.peek() == ord("."):
+        consume()
+        if not _stream_json_is_digit(reader.peek()):
+            raise ValueError("invalid_json_number")
+        while _stream_json_is_digit(reader.peek()):
+            consume()
+    if reader.peek() in (ord("e"), ord("E")):
+        consume()
+        if reader.peek() in (ord("+"), ord("-")):
+            consume()
+        if not _stream_json_is_digit(reader.peek()):
+            raise ValueError("invalid_json_number")
+        while _stream_json_is_digit(reader.peek()):
+            consume()
+    return None if truncated else captured.decode("ascii")
+
+
+def _stream_json_consume_literal(reader: _StreamingJSONReader, literal: bytes) -> None:
+    for expected in literal:
+        if reader.read() != expected:
+            raise ValueError("invalid_json_literal")
+
+
+def _stream_json_skip_value(reader: _StreamingJSONReader, *, depth: int = 0) -> None:
+    if depth > 64:
+        raise ValueError("json_nesting_too_deep")
+    _stream_json_skip_whitespace(reader)
+    byte = reader.peek()
+    if byte == ord('"'):
+        _stream_json_read_string(reader, capture_limit=0)
+        return
+    if byte == ord("{"):
+        reader.read()
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() == ord("}"):
+            reader.read()
+            return
+        while True:
+            _stream_json_read_string(reader, capture_limit=0)
+            _stream_json_skip_whitespace(reader)
+            if reader.read() != ord(":"):
+                raise ValueError("invalid_json_object")
+            _stream_json_skip_value(reader, depth=depth + 1)
+            _stream_json_skip_whitespace(reader)
+            separator = reader.read()
+            if separator == ord("}"):
+                return
+            if separator != ord(","):
+                raise ValueError("invalid_json_object")
+            _stream_json_skip_whitespace(reader)
+    if byte == ord("["):
+        reader.read()
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() == ord("]"):
+            reader.read()
+            return
+        while True:
+            _stream_json_skip_value(reader, depth=depth + 1)
+            _stream_json_skip_whitespace(reader)
+            separator = reader.read()
+            if separator == ord("]"):
+                return
+            if separator != ord(","):
+                raise ValueError("invalid_json_array")
+            _stream_json_skip_whitespace(reader)
+    if byte in (ord("-"), *range(ord("0"), ord("9") + 1)):
+        _stream_json_read_number(reader)
+        return
+    if byte == ord("t"):
+        _stream_json_consume_literal(reader, b"true")
+        return
+    if byte == ord("f"):
+        _stream_json_consume_literal(reader, b"false")
+        return
+    if byte == ord("n"):
+        _stream_json_consume_literal(reader, b"null")
+        return
+    raise ValueError("invalid_json_value")
+
+
+def _stream_json_read_marker_object(reader: _StreamingJSONReader) -> Dict[str, Any] | None:
+    if reader.read() != ord("{"):
+        raise ValueError("invalid_marker_object")
+    marker: Dict[str, Any] = {}
+    _stream_json_skip_whitespace(reader)
+    if reader.peek() == ord("}"):
+        reader.read()
+        return None
+    while True:
+        key = _stream_json_read_string(reader, capture_limit=256)
+        _stream_json_skip_whitespace(reader)
+        if reader.read() != ord(":"):
+            raise ValueError("invalid_marker_object")
+        _stream_json_skip_whitespace(reader)
+        if key == "source_path" and reader.peek() == ord('"'):
+            marker["source_path"] = _stream_json_read_string(reader)
+        elif key == "expected_chars" and reader.peek() == ord('"'):
+            marker["expected_chars"] = _stream_json_read_string(reader, capture_limit=128)
+        elif key == "expected_chars" and reader.peek() in (
+            ord("-"),
+            *range(ord("0"), ord("9") + 1),
+        ):
+            marker["expected_chars"] = _stream_json_read_number(reader)
+        else:
+            _stream_json_skip_value(reader, depth=1)
+        _stream_json_skip_whitespace(reader)
+        separator = reader.read()
+        if separator == ord("}"):
+            break
+        if separator != ord(","):
+            raise ValueError("invalid_marker_object")
+        _stream_json_skip_whitespace(reader)
+    return _persisted_output_marker_entry_from_metadata(
+        {
+            "persisted_output_source_path": marker.get("source_path"),
+            "persisted_output_expected_chars": marker.get("expected_chars"),
+        }
+    )
+
+
+def _stream_json_read_marker_array(reader: _StreamingJSONReader) -> Dict[str, Any] | None:
+    if reader.read() != ord("["):
+        raise ValueError("invalid_marker_array")
+    first_valid: Dict[str, Any] | None = None
+    _stream_json_skip_whitespace(reader)
+    if reader.peek() == ord("]"):
+        reader.read()
+        return None
+    while True:
+        if reader.peek() == ord("{"):
+            marker = _stream_json_read_marker_object(reader)
+            if first_valid is None and marker is not None:
+                first_valid = marker
+        else:
+            _stream_json_skip_value(reader, depth=1)
+        _stream_json_skip_whitespace(reader)
+        separator = reader.read()
+        if separator == ord("]"):
+            return first_valid
+        if separator != ord(","):
+            raise ValueError("invalid_marker_array")
+        _stream_json_skip_whitespace(reader)
+
+
+def _stream_externalized_content_end(handle: BinaryIO, *, content_start: int) -> int | None:
+    if content_start < 0:
+        return None
     handle.seek(content_start)
-    remaining = suffix_start - content_start
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     escaped = False
     unicode_digits_remaining = 0
-    closed = False
-
-    while remaining > 0:
-        chunk = handle.read(min(64 * 1024, remaining))
+    while True:
+        chunk_start = handle.tell()
+        chunk = handle.read(64 * 1024)
         if not chunk:
-            return False
-        decoder.decode(chunk, final=False)
-        for byte in chunk:
-            if closed:
-                if byte not in b" \t\n\r":
-                    return False
-            elif unicode_digits_remaining:
+            return None
+        for index, byte in enumerate(chunk):
+            if unicode_digits_remaining:
                 if byte not in b"0123456789abcdefABCDEF":
-                    return False
+                    return None
                 unicode_digits_remaining -= 1
             elif escaped:
                 if byte == ord("u"):
                     unicode_digits_remaining = 4
                 elif byte not in b'"\\/bfnrt':
-                    return False
+                    return None
                 escaped = False
             elif byte == ord("\\"):
                 escaped = True
             elif byte == ord('"'):
-                closed = True
+                decoder.decode(chunk[:index], final=True)
+                return chunk_start + index + 1
             elif byte < 0x20:
-                return False
-        remaining -= len(chunk)
+                return None
+        decoder.decode(chunk, final=False)
 
-    decoder.decode(b"", final=True)
-    return closed and not escaped and unicode_digits_remaining == 0
+
+def _stream_externalized_payload_suffix_metadata(
+    handle: BinaryIO,
+    *,
+    content_start: int,
+) -> Dict[str, Any] | None:
+    """Validate the complete sidecar and retain only bounded marker metadata."""
+    content_end = _stream_externalized_content_end(handle, content_start=content_start)
+    if content_end is None:
+        return None
+    reader = _StreamingJSONReader(handle, start=content_end)
+    metadata: Dict[str, Any] = {}
+    try:
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() == ord("}"):
+            reader.read()
+        else:
+            if reader.read() != ord(","):
+                return None
+            while True:
+                _stream_json_skip_whitespace(reader)
+                key = _stream_json_read_string(reader, capture_limit=256)
+                _stream_json_skip_whitespace(reader)
+                if reader.read() != ord(":"):
+                    return None
+                _stream_json_skip_whitespace(reader)
+                if key == "persisted_output_markers" and reader.peek() == ord("["):
+                    marker = _stream_json_read_marker_array(reader)
+                    if marker is not None:
+                        metadata["persisted_output_markers"] = [marker]
+                elif key == "persisted_output_source_path" and reader.peek() == ord('"'):
+                    metadata[key] = _stream_json_read_string(reader)
+                elif key == "persisted_output_expected_chars" and reader.peek() == ord('"'):
+                    metadata[key] = _stream_json_read_string(reader, capture_limit=128)
+                elif key == "persisted_output_expected_chars" and reader.peek() in (
+                    ord("-"),
+                    *range(ord("0"), ord("9") + 1),
+                ):
+                    metadata[key] = _stream_json_read_number(reader)
+                else:
+                    _stream_json_skip_value(reader, depth=1)
+                _stream_json_skip_whitespace(reader)
+                separator = reader.read()
+                if separator == ord("}"):
+                    break
+                if separator != ord(","):
+                    return None
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() is not None:
+            return None
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return metadata
 
 
 def _read_oversize_externalized_payload_metadata(
@@ -1137,7 +1413,7 @@ def _read_oversize_externalized_payload_metadata(
     *,
     storage_dir: Path,
 ) -> Dict[str, Any] | None:
-    """Read only bounded header/tail metadata from an oversized sidecar."""
+    """Stream-validate an oversized sidecar and retain bounded marker metadata."""
     opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
     if opened is None:
         return None
@@ -1156,18 +1432,11 @@ def _read_oversize_externalized_payload_metadata(
             )
             if not content_key_seen or prefix_truncated:
                 return None
-            tail_start = max(0, payload_stat.st_size - _EXTERNALIZED_SEARCH_TAIL_BYTES)
-            handle.seek(tail_start)
-            tail = handle.read(_EXTERNALIZED_SEARCH_TAIL_BYTES)
-            parsed_suffix = _parse_externalized_payload_metadata_tail(tail)
-            if parsed_suffix is None:
-                return None
-            suffix, relative_suffix_start = parsed_suffix
-            if not _validate_externalized_payload_content_string(
+            suffix = _stream_externalized_payload_suffix_metadata(
                 handle,
                 content_start=len(prefix.encode("utf-8")),
-                suffix_start=tail_start + relative_suffix_start,
-            ):
+            )
+            if suffix is None:
                 return None
             return {**fields, **suffix}
     except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
@@ -1228,6 +1497,11 @@ def _reassign_oversize_externalized_payload(
                 or prefix_truncated
                 or fields.get("session_id") != old_session_id
             ):
+                return False
+            if _stream_externalized_payload_suffix_metadata(
+                source,
+                content_start=len(prefix.encode("utf-8")),
+            ) is None:
                 return False
             rewritten_prefix = _replace_session_id_in_metadata_prefix(
                 prefix,

@@ -416,6 +416,7 @@ def _build_l1_prompt(
     focus_topic: str = "",
     custom_instructions: str = "",
     source_provenance: Mapping[str, Any] | None = None,
+    source_content_token_budget: int | None = None,
 ) -> list[dict[str, str]]:
     """Build a role-separated Level 1 prompt over untrusted source data."""
     depth_guidance = {
@@ -459,6 +460,7 @@ Target approximately {int(token_budget)} tokens.{focus_guidance}{custom_guidance
                 source_provenance=source_provenance,
             )
         ],
+        source_content_token_budget=source_content_token_budget,
     )
 
 
@@ -469,6 +471,7 @@ def _build_l2_prompt(
     custom_instructions: str = "",
     source_provenance: Mapping[str, Any] | None = None,
     source_depth: int = 0,
+    source_content_token_budget: int | None = None,
 ) -> list[dict[str, str]]:
     """Build a role-separated Level 2 prompt over untrusted source data."""
     focus_guidance = ""
@@ -501,6 +504,7 @@ Drop reasoning, alternatives considered, and process detail.{focus_guidance}{cus
                 source_provenance=source_provenance,
             )
         ],
+        source_content_token_budget=source_content_token_budget,
     )
 
 
@@ -611,10 +615,15 @@ def summarize_with_escalation(
     output shorter than the source.
     """
     # Level 1: detailed summary
-    l1_prompt = _build_l1_prompt(text, token_budget, depth,
-                                 focus_topic=focus_topic,
-                                 custom_instructions=custom_instructions,
-                                 source_provenance=source_provenance)
+    l1_prompt = _build_l1_prompt(
+        text,
+        token_budget,
+        depth,
+        focus_topic=focus_topic,
+        custom_instructions=custom_instructions,
+        source_provenance=source_provenance,
+        source_content_token_budget=source_tokens,
+    )
     l1_result = _invoke_summary_llm_chain(
         l1_prompt,
         token_budget * 2,
@@ -632,11 +641,15 @@ def summarize_with_escalation(
 
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
-    l2_prompt = _build_l2_prompt(text, l2_budget,
-                                 focus_topic=focus_topic,
-                                 custom_instructions=custom_instructions,
-                                 source_provenance=source_provenance,
-                                 source_depth=depth)
+    l2_prompt = _build_l2_prompt(
+        text,
+        l2_budget,
+        focus_topic=focus_topic,
+        custom_instructions=custom_instructions,
+        source_provenance=source_provenance,
+        source_depth=depth,
+        source_content_token_budget=source_tokens,
+    )
     l2_result = _invoke_summary_llm_chain(
         l2_prompt,
         l2_budget * 2,

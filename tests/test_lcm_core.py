@@ -271,15 +271,60 @@ class TestProviderPrefixedAuxiliaryCalls:
             envelope = json.loads(messages[1]["content"])
             assert envelope["contract"] == "lcm_untrusted_data_v1"
             assert envelope["operation"] == operation
-            assert envelope["sources"] == [
-                {
-                    "provenance": {
-                        "source_type": "messages",
-                        "store_ids": [17, 18],
-                    },
-                    "content": source,
-                }
-            ]
+            bounded_source = envelope["sources"][0]
+            assert bounded_source["provenance"] == {
+                "source_type": "messages",
+                "store_ids": [17, 18],
+            }
+            assert bounded_source["content"].startswith(adversarial)
+            if bounded_source["content"] != source:
+                assert bounded_source["content_truncated"] is True
+                assert bounded_source["original_content_chars"] == len(source)
+
+    def test_summary_l1_and_l2_budget_serialized_json_escaping_before_dispatch(
+        self,
+        monkeypatch,
+    ):
+        from hermes_lcm.escalation import summarize_with_escalation
+
+        source = ('quote=" slash=\\ tab=\t newline=\n control=\x01\n' * 1500)
+        source_tokens = count_tokens(source)
+        calls = []
+
+        def fake_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return self._fake_response("verbose " * (source_tokens + 20))
+            return self._fake_response("Grounded compact summary.")
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+
+        summary, level = summarize_with_escalation(
+            source,
+            source_tokens=source_tokens,
+            token_budget=100,
+        )
+
+        assert (summary, level) == ("Grounded compact summary.", 2)
+        assert len(calls) == 2
+        for call in calls:
+            messages = call["messages"]
+            envelope = json.loads(messages[1]["content"])
+            bounded_source = envelope["sources"][0]
+            baseline_envelope = copy.deepcopy(envelope)
+            baseline_envelope["sources"][0]["content"] = ""
+            baseline_messages = copy.deepcopy(messages)
+            baseline_messages[1]["content"] = json.dumps(
+                baseline_envelope,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            assert count_messages_tokens(messages) <= (
+                count_messages_tokens(baseline_messages) + source_tokens
+            )
+            assert bounded_source["content"] != source
+            assert bounded_source["content_truncated"] is True
+            assert bounded_source["original_content_chars"] == len(source)
 
     def test_summary_call_keeps_unresolved_direct_slug_model_only(self, monkeypatch):
         from hermes_lcm.escalation import _call_llm_for_summary
