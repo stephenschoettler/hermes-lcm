@@ -523,6 +523,60 @@ def test_dispatch_stamps_scan_started_before_thread_runs(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_plugin_unload_waits_for_background_integrity_scan(tmp_path, monkeypatch):
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.engine import LCMEngine
+
+    db_path = tmp_path / "lcm.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+
+    def blocking_scan(path, _spec, _started_at):
+        scan_conn = sqlite3.connect(path, check_same_thread=False)
+        try:
+            scan_started.set()
+            if not release_scan.wait(timeout=3):
+                raise AssertionError("test did not release integrity scan")
+        finally:
+            scan_conn.close()
+
+    monkeypatch.setattr(
+        db_bootstrap,
+        "_run_background_integrity_scan",
+        blocking_scan,
+    )
+    assert db_bootstrap._dispatch_background_integrity_scan(
+        engine._store._conn,
+        _spec(),
+    )
+    assert scan_started.wait(timeout=1)
+
+    unload_done = threading.Event()
+    unload_errors = []
+
+    def unload_plugin():
+        try:
+            engine.shutdown_all_instances()
+        except BaseException as exc:  # captured for assertion in the main thread
+            unload_errors.append(exc)
+        finally:
+            unload_done.set()
+
+    unload_thread = threading.Thread(target=unload_plugin)
+    unload_thread.start()
+    unload_waited = not unload_done.wait(timeout=0.1)
+    release_scan.set()
+    unload_thread.join(timeout=3)
+    db_bootstrap.join_background_integrity_scans(timeout=2)
+
+    assert unload_waited
+    assert not unload_thread.is_alive()
+    assert unload_errors == []
+    db_path.unlink()
+    assert not db_path.exists()
+
+
 def test_kill_switch_false_runs_synchronously_without_a_thread(tmp_path, monkeypatch, integrity_calls):
     """SPEC E (c): LCM_FTS_INTEGRITY_BACKGROUND=false = exact old synchronous path."""
     monkeypatch.setenv(INTERVAL_ENV, "24")

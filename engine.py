@@ -27,6 +27,7 @@ from .codex_routing import (
     _is_codex_gpt55_route,
 )
 from .config import LCMConfig
+from .db_bootstrap import join_background_integrity_scans
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
@@ -488,6 +489,7 @@ class _EngineShutdownGroup:
             retired_background = list(self._retired_background)
         for record in retired_background:
             self._drain_retired_background(record)
+        join_background_integrity_scans()
         if first_error is not None:
             raise first_error
 
