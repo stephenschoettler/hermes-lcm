@@ -465,11 +465,18 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
+        last_timestamp = -math.inf
         with self._write_lock, self._conn:
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
+                candidate_timestamp = time.time()
+                ts = (
+                    candidate_timestamp
+                    if candidate_timestamp > last_timestamp
+                    else math.nextafter(last_timestamp, math.inf)
+                )
+                last_timestamp = ts
                 observed_at = _normalize_observed_at(msg.get("timestamp"))
                 cur = self._conn.execute(
                     """INSERT INTO messages
