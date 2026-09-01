@@ -645,8 +645,10 @@ platform. POSIX hosts also flush the parent directory after create or replace.
 Portable Python on Windows cannot open a directory descriptor for `fsync`, so
 Windows retains the file flush and same-volume atomic replace but has weaker
 power-loss durability for the directory entry itself. Windows confidentiality
-follows ACL inheritance from `HERMES_HOME`, not POSIX mode bits; review those
-ACLs before storing sensitive payloads.
+follows ACL inheritance from the effective externalization directory and its
+parent, not POSIX mode bits. When `LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH`
+points outside `HERMES_HOME`, the `HERMES_HOME` ACL does not protect those
+payloads; review the ACLs on the resolved configured directory and its parent.
 
 `lcm_grep` keeps history-only behavior by default. Operators and agents may opt
 into bounded active-session payload search with
