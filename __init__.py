@@ -397,6 +397,9 @@ def register(ctx):
 
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(engine.shutdown)
 
     # Ship the same recall contract through both Hermes plugin skill
     # registration (explicit qualified loads) and the installer's ordinary
