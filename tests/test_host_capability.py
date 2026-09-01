@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 EXPECTED_LCM_TOOLS = {
     "lcm_grep",
@@ -172,6 +174,14 @@ class TestRegistrationGating:
         assert clone._store._conn is None
         db_path.unlink()
         assert not db_path.exists()
+
+        late_clone = None
+        try:
+            with pytest.raises(RuntimeError, match="unloading"):
+                late_clone = ctx.engine.clone_for_agent()
+        finally:
+            if late_clone is not None:
+                late_clone.shutdown()
 
 
 class TestHermesAgentRegression:

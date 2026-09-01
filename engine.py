@@ -376,10 +376,15 @@ class _EngineShutdownGroup:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._engines = weakref.WeakSet()
+        self._closed = False
 
-    def add(self, engine: "LCMEngine") -> None:
+    def add(self, engine: "LCMEngine") -> bool:
         with self._lock:
-            self._engines.add(engine)
+            if not self._closed:
+                self._engines.add(engine)
+                return True
+        engine.shutdown()
+        return False
 
     def discard(self, engine: "LCMEngine") -> None:
         with self._lock:
@@ -387,6 +392,7 @@ class _EngineShutdownGroup:
 
     def shutdown_all(self) -> None:
         with self._lock:
+            self._closed = True
             engines = list(self._engines)
         first_error: Exception | None = None
         for engine in engines:
@@ -676,7 +682,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         clone._shutdown_group.discard(clone)
         clone._shutdown_group = self._shutdown_group
-        self._shutdown_group.add(clone)
+        if not self._shutdown_group.add(clone):
+            raise RuntimeError("Cannot clone LCM engine while plugin is unloading")
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key
