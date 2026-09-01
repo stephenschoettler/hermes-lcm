@@ -785,7 +785,11 @@ def test_rollup_background_failure_is_logged_without_breaking_bind(
 def test_engine_shutdown_stays_nonblocking_but_plugin_unload_waits(
     tmp_path,
     monkeypatch,
+    request,
 ):
+    from hermes_lcm import retrieval_core
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
     config = LCMConfig(
         database_path=str(tmp_path / "shutdown-background-maintenance.db"),
         temporal_rollups_enabled=True,
@@ -843,7 +847,12 @@ def test_engine_shutdown_stays_nonblocking_but_plugin_unload_waits(
         assert engine.drain_rollup_maintenance(timeout=2)
 
 
-def test_plugin_unload_waits_for_background_rollup_provider(tmp_path, monkeypatch):
+def test_plugin_unload_waits_for_background_rollup_provider(
+    tmp_path, monkeypatch, request
+):
+    from hermes_lcm import retrieval_core
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
     db_path = tmp_path / "unload-background-maintenance.db"
     engine = LCMEngine(
         config=LCMConfig(

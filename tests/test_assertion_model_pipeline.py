@@ -336,7 +336,12 @@ def test_compression_hook_queues_exact_rows_without_waiting_for_assertion_public
         engine.shutdown()
 
 
-def test_plugin_unload_waits_for_background_assertion_worker(tmp_path, monkeypatch):
+def test_plugin_unload_waits_for_background_assertion_worker(
+    tmp_path, monkeypatch, request
+):
+    from hermes_lcm import retrieval_core
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
     worker_started = threading.Event()
     release_worker = threading.Event()
 

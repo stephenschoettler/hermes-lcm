@@ -523,7 +523,12 @@ def test_dispatch_stamps_scan_started_before_thread_runs(tmp_path, monkeypatch):
     conn.close()
 
 
-def test_plugin_unload_waits_for_background_integrity_scan(tmp_path, monkeypatch):
+def test_plugin_unload_waits_for_background_integrity_scan(
+    tmp_path, monkeypatch, request
+):
+    from hermes_lcm import retrieval_core
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
     from hermes_lcm.config import LCMConfig
     from hermes_lcm.engine import LCMEngine
 
