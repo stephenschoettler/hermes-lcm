@@ -223,6 +223,46 @@ def test_maintenance_creates_private_backups_and_tightens_existing_slot(tmp_path
         store.close()
 
 
+@pytest.mark.parametrize("operation", ["timestamped", "rotate"])
+def test_maintenance_rejects_symlinked_backup_directory_before_chmod(
+    tmp_path,
+    operation,
+):
+    db_path = tmp_path / "database" / "lcm.db"
+    store = MessageStore(db_path)
+    store.append("session", {"role": "user", "content": "backup"})
+    store.commit()
+
+    backup_parent = tmp_path / "backups"
+    backup_parent.mkdir()
+    backup_dir = backup_parent / "lcm"
+    unrelated_target = tmp_path / "unrelated-target"
+    unrelated_target.mkdir(mode=0o755)
+    unrelated_target.chmod(0o755)
+    backup_dir.symlink_to(unrelated_target, target_is_directory=True)
+    rotate_path = backup_dir / "rotate-latest.sqlite3"
+    engine = SimpleNamespace(
+        _store=store,
+        _dag=SimpleNamespace(_conn=store.connection),
+        _lifecycle=None,
+        backup_dir=lambda: backup_dir,
+        rotate_backup_path=lambda: rotate_path,
+    )
+
+    try:
+        result = (
+            backup_database(engine)
+            if operation == "timestamped"
+            else rotate_backup_database(engine)
+        )
+
+        assert result["ok"] is False
+        assert _mode(unrelated_target) == 0o755
+        assert list(unrelated_target.iterdir()) == []
+    finally:
+        store.close()
+
+
 def test_rotate_backup_failure_preserves_existing_atomic_slot(tmp_path, monkeypatch):
     db_path = tmp_path / "database" / "lcm.db"
     store = MessageStore(db_path)

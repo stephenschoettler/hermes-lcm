@@ -30,6 +30,7 @@ _EXTERNALIZED_SEARCH_TAIL_BYTES = 64 * 1024
 # attacker-controlled file size without a ceiling. This is deliberately larger
 # than normal provider-visible payloads while keeping one read memory-bounded.
 _LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES = 64 * 1024 * 1024
+_SESSION_ID_VALUE_SPAN_KEY = "_session_id_value_span"
 
 
 def _placeholder_metadata(value: Any) -> str:
@@ -603,10 +604,10 @@ def _same_file_identity(left, right) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
-def _same_owner(left, right) -> bool:
-    left_uid = getattr(left, "st_uid", None)
-    right_uid = getattr(right, "st_uid", None)
-    return left_uid is None or right_uid is None or left_uid == right_uid
+def _owned_by_effective_user(file_stat) -> bool:
+    file_uid = getattr(file_stat, "st_uid", None)
+    get_effective_uid = getattr(os, "geteuid", None)
+    return file_uid is None or get_effective_uid is None or file_uid == get_effective_uid()
 
 
 def _has_single_link(file_stat) -> bool:
@@ -645,7 +646,7 @@ def _open_legacy_externalized_payload(
         expected_payload = os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False)
         if (
             not stat.S_ISREG(expected_payload.st_mode)
-            or not _same_owner(expected_payload, opened_dir)
+            or not _owned_by_effective_user(expected_payload)
             or not _has_single_link(expected_payload)
         ):
             return None
@@ -660,7 +661,7 @@ def _open_legacy_externalized_payload(
         if (
             not stat.S_ISREG(opened_payload.st_mode)
             or not _same_file_identity(expected_payload, opened_payload)
-            or not _same_owner(opened_payload, opened_dir)
+            or not _owned_by_effective_user(opened_payload)
             or not _has_single_link(opened_payload)
             or opened_payload.st_size < 0
         ):
@@ -878,18 +879,25 @@ def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[
             return fields, index if index < length and text[index] == '"' else None
         if index >= length:
             return fields, None
+        value_start = index
         try:
             value, index = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
             return fields, None
         if isinstance(value, str):
             fields[key] = value
+            if key == "session_id":
+                fields[_SESSION_ID_VALUE_SPAN_KEY] = (
+                    len(text[:value_start].encode("utf-8")),
+                    len(text[:index].encode("utf-8")),
+                )
         elif key == "kind":
             # Preserve an explicitly invalid kind so oversized readers cannot
             # mistake it for the supported missing-kind legacy shape.
             fields[key] = value
         elif key == "session_id":
             fields.pop(key, None)
+            fields[_SESSION_ID_VALUE_SPAN_KEY] = None
         index = skip_json_whitespace(index)
         if index >= length:
             return fields, None
@@ -1095,6 +1103,9 @@ class _StreamingJSONReader:
         if byte is not None:
             self._index += 1
         return byte
+
+    def tell(self) -> int:
+        return self._handle.tell() - len(self._buffer) + self._index
 
 
 def _stream_json_skip_whitespace(reader: _StreamingJSONReader) -> None:
@@ -1383,7 +1394,19 @@ def _stream_externalized_payload_suffix_metadata(
                 if reader.read() != ord(":"):
                     return None
                 _stream_json_skip_whitespace(reader)
-                if key == "persisted_output_markers":
+                value_start = reader.tell()
+                if key == "session_id":
+                    metadata[_SESSION_ID_VALUE_SPAN_KEY] = None
+                    if reader.peek() == ord('"'):
+                        metadata[key] = _stream_json_read_string(reader)
+                        metadata[_SESSION_ID_VALUE_SPAN_KEY] = (
+                            value_start,
+                            reader.tell(),
+                        )
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
+                elif key == "persisted_output_markers":
                     if reader.peek() == ord("["):
                         marker = _stream_json_read_marker_array(reader)
                         metadata[key] = [marker] if marker is not None else []
@@ -1460,25 +1483,6 @@ def _read_oversize_externalized_payload_metadata(
         os.close(dir_fd)
 
 
-def _replace_session_id_in_metadata_prefix(
-    prefix: str,
-    *,
-    old_session_id: str,
-    new_session_id: str,
-) -> str | None:
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r'"session_id"\s*:\s*', prefix):
-        try:
-            value, end = decoder.raw_decode(prefix, match.end())
-        except json.JSONDecodeError:
-            continue
-        if value != old_session_id:
-            continue
-        replacement = json.dumps(new_session_id, ensure_ascii=False)
-        return prefix[: match.end()] + replacement + prefix[end:]
-    return None
-
-
 def _reassign_oversize_externalized_payload(
     path: Path,
     *,
@@ -1505,23 +1509,26 @@ def _reassign_oversize_externalized_payload(
                     max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
                 )
             )
-            if (
-                not content_key_seen
-                or prefix_truncated
-                or fields.get("session_id") != old_session_id
-            ):
+            if not content_key_seen or prefix_truncated:
                 return False
-            if _stream_externalized_payload_suffix_metadata(
+            suffix = _stream_externalized_payload_suffix_metadata(
                 source,
                 content_start=len(prefix.encode("utf-8")),
-            ) is None:
-                return False
-            rewritten_prefix = _replace_session_id_in_metadata_prefix(
-                prefix,
-                old_session_id=old_session_id,
-                new_session_id=new_session_id,
             )
-            if rewritten_prefix is None:
+            if suffix is None:
+                return False
+            effective_fields = {**fields, **suffix}
+            value_span = effective_fields.get(_SESSION_ID_VALUE_SPAN_KEY)
+            if effective_fields.get("session_id") != old_session_id:
+                return False
+            if (
+                not isinstance(value_span, tuple)
+                or len(value_span) != 2
+                or not all(isinstance(offset, int) for offset in value_span)
+            ):
+                return False
+            value_start, value_end = value_span
+            if value_start < 0 or value_start >= value_end or value_end > payload_stat.st_size:
                 return False
 
             flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
@@ -1529,11 +1536,17 @@ def _reassign_oversize_externalized_payload(
             tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
             with os.fdopen(tmp_fd, "w+b") as destination:
                 tmp_fd = -1
-                prefix_bytes = prefix.encode("utf-8")
-                rewritten_prefix_bytes = rewritten_prefix.encode("utf-8")
-                destination.write(rewritten_prefix_bytes)
-                source.seek(len(prefix_bytes))
-                remaining = payload_stat.st_size - len(prefix_bytes)
+                source.seek(0)
+                remaining = value_start
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("payload_changed_during_copy")
+                    destination.write(chunk)
+                    remaining -= len(chunk)
+                destination.write(json.dumps(new_session_id, ensure_ascii=False).encode("utf-8"))
+                source.seek(value_end)
+                remaining = payload_stat.st_size - value_end
                 if remaining < 0:
                     raise ValueError("payload_changed_during_copy")
                 while remaining:
@@ -1557,15 +1570,19 @@ def _reassign_oversize_externalized_payload(
                     destination,
                     max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
                 )
+                copied_suffix = _stream_externalized_payload_suffix_metadata(
+                    destination,
+                    content_start=len(copied_prefix.encode("utf-8")),
+                )
+                copied_effective_fields = (
+                    {**copied_fields, **copied_suffix}
+                    if copied_suffix is not None
+                    else {}
+                )
                 if (
                     not copied_content_key_seen
                     or copied_prefix_truncated
-                    or copied_fields.get("session_id") != new_session_id
-                    or _stream_externalized_payload_suffix_metadata(
-                        destination,
-                        content_start=len(copied_prefix.encode("utf-8")),
-                    )
-                    is None
+                    or copied_effective_fields.get("session_id") != new_session_id
                 ):
                     raise ValueError("copied_payload_validation_failed")
 

@@ -127,6 +127,35 @@ def _report_payload_as_foreign_owned(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(externalize_module.os, "fstat", foreign_owned_fstat)
 
 
+def _report_storage_directory_as_differently_owned(
+    monkeypatch: pytest.MonkeyPatch,
+    storage_dir: Path,
+) -> None:
+    real_lstat = os.lstat
+    real_fstat = os.fstat
+
+    def with_different_uid(value):
+        return SimpleNamespace(
+            st_mode=value.st_mode,
+            st_dev=value.st_dev,
+            st_ino=value.st_ino,
+            st_size=value.st_size,
+            st_uid=value.st_uid + 1,
+            st_nlink=value.st_nlink,
+        )
+
+    def differently_owned_lstat(path):
+        value = real_lstat(path)
+        return with_different_uid(value) if Path(path) == storage_dir else value
+
+    def differently_owned_fstat(fd):
+        value = real_fstat(fd)
+        return with_different_uid(value) if stat.S_ISDIR(value.st_mode) else value
+
+    monkeypatch.setattr(externalize_module.os, "lstat", differently_owned_lstat)
+    monkeypatch.setattr(externalize_module.os, "fstat", differently_owned_fstat)
+
+
 def _fail_if_json_decoded(_value):
     raise AssertionError("oversized payload reached JSON decoding")
 
@@ -140,6 +169,26 @@ def test_marker_reader_accepts_owned_regular_payload(payload_store):
         payload_path.name,
         config=config,
     ) is True
+
+
+def test_legacy_readers_accept_service_owned_payload_in_differently_owned_store(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "marker.json"
+    _write_payload(payload_path)
+    _report_storage_directory_as_differently_owned(monkeypatch, storage_dir)
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
 
 
 def test_marker_reader_rejects_symlink(payload_store, tmp_path):
@@ -391,6 +440,118 @@ def test_oversize_marker_and_reassignment_use_bounded_metadata_path(payload_stor
     reassigned = json.loads(payload_path.read_text(encoding="utf-8"))
     assert reassigned["session_id"] == "new-session"
     assert reassigned["content"] == "x" * 1024
+
+
+def test_oversize_reassignment_finds_session_id_after_content(payload_store, monkeypatch):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "session-after-content.json"
+    raw = (
+        '{"kind":"tool_result","content":"'
+        + ("x" * 1024)
+        + '","session_id":"old-session"}'
+    ).encode("utf-8")
+    payload_path.write_bytes(raw)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+    monkeypatch.setattr(externalize_module.json, "loads", _fail_if_json_decoded)
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
+    monkeypatch.undo()
+    reassigned = json.loads(payload_path.read_text(encoding="utf-8"))
+    assert reassigned["session_id"] == "new-session"
+    assert reassigned["content"] == "x" * 1024
+
+
+def test_oversize_reassignment_rewrites_only_final_duplicate_session_id(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "duplicate-session.json"
+    raw = (
+        '{"session_id":"prefix-session","content":"'
+        + ("x" * 1024)
+        + '","session_id":"old-session"}'
+    ).encode("utf-8")
+    payload_path.write_bytes(raw)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
+    rewritten = payload_path.read_bytes()
+    assert b'"session_id":"prefix-session"' in rewritten
+    assert json.loads(rewritten)["session_id"] == "new-session"
+
+
+def test_oversize_reassignment_honors_nonmatching_final_duplicate_session_id(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "nonmatching-final-session.json"
+    original = (
+        '{"session_id":"old-session","content":"'
+        + ("x" * 1024)
+        + '","session_id":"final-session"}'
+    ).encode("utf-8")
+    payload_path.write_bytes(original)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    assert payload_path.read_bytes() == original
+
+
+def test_oversize_reassignment_rejects_invalid_suffix_after_session_id(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "invalid-session-suffix.json"
+    original = (
+        b'{"content":"'
+        + (b"x" * 1024)
+        + b'","session_id":"old-session","invalid":"\x00"}'
+    )
+    payload_path.write_bytes(original)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    assert payload_path.read_bytes() == original
+    assert list(storage_dir.glob("*.tmp")) == []
 
 
 def test_oversize_reassignment_rejects_truncated_payload_before_temp_creation(

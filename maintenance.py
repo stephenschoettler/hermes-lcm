@@ -10,8 +10,10 @@ formatting, and the store/dag/lifecycle connection handling lives in one place.
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
 import sqlite3
+import stat
 from typing import Any
 
 from .sqlite_util import (
@@ -22,7 +24,25 @@ from .sqlite_util import (
 
 def _prepare_private_backup_directory(path: Path) -> None:
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    path.chmod(0o700)
+    expected = os.lstat(path)
+    if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+        raise OSError(f"backup directory is not a real directory: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise OSError(f"backup directory changed during validation: {path}")
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is None:
+            raise OSError("descriptor-based directory chmod is unavailable")
+        fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
 
 def flush_engine_connections(engine) -> None:
     """Commit pending writes on every SQLite connection the engine owns.
