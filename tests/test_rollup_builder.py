@@ -949,6 +949,12 @@ def test_plugin_unload_waits_for_rollup_owned_by_collected_clone(
     try:
         clone._schedule_rollup_maintenance("collected-clone")
         assert maintenance_started.wait(timeout=1)
+        record = (
+            clone._rollup_maintenance_owner,
+            clone._assertion_extraction_idle,
+        )
+        with prototype._shutdown_group._condition:
+            assert record in prototype._shutdown_group._background_work
         clone_ref = weakref.ref(clone)
         del clone
         gc.collect()

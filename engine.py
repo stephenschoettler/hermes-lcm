@@ -378,9 +378,10 @@ class _EngineShutdownGroup:
     def __init__(self) -> None:
         self._condition = threading.Condition(threading.RLock())
         self._engines = weakref.WeakSet()
-        self._retired_background: set[tuple[object, threading.Event]] = set()
+        self._background_work: dict[tuple[object, threading.Event], int] = {}
         self._closed = False
         self._clones_in_flight = 0
+        self._background_schedules_in_flight = 0
 
     def add(self, engine: "LCMEngine") -> bool:
         with self._condition:
@@ -397,6 +398,19 @@ class _EngineShutdownGroup:
                 return False
             self._clones_in_flight += 1
             return True
+
+    def begin_background_schedule(self) -> bool:
+        """Reserve one schedule attempt before unload closes the group gate."""
+        with self._condition:
+            if self._closed:
+                return False
+            self._background_schedules_in_flight += 1
+            return True
+
+    def end_background_schedule(self) -> None:
+        with self._condition:
+            self._background_schedules_in_flight -= 1
+            self._condition.notify_all()
 
     def complete_clone(self, engine: "LCMEngine") -> bool:
         """Publish a fully initialized clone, or close it after unload starts."""
@@ -436,14 +450,14 @@ class _EngineShutdownGroup:
         with self._condition:
             self._engines.discard(engine)
 
-    def _start_retired_background_waiter(
+    def _start_background_waiter(
         self,
         record: tuple[object, threading.Event],
     ) -> None:
         waiter = threading.Thread(
-            target=self._drain_retired_background,
+            target=self._drain_background,
             args=(record,),
-            name="lcm-retired-background-drain",
+            name="lcm-background-drain",
             daemon=True,
         )
         try:
@@ -451,25 +465,21 @@ class _EngineShutdownGroup:
         except Exception:
             # Keep the record for shutdown_all(); failure to start a cleanup
             # waiter must not make accepted work invisible to plugin unload.
-            logger.warning("LCM could not start retired background drain", exc_info=True)
+            logger.warning("LCM could not start background drain", exc_info=True)
 
-    def retain_orphaned_background(
+    def track_background(
         self,
         rollup_owner: object,
         assertion_idle: threading.Event,
     ) -> None:
-        """Keep accepted work visible after its weakly tracked engine is collected."""
-        if (
-            _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(rollup_owner, timeout=0)
-            and assertion_idle.is_set()
-        ):
-            return
+        """Track accepted work independently of the engine's weak lifetime."""
         record = (rollup_owner, assertion_idle)
         with self._condition:
-            if record in self._retired_background:
-                return
-            self._retired_background.add(record)
-        self._start_retired_background_waiter(record)
+            generation = self._background_work.get(record, 0) + 1
+            self._background_work[record] = generation
+            start_waiter = generation == 1
+        if start_waiter:
+            self._start_background_waiter(record)
 
     def retire(
         self,
@@ -480,33 +490,38 @@ class _EngineShutdownGroup:
         background_pending: bool,
     ) -> None:
         """Remove a closed engine while keeping its outstanding work visible."""
-        record = (rollup_owner, assertion_idle)
-        start_waiter = False
+        if background_pending:
+            self.track_background(rollup_owner, assertion_idle)
         with self._condition:
-            if background_pending and record not in self._retired_background:
-                self._retired_background.add(record)
-                start_waiter = True
             self._engines.discard(engine)
-        if start_waiter:
-            self._start_retired_background_waiter(record)
 
-    def _drain_retired_background(
+    def _drain_background(
         self,
         record: tuple[object, threading.Event],
     ) -> None:
         rollup_owner, assertion_idle = record
-        try:
+        while True:
+            with self._condition:
+                generation = self._background_work.get(record)
+                if generation is None:
+                    return
             _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(rollup_owner)
             assertion_idle.wait()
-        finally:
             with self._condition:
-                self._retired_background.discard(record)
+                if self._background_work.get(record) != generation:
+                    continue
+                if not _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(
+                    rollup_owner, timeout=0
+                ) or not assertion_idle.is_set():
+                    continue
+                self._background_work.pop(record, None)
                 self._condition.notify_all()
+                return
 
     def shutdown_all(self) -> None:
         with self._condition:
             self._closed = True
-            while self._clones_in_flight:
+            while self._clones_in_flight or self._background_schedules_in_flight:
                 self._condition.wait()
             engines = list(self._engines)
         first_error: Exception | None = None
@@ -518,9 +533,9 @@ class _EngineShutdownGroup:
                 if first_error is None:
                     first_error = exc
         with self._condition:
-            retired_background = list(self._retired_background)
-        for record in retired_background:
-            self._drain_retired_background(record)
+            background_work = list(self._background_work)
+        for record in background_work:
+            self._drain_background(record)
         join_background_integrity_scans()
         _close_vector_store_pool()
         if first_error is not None:
@@ -786,18 +801,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # diagnostic drains do not retain every historical session key forever.
         self._rollup_maintenance_owner = object()
         self._shutdown_group.add(self)
-        self._install_shutdown_finalizer()
-
-    def _install_shutdown_finalizer(self) -> None:
-        previous = getattr(self, "_shutdown_finalizer", None)
-        if previous is not None and previous.alive:
-            previous.detach()
-        self._shutdown_finalizer = weakref.finalize(
-            self,
-            self._shutdown_group.retain_orphaned_background,
-            self._rollup_maintenance_owner,
-            self._assertion_extraction_idle,
-        )
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -831,7 +834,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             initialized = True
             clone._shutdown_group.discard(clone)
             clone._shutdown_group = shutdown_group
-            clone._install_shutdown_finalizer()
             clone.model = self.model
             clone.base_url = self.base_url
             clone.api_key = self.api_key
@@ -1955,9 +1957,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         _ROLLUP_MAINTENANCE_SCHEDULER.release_exclusive(key)
 
     def _begin_background_schedule(self) -> bool:
-        """Reserve scheduling work unless engine shutdown has started."""
+        """Reserve scheduling work unless engine or plugin shutdown has started."""
+        shutdown_group = self._shutdown_group
+        if not shutdown_group.begin_background_schedule():
+            return False
         with self._background_work_condition:
             if self._background_shutdown_started:
+                shutdown_group.end_background_schedule()
                 return False
             self._background_schedules_in_flight += 1
             return True
@@ -1966,6 +1972,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         with self._background_work_condition:
             self._background_schedules_in_flight -= 1
             self._background_work_condition.notify_all()
+        self._shutdown_group.end_background_schedule()
 
     def _schedule_rollup_maintenance(self, scope: str) -> None:
         if not self._begin_background_schedule():
@@ -2004,11 +2011,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 finally:
                     private_dag.close()
 
-            _ROLLUP_MAINTENANCE_SCHEDULER.schedule(
+            accepted = _ROLLUP_MAINTENANCE_SCHEDULER.schedule(
                 key,
                 maintain,
                 owner=self._rollup_maintenance_owner,
             )
+            if accepted:
+                self._shutdown_group.track_background(
+                    self._rollup_maintenance_owner,
+                    self._assertion_extraction_idle,
+                )
         except Exception:
             # Maintenance is opportunistic; a scheduler/setup failure must never
             # turn a successful foreground session bind into a host failure.
@@ -5301,6 +5313,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 last_error,
             )
             return False
+        self._shutdown_group.track_background(
+            self._rollup_maintenance_owner,
+            self._assertion_extraction_idle,
+        )
         return True
 
     def _maybe_gc_compacted_tool_results(
