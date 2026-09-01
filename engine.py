@@ -436,6 +436,41 @@ class _EngineShutdownGroup:
         with self._condition:
             self._engines.discard(engine)
 
+    def _start_retired_background_waiter(
+        self,
+        record: tuple[object, threading.Event],
+    ) -> None:
+        waiter = threading.Thread(
+            target=self._drain_retired_background,
+            args=(record,),
+            name="lcm-retired-background-drain",
+            daemon=True,
+        )
+        try:
+            waiter.start()
+        except Exception:
+            # Keep the record for shutdown_all(); failure to start a cleanup
+            # waiter must not make accepted work invisible to plugin unload.
+            logger.warning("LCM could not start retired background drain", exc_info=True)
+
+    def retain_orphaned_background(
+        self,
+        rollup_owner: object,
+        assertion_idle: threading.Event,
+    ) -> None:
+        """Keep accepted work visible after its weakly tracked engine is collected."""
+        if (
+            _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(rollup_owner, timeout=0)
+            and assertion_idle.is_set()
+        ):
+            return
+        record = (rollup_owner, assertion_idle)
+        with self._condition:
+            if record in self._retired_background:
+                return
+            self._retired_background.add(record)
+        self._start_retired_background_waiter(record)
+
     def retire(
         self,
         engine: "LCMEngine",
@@ -452,20 +487,8 @@ class _EngineShutdownGroup:
                 self._retired_background.add(record)
                 start_waiter = True
             self._engines.discard(engine)
-        if not start_waiter:
-            return
-        waiter = threading.Thread(
-            target=self._drain_retired_background,
-            args=(record,),
-            name="lcm-retired-background-drain",
-            daemon=True,
-        )
-        try:
-            waiter.start()
-        except Exception:
-            # Keep the record for shutdown_all(); failure to start a cleanup
-            # waiter must not make accepted work invisible to plugin unload.
-            logger.warning("LCM could not start retired background drain", exc_info=True)
+        if start_waiter:
+            self._start_retired_background_waiter(record)
 
     def _drain_retired_background(
         self,
@@ -763,6 +786,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # diagnostic drains do not retain every historical session key forever.
         self._rollup_maintenance_owner = object()
         self._shutdown_group.add(self)
+        self._install_shutdown_finalizer()
+
+    def _install_shutdown_finalizer(self) -> None:
+        previous = getattr(self, "_shutdown_finalizer", None)
+        if previous is not None and previous.alive:
+            previous.detach()
+        self._shutdown_finalizer = weakref.finalize(
+            self,
+            self._shutdown_group.retain_orphaned_background,
+            self._rollup_maintenance_owner,
+            self._assertion_extraction_idle,
+        )
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -796,6 +831,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             initialized = True
             clone._shutdown_group.discard(clone)
             clone._shutdown_group = shutdown_group
+            clone._install_shutdown_finalizer()
             clone.model = self.model
             clone.base_url = self.base_url
             clone.api_key = self.api_key
