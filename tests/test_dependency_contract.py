@@ -86,6 +86,181 @@ def test_dependency_scanner_fails_closed_on_static_and_literal_dynamic_imports(t
     assert {"newpkg", "requests"}.issubset(imports)
 
 
+def _collect_sample_imports(tmp_path, source):
+    validator = _load_validator()
+    (tmp_path / "sample.py").write_text(source, encoding="utf-8")
+    return (
+        validator.collect_external_imports(
+            tmp_path,
+            ["*.py"],
+            local_imports=set(),
+        ),
+        validator.collect_external_imported_apis(
+            tmp_path,
+            ["*.py"],
+            local_imports=set(),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        ("from importlib import import_module\nimport_module('newpkg.api')\n", 2),
+        ("from importlib import import_module as load\nload('newpkg.api')\n", 2),
+        ("import importlib\nimportlib.import_module('newpkg.api')\n", 2),
+        ("import importlib as loader\nloader.import_module('newpkg.api')\n", 2),
+        ("__import__('newpkg.api')\n", 1),
+        (
+            "from importlib import import_module as load\n"
+            "if flag:\n"
+            "    load = fallback\n"
+            "load('newpkg.api')\n",
+            4,
+        ),
+        (
+            "if flag:\n"
+            "    from importlib import import_module as load\n"
+            "load('newpkg.api')\n",
+            3,
+        ),
+        (
+            "from importlib import import_module as load\n"
+            "def replace():\n"
+            "    global load\n"
+            "    load = fallback\n"
+            "load('newpkg.api')\n",
+            5,
+        ),
+        (
+            "def outer():\n"
+            "    from importlib import import_module as load\n"
+            "    def replace():\n"
+            "        nonlocal load\n"
+            "        load = fallback\n"
+            "    load('newpkg.api')\n",
+            6,
+        ),
+        (
+            "def install():\n"
+            "    global load\n"
+            "    from importlib import import_module as load\n"
+            "    load('newpkg.api')\n",
+            4,
+        ),
+        (
+            "def replace():\n"
+            "    global __import__\n"
+            "    __import__ = fallback\n"
+            "__import__('newpkg.api')\n",
+            4,
+        ),
+        (
+            "if flag:\n"
+            "    __import__ = fallback\n"
+            "__import__('newpkg.api')\n",
+            3,
+        ),
+    ],
+)
+def test_dependency_scanner_resolves_bound_literal_dynamic_imports(
+    tmp_path,
+    source,
+    line,
+):
+    imports, imported_apis = _collect_sample_imports(tmp_path, source)
+
+    assert imports["newpkg"] == [f"sample.py:{line}"]
+    assert imported_apis["newpkg"]["newpkg.api"] == [f"sample.py:{line}"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def import_module(name):\n    return name\nimport_module('newpkg.api')\n",
+        (
+            "from importlib import import_module as load\n"
+            "load = fallback\n"
+            "load('newpkg.api')\n"
+        ),
+        "def run(import_module):\n    return import_module('newpkg.api')\n",
+        "def __import__(name):\n    return name\n__import__('newpkg.api')\n",
+        "__import__ = loader\n__import__('newpkg.api')\n",
+        "def run(__import__):\n    return __import__('newpkg.api')\n",
+        (
+            "import importlib\n"
+            "importlib = local_importer\n"
+            "importlib.import_module('newpkg.api')\n"
+        ),
+        (
+            "from importlib import import_module as load\n"
+            "if flag:\n"
+            "    load = left\n"
+            "else:\n"
+            "    load = right\n"
+            "load('newpkg.api')\n"
+        ),
+        (
+            "def install():\n"
+            "    global load\n"
+            "    from importlib import import_module as load\n"
+            "load('newpkg.api')\n"
+        ),
+        (
+            "def outer():\n"
+            "    load = fallback\n"
+            "    def install():\n"
+            "        nonlocal load\n"
+            "        from importlib import import_module as load\n"
+            "    load('newpkg.api')\n"
+        ),
+        (
+            "if flag:\n"
+            "    __import__ = left\n"
+            "else:\n"
+            "    __import__ = right\n"
+            "__import__('newpkg.api')\n"
+        ),
+        "from importlib import import_module\nimport_module(module_name)\n",
+    ],
+)
+def test_dependency_scanner_rejects_shadowed_rebound_or_nonliteral_dynamic_imports(
+    tmp_path,
+    source,
+):
+    imports, imported_apis = _collect_sample_imports(tmp_path, source)
+
+    assert "newpkg" not in imports
+    assert "newpkg" not in imported_apis
+
+
+def test_dependency_scanner_sorts_dynamic_import_references_by_path_and_line(tmp_path):
+    validator = _load_validator()
+    (tmp_path / "z_last.py").write_text(
+        "from importlib import import_module as load\nload('newpkg.api')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "a_first.py").write_text(
+        "from importlib import import_module\n\nimport_module('newpkg.api')\n",
+        encoding="utf-8",
+    )
+
+    imports = validator.collect_external_imports(
+        tmp_path,
+        ["*.py"],
+        local_imports=set(),
+    )
+    imported_apis = validator.collect_external_imported_apis(
+        tmp_path,
+        ["*.py"],
+        local_imports=set(),
+    )
+
+    expected_references = ["a_first.py:3", "z_last.py:2"]
+    assert imports["newpkg"] == expected_references
+    assert imported_apis["newpkg"]["newpkg.api"] == expected_references
+
+
 def test_dependency_scanner_does_not_treat_generated_host_stub_as_local(tmp_path):
     validator = _load_validator()
     (tmp_path / "sample.py").write_text(
@@ -151,6 +326,62 @@ def _validate_sample_imports(tmp_path, monkeypatch, source, *modules):
     }
     monkeypatch.setattr(validator, "_validate_python_matrix", lambda *_args: [])
     return validator.validate_contract(tmp_path, contract)
+
+
+def _validate_dynamic_import(tmp_path, monkeypatch, source, declared_api):
+    validator = _load_validator()
+    (tmp_path / "sample.py").write_text(source, encoding="utf-8")
+    repository_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract = {
+        **repository_contract,
+        "runtime_scan": {
+            "globs": ["*.py"],
+            "local_imports": [],
+            "excluded": [],
+        },
+        "external_imports": {
+            "newpkg": {
+                **repository_contract["external_imports"]["yaml"],
+                "distribution": "newpkg",
+                "imported_api": [declared_api],
+            }
+        },
+    }
+    monkeypatch.setattr(validator, "_validate_python_matrix", lambda *_args: [])
+    return validator.validate_contract(tmp_path, contract)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from importlib import import_module\nimport_module('newpkg.api')\n",
+        "from importlib import import_module as load\nload('newpkg.api')\n",
+        "import importlib\nimportlib.import_module('newpkg.api')\n",
+        "__import__('newpkg.api')\n",
+    ],
+)
+def test_dependency_contract_accepts_declared_literal_dynamic_imports(
+    tmp_path,
+    monkeypatch,
+    source,
+):
+    assert _validate_dynamic_import(tmp_path, monkeypatch, source, "newpkg.api") == []
+
+
+def test_dependency_contract_rejects_undeclared_direct_import_module_api(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_dynamic_import(
+        tmp_path,
+        monkeypatch,
+        "from importlib import import_module as load\nload('newpkg.unsupported')\n",
+        "newpkg.api",
+    )
+
+    assert errors == [
+        "undeclared imported API 'newpkg.unsupported': sample.py:2"
+    ]
 
 
 def test_dependency_contract_accepts_declared_module_alias_attribute_uses(
@@ -357,6 +588,115 @@ def test_dependency_contract_does_not_treat_shadowed_or_rebound_direct_imports_a
         monkeypatch,
         source,
         "agent",
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        (
+            "import numpy as np\n"
+            "if flag:\n"
+            "    np = fallback\n"
+            "np.unsupported()\n",
+            4,
+        ),
+        (
+            "import numpy as np\n"
+            "if flag:\n"
+            "    np = fallback\n"
+            "else:\n"
+            "    pass\n"
+            "np.unsupported()\n",
+            6,
+        ),
+        (
+            "import numpy as np\n"
+            "if outer:\n"
+            "    if inner:\n"
+            "        np = fallback\n"
+            "    else:\n"
+            "        pass\n"
+            "else:\n"
+            "    pass\n"
+            "np.unsupported()\n",
+            9,
+        ),
+        (
+            "import numpy as np\n"
+            "if False:\n"
+            "    np = fallback\n"
+            "np.unsupported()\n",
+            4,
+        ),
+        (
+            "import numpy as np\n"
+            "if True:\n"
+            "    pass\n"
+            "else:\n"
+            "    np = fallback\n"
+            "np.unsupported()\n",
+            6,
+        ),
+    ],
+)
+def test_dependency_contract_merges_possible_alias_bindings_across_if_branches(
+    tmp_path,
+    monkeypatch,
+    source,
+    line,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        source,
+        "numpy",
+    )
+
+    assert errors == [
+        f"undeclared imported API 'numpy.unsupported': sample.py:{line}"
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "import numpy as np\n"
+            "if flag:\n"
+            "    np = left\n"
+            "else:\n"
+            "    np = right\n"
+            "np.unsupported_local_attribute()\n"
+        ),
+        (
+            "import numpy as np\n"
+            "if True:\n"
+            "    np = local_value\n"
+            "np.unsupported_local_attribute()\n"
+        ),
+        (
+            "import numpy as np\n"
+            "if False:\n"
+            "    pass\n"
+            "else:\n"
+            "    np = local_value\n"
+            "np.unsupported_local_attribute()\n"
+        ),
+    ],
+)
+def test_dependency_contract_does_not_retain_definitely_rebound_if_alias(
+    tmp_path,
+    monkeypatch,
+    source,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        source,
+        "numpy",
     )
 
     assert errors == []

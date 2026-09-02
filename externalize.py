@@ -1450,15 +1450,23 @@ def _stream_json_read_marker_object(reader: _StreamingJSONReader) -> Dict[str, A
         if reader.read() != ord(":"):
             raise ValueError("invalid_marker_object")
         _stream_json_skip_whitespace(reader)
-        if key == "source_path" and reader.peek() == ord('"'):
-            marker["source_path"] = _stream_json_read_string(reader)
-        elif key == "expected_chars" and reader.peek() == ord('"'):
-            marker["expected_chars"] = _stream_json_read_string(reader, capture_limit=128)
-        elif key == "expected_chars" and reader.peek() in (
-            ord("-"),
-            *range(ord("0"), ord("9") + 1),
-        ):
-            marker["expected_chars"] = _stream_json_read_number(reader)
+        if key == "source_path":
+            marker[key] = None
+            if reader.peek() == ord('"'):
+                marker[key] = _stream_json_read_string(reader)
+            else:
+                _stream_json_skip_value(reader, depth=1)
+        elif key == "expected_chars":
+            marker[key] = None
+            if reader.peek() == ord('"'):
+                marker[key] = _stream_json_read_string(reader, capture_limit=128)
+            elif reader.peek() in (
+                ord("-"),
+                *range(ord("0"), ord("9") + 1),
+            ):
+                marker[key] = _stream_json_read_number(reader)
+            else:
+                _stream_json_skip_value(reader, depth=1)
         else:
             _stream_json_skip_value(reader, depth=1)
         _stream_json_skip_whitespace(reader)

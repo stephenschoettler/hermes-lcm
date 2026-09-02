@@ -88,6 +88,34 @@ def _write_payload_with_duplicate_legacy_source_path(
     return raw
 
 
+def _write_payload_with_duplicate_nested_marker_field(
+    path: Path,
+    field: str,
+    first_value,
+    final_value,
+) -> bytes:
+    fields = {
+        "source_path": "/tmp/hermes-results/prefix.txt",
+        "expected_chars": 1024,
+    }
+    fields[field] = first_value
+    marker = (
+        "{"
+        + ",".join(f"{json.dumps(key)}:{json.dumps(value)}" for key, value in fields.items())
+        + f",{json.dumps(field)}:{json.dumps(final_value)}"
+        + "}"
+    )
+    raw = (
+        '{"kind":"tool_result","content":"'
+        + ("x" * 1024)
+        + '","persisted_output_markers":['
+        + marker
+        + "]}"
+    ).encode("utf-8")
+    path.write_bytes(raw)
+    return raw
+
+
 def _swap_payload_for_symlink_on_open(
     monkeypatch: pytest.MonkeyPatch,
     payload_path: Path,
@@ -470,6 +498,93 @@ def test_oversize_marker_reader_honors_final_duplicate_marker_value(
     ) is False
 
 
+@pytest.mark.parametrize(
+    ("field", "first_value", "final_value"),
+    [
+        ("source_path", "/tmp/hermes-results/prefix.txt", None),
+        ("source_path", "/tmp/hermes-results/prefix.txt", 0),
+        ("source_path", "/tmp/hermes-results/prefix.txt", False),
+        ("source_path", "/tmp/hermes-results/prefix.txt", []),
+        ("source_path", "/tmp/hermes-results/prefix.txt", {}),
+        ("expected_chars", 1024, None),
+        ("expected_chars", 1024, False),
+        ("expected_chars", 1024, []),
+        ("expected_chars", 1024, {}),
+        ("expected_chars", 1024, "invalid"),
+    ],
+)
+def test_oversize_marker_reader_honors_final_invalid_duplicate_nested_field(
+    payload_store,
+    monkeypatch,
+    field,
+    first_value,
+    final_value,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / f"duplicate-nested-{field}.json"
+    raw = _write_payload_with_duplicate_nested_marker_field(
+        payload_path,
+        field,
+        first_value,
+        final_value,
+    )
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert json.loads(raw)["persisted_output_markers"][0][field] == final_value
+    metadata = externalize_module._read_oversize_externalized_payload_metadata(
+        payload_path,
+        storage_dir=storage_dir,
+    )
+    assert metadata is not None
+    assert metadata["persisted_output_markers"] == []
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "first_value", "final_value"),
+    [
+        ("source_path", None, "/tmp/hermes-results/final.txt"),
+        ("expected_chars", None, 2048),
+        ("expected_chars", {}, "2048"),
+    ],
+)
+def test_oversize_marker_reader_honors_final_valid_duplicate_nested_field(
+    payload_store,
+    monkeypatch,
+    field,
+    first_value,
+    final_value,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / f"duplicate-final-nested-{field}.json"
+    raw = _write_payload_with_duplicate_nested_marker_field(
+        payload_path,
+        field,
+        first_value,
+        final_value,
+    )
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert json.loads(raw)["persisted_output_markers"][0][field] == final_value
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+
+
 @pytest.mark.parametrize("final_source_path", [None, 0, False, [], {}])
 def test_oversize_marker_reader_honors_final_non_string_duplicate_legacy_source_path(
     payload_store,
@@ -564,13 +679,11 @@ def test_oversize_marker_reader_preserves_prefix_only_legacy_source_path(
     ) is True
 
 
-def test_superseded_oversize_legacy_source_does_not_enable_durable_reconcile_match(
-    payload_store,
+def _assert_payload_does_not_enable_durable_reconcile_match(
+    config,
     monkeypatch,
+    payload_path,
 ):
-    storage_dir, config = payload_store
-    payload_path = storage_dir / "superseded-reconcile-source.json"
-    _write_payload_with_duplicate_legacy_source_path(payload_path, None)
     monkeypatch.setattr(
         externalize_module,
         "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
@@ -615,6 +728,41 @@ def test_superseded_oversize_legacy_source_does_not_enable_durable_reconcile_mat
         stored_identity,
         stored_rows,
     ) is False
+
+
+def test_superseded_oversize_legacy_source_does_not_enable_durable_reconcile_match(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "superseded-reconcile-source.json"
+    _write_payload_with_duplicate_legacy_source_path(payload_path, None)
+
+    _assert_payload_does_not_enable_durable_reconcile_match(
+        config,
+        monkeypatch,
+        payload_path,
+    )
+
+
+def test_superseded_oversize_nested_marker_does_not_enable_durable_reconcile_match(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "superseded-nested-reconcile-source.json"
+    _write_payload_with_duplicate_nested_marker_field(
+        payload_path,
+        "source_path",
+        "/tmp/hermes-results/prefix.txt",
+        None,
+    )
+
+    _assert_payload_does_not_enable_durable_reconcile_match(
+        config,
+        monkeypatch,
+        payload_path,
+    )
 
 
 def test_oversize_marker_and_reassignment_use_bounded_metadata_path(payload_store, monkeypatch):
