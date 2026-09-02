@@ -308,6 +308,84 @@ class TestRegistrationGating:
         assert partial_closed
         assert not db_path.exists()
 
+    def test_unload_serializes_profile_storage_rebind(
+        self, tmp_path, monkeypatch, request
+    ):
+        from hermes_lcm import retrieval_core
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        request.addfinalizer(retrieval_core._reset_vector_store_pool)
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        home_a.mkdir()
+        home_b.mkdir()
+        engine = LCMEngine(
+            config=LCMConfig(database_path=""),
+            hermes_home=str(home_a),
+        )
+        real_bind = engine._bind_storage
+        bind_started = threading.Event()
+        release_bind = threading.Event()
+        unload_done = threading.Event()
+        rebind_errors = []
+        unload_errors = []
+
+        def blocking_bind(db_path, hermes_home):
+            if str(hermes_home) == str(home_b):
+                bind_started.set()
+                if not release_bind.wait(timeout=3):
+                    raise AssertionError("test did not release profile storage bind")
+            return real_bind(db_path, hermes_home)
+
+        def rebind_storage():
+            try:
+                engine._rebind_storage_for_home(str(home_b))
+            except BaseException as exc:  # captured for assertion in the main thread
+                rebind_errors.append(exc)
+
+        def unload_plugin():
+            try:
+                engine.shutdown_all_instances()
+            except BaseException as exc:  # captured for assertion in the main thread
+                unload_errors.append(exc)
+            finally:
+                unload_done.set()
+
+        monkeypatch.setattr(engine, "_bind_storage", blocking_bind)
+        rebind_thread = threading.Thread(target=rebind_storage)
+        unload_thread = threading.Thread(target=unload_plugin)
+        db_paths = (home_a / "lcm.db", home_b / "lcm.db")
+        try:
+            rebind_thread.start()
+            assert bind_started.wait(timeout=1)
+            unload_thread.start()
+            unload_waited = not unload_done.wait(timeout=0.1)
+            release_bind.set()
+            rebind_thread.join(timeout=3)
+            unload_thread.join(timeout=3)
+
+            assert unload_waited
+            assert not rebind_thread.is_alive()
+            assert not unload_thread.is_alive()
+            assert rebind_errors == []
+            assert unload_errors == []
+            assert engine._store._conn is None
+            with pytest.raises(RuntimeError, match="plugin is unloading"):
+                engine._rebind_storage_for_home(str(home_a))
+            for path in db_paths:
+                if path.exists():
+                    path.unlink()
+                assert not path.exists()
+        finally:
+            release_bind.set()
+            rebind_thread.join(timeout=3)
+            unload_thread.join(timeout=3)
+            engine._close_storage()
+            for path in db_paths:
+                if path.exists():
+                    path.unlink()
+
 
 class TestHermesAgentRegression:
     """Regression: Hermes Agent-shaped hosts must not shadow native LCM routing."""

@@ -1023,6 +1023,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._reset_session_scoped_runtime_state()
 
     def _rebind_storage_for_home(self, hermes_home: str = "") -> bool:
+        """Serialize profile storage rebinding with engine shutdown."""
+        if not hermes_home:
+            return False
+        with self._shutdown_lock:
+            if self._background_shutdown_started or self._primary_shutdown_complete:
+                raise RuntimeError("Cannot rebind LCM storage while plugin is unloading")
+            return self._rebind_storage_for_home_locked(hermes_home)
+
+    def _rebind_storage_for_home_locked(self, hermes_home: str) -> bool:
         """Switch SQLite-backed state when a reused engine serves another profile.
 
         Hermes core passes the active ``hermes_home`` on session start.  Older
@@ -1030,8 +1039,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         after ``HERMES_HOME`` changes, so the plugin must not assume the store
         captured during ``register()`` is still correct.
         """
-        if not hermes_home:
-            return False
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
