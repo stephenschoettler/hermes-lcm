@@ -726,6 +726,138 @@ def test_dependency_contract_merges_possible_alias_bindings_across_if_branches(
     ]
 
 
+def test_dependency_contract_rejects_distinct_external_branch_alias_bindings(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "if flag:\n"
+        "    import numpy as api\n"
+        "else:\n"
+        "    import yaml as api\n"
+        "api.unsupported()\n",
+        "numpy",
+        "yaml",
+    )
+
+    assert errors == [
+        "undeclared imported API 'numpy.unsupported': sample.py:5",
+        "undeclared imported API 'yaml.unsupported': sample.py:5",
+    ]
+
+
+def test_dependency_contract_accepts_declared_distinct_external_branch_alias_bindings(
+    tmp_path,
+    monkeypatch,
+):
+    validator = _load_validator()
+    (tmp_path / "sample.py").write_text(
+        "if flag:\n"
+        "    import numpy as api\n"
+        "else:\n"
+        "    import yaml as api\n"
+        "api.unsupported()\n",
+        encoding="utf-8",
+    )
+    observed_apis = validator.collect_external_imported_apis(
+        tmp_path,
+        ["*.py"],
+        local_imports=set(),
+    )
+    assert observed_apis["numpy"]["numpy.unsupported"] == ["sample.py:5"]
+    assert observed_apis["yaml"]["yaml.unsupported"] == ["sample.py:5"]
+
+    repository_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract = {
+        **repository_contract,
+        "runtime_scan": {
+            "globs": ["*.py"],
+            "local_imports": [],
+            "excluded": [],
+        },
+        "external_imports": {
+            module: {
+                **repository_contract["external_imports"][module],
+                "imported_api": [
+                    *repository_contract["external_imports"][module]["imported_api"],
+                    f"{module}.unsupported",
+                ],
+            }
+            for module in ("numpy", "yaml")
+        },
+    }
+    monkeypatch.setattr(validator, "_validate_python_matrix", lambda *_args: [])
+
+    assert validator.validate_contract(tmp_path, contract) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "line"),
+    [
+        (
+            "if flag:\n"
+            "    import numpy as api\n"
+            "else:\n"
+            "    import numpy as api\n"
+            "api.unsupported()\n",
+            5,
+        ),
+        (
+            "if flag:\n"
+            "    import numpy as api\n"
+            "api.unsupported()\n",
+            3,
+        ),
+        (
+            "if flag:\n"
+            "    import numpy as api\n"
+            "else:\n"
+            "    api = object()\n"
+            "api.unsupported()\n",
+            5,
+        ),
+    ],
+)
+def test_dependency_contract_preserves_existing_branch_alias_possibilities(
+    tmp_path,
+    monkeypatch,
+    source,
+    line,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        source,
+        "numpy",
+    )
+
+    assert errors == [
+        f"undeclared imported API 'numpy.unsupported': sample.py:{line}"
+    ]
+
+
+def test_dependency_contract_discards_branch_alias_possibilities_after_rebinding(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "if flag:\n"
+        "    import numpy as api\n"
+        "else:\n"
+        "    import yaml as api\n"
+        "api = object()\n"
+        "api.unsupported_local_attribute()\n",
+        "numpy",
+        "yaml",
+    )
+
+    assert errors == []
+
+
 @pytest.mark.parametrize(
     "source",
     [

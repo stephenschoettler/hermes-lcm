@@ -148,7 +148,7 @@ class _AliasScope:
         self,
         kind: str,
         *,
-        bindings: dict[str, str | None | object] | None = None,
+        bindings: dict[str, str | frozenset[str] | None | object] | None = None,
         global_names: set[str] | None = None,
         nonlocal_names: set[str] | None = None,
     ) -> None:
@@ -188,7 +188,7 @@ class _ModuleAliasUseCollector(ast.NodeVisitor):
         # into the enclosing scope after the definition.
         self.scopes[-1].bindings[name] = imported_api
 
-    def _resolve_binding_state(self, name: str) -> str | None | object:
+    def _resolve_binding_state(self, name: str) -> str | frozenset[str] | None | object:
         origin_is_function = self.scopes[-1].kind in self._FUNCTION_SCOPE_KINDS
         for index in range(len(self.scopes) - 1, -1, -1):
             scope = self.scopes[index]
@@ -209,6 +209,14 @@ class _ModuleAliasUseCollector(ast.NodeVisitor):
             return binding
         return None
 
+    def _resolve_bindings(self, name: str) -> tuple[str, ...]:
+        binding = self._resolve_binding_state(name)
+        if isinstance(binding, str):
+            return (binding,)
+        if isinstance(binding, frozenset):
+            return tuple(sorted(binding))
+        return ()
+
     def _push_function_scope(self, node: ast.AST, arguments: ast.arguments) -> None:
         collector = _DirectScopeBindingCollector()
         body = node.body if isinstance(node.body, list) else [node.body]
@@ -227,7 +235,7 @@ class _ModuleAliasUseCollector(ast.NodeVisitor):
         if arguments.kwarg:
             argument_names.add(arguments.kwarg.arg)
         local_names = (collector.names | argument_names) - collector.global_names - collector.nonlocal_names
-        redirected_bindings: dict[str, str | None | object] = {}
+        redirected_bindings: dict[str, str | frozenset[str] | None | object] = {}
         for name in collector.global_names | collector.nonlocal_names:
             inherited_binding = self._resolve_binding_state(name)
             if isinstance(inherited_binding, str) or (
@@ -362,8 +370,8 @@ class _ModuleAliasUseCollector(ast.NodeVisitor):
     def _visit_branch(
         self,
         statements: Iterable[ast.stmt],
-        initial_bindings: dict[str, str | None | object],
-    ) -> dict[str, str | None | object]:
+        initial_bindings: dict[str, str | frozenset[str] | None | object],
+    ) -> dict[str, str | frozenset[str] | None | object]:
         self.scopes[-1].bindings = dict(initial_bindings)
         for statement in statements:
             self.visit(statement)
@@ -371,17 +379,29 @@ class _ModuleAliasUseCollector(ast.NodeVisitor):
 
     @staticmethod
     def _merge_possible_bindings(
-        branches: Iterable[dict[str, str | None | object]],
-    ) -> dict[str, str | None | object]:
+        branches: Iterable[dict[str, str | frozenset[str] | None | object]],
+    ) -> dict[str, str | frozenset[str] | None | object]:
         branch_list = list(branches)
-        merged: dict[str, str | None | object] = {}
+        merged: dict[str, str | frozenset[str] | None | object] = {}
         for name in set().union(*(branch.keys() for branch in branch_list)):
-            imported_apis = {
-                branch.get(name)
-                for branch in branch_list
-                if isinstance(branch.get(name), str) or branch.get(name) is _UNBOUND
-            }
-            merged[name] = next(iter(imported_apis)) if len(imported_apis) == 1 else None
+            imported_apis: set[str] = set()
+            has_unbound = False
+            for branch in branch_list:
+                binding = branch.get(name)
+                if isinstance(binding, str):
+                    imported_apis.add(binding)
+                elif isinstance(binding, frozenset):
+                    imported_apis.update(binding)
+                elif binding is _UNBOUND:
+                    has_unbound = True
+            if has_unbound:
+                merged[name] = _UNBOUND if not imported_apis else None
+            elif len(imported_apis) == 1:
+                merged[name] = next(iter(imported_apis))
+            elif imported_apis:
+                merged[name] = frozenset(imported_apis)
+            else:
+                merged[name] = None
         return merged
 
     def visit_If(self, node: ast.If) -> None:
@@ -481,8 +501,7 @@ class _ModuleAliasUseCollector(ast.NodeVisitor):
             attributes.append(value.attr)
             value = value.value
         if isinstance(value, ast.Name):
-            imported_api = self._resolve_binding(value.id)
-            if imported_api is not None:
+            for imported_api in self._resolve_bindings(value.id):
                 canonical_api = ".".join((imported_api, *reversed(attributes)))
                 top_level = canonical_api.split(".", 1)[0]
                 if (
