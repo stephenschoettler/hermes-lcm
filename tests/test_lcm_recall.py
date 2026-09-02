@@ -1283,9 +1283,13 @@ def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeyp
         rc._reset_vector_store_pool()
 
 
-def test_plugin_unload_closes_pooled_vector_store(recall_engine, monkeypatch):
+def test_plugin_unload_closes_pooled_vector_store(
+    recall_engine, monkeypatch, request
+):
     import hermes_lcm.retrieval_core as rc
+    from hermes_lcm import tools as lcm_tools
 
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
     rc._reset_vector_store_pool()
     try:
         node = _add_summary(
@@ -1459,6 +1463,79 @@ def test_busy_pooled_store_does_not_block_other_pool_keys(recall_engine):
         for thread in (first, same_store, other_store):
             thread.join(2)
         rc._reset_vector_store_pool()
+
+
+def test_plugin_unload_waits_for_timed_out_sqlite_deadline_worker(
+    tmp_path, request
+):
+    import sqlite3
+    import threading
+
+    from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.engine import LCMEngine
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
+    db_path = tmp_path / "deadline-worker.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    unload_done = threading.Event()
+    unload_errors = []
+
+    def sqlite_worker():
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        try:
+            worker_started.set()
+            if not release_worker.wait(3):
+                raise TimeoutError("test did not release SQLite deadline worker")
+        finally:
+            conn.close()
+
+    def unload_plugin():
+        try:
+            engine.shutdown_all_instances()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            unload_errors.append(exc)
+        finally:
+            unload_done.set()
+
+    unload_thread = threading.Thread(target=unload_plugin)
+    try:
+        with pytest.raises(TimeoutError, match="latency budget"):
+            lcm_tools._run_within_deadline(
+                sqlite_worker,
+                remaining_s=0.05,
+                name="lcm-test-sqlite-deadline",
+                track_for_unload=True,
+            )
+        assert worker_started.wait(1)
+        unload_thread.start()
+        unload_waited = not unload_done.wait(0.1)
+        release_worker.set()
+        unload_thread.join(3)
+
+        assert unload_waited
+        assert not unload_thread.is_alive()
+        assert not unload_errors
+        with pytest.raises(lcm_tools._WorkerCapacityError, match="unloading"):
+            lcm_tools._run_within_deadline(
+                lambda: None,
+                remaining_s=0.05,
+                name="lcm-test-post-unload-deadline",
+                track_for_unload=True,
+            )
+        db_path.unlink()
+        assert not db_path.exists()
+    finally:
+        release_worker.set()
+        if unload_thread.is_alive():
+            unload_thread.join(3)
+        engine.shutdown(wait_for_background_work=True)
+        if db_path.exists():
+            db_path.unlink()
 
 
 def test_matrix_cache_is_bounded_lru_not_cleared_on_miss():

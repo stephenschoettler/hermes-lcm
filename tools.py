@@ -2780,6 +2780,30 @@ _lcm_semantic_worker_slots = threading.BoundedSemaphore(_LCM_SEMANTIC_MAX_WORKER
 _LCM_FULL_TEXT_MAX_WORKERS = 4
 _lcm_full_text_worker_slots = threading.BoundedSemaphore(_LCM_FULL_TEXT_MAX_WORKERS)
 
+# Deadline workers cannot be cancelled after their caller times out. Track only
+# workers that may retain private SQLite connections so plugin unload can wait
+# for those handles without also waiting on unrelated provider/network calls.
+_deadline_worker_condition = threading.Condition(threading.RLock())
+_tracked_deadline_workers: set[threading.Thread] = set()
+_deadline_worker_registry_closed = False
+
+
+def _open_deadline_worker_registry() -> None:
+    """Allow a newly registered plugin instance to start tracked workers."""
+    global _deadline_worker_registry_closed
+    with _deadline_worker_condition:
+        _deadline_worker_registry_closed = False
+
+
+def _close_and_join_deadline_workers() -> None:
+    """Reject new tracked workers and wait for existing SQLite owners."""
+    global _deadline_worker_registry_closed
+    with _deadline_worker_condition:
+        _deadline_worker_registry_closed = True
+        workers = list(_tracked_deadline_workers)
+    for worker in workers:
+        worker.join()
+
 
 class _WorkerCapacityError(RuntimeError):
     """Raised when no bounded worker slot is available."""
@@ -2791,6 +2815,7 @@ def _run_within_deadline(
     remaining_s: float,
     name: str,
     worker_slots: threading.BoundedSemaphore | None = None,
+    track_for_unload: bool = False,
 ):
     """Run ``fn`` in a bounded daemon worker, raising if the deadline lapses.
 
@@ -2812,14 +2837,38 @@ def _run_within_deadline(
         except BaseException as exc:  # noqa: BLE001 - forwarded to caller
             outcome.append((False, exc))
         finally:
-            slots.release()
+            try:
+                slots.release()
+            finally:
+                if track_for_unload:
+                    with _deadline_worker_condition:
+                        _tracked_deadline_workers.discard(threading.current_thread())
+                        _deadline_worker_condition.notify_all()
 
     worker = threading.Thread(target=invoke, name=name, daemon=True)
-    try:
-        worker.start()
-    except BaseException:
-        slots.release()
-        raise
+    if track_for_unload:
+        with _deadline_worker_condition:
+            if _deadline_worker_registry_closed:
+                slots.release()
+                raise _WorkerCapacityError(
+                    f"{name} worker rejected while plugin is unloading"
+                )
+            _tracked_deadline_workers.add(worker)
+            try:
+                # Start under the registry lock so unload cannot snapshot an
+                # added-but-not-yet-started thread and attempt to join it.
+                worker.start()
+            except BaseException:
+                _tracked_deadline_workers.discard(worker)
+                _deadline_worker_condition.notify_all()
+                slots.release()
+                raise
+    else:
+        try:
+            worker.start()
+        except BaseException:
+            slots.release()
+            raise
     worker.join(remaining_s)
     if worker.is_alive():
         raise TimeoutError(f"{name} exceeded the semantic latency budget")
@@ -2920,6 +2969,7 @@ def _lcm_grep_full_text_with_deadline(
             remaining_s=remaining,
             name="lcm-full-text",
             worker_slots=_lcm_full_text_worker_slots,
+            track_for_unload=True,
         )
     except (_WorkerCapacityError, TimeoutError):
         return _lcm_grep_deadline_error(
@@ -3256,6 +3306,7 @@ def _lcm_grep_semantic(
             ),
             remaining_s=deadline - time.monotonic(),
             name="lcm-result-hydration",
+            track_for_unload=True,
         )
     except _WorkerCapacityError as exc:
         return degraded(f"semantic capacity exhausted: {exc}")
@@ -4428,6 +4479,7 @@ def _lcm_recall_summary_arm(
         ),
         remaining_s=deadline - time.monotonic(),
         name="lcm-recall-summary-hydrate",
+        track_for_unload=True,
     )
     current = engine.current_session_id
     if reference_strict:
@@ -4502,6 +4554,7 @@ def _lcm_recall_chunk_arm(
         ),
         remaining_s=deadline - time.monotonic(),
         name="lcm-recall-chunk-hydrate",
+        track_for_unload=True,
     )
     current = engine.current_session_id
     hits: list[dict[str, Any]] = []

@@ -527,8 +527,10 @@ def test_plugin_unload_waits_for_background_integrity_scan(
     tmp_path, monkeypatch, request
 ):
     from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
 
     request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
     from hermes_lcm.config import LCMConfig
     from hermes_lcm.engine import LCMEngine
 

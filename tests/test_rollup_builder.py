@@ -790,8 +790,10 @@ def test_engine_shutdown_stays_nonblocking_but_plugin_unload_waits(
     request,
 ):
     from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
 
     request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
     config = LCMConfig(
         database_path=str(tmp_path / "shutdown-background-maintenance.db"),
         temporal_rollups_enabled=True,
@@ -853,8 +855,10 @@ def test_plugin_unload_waits_for_background_rollup_provider(
     tmp_path, monkeypatch, request
 ):
     from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
 
     request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
     db_path = tmp_path / "unload-background-maintenance.db"
     engine = LCMEngine(
         config=LCMConfig(
@@ -911,8 +915,10 @@ def test_plugin_unload_waits_for_rollup_owned_by_collected_clone(
     tmp_path, monkeypatch, request
 ):
     from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
 
     request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
     db_path = tmp_path / "collected-clone-rollup.db"
     prototype = LCMEngine(
         config=LCMConfig(

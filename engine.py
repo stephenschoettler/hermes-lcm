@@ -537,6 +537,7 @@ class _EngineShutdownGroup:
         for record in background_work:
             self._drain_background(record)
         join_background_integrity_scans()
+        lcm_tools._close_and_join_deadline_workers()
         _close_vector_store_pool()
         if first_error is not None:
             raise first_error

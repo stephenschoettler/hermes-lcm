@@ -340,8 +340,10 @@ def test_plugin_unload_waits_for_background_assertion_worker(
     tmp_path, monkeypatch, request
 ):
     from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
 
     request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
     worker_started = threading.Event()
     release_worker = threading.Event()
 

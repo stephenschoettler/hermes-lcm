@@ -365,6 +365,7 @@ def register(ctx):
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .retrieval_core import _open_vector_store_pool
+    from .tools import _open_deadline_worker_registry
     from .schemas import (
         LCM_GREP,
         LCM_RECALL,
@@ -383,6 +384,7 @@ def register(ctx):
         LCM_DOCTOR,
     )
 
+    _open_deadline_worker_registry()
     _open_vector_store_pool()
     config = LCMConfig.from_env()
 

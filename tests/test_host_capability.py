@@ -312,10 +312,12 @@ class TestRegistrationGating:
         self, tmp_path, monkeypatch, request
     ):
         from hermes_lcm import retrieval_core
+        from hermes_lcm import tools as lcm_tools
         from hermes_lcm.config import LCMConfig
         from hermes_lcm.engine import LCMEngine
 
         request.addfinalizer(retrieval_core._reset_vector_store_pool)
+        request.addfinalizer(lcm_tools._open_deadline_worker_registry)
         home_a = tmp_path / "profile-a"
         home_b = tmp_path / "profile-b"
         home_a.mkdir()
