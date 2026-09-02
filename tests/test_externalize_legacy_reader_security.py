@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import stat
 from pathlib import Path
@@ -158,6 +159,34 @@ def _report_storage_directory_as_differently_owned(
 
 def _fail_if_json_decoded(_value):
     raise AssertionError("oversized payload reached JSON decoding")
+
+
+def _force_descriptor_relative_stat_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type=NotImplementedError,
+) -> None:
+    real_stat = os.stat
+
+    def unsupported_dir_fd_stat(path, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None:
+            raise error_type("descriptor-relative stat is unavailable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(externalize_module.os, "stat", unsupported_dir_fd_stat)
+
+
+def _force_descriptor_relative_open_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type=NotImplementedError,
+) -> None:
+    real_open = os.open
+
+    def unsupported_dir_fd_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            raise error_type("descriptor-relative open is unavailable")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(externalize_module.os, "open", unsupported_dir_fd_open)
 
 
 def test_marker_reader_accepts_owned_regular_payload(payload_store):
@@ -736,18 +765,85 @@ def test_oversize_reassignment_rejects_append_after_validation(
     assert list(storage_dir.glob("*.tmp")) == []
 
 
-def test_legacy_readers_fail_closed_when_descriptor_relative_stat_is_unsupported(payload_store, monkeypatch):
+@pytest.mark.parametrize("error_type", [TypeError, NotImplementedError])
+def test_legacy_readers_use_safe_fallback_when_descriptor_relative_stat_is_unsupported(
+    payload_store,
+    monkeypatch,
+    error_type,
+):
     storage_dir, config = payload_store
     payload_path = storage_dir / "marker.json"
     _write_payload(payload_path)
-    real_stat = os.stat
+    _force_descriptor_relative_stat_failure(monkeypatch, error_type)
 
-    def unsupported_dir_fd_stat(path, *args, **kwargs):
-        if kwargs.get("dir_fd") is not None:
-            raise NotImplementedError("descriptor-relative stat is unavailable")
-        return real_stat(path, *args, **kwargs)
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
+    assert json.loads(payload_path.read_text(encoding="utf-8"))["session_id"] == "new-session"
 
-    monkeypatch.setattr(externalize_module.os, "stat", unsupported_dir_fd_stat)
+
+@pytest.mark.parametrize("error_type", [TypeError, NotImplementedError])
+def test_legacy_readers_use_safe_fallback_when_descriptor_relative_open_is_unsupported(
+    payload_store,
+    monkeypatch,
+    error_type,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "marker.json"
+    _write_payload(payload_path)
+    _force_descriptor_relative_open_failure(monkeypatch, error_type)
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
+    assert json.loads(payload_path.read_text(encoding="utf-8"))["session_id"] == "new-session"
+
+
+def test_oversize_legacy_readers_use_capability_fallback(payload_store, monkeypatch):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "large-marker.json"
+    _write_payload(payload_path, content="x" * 1024)
+    _force_descriptor_relative_stat_failure(monkeypatch)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 1
+    reassigned = json.loads(payload_path.read_text(encoding="utf-8"))
+    assert reassigned["session_id"] == "new-session"
+    assert reassigned["content"] == "x" * 1024
+
+
+def test_legacy_reader_capability_fallback_rejects_symlink(payload_store, tmp_path, monkeypatch):
+    storage_dir, config = payload_store
+    outside_path = tmp_path / "outside-marker.json"
+    _write_payload(outside_path)
+    payload_path = storage_dir / "marker.json"
+    payload_path.symlink_to(outside_path)
+    _force_descriptor_relative_stat_failure(monkeypatch)
 
     assert externalized_tool_result_has_persisted_output_marker(
         payload_path.name,
@@ -758,6 +854,103 @@ def test_legacy_readers_fail_closed_when_descriptor_relative_stat_is_unsupported
         "new-session",
         config=config,
     ) == 0
+
+
+def test_legacy_reader_capability_fallback_rejects_payload_swap(
+    payload_store,
+    tmp_path,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "marker.json"
+    outside_path = tmp_path / "outside-marker.json"
+    _write_payload(payload_path)
+    _write_payload(outside_path)
+    _force_descriptor_relative_stat_failure(monkeypatch)
+    real_open = os.open
+    swapped = False
+
+    def swapping_fallback_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped and dir_fd is None and Path(path) == payload_path:
+            swapped = True
+            payload_path.unlink()
+            payload_path.symlink_to(outside_path)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(externalize_module.os, "open", swapping_fallback_open)
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
+    assert swapped is True
+
+
+def test_legacy_reader_does_not_fallback_for_unrelated_io_error(payload_store, monkeypatch):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "marker.json"
+    _write_payload(payload_path)
+    real_stat = os.stat
+
+    def denied_dir_fd_stat(path, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None:
+            raise PermissionError(errno.EACCES, "permission denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(externalize_module.os, "stat", denied_dir_fd_stat)
+
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    assert json.loads(payload_path.read_text(encoding="utf-8"))["session_id"] == "old-session"
+
+
+def test_fallback_reassignment_revalidates_payload_before_replace(
+    payload_store,
+    tmp_path,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "reassign.json"
+    original = _write_payload(payload_path)
+    held_original = tmp_path / "held-original.json"
+    replacement_path = tmp_path / "replacement.json"
+    replacement = _write_payload(
+        replacement_path,
+        session_id="replacement-session",
+        content="replacement sentinel",
+    )
+    _force_descriptor_relative_stat_failure(monkeypatch)
+    real_replace = externalize_module._replace_externalized_payload
+    swapped = False
+
+    def swapping_replace(path, payload, *args, **kwargs):
+        nonlocal swapped
+        payload_path.replace(held_original)
+        replacement_path.replace(payload_path)
+        swapped = True
+        return real_replace(path, payload, *args, **kwargs)
+
+    monkeypatch.setattr(externalize_module, "_replace_externalized_payload", swapping_replace)
+
+    assert reassign_externalized_payloads(
+        "old-session",
+        "new-session",
+        config=config,
+    ) == 0
+    assert swapped is True
+    assert json.loads(payload_path.read_text(encoding="utf-8")) == replacement
+    assert json.loads(held_original.read_text(encoding="utf-8")) == original
+    assert list(storage_dir.glob("*.tmp")) == []
 
 
 def test_reassignment_preserves_content_and_atomic_replacement(payload_store):

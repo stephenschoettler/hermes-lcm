@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.2",
+  "contract_version": "1.0.3",
   "boundary": "host-owned",
   "description": "Hermes-LCM is a source-installed Hermes Agent plugin. Hermes Agent owns the Python environment and dependency resolution; the plugin declares the host and optional feature imports it consumes without creating a second package installer or lock.",
   "ownership": {
@@ -104,7 +104,12 @@
       "version_policy": "host-resolved; supported when compiled Pattern.search accepts timeout",
       "imported_api": [
         "regex.compile",
-        "regex.Pattern.search(timeout=...)"
+        "regex.Pattern.search(timeout=...)",
+        "regex.DOTALL",
+        "regex.IGNORECASE",
+        "regex.MULTILINE",
+        "regex.VERBOSE",
+        "regex.error"
       ]
     },
     "tiktoken": {

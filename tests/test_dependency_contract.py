@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_PATH = REPO_ROOT / "dependency-contract.json"
@@ -33,7 +35,7 @@ def test_dependency_contract_validator_accepts_repository():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "dependency contract valid: version 1.0.2" in result.stdout
+    assert "dependency contract valid: version 1.0.3" in result.stdout
     assert "9 external imports declared" in result.stdout
 
 
@@ -131,11 +133,131 @@ def test_dependency_contract_validator_rejects_imported_api_drift(tmp_path, monk
     ]
 
 
+def _validate_sample_imports(tmp_path, monkeypatch, source, *modules):
+    validator = _load_validator()
+    (tmp_path / "sample.py").write_text(source, encoding="utf-8")
+    repository_contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract = {
+        **repository_contract,
+        "runtime_scan": {
+            "globs": ["*.py"],
+            "local_imports": [],
+            "excluded": [],
+        },
+        "external_imports": {
+            module: repository_contract["external_imports"][module]
+            for module in modules
+        },
+    }
+    monkeypatch.setattr(validator, "_validate_python_matrix", lambda *_args: [])
+    return validator.validate_contract(tmp_path, contract)
+
+
+def test_dependency_contract_accepts_declared_module_alias_attribute_uses(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "import numpy as _np\n"
+        "import yaml\n"
+        "_np.asarray([1, 2, 3])\n"
+        "yaml.safe_load('value: 1')\n",
+        "numpy",
+        "yaml",
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("source", "module", "expected_api", "line"),
+    [
+        ("import numpy as _np\n_np.matrix([1])\n", "numpy", "numpy.matrix", 2),
+        (
+            "import numpy as _np\n_np.linalg.norm([1])\n",
+            "numpy",
+            "numpy.linalg.norm",
+            2,
+        ),
+        (
+            "import tiktoken as tokenizer\n"
+            "tokenizer.encoding_for_model('unsupported')\n",
+            "tiktoken",
+            "tiktoken.encoding_for_model",
+            2,
+        ),
+        (
+            "try:\n"
+            "    import yaml\n"
+            "except Exception:\n"
+            "    yaml = None\n"
+            "yaml.unsafe_load('value: 1')\n",
+            "yaml",
+            "yaml.unsafe_load",
+            5,
+        ),
+    ],
+)
+def test_dependency_contract_rejects_undeclared_module_alias_attribute_uses(
+    tmp_path,
+    monkeypatch,
+    source,
+    module,
+    expected_api,
+    line,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        source,
+        module,
+    )
+
+    assert errors == [
+        f"undeclared imported API {expected_api!r}: sample.py:{line}"
+    ]
+
+
+def test_dependency_contract_does_not_treat_shadowed_aliases_as_module_uses(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "import numpy as _np\n"
+        "def local_value(_np):\n"
+        "    return _np.unsupported_local_attribute()\n"
+        "_np.asarray([1, 2, 3])\n",
+        "numpy",
+    )
+
+    assert errors == []
+
+
+def test_dependency_contract_does_not_treat_rebound_module_name_as_api_use(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "import yaml\n"
+        "yaml = object()\n"
+        "yaml.unsupported_local_attribute()\n",
+        "yaml",
+    )
+
+    assert errors == []
+
+
 def test_contract_records_host_ownership_versions_and_update_owner():
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert contract["schema_version"] == 1
-    assert contract["contract_version"] == "1.0.2"
+    assert contract["contract_version"] == "1.0.3"
     assert contract["boundary"] == "host-owned"
     assert contract["ownership"]["dependency_resolver"] == "Hermes Agent host environment"
     assert contract["ownership"]["update_owner"] == "Hermes-LCM maintainers"
@@ -154,6 +276,14 @@ def test_contract_records_host_ownership_versions_and_update_owner():
         "yaml",
     }
     assert contract["external_imports"]["agent"]["availability"] == "required"
+    assert {
+        "regex.compile",
+        "regex.DOTALL",
+        "regex.IGNORECASE",
+        "regex.MULTILINE",
+        "regex.VERBOSE",
+        "regex.error",
+    }.issubset(contract["external_imports"]["regex"]["imported_api"])
     assert all(
         dependency["version_policy"]
         for dependency in contract["external_imports"].values()

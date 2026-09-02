@@ -9,6 +9,7 @@ recoverable through the LCM inspection and expansion tools.
 from __future__ import annotations
 
 import codecs
+import errno
 import hashlib
 import json
 import logging
@@ -42,6 +43,31 @@ def _placeholder_metadata(value: Any) -> str:
 logger = logging.getLogger(__name__)
 
 
+_UNSUPPORTED_FILESYSTEM_ERRNOS = {
+    value
+    for value in (
+        getattr(errno, "ENOSYS", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if value is not None
+}
+
+
+def _is_unsupported_filesystem_capability(
+    exc: BaseException,
+    *,
+    windows_directory_access: bool = False,
+) -> bool:
+    if isinstance(exc, (TypeError, NotImplementedError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno in _UNSUPPORTED_FILESYSTEM_ERRNOS:
+        return True
+    return windows_directory_access and os.name == "nt" and isinstance(exc, PermissionError)
+
+
 def _tool_call_stub(tool_call_id: str) -> str:
     return (tool_call_id or "tool-result").replace("/", "-").replace(":", "-")[:48]
 
@@ -65,9 +91,24 @@ def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    dir_fd = os.open(path, flags)
     try:
-        os.fsync(dir_fd)
+        dir_fd = os.open(path, flags)
+    except (OSError, TypeError, NotImplementedError) as exc:
+        if _is_unsupported_filesystem_capability(
+            exc,
+            windows_directory_access=True,
+        ):
+            return
+        raise
+    try:
+        try:
+            os.fsync(dir_fd)
+        except (OSError, TypeError, NotImplementedError) as exc:
+            if not _is_unsupported_filesystem_capability(
+                exc,
+                windows_directory_access=True,
+            ):
+                raise
     finally:
         os.close(dir_fd)
 
@@ -164,7 +205,9 @@ def _unlink_partial_payload_at(name: str, *, dir_fd: int) -> None:
 
 def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
     data = json.dumps(payload, ensure_ascii=False, indent=2)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
@@ -235,9 +278,22 @@ def _replace_externalized_payload(
         return
     try:
         _write_externalized_payload(tmp_path, payload)
-        tmp_path.replace(path)
+        tmp_stat = _legacy_payload_path_snapshot(
+            tmp_path,
+            storage_dir=path.parent,
+        )[1]
+        if expected_identity is not None:
+            _revalidate_legacy_payload_path(
+                path,
+                expected_identity=expected_identity,
+            )
+        _revalidate_legacy_payload_path(
+            tmp_path,
+            expected_identity=(tmp_stat.st_dev, tmp_stat.st_ino),
+        )
+        os.replace(tmp_path, path)
         _fsync_directory(path.parent)
-    except OSError:
+    except (OSError, TypeError, NotImplementedError):
         _unlink_partial_payload(tmp_path)
         raise
 
@@ -614,11 +670,105 @@ def _has_single_link(file_stat) -> bool:
     return getattr(file_stat, "st_nlink", 1) == 1
 
 
+def _is_symlink_or_reparse_point(file_stat) -> bool:
+    if stat.S_ISLNK(file_stat.st_mode):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(file_stat, "st_file_attributes", 0) & reparse_flag)
+
+
+def _legacy_payload_path_snapshot(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> tuple[os.stat_result, os.stat_result]:
+    """Validate a path-based lookup used only without ``dir_fd`` support.
+
+    The descriptor-backed POSIX path remains authoritative. This fallback
+    rechecks containment, reparse/symlink state, ownership, link count, and
+    file identities around every open or replacement.
+    """
+    if path.parent != storage_dir or not path.name or Path(path.name).name != path.name:
+        raise OSError("externalized payload path is outside its configured store")
+    storage_stat = os.lstat(storage_dir)
+    if _is_symlink_or_reparse_point(storage_stat) or not stat.S_ISDIR(storage_stat.st_mode):
+        raise OSError("externalized payload store is not a plain directory")
+    resolved_storage = storage_dir.resolve(strict=True)
+    if path.parent.resolve(strict=True) != resolved_storage:
+        raise OSError("externalized payload parent escaped its configured store")
+    payload_stat = os.lstat(path)
+    if (
+        _is_symlink_or_reparse_point(payload_stat)
+        or not stat.S_ISREG(payload_stat.st_mode)
+        or not _owned_by_effective_user(payload_stat)
+        or not _has_single_link(payload_stat)
+        or payload_stat.st_size < 0
+    ):
+        raise OSError("externalized payload is not a safe regular file")
+    resolved_payload = path.resolve(strict=True)
+    if resolved_payload.parent != resolved_storage or resolved_payload.name != path.name:
+        raise OSError("externalized payload escaped its configured store")
+    return storage_stat, payload_stat
+
+
+def _revalidate_legacy_payload_path(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    _storage_stat, payload_stat = _legacy_payload_path_snapshot(
+        path,
+        storage_dir=path.parent,
+    )
+    if (payload_stat.st_dev, payload_stat.st_ino) != expected_identity:
+        raise OSError("externalized payload directory entry changed before replacement")
+
+
+def _open_legacy_externalized_payload_fallback(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> tuple[int, None, os.stat_result] | None:
+    """Open a sidecar safely when directory-relative descriptors are unavailable."""
+    payload_fd = -1
+    try:
+        expected_dir, expected_payload = _legacy_payload_path_snapshot(
+            path,
+            storage_dir=storage_dir,
+        )
+        payload_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        payload_flags |= getattr(os, "O_BINARY", 0)
+        payload_fd = os.open(path, payload_flags)
+        opened_payload = os.fstat(payload_fd)
+        current_dir, current_payload = _legacy_payload_path_snapshot(
+            path,
+            storage_dir=storage_dir,
+        )
+        if (
+            not stat.S_ISREG(opened_payload.st_mode)
+            or not _same_file_identity(expected_payload, opened_payload)
+            or not _same_file_identity(current_payload, opened_payload)
+            or not _same_file_identity(expected_dir, current_dir)
+            or not _owned_by_effective_user(opened_payload)
+            or not _has_single_link(opened_payload)
+            or opened_payload.st_size < 0
+        ):
+            return None
+        result = (payload_fd, None, opened_payload)
+        payload_fd = -1
+        return result
+    except (OSError, TypeError, NotImplementedError):
+        return None
+    finally:
+        if payload_fd >= 0:
+            os.close(payload_fd)
+
+
 def _open_legacy_externalized_payload(
     path: Path,
     *,
     storage_dir: Path,
-) -> tuple[int, int, os.stat_result] | None:
+) -> tuple[int, int | None, os.stat_result] | None:
     """Open one legacy sidecar through verified directory-relative descriptors.
 
     The pre-open ``stat`` and post-open ``fstat`` identity check closes the
@@ -630,8 +780,15 @@ def _open_legacy_externalized_payload(
     if path.parent != storage_dir or not path.name or Path(path.name).name != path.name:
         return None
 
+    if os.name == "nt":
+        return _open_legacy_externalized_payload_fallback(
+            path,
+            storage_dir=storage_dir,
+        )
+
     dir_fd = -1
     payload_fd = -1
+    capability_failure = False
     try:
         expected_dir = os.lstat(storage_dir)
         if stat.S_ISLNK(expected_dir.st_mode) or not stat.S_ISDIR(expected_dir.st_mode):
@@ -671,20 +828,26 @@ def _open_legacy_externalized_payload(
         payload_fd = -1
         dir_fd = -1
         return result
-    except (OSError, TypeError, NotImplementedError):
-        return None
+    except (OSError, TypeError, NotImplementedError) as exc:
+        capability_failure = _is_unsupported_filesystem_capability(exc)
     finally:
         if payload_fd >= 0:
             os.close(payload_fd)
         if dir_fd >= 0:
             os.close(dir_fd)
+    if capability_failure:
+        return _open_legacy_externalized_payload_fallback(
+            path,
+            storage_dir=storage_dir,
+        )
+    return None
 
 
 def _read_legacy_externalized_payload_json_with_directory(
     path: Path,
     *,
     storage_dir: Path,
-) -> tuple[Dict[str, Any], int, os.stat_result] | None:
+) -> tuple[Dict[str, Any], int | None, os.stat_result] | None:
     """Read one legacy sidecar fully, subject to the allocation ceiling."""
     opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
     if opened is None:
@@ -704,14 +867,14 @@ def _read_legacy_externalized_payload_json_with_directory(
         if not isinstance(decoded, dict):
             return None
         result = (decoded, dir_fd, opened_payload)
-        dir_fd = -1
+        dir_fd = None
         return result
     except (OSError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError, NotImplementedError):
         return None
     finally:
         if payload_fd >= 0:
             os.close(payload_fd)
-        if dir_fd >= 0:
+        if dir_fd is not None and dir_fd >= 0:
             os.close(dir_fd)
 
 
@@ -727,7 +890,8 @@ def _read_legacy_externalized_payload_json(
     try:
         return payload
     finally:
-        os.close(dir_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
 
 
 def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
@@ -1480,7 +1644,8 @@ def _read_oversize_externalized_payload_metadata(
     finally:
         if payload_fd >= 0:
             os.close(payload_fd)
-        os.close(dir_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
 
 
 def _reassign_oversize_externalized_payload(
@@ -1496,7 +1661,9 @@ def _reassign_oversize_externalized_payload(
         return False
     payload_fd, dir_fd, payload_stat = opened
     tmp_name = f"{path.name}.{time.time_ns():x}.tmp"
+    tmp_path = path.with_name(tmp_name)
     tmp_fd = -1
+    tmp_identity: tuple[int, int] | None = None
     try:
         max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
         if payload_stat.st_size <= max_bytes:
@@ -1533,7 +1700,18 @@ def _reassign_oversize_externalized_payload(
 
             flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
             flags |= getattr(os, "O_CLOEXEC", 0)
-            tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+            if dir_fd is None:
+                tmp_fd = os.open(tmp_path, flags, 0o600)
+            else:
+                tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+            opened_tmp = os.fstat(tmp_fd)
+            if (
+                not stat.S_ISREG(opened_tmp.st_mode)
+                or not _owned_by_effective_user(opened_tmp)
+                or not _has_single_link(opened_tmp)
+            ):
+                raise OSError("externalized payload temporary file is not safe")
+            tmp_identity = (opened_tmp.st_dev, opened_tmp.st_ino)
             with os.fdopen(tmp_fd, "w+b") as destination:
                 tmp_fd = -1
                 source.seek(0)
@@ -1586,23 +1764,41 @@ def _reassign_oversize_externalized_payload(
                 ):
                     raise ValueError("copied_payload_validation_failed")
 
-        _revalidate_payload_name(
-            path.name,
-            dir_fd=dir_fd,
-            expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
-        )
-        os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        os.fsync(dir_fd)
+        if dir_fd is None:
+            if tmp_identity is None:
+                raise OSError("externalized payload temporary identity is unavailable")
+            _revalidate_legacy_payload_path(
+                path,
+                expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
+            )
+            _revalidate_legacy_payload_path(
+                tmp_path,
+                expected_identity=tmp_identity,
+            )
+            os.replace(tmp_path, path)
+            _fsync_directory(storage_dir)
+        else:
+            _revalidate_payload_name(
+                path.name,
+                dir_fd=dir_fd,
+                expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
+            )
+            os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.fsync(dir_fd)
         return True
     except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
-        _unlink_partial_payload_at(tmp_name, dir_fd=dir_fd)
+        if dir_fd is None:
+            _unlink_partial_payload(tmp_path)
+        else:
+            _unlink_partial_payload_at(tmp_name, dir_fd=dir_fd)
         raise
     finally:
         if tmp_fd >= 0:
             os.close(tmp_fd)
         if payload_fd >= 0:
             os.close(payload_fd)
-        os.close(dir_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
 
 
 def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, hermes_home: str = "") -> bool:
@@ -1668,7 +1864,8 @@ def reassign_externalized_payloads(
                 continue
             moved += 1
         finally:
-            os.close(dir_fd)
+            if dir_fd is not None:
+                os.close(dir_fd)
     return moved
 
 
