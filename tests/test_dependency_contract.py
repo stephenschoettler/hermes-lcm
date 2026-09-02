@@ -172,6 +172,28 @@ def test_dependency_contract_accepts_declared_module_alias_attribute_uses(
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        "from agent import context_engine as ce\nce.ContextEngine()\n",
+        "from agent import context_engine\ncontext_engine.ContextEngine()\n",
+    ],
+)
+def test_dependency_contract_accepts_declared_direct_import_attribute_uses(
+    tmp_path,
+    monkeypatch,
+    source,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        source,
+        "agent",
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
     ("source", "module", "expected_api", "line"),
     [
         ("import numpy as _np\n_np.matrix([1])\n", "numpy", "numpy.matrix", 2),
@@ -220,6 +242,66 @@ def test_dependency_contract_rejects_undeclared_module_alias_attribute_uses(
     ]
 
 
+@pytest.mark.parametrize(
+    ("source", "module", "expected_api", "line"),
+    [
+        (
+            "from agent import context_engine as ce\nce.Unsupported()\n",
+            "agent",
+            "agent.context_engine.Unsupported",
+            2,
+        ),
+        (
+            "from agent import context_engine\ncontext_engine.Unsupported()\n",
+            "agent",
+            "agent.context_engine.Unsupported",
+            2,
+        ),
+        (
+            "from agent import context_engine as ce\nce.ContextEngine.unsupported()\n",
+            "agent",
+            "agent.context_engine.ContextEngine.unsupported",
+            2,
+        ),
+        (
+            "from fastembed import TextEmbedding as Embedding\n"
+            "Embedding.unsupported()\n",
+            "fastembed",
+            "fastembed.TextEmbedding.unsupported",
+            2,
+        ),
+        (
+            "try:\n"
+            "    from agent import context_engine as ce\n"
+            "except ImportError:\n"
+            "    ce = None\n"
+            "ce.Unsupported()\n",
+            "agent",
+            "agent.context_engine.Unsupported",
+            5,
+        ),
+    ],
+)
+def test_dependency_contract_rejects_undeclared_direct_import_attribute_uses(
+    tmp_path,
+    monkeypatch,
+    source,
+    module,
+    expected_api,
+    line,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        source,
+        module,
+    )
+
+    assert errors == [
+        f"undeclared imported API {expected_api!r}: sample.py:{line}"
+    ]
+
+
 def test_dependency_contract_does_not_treat_shadowed_aliases_as_module_uses(
     tmp_path,
     monkeypatch,
@@ -247,6 +329,69 @@ def test_dependency_contract_does_not_treat_rebound_module_name_as_api_use(
         "import yaml\n"
         "yaml = object()\n"
         "yaml.unsupported_local_attribute()\n",
+        "yaml",
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from agent import context_engine as ce\n"
+        "def local_value(ce):\n"
+        "    return ce.unsupported_local_attribute()\n"
+        "ce.ContextEngine()\n",
+        "from agent import context_engine as ce\n"
+        "ce = object()\n"
+        "ce.unsupported_local_attribute()\n",
+    ],
+)
+def test_dependency_contract_does_not_treat_shadowed_or_rebound_direct_imports_as_api_uses(
+    tmp_path,
+    monkeypatch,
+    source,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        source,
+        "agent",
+    )
+
+    assert errors == []
+
+
+def test_dependency_contract_does_not_treat_stdlib_direct_import_as_api_use(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "from pathlib import Path as LocalPath\n"
+        "LocalPath.unsupported_local_attribute()\n"
+        "import yaml\n"
+        "yaml.safe_load('value: 1')\n",
+        "yaml",
+    )
+
+    assert errors == []
+
+
+def test_dependency_contract_does_not_treat_local_direct_import_as_api_use(
+    tmp_path,
+    monkeypatch,
+):
+    (tmp_path / "localmod.py").write_text("class Client:\n    pass\n", encoding="utf-8")
+
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "from localmod import Client as LocalClient\n"
+        "LocalClient.unsupported_local_attribute()\n"
+        "import yaml\n"
+        "yaml.safe_load('value: 1')\n",
         "yaml",
     )
 

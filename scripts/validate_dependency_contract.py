@@ -247,9 +247,18 @@ class _ModuleAliasUseCollector(ast.NodeVisitor):
                 self._set_binding(bound_name, imported_api)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        top_level = module.split(".", 1)[0]
+        is_external = (
+            node.level == 0
+            and bool(top_level)
+            and top_level not in sys.stdlib_module_names
+            and top_level not in self.local_modules
+        )
         for alias in node.names:
             if alias.name != "*":
-                self._set_binding(alias.asname or alias.name, None)
+                imported_api = f"{module}.{alias.name}" if is_external else None
+                self._set_binding(alias.asname or alias.name, imported_api)
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:

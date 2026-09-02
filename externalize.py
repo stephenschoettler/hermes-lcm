@@ -1577,8 +1577,12 @@ def _stream_externalized_payload_suffix_metadata(
                     else:
                         metadata[key] = None
                         _stream_json_skip_value(reader, depth=1)
-                elif key == "persisted_output_source_path" and reader.peek() == ord('"'):
-                    metadata[key] = _stream_json_read_string(reader)
+                elif key == "persisted_output_source_path":
+                    if reader.peek() == ord('"'):
+                        metadata[key] = _stream_json_read_string(reader)
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
                 elif key == "persisted_output_expected_chars" and reader.peek() == ord('"'):
                     metadata[key] = _stream_json_read_string(reader, capture_limit=128)
                 elif key == "persisted_output_expected_chars" and reader.peek() in (

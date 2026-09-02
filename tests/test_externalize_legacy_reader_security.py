@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import errno
 import os
@@ -63,6 +64,24 @@ def _write_payload_with_duplicate_marker(path: Path, final_marker_value) -> byte
         + json.dumps(valid_markers)
         + ', "persisted_output_markers": '
         + json.dumps(final_marker_value)
+        + "}"
+    ).encode("utf-8")
+    path.write_bytes(raw)
+    return raw
+
+
+def _write_payload_with_duplicate_legacy_source_path(
+    path: Path,
+    final_source_path,
+) -> bytes:
+    raw = (
+        '{"kind":"tool_result",'
+        '"persisted_output_source_path":"/tmp/hermes-results/prefix.txt",'
+        '"persisted_output_expected_chars":"1024",'
+        '"content":"'
+        + ("x" * 1024)
+        + '\",\"persisted_output_source_path\":'
+        + json.dumps(final_source_path)
         + "}"
     ).encode("utf-8")
     path.write_bytes(raw)
@@ -448,6 +467,153 @@ def test_oversize_marker_reader_honors_final_duplicate_marker_value(
     assert externalized_tool_result_has_persisted_output_marker(
         payload_path.name,
         config=config,
+    ) is False
+
+
+@pytest.mark.parametrize("final_source_path", [None, 0, False, [], {}])
+def test_oversize_marker_reader_honors_final_non_string_duplicate_legacy_source_path(
+    payload_store,
+    monkeypatch,
+    final_source_path,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "duplicate-legacy-source.json"
+    raw = _write_payload_with_duplicate_legacy_source_path(
+        payload_path,
+        final_source_path,
+    )
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    assert json.loads(raw)["persisted_output_source_path"] == final_source_path
+    metadata = externalize_module._read_oversize_externalized_payload_metadata(
+        payload_path,
+        storage_dir=storage_dir,
+    )
+    assert metadata is not None
+    assert metadata["persisted_output_source_path"] is None
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is False
+
+
+def test_oversize_marker_reader_honors_final_string_duplicate_legacy_source_path(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "duplicate-final-legacy-source.json"
+    final_source_path = "/tmp/hermes-results/final.txt"
+    _write_payload_with_duplicate_legacy_source_path(payload_path, final_source_path)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    metadata = externalize_module._read_oversize_externalized_payload_metadata(
+        payload_path,
+        storage_dir=storage_dir,
+    )
+    assert metadata is not None
+    assert metadata["persisted_output_source_path"] == final_source_path
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+
+
+def test_oversize_marker_reader_preserves_prefix_only_legacy_source_path(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "prefix-only-legacy-source.json"
+    source_path = "/tmp/hermes-results/prefix-only.txt"
+    raw = (
+        '{"kind":"tool_result",'
+        f'"persisted_output_source_path":{json.dumps(source_path)},'
+        '"persisted_output_expected_chars":"1024",'
+        '"content":"'
+        + ("x" * 1024)
+        + '\"}'
+    ).encode("utf-8")
+    payload_path.write_bytes(raw)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+
+    metadata = externalize_module._read_oversize_externalized_payload_metadata(
+        payload_path,
+        storage_dir=storage_dir,
+    )
+    assert metadata is not None
+    assert metadata["persisted_output_source_path"] == source_path
+    assert externalized_tool_result_has_persisted_output_marker(
+        payload_path.name,
+        config=config,
+    ) is True
+
+
+def test_superseded_oversize_legacy_source_does_not_enable_durable_reconcile_match(
+    payload_store,
+    monkeypatch,
+):
+    storage_dir, config = payload_store
+    payload_path = storage_dir / "superseded-reconcile-source.json"
+    _write_payload_with_duplicate_legacy_source_path(payload_path, None)
+    monkeypatch.setattr(
+        externalize_module,
+        "_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES",
+        64,
+        raising=False,
+    )
+    reconciler = importlib.import_module("hermes_lcm.reconcile").ReconcileMixin()
+    reconciler._config = config
+    reconciler._hermes_home = ""
+    monkeypatch.setattr(
+        reconciler,
+        "_has_durable_persisted_output_replay_identity",
+        lambda _message: True,
+    )
+    candidate_content = (
+        "<persisted-output>\n"
+        "This tool result was too large (1,024 characters, 1.0 KB).\n"
+        "Full output saved to: /tmp/hermes-results/prefix.txt\n"
+        "</persisted-output>"
+    )
+    candidate_messages = [
+        {"role": "tool", "tool_call_id": "call-sec01", "content": candidate_content}
+    ]
+    candidate_identity = [("tool", candidate_content, "call-sec01", "")]
+    stored_identity = [("tool", "stored output", "call-sec01", "")]
+    stored_rows = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-sec01",
+            "content": (
+                "[Externalized tool output: tool_call_id=call-sec01; chars=1024; "
+                f"bytes=1024; ref={payload_path.name}]"
+            ),
+        }
+    ]
+
+    # A true result suppresses ingestion as a durable replay. The final null
+    # invalidates that proof, so the candidate must remain eligible for ingest.
+    assert reconciler._matches_persisted_output_durable_full_replay(
+        candidate_messages,
+        candidate_identity,
+        stored_identity,
+        stored_rows,
     ) is False
 
 
