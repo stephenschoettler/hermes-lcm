@@ -35,7 +35,7 @@ def test_dependency_contract_validator_accepts_repository():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "dependency contract valid: version 1.0.3" in result.stdout
+    assert "dependency contract valid: version 1.0.4" in result.stdout
     assert "9 external imports declared" in result.stdout
 
 
@@ -44,6 +44,42 @@ def test_dependency_assurance_documentation_matches_contract_version():
     assurance_doc = ASSURANCE_DOC_PATH.read_text(encoding="utf-8")
 
     assert f"`{contract['contract_version']}` supports:" in assurance_doc
+    assert (
+        "fails on undeclared external imports and collector-observed imported APIs that "
+        "lack an `imported_api` declaration; it does not reject an `imported_api` "
+        "declaration solely because the current collector did not observe it"
+        in assurance_doc
+    )
+    assert (
+        "The machine-readable `imported_api_validation` policy is "
+        "`observed-coverage-only`."
+        in assurance_doc
+    )
+    assert "Declarations may conservatively over-approximate that observed set" in assurance_doc
+    assert (
+        "This validator is not an SBOM, lockfile, dependency resolver, complete "
+        "runtime-reachability analysis, or proof that every declared API is currently "
+        "reachable."
+        in assurance_doc
+    )
+    assert (
+        "Removing a use does not automatically establish that a declaration is stale"
+        in assurance_doc
+    )
+
+
+@pytest.mark.parametrize("policy", [None, "reverse-drift", ""])
+def test_dependency_contract_validator_requires_observed_coverage_policy(policy):
+    validator = _load_validator()
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    if policy is None:
+        contract.pop("imported_api_validation", None)
+    else:
+        contract["imported_api_validation"] = policy
+
+    assert validator.validate_contract(REPO_ROOT, contract) == [
+        "imported_api_validation must be observed-coverage-only"
+    ]
 
 
 def test_dependency_contract_validator_rejects_non_object_supported_versions(tmp_path):
@@ -402,6 +438,36 @@ def test_dependency_contract_accepts_declared_module_alias_attribute_uses(
     assert errors == []
 
 
+def test_dependency_contract_allows_conservative_imported_api_declarations(
+    tmp_path,
+    monkeypatch,
+):
+    errors = _validate_sample_imports(
+        tmp_path,
+        monkeypatch,
+        "import yaml\nyaml.safe_load('value: 1')\n",
+        "yaml",
+    )
+
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("observed", "declared"),
+    [
+        ("fastembed.TextEmbedding", {"fastembed.TextEmbedding"}),
+        ("agent.context_engine", {"agent.context_engine.ContextEngine"}),
+    ],
+)
+def test_imported_api_declaration_matching_preserves_exact_and_parent_coverage(
+    observed,
+    declared,
+):
+    validator = _load_validator()
+
+    assert validator._imported_api_is_declared(observed, declared) is True
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -742,10 +808,16 @@ def test_contract_records_host_ownership_versions_and_update_owner():
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert contract["schema_version"] == 1
-    assert contract["contract_version"] == "1.0.3"
+    assert contract["contract_version"] == "1.0.4"
     assert contract["boundary"] == "host-owned"
+    assert contract["imported_api_validation"] == "observed-coverage-only"
     assert contract["ownership"]["dependency_resolver"] == "Hermes Agent host environment"
     assert contract["ownership"]["update_owner"] == "Hermes-LCM maintainers"
+    assert contract["ownership"]["update_trigger"] == (
+        "Review and increment this contract when the imported-API assurance policy, a "
+        "scanned runtime import, supported Python or Hermes Agent version, or required "
+        "imported API changes."
+    )
     assert contract["supported_versions"]["python"] == ["3.11", "3.12", "3.13", "3.14"]
     assert contract["supported_versions"]["hermes_agent"] == ">=0.16,<1"
     assert contract["runtime_scan"]["local_imports"] == ["hermes_lcm", "benchmarking"]
@@ -769,6 +841,12 @@ def test_contract_records_host_ownership_versions_and_update_owner():
         "regex.VERBOSE",
         "regex.error",
     }.issubset(contract["external_imports"]["regex"]["imported_api"])
+    assert "numpy.packbits" in contract["external_imports"]["numpy"]["imported_api"]
+    assert (
+        "regex.Pattern.search(timeout=...)"
+        in contract["external_imports"]["regex"]["imported_api"]
+    )
+    assert "yaml.safe_dump" in contract["external_imports"]["yaml"]["imported_api"]
     assert all(
         dependency["version_policy"]
         for dependency in contract["external_imports"].values()

@@ -603,6 +603,8 @@ def validate_contract(repo_root: Path, contract: dict[str, Any]) -> list[str]:
         errors.append("contract_version must be a non-zero semantic version")
     if contract.get("boundary") != "host-owned":
         errors.append("boundary must be host-owned")
+    if contract.get("imported_api_validation") != "observed-coverage-only":
+        errors.append("imported_api_validation must be observed-coverage-only")
 
     ownership = contract.get("ownership")
     if not isinstance(ownership, dict):

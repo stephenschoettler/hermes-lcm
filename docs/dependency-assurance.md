@@ -8,7 +8,7 @@ or install packages to make an assurance tool pass.
 
 The authoritative, versioned contract is
 [`dependency-contract.json`](../dependency-contract.json). Contract version
-`1.0.3` supports:
+`1.0.4` supports:
 
 - Hermes Agent `>=0.16,<1`
 - Python 3.11, 3.12, 3.13, and 3.14 (the CI matrix)
@@ -36,8 +36,12 @@ The validator uses only the Python standard library. It:
 3. parses shipped plugin, operator-script, and benchmarking Python sources with
    `ast`, including literal `importlib.import_module(...)` and `__import__(...)`
    calls;
-4. fails on undeclared external imports or declarations no longer observed; and
+4. fails on undeclared external imports and collector-observed imported APIs that lack an `imported_api` declaration; it does not reject an `imported_api` declaration solely because the current collector did not observe it; and
 5. reports locally available modules and distribution versions literally.
+
+The machine-readable `imported_api_validation` policy is `observed-coverage-only`. It guarantees coverage of the external imports and imported APIs the current static collector observes. Declarations may conservatively over-approximate that observed set, including APIs reached through parameter propagation, returned capabilities, runtime wiring, or other patterns the collector does not fully model.
+
+This validator is not an SBOM, lockfile, dependency resolver, complete runtime-reachability analysis, or proof that every declared API is currently reachable. Removing a use does not automatically establish that a declaration is stale; contract changes remain a maintainer-reviewed, versioned decision.
 
 The same command is a CI gate and a release-validation gate. The environment
 report is **not a vulnerability scan**. It does not prove that an installed
