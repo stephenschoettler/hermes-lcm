@@ -1622,6 +1622,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     conversation_id=self._conversation_id,
                 )
                 self._ingest_messages(messages)
+                # Frontier must advance WITH ingest, not only on compaction.
+                # advance_frontier is otherwise called only at bind + after a
+                # compaction; when the preflight is gated off (or no compaction
+                # fires), the lifecycle frontier stays frozen while MAX(store_id)
+                # grows -> the engine computes 0 raw backlog -> no debt -> no
+                # deferred maintenance -> context runs hot (fleet-wide frozen
+                # frontier incident 2026-08-29, Zero's scan: daji 283K lag etc).
+                # advance_frontier uses MAX() in SQL so this stays monotonic;
+                # the conversation-level max keeps the checkpoint honest.
+                if self._conversation_id:
+                    self._lifecycle.advance_frontier_to_store_max(
+                        self._conversation_id,
+                        self._session_id,
+                    )
                 self._record_ingest_success()
                 self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
                 logger.debug(
@@ -1818,10 +1832,122 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         conversation_id: str | None = None,
     ) -> None:
+        # Gateway restart/resume discriminator: capture the pre-bind lifecycle
+        # row so we can tell a resume of a finalized session apart from a real
+        # session boundary. A shutdown may have finalized the currently-bound
+        # active session (zeroing the persisted frontier); resuming the SAME
+        # session id is not a boundary, so the frontier must be restored below.
+        prior_state = (
+            self._lifecycle.get_by_conversation(conversation_id)
+            if conversation_id
+            else self._lifecycle.get_by_session(session_id)
+        )
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
         self._lcm_session_last_conversation_id[session_id] = state.conversation_id
         self._last_compacted_store_id = state.current_frontier_store_id
+        if (
+            prior_state is not None
+            and prior_state.current_session_id is None
+            and prior_state.last_finalized_session_id == session_id
+            and int(prior_state.last_finalized_frontier_store_id or 0) > 0
+            and int(state.current_frontier_store_id or 0)
+            < int(prior_state.last_finalized_frontier_store_id or 0)
+        ):
+            # The next process is binding the SAME session id that the prior
+            # process finalized on shutdown — a restart/resume, not a boundary.
+            # bind_session zeroed the frontier because the row was finalized;
+            # restore it from the finalized marker so raw rows at or below it
+            # are not reclassified as new compression debt on the resumed run.
+            # The finalized marker and any stale debt are also cleared in the
+            # same write: leaving last_finalized_session_id == the live session
+            # makes the row look already-finalized, so downstream logic treats
+            # the 42K+ live raw messages as UNBOUND backlog and churns compress
+            # preflights/refusals. resume_finalized_session is guarded on
+            # current_session_id == session_id, so a genuine new-session
+            # boundary (last_finalized points at the OLD id) is left untouched.
+            restored = self._lifecycle.resume_finalized_session(
+                state.conversation_id,
+                session_id,
+                int(prior_state.last_finalized_frontier_store_id),
+            )
+            if restored is not None and int(restored.current_frontier_store_id) > int(
+                state.current_frontier_store_id
+            ):
+                state = restored
+                self._last_compacted_store_id = state.current_frontier_store_id
+        elif (
+            prior_state is not None
+            and prior_state.current_session_id is None
+            and prior_state.last_finalized_session_id is None
+            and int(state.current_frontier_store_id or 0) == 0
+        ):
+            # No-marker resume arm: the shutdown finalize was SKIPPED (the
+            # session-end guard, or a SQLite lock), so last_finalized_session_id
+            # was NEVER written. bind_session saw current=None +
+            # last_finalized=NULL and zeroed the frontier. If the binding
+            # session has live messages, this is a resume of an existing
+            # session, not a new session: restore the frontier to the session's
+            # real content boundary (MAX(store_id) -- everything already in the
+            # DB is known content, so there is no compression debt). A genuinely
+            # new session (0 messages) stays at frontier 0. A real boundary
+            # (last_finalized points at the OLD id) is left untouched because
+            # the marker is not NULL.
+            max_store_id = self._lifecycle.get_session_max_store_id(session_id)
+            if max_store_id > 0:
+                restored = self._lifecycle.resume_orphaned_session(
+                    state.conversation_id,
+                    session_id,
+                    max_store_id,
+                )
+                if restored is not None and int(restored.current_frontier_store_id) > int(
+                    state.current_frontier_store_id
+                ):
+                    state = restored
+                    self._last_compacted_store_id = state.current_frontier_store_id
+        elif (
+            prior_state is not None
+            and prior_state.current_session_id is not None
+            and prior_state.last_finalized_session_id is not None
+            and prior_state.last_finalized_session_id
+            == prior_state.current_session_id
+            and int(state.current_frontier_store_id or 0) == 0
+        ):
+            # Stale-marker resume arm (case (c)): a prior finalize_session was
+            # called with frontier_store_id=0 (partial/finalize-and-forget, or
+            # after the frontier was already zeroed), writing current=None,
+            # last_finalized=<S>, frontier=0, last_finalized_frontier=0. A
+            # subsequent bind_session(<S>) set current=<S> but did NOT clear
+            # last_finalized, so the marker now points at the LIVE session
+            # itself (current == last_finalized == <S>) with both frontiers at
+            # 0 — stale by construction. The marker arm misses it
+            # (last_finalized_frontier == 0) and the no-marker arm misses it
+            # (last_finalized is not NULL). bind_session early-returned because
+            # current == session_id, so the frontier stayed at 0.
+            #
+            # This is a resume of the SAME session id, not a boundary: if the
+            # session has live messages, restore the frontier to MAX(store_id)
+            # (the real content boundary — everything already in the DB is known
+            # content, no debt) AND clear the stale finalized marker + any stale
+            # debt, so downstream logic does not treat the live resumed session
+            # as already-finalized backlog. A session with no rows (MAX == 0)
+            # has nothing to restore: leave the row as-is (the marker stays but
+            # there is no backlog to misclassify). A real boundary marker
+            # (last_finalized points at the OLD session, != current) does NOT
+            # fire here because the discriminator requires current ==
+            # last_finalized.
+            max_store_id = self._lifecycle.get_session_max_store_id(session_id)
+            if max_store_id > 0:
+                restored = self._lifecycle.resume_stale_marker_session(
+                    state.conversation_id,
+                    session_id,
+                    max_store_id,
+                )
+                if restored is not None and int(restored.current_frontier_store_id) > int(
+                    state.current_frontier_store_id
+                ):
+                    state = restored
+                    self._last_compacted_store_id = state.current_frontier_store_id
         self._register_active_engine_binding()
         if not self._session_ignored and not self._session_stateless:
             self._remember_foreground_rebind_candidate(session_id)

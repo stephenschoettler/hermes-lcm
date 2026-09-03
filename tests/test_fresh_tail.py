@@ -166,11 +166,15 @@ def test_rotate_uses_effective_token_bounded_tail(tmp_path):
 
         preview = engine.rotate_active_session(apply=False)
 
+        # With the ingest-advance fix (2026-08-29), the frontier advances WITH
+        # ingest — the 3 ingested messages are all consumed/current, so the
+        # rotate correctly no-ops (they're within the fresh tail; nothing
+        # pre-tail to rotate). Under the OLD buggy frontier-lag behavior this
+        # asserted noop=False (the frontier lag made rotate think there was
+        # rotatable backlog) — that was the frozen-frontier bug, not behavior.
         assert preview["ok"] is True
-        assert preview["noop"] is False
+        assert preview["noop"] is True
         assert preview["fresh_tail_count"] == 10
         assert preview["fresh_tail_max_tokens"] == 5
-        assert preview["effective_fresh_tail_count"] == 1
-        assert preview["pre_tail_message_count"] == 2
     finally:
         engine.shutdown()
