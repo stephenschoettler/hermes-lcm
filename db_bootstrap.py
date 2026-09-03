@@ -2999,13 +2999,13 @@ def repair_external_content_fts(
 ) -> dict[str, bool]:
     rebuilt = False
     degraded = False
-    structural_repair_needed = external_content_fts_needs_repair(conn, spec)
+    fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec)
     deep_repair_needed = False
-    if not structural_repair_needed or not throttle:
+    if not fts_structure_needs_rebuild or not throttle:
         # Preserve the cheap startup path and its background integrity-scan
-        # behavior. Explicit repair remains unthrottled even when a structural
-        # trigger repair is also needed, so same-row-count index drift is not
-        # hidden behind the trigger-only path.
+        # behavior whenever the FTS table and shadow structure can support a
+        # deep check. Missing triggers alone must not hide same-row-count index
+        # drift. Explicit repair remains unthrottled for every repair state.
         deep_repair_needed = _fts_needs_rebuild(conn, spec, now=now, throttle=throttle)
         if not deep_repair_needed:
             # A trigger can disappear after the initial complete-state check.

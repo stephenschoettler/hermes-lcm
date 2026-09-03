@@ -531,6 +531,114 @@ def test_explicit_repair_rebuilds_same_count_corruption_with_missing_triggers(tm
     conn.close()
 
 
+def test_startup_structural_repair_does_not_deep_check_incomplete_fts(
+    tmp_path, monkeypatch
+):
+    """Missing FTS tables are rebuilt before any deep integrity operation."""
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("deep integrity route must not inspect incomplete FTS")
+
+    monkeypatch.setattr(db_bootstrap, "_fts_needs_rebuild", fail_if_called)
+
+    repaired = db_bootstrap.repair_external_content_fts(
+        conn, spec, throttle=True
+    )
+
+    assert repaired == {
+        "rebuilt": True,
+        "degraded": False,
+        "triggers_recreated": False,
+    }
+    assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+    conn.close()
+
+
+def test_due_startup_repair_rebuilds_same_count_drift_with_one_missing_trigger(
+    tmp_path, monkeypatch
+):
+    """A missing trigger must not suppress a due synchronous deep check."""
+    from hermes_lcm.store import MessageStore, build_message_fts_spec
+
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
+    db_path = str(tmp_path / "due-trigger-drift.db")
+    store = MessageStore(db_path)
+    try:
+        ids = store.append_batch(
+            "session",
+            [{"role": "user", "content": "oldtoken stable payload"}],
+            [3],
+            source="trigger-drift-regression",
+            conversation_id="conversation",
+        )
+        conn = store.connection
+        assert conn is not None
+        spec = build_message_fts_spec()
+        conn.execute("DROP TRIGGER msg_fts_update")
+        conn.execute(
+            "UPDATE messages SET content = 'newtoken stable payload' WHERE store_id = ?",
+            (ids[0],),
+        )
+        conn.execute(
+            "UPDATE metadata SET value = ? WHERE key = ?",
+            (
+                str(time.time() - 100 * 3600),
+                db_bootstrap._integrity_marker_key(spec),
+            ),
+        )
+        conn.commit()
+
+        assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is False
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is True
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'oldtoken'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'newtoken'"
+        ).fetchone()[0] == 0
+
+        repaired = db_bootstrap.repair_external_content_fts(
+            conn, spec, throttle=True
+        )
+
+        assert repaired == {
+            "rebuilt": True,
+            "degraded": False,
+            "triggers_recreated": True,
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'oldtoken'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'newtoken'"
+        ).fetchone()[0] == 1
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is False
+        assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        store.close()
+
+    reopened = MessageStore(db_path)
+    try:
+        assert reopened.search("oldtoken") == []
+        matches = reopened.search("newtoken")
+        assert len(matches) == 1
+        assert matches[0]["content"] == "newtoken stable payload"
+        conn = reopened.connection
+        assert conn is not None
+        spec = build_message_fts_spec()
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is False
+        assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        reopened.close()
+
+
 def test_repair_without_rebuild_still_clears_integrity_failed_flag(tmp_path, monkeypatch):
     """Even a no-op repair (nothing to rebuild) clears a stale corruption flag."""
     monkeypatch.setenv(INTERVAL_ENV, "24")
