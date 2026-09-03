@@ -3751,7 +3751,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [
+        disabled = self._disabled_tool_names()
+        schemas = [
             LCM_GREP,
             LCM_RECALL,
             LCM_QUERY_STATE,
@@ -3768,8 +3769,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_INSPECT,
             LCM_DOCTOR,
         ]
+        if disabled:
+            return [s for s in schemas if s.get("name") not in disabled]
+        return schemas
+
+    @staticmethod
+    def _disabled_tool_names() -> set[str]:
+        """Tools disabled via LCM_DISABLED_TOOLS (comma-separated lcm_* names).
+
+        Disabled tools are excluded from the injected context-engine schemas
+        AND refused in handle_tool_call, so they cost zero tokens per turn.
+        """
+        raw = os.environ.get("LCM_DISABLED_TOOLS", "")
+        if not raw:
+            return set()
+        return {part.strip() for part in raw.split(",") if part.strip()}
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+        if name in self._disabled_tool_names():
+            return json.dumps({"error": f"LCM tool {name} is disabled via LCM_DISABLED_TOOLS"})
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 

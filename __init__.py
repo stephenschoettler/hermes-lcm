@@ -29,6 +29,14 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _disabled_tool_names() -> set[str]:
+    """Tools disabled via LCM_DISABLED_TOOLS (comma-separated lcm_* names)."""
+    raw = os.environ.get("LCM_DISABLED_TOOLS", "")
+    if not raw:
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
 def _make_wrapped_handler(tool_name: str, engine):
     """Route a registered lcm_* tool through the engine dispatch path."""
     def _wrapped(args: dict, **kwargs) -> str:
@@ -494,6 +502,12 @@ def register(ctx):
         ("lcm_inspect", LCM_INSPECT, "🧭"),
         ("lcm_doctor", LCM_DOCTOR, "🏥"),
     ]
+    # LCM_DISABLED_TOOLS (comma-separated lcm_* names) removes tools from the
+    # plugin-registry registration too, mirroring engine.get_tool_schemas() so
+    # disabled tools cost zero tokens on every host path.
+    _disabled = _disabled_tool_names()
+    if _disabled:
+        _TOOLS = [t for t in _TOOLS if t[0] not in _disabled]
     register_tool = getattr(ctx, "register_tool", None)
     if callable(register_tool) and _host_forwards_registered_tool_messages(ctx):
         for name, schema, emoji in _TOOLS:

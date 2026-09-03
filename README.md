@@ -417,6 +417,7 @@ moved back to that assistant even when doing so exceeds a configured bound.
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires |
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
+| `LCM_DISABLED_TOOLS` | empty | Comma-separated `lcm_*` tool names excluded from injected tool schemas, refused in `handle_tool_call` before message ingest, and filtered from plugin-registry registration — disabled tools cost zero tokens per turn. Unset to restore all tools. |
 
 ### Model and timeout settings
 
