@@ -4,7 +4,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+### Fixed
+
+- #196 assistant outputs with extremely high repetition are now quarantined
+  regardless of size: a short looped response (for example one sentence
+  repeated 46 times, ~3k chars) previously bypassed the 65,536-char gate and
+  stayed in retrieval context forever.
 
 ## v0.21.0-rc2 - 2026-08-05
 
