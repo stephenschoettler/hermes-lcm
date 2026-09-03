@@ -298,6 +298,66 @@ Cross-session externalized search remains unsupported. Search the historical
 row first, load the intended session, or recover a known current-session ref
 directly with `lcm_expand`.
 
+## Strong retrieval references V1 foundation
+
+The V1 foundation is additive and intentionally narrower than the existing
+legacy locators. It does not change any public tool schema or emit references
+from tools yet; message, summary-node, sidecar, and cursor adapters are later
+packets.
+
+A migrated database has one canonical UUIDv4 authority in `metadata` under
+`database_uuid`. The `database_uuid_v1` named migration creates it exactly once
+for a fresh or pre-V1 database and fails closed if a completed migration later
+finds a missing or malformed value. The numeric core schema remains v5.
+
+The named `retrieval_references_v1` registry stores only the non-null SHA-256 hex
+digest of a random `rh1_` + 256-bit opaque token. Target, scope, and revision
+bindings are canonical JSON held server-side. V1 kinds are `message`,
+`summary_node`, `externalized_payload`, `source_cursor`, `content_cursor`, and
+`session_cursor`; consistency is `live`, `high_watermark`, or `snapshot`.
+Every issue, resolve, revoke, and explicit-clone operation read-validates both
+named migration markers plus the exact registry schema; an unmarked, orphaned,
+or damaged authority fails closed rather than being adopted or repaired by an
+operation.
+
+The wire envelope is:
+
+```json
+{"v":1,"kind":"message","database_uuid":"...","token":"rh1_..."}
+```
+
+Resolution requires trusted host context and two explicit authorization boundaries. A
+preauthorization callback is invoked after parsing/version validation but before
+the registry row is read, so an unauthenticated or categorically unauthorized
+caller cannot probe target, scope, revision, existence, or replacement content.
+After lookup, a separate scope callback receives only the canonical stored scope
+and must authorize that binding before target or revision JSON is decoded or
+returned. Omitting either callback fails closed. `expected_scope` remains an
+additional trusted-adapter constraint; it is not a substitute for host scope
+authorization. Before stored-scope authorization succeeds, missing, malformed,
+wrong-kind, revoked, and expired registry states are normalized to
+`reference_forbidden`; detailed lifecycle and kind errors are available only
+after the caller is authorized for that scope. Target and revision columns are
+fetched only after those checks. Revocation uses the same two gates and does not
+decode or return target/revision data. Issuance requires a separate trusted
+operation callback over canonical kind, target, scope, and revision before
+registry publication. The caller must not emit the envelope before its
+transaction is durable. Explicit clone rotation requires its own administrative
+callback and is an operator/database-boundary operation, not a user reference
+action. The stable
+strong error codes are `invalid_request`, `reference_invalid`,
+`reference_unsupported_version`, `reference_database_mismatch`,
+`reference_kind_mismatch`, `reference_scope_mismatch`, `reference_forbidden`,
+`reference_not_found`, and `reference_stale`; structured failures retain a
+human-readable `error` field.
+
+Ordinary restart and byte-for-byte restore preserve the authority UUID and
+registry. A replacement database has a different UUID. A raw byte copy remains
+indistinguishable from a restore until an explicit clone operation rotates the
+UUID and atomically revokes copied V1 rows. This foundation does not claim that
+legacy scalar IDs are safe, and it provides no principal/tenant, signing/MAC,
+key-management, target loading, revision adapter, or pagination behavior.
+
 ### lossless-claw/OpenClaw import utility
 
 `hermes-lcm` includes an opt-in operator script for backfilling raw message rows from a lossless-claw/OpenClaw LCM SQLite database into the local hermes-lcm SQLite store:
@@ -323,6 +383,30 @@ The script is intentionally conservative:
 - no OpenClaw config or separate secret tables are imported, but raw transcripts and tool payloads are imported and may contain sensitive user data
 
 This is a local archive migration path. It does not make LCM a general memory provider, and it does not change the current-session retrieval contract for agent tools.
+
+## Message retrieval-reference V1 adapter
+
+The narrow `hermes_lcm.message_references` adapter binds one existing
+`messages.store_id` to a V1 opaque `kind="message"` envelope. It accepts a
+caller-supplied canonical scope and computes a SHA-256 semantic revision over
+normalized session/source/conversation/role/content/tool metadata and the
+finite timestamp. `pinned` and `token_estimate` are operational metadata and do
+not affect the revision.
+
+Use `issue_message_reference(...)` with the trusted host
+`authorization_context`, mandatory `authorize_target` callback, and
+`authorize_issue` callback. Target preauthorization runs before any transaction
+or `messages` lookup, so denied existing and missing IDs are indistinguishable;
+foundation issue authorization then validates the loaded target/revision before
+registry insertion. Use `resolve_message_reference(...)` with both foundation
+authorization callbacks. Resolution authorizes the opaque envelope and stored
+scope before selecting the message row, and verifies the current semantic
+revision in one stable read snapshot. Issuance uses one `BEGIN IMMEDIATE`
+transaction when the caller has no active transaction; caller-owned transactions
+remain rollbackable. The adapter returns only the foundation's closed V1 error
+codes and does not add public tool emission, pagination, session cursors,
+summary-node/sidecar references, principal/tenant policy, signing, or schema
+changes.
 
 ## Related references
 
