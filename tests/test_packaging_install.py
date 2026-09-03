@@ -10,6 +10,17 @@ import subprocess
 import sys
 import types
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_plugin_registration_storage(tmp_path, monkeypatch):
+    """Keep packaging tests away from the live profile's SQLite database."""
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("LCM_DATABASE_PATH", raising=False)
+    return hermes_home
+
 
 EXPECTED_LCM_TOOLS = {
     "lcm_grep",
@@ -417,7 +428,7 @@ def test_lcm_grep_declares_opt_in_externalized_content_scope():
     assert properties["externalized_refs"]["maxItems"] == 256
 
 
-def test_plugin_entrypoint_registers_lcm_context_engine():
+def test_plugin_entrypoint_registers_lcm_context_engine(_isolate_plugin_registration_storage):
     engine = _register_plugin_engine("hermes_lcm_packaging_entrypoint")
 
     assert engine is not None
@@ -427,7 +438,8 @@ def test_plugin_entrypoint_registers_lcm_context_engine():
     assert identity["plugin_name"] == "hermes-lcm"
     assert identity["plugin_version"] == "0.21.0-rc2"
     assert Path(identity["plugin_path"]) == repo_root
-    assert identity["database_path_source"] in {"config.database_path", "hermes_home", "default_home"}
+    assert identity["database_path_source"] == "hermes_home"
+    assert Path(identity["database_path"]) == _isolate_plugin_registration_storage / "lcm.db"
     assert identity["plugin_git_commit"]
     assert identity["plugin_git_commit"] == subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
