@@ -123,6 +123,76 @@ def test_discord_short_turn_ingest_preserves_conversation_id(tmp_path):
         engine.shutdown()
 
 
+def test_compaction_stops_before_unmapped_cross_source_store_gap(tmp_path, monkeypatch):
+    config = LCMConfig(
+        database_path=str(tmp_path / "durable-frontier-gap.db"),
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+    )
+    engine = LCMEngine(config=config)
+    captured: dict[str, str] = {}
+
+    def capture_summary(**kwargs):
+        captured["text"] = kwargs["text"]
+        return "contiguous prefix summary\n[Expand for details: contiguous prefix]", 1
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", capture_summary)
+    try:
+        conversation_id = "agent:main:telegram:dm:durable-gap"
+        engine.on_session_start(
+            "durable-gap-session",
+            platform="desktop",
+            conversation_id=conversation_id,
+            context_length=200_000,
+        )
+        prefix = {"role": "user", "content": "PREFIX " + "a" * 200}
+        omitted = {"role": "assistant", "content": "OMITTED " + "b" * 200}
+        suffix = {"role": "user", "content": "SUFFIX " + "c" * 200}
+        fresh_tail = {"role": "assistant", "content": "FRESH_TAIL"}
+
+        prefix_id = engine._store.append(
+            "durable-gap-session",
+            prefix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        omitted_id = engine._store.append(
+            "durable-gap-session",
+            omitted,
+            source="telegram",
+            conversation_id=conversation_id,
+        )
+        suffix_id = engine._store.append(
+            "durable-gap-session",
+            suffix,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+        engine._store.append(
+            "durable-gap-session",
+            fresh_tail,
+            source="desktop",
+            conversation_id=conversation_id,
+        )
+
+        active_context = [prefix, suffix, fresh_tail]
+        engine._ingest_cursor = len(active_context)
+        engine._ingest_cursor_needs_reconcile = False
+
+        result = engine.compress(active_context, current_tokens=10_000, force=True)
+
+        nodes = engine._dag.get_session_nodes("durable-gap-session", depth=0)
+        assert len(nodes) == 1
+        assert nodes[0].source_ids == [prefix_id]
+        assert engine._last_compacted_store_id == prefix_id
+        assert omitted_id not in nodes[0].source_ids
+        assert suffix_id not in nodes[0].source_ids
+        assert "SUFFIX" not in captured["text"]
+        assert any(message.get("content", "").startswith("SUFFIX") for message in result)
+    finally:
+        engine.shutdown()
+
+
 def test_webui_like_local_short_turn_ingest_preserves_lane_metadata(tmp_path):
     config = LCMConfig(database_path=str(tmp_path / "webui-local.db"))
     engine = LCMEngine(config=config)

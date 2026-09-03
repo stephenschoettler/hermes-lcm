@@ -561,9 +561,13 @@ class CompactionMixin:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
 
+            blocked_cross_source_message_ids: set[int] = set()
             if candidate_start < fresh_tail_start:
                 self._current_compress_store_ids_by_message_id = self._get_store_id_map_for_messages(
-                    working_messages[leading_anchor_count:]
+                    working_messages[leading_anchor_count:],
+                    stop_at_cross_source_gap=True,
+                    covered_prefix_messages=working_messages[:leading_anchor_count],
+                    blocked_message_ids=blocked_cross_source_message_ids,
                 )
                 compactable_pairs = list(
                     zip(
@@ -654,8 +658,19 @@ class CompactionMixin:
                 focus_topic = self._derive_auto_focus_topic(working_messages)
 
             candidate_raw = working_messages[leading_anchor_count:fresh_tail_start]
+            lineage_prefix_len = 0
+            for candidate_message in candidate_raw:
+                if id(candidate_message) in blocked_cross_source_message_ids:
+                    break
+                lineage_prefix_len += 1
+            if lineage_prefix_len < len(candidate_raw):
+                # Fail closed at the first cross-source store gap. Messages
+                # after that gap stay active and must not be summarized into a
+                # node whose source_ids omit the intervening history.
+                fresh_tail_start = leading_anchor_count + lineage_prefix_len
+                candidate_raw = candidate_raw[:lineage_prefix_len]
             if not candidate_raw:
-                noop_reason = "no eligible raw backlog outside fresh tail"
+                noop_reason = "selected leaf chunk crosses raw store source lineage"
                 if threshold_full_sweep_active:
                     sweep_raw_drained = True
                     sweep_stop_reason = "raw_prefix_drained"
