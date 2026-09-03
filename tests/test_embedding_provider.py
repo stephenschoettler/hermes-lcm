@@ -18,6 +18,7 @@ from hermes_lcm.embedding_provider import (
     EmbeddingSpendGuard,
     FastembedProvider,
     HttpResponse,
+    OpenAICompatibleProvider,
     OllamaProvider,
     ProviderCircuitOpen,
     ProviderNotWarmedUp,
@@ -1323,3 +1324,285 @@ def test_voyage_rerank_empty_documents_short_circuits(monkeypatch):
 
     assert provider.rerank("q", [], timeout=5.0) == []
     assert transport.calls == []
+
+
+def _openai_compatible_success(count: int, dim: int = 3) -> HttpResponse:
+    return _response(
+        200,
+        {
+            "data": [
+                {"index": index, "embedding": [float(index + 1)] * dim}
+                for index in range(count)
+            ]
+        },
+    )
+
+
+def _openai_compatible_rerank_response(rows) -> HttpResponse:
+    return _response(200, {"results": rows})
+
+
+def test_openai_compatible_rerank_request_shape_and_success(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_rerank_response(
+            [
+                {"index": 0, "relevance_score": 0.1},
+                {"index": 1, "relevance_score": 0.9},
+            ]
+        )
+    )
+    provider = OpenAICompatibleProvider(
+        "BAAI/bge-m3", base_url="https://api.example.com/v1/", transport=transport
+    )
+
+    assert provider.rerank("q", ["first", "second"], timeout=5.0) == [(1, 0.9), (0, 0.1)]
+    call = transport.calls[0]
+    assert call["url"] == "https://api.example.com/v1/rerank"
+    assert call["payload"] == {
+        "model": "BAAI/bge-reranker-v2-m3",
+        "query": "q",
+        "documents": ["first", "second"],
+        "top_n": 2,
+    }
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_openai_compatible_rerank_url_defaults_to_embedding_base_url():
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1/"
+    )
+
+    assert provider.rerank_base_url == ""
+    assert provider.rerank_url == "https://api.example.com/v1/rerank"
+
+
+def test_openai_compatible_rerank_dedicated_base_url(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_rerank_response([{"index": 0, "relevance_score": 0.9}])
+    )
+    provider = OpenAICompatibleProvider(
+        "BAAI/bge-m3",
+        base_url="https://embed.example.com/v1",
+        rerank_base_url="https://rerank.example.com/v1/",
+        transport=transport,
+    )
+
+    assert provider.rerank_url == "https://rerank.example.com/v1/rerank"
+    assert provider.rerank("q", ["only"], timeout=5.0) == [(0, 0.9)]
+    assert transport.calls[0]["url"] == "https://rerank.example.com/v1/rerank"
+
+
+def test_rerank_base_url_env_and_resolve_pass_through(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("LCM_EMBEDDING_MODEL", "BAAI/bge-m3")
+    monkeypatch.setenv("LCM_EMBEDDING_BASE_URL", "https://embed.example.com/v1")
+    monkeypatch.setenv("LCM_RERANK_BASE_URL", "https://rerank.example.com")
+    config = LCMConfig.from_env()
+
+    assert config.rerank_base_url == "https://rerank.example.com"
+    provider = resolve_provider(config)
+    assert provider.base_url == "https://embed.example.com/v1"
+    assert provider.rerank_url == "https://rerank.example.com/rerank"
+
+
+def test_openai_compatible_rerank_top_k_maps_to_top_n(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_rerank_response(
+            [{"index": 1, "relevance_score": 0.5}, {"index": 0, "relevance_score": 0.9}]
+        )
+    )
+    provider = OpenAICompatibleProvider("bge-m3", base_url="https://api.example.com/v1", transport=transport)
+
+    assert provider.rerank("q", ["a", "b", "c", "d", "e"], top_k=2, timeout=5.0) == [(0, 0.9), (1, 0.5)]
+    assert transport.calls[0]["payload"]["top_n"] == 2
+
+
+def test_openai_compatible_rerank_drops_out_of_range_index(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_rerank_response(
+            [{"index": 0, "relevance_score": 0.8}, {"index": 5, "relevance_score": 0.99}]
+        )
+    )
+    provider = OpenAICompatibleProvider("bge-m3", base_url="https://api.example.com/v1", transport=transport)
+
+    assert provider.rerank("q", ["a", "b"], timeout=5.0) == [(0, 0.8)]
+
+
+def test_openai_compatible_rerank_non_2xx_raises(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=FakeTransport(_response(500, {}))
+    )
+
+    with pytest.raises(EmbeddingProviderError, match=r"rerank request failed \(500\)"):
+        provider.rerank("q", ["a"], timeout=5.0)
+
+
+def test_openai_compatible_rerank_empty_documents_short_circuits():
+    transport = FakeTransport()
+    provider = OpenAICompatibleProvider("bge-m3", base_url="https://api.example.com/v1", transport=transport)
+
+    assert provider.rerank("q", [], timeout=5.0) == []
+    assert transport.calls == []
+
+
+def test_openai_compatible_rerank_no_api_key_sends_no_auth_header(monkeypatch):
+    monkeypatch.delenv("LCM_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    transport = FakeTransport(_openai_compatible_rerank_response([]))
+    provider = OpenAICompatibleProvider("bge-m3", base_url="https://api.example.com/v1", transport=transport)
+
+    assert provider.rerank("q", ["a"], timeout=5.0) == []
+    assert "Authorization" not in transport.calls[0]["headers"]
+
+
+def test_openai_compatible_rerank_network_error_not_retried(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(OSError("boom"))
+    provider = OpenAICompatibleProvider("bge-m3", base_url="https://api.example.com/v1", transport=transport)
+
+    with pytest.raises(EmbeddingProviderError, match="rerank network error"):
+        provider.rerank("q", ["a"], timeout=5.0)
+    assert len(transport.calls) == 1
+
+
+def test_openai_compatible_rerank_skips_malformed_rows(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_rerank_response(
+            [
+                "not-a-row",
+                {"index": 0, "relevance_score": None},
+                {"relevance_score": 0.9},
+                {"index": 1, "relevance_score": 0.5},
+                {"index": 1, "relevance_score": 0.7},
+            ]
+        )
+    )
+    provider = OpenAICompatibleProvider("bge-m3", base_url="https://api.example.com/v1", transport=transport)
+
+    assert provider.rerank("q", ["a", "b"], timeout=5.0) == [(1, 0.7), (1, 0.5)]
+
+
+def test_openai_compatible_request_shape_and_success(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(_openai_compatible_success(2))
+    provider = OpenAICompatibleProvider(
+        "BAAI/bge-m3",
+        base_url="https://api.example.com/v1/",
+        transport=transport,
+    )
+
+    vectors = provider.embed_documents(["first", "second"])
+
+    assert len(vectors) == 2
+    assert provider.dim == 3
+    assert len(transport.calls) == 1
+    call = transport.calls[0]
+    # Trailing slash on the base URL is stripped before joining.
+    assert call["url"] == "https://api.example.com/v1/embeddings"
+    assert call["payload"] == {
+        "model": "BAAI/bge-m3",
+        "input": ["first", "second"],
+    }
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_openai_compatible_query_and_interactive(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_success(1, dim=4),
+        _openai_compatible_success(1, dim=4),
+    )
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="http://localhost:8080/v1", transport=transport
+    )
+
+    assert provider.embed_query("question") == [1.0, 1.0, 1.0, 1.0]
+    assert provider.embed_query_interactive("q", timeout=5.0) == [1.0, 1.0, 1.0, 1.0]
+
+    assert [call["url"] for call in transport.calls] == [
+        "http://localhost:8080/v1/embeddings",
+        "http://localhost:8080/v1/embeddings",
+    ]
+
+
+def test_openai_compatible_missing_api_key_raises(monkeypatch):
+    monkeypatch.delenv("LCM_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    transport = FakeTransport(_openai_compatible_success(1))
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="LCM_EMBEDDING_API_KEY"):
+        provider.embed_query("q")
+
+    assert transport.calls == []
+
+
+def test_openai_compatible_siliconflow_key_fallback(monkeypatch):
+    monkeypatch.delenv("LCM_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "fallback-key")
+    transport = FakeTransport(_openai_compatible_success(1))
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    provider.embed_query("q")
+
+    assert transport.calls[0]["headers"]["Authorization"] == "Bearer fallback-key"
+
+
+def test_openai_compatible_empty_base_url_raises():
+    with pytest.raises(ValueError, match="LCM_EMBEDDING_BASE_URL"):
+        OpenAICompatibleProvider("bge-m3", base_url="   ")
+
+
+def test_openai_compatible_empty_model_raises():
+    with pytest.raises(ValueError, match="must not be empty"):
+        OpenAICompatibleProvider("  ", base_url="https://api.example.com/v1")
+
+
+def test_openai_compatible_network_error_is_not_retried(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(OSError("boom"))
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="network error"):
+        provider.embed_documents(["doc"])
+
+    # The transport start makes an automatic identical resend unsafe.
+    assert len(transport.calls) == 1
+
+
+def test_openai_compatible_response_count_mismatch_raises(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(_openai_compatible_success(1))  # 1 vector for 2 texts
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="different number of embeddings"):
+        provider.embed_documents(["a", "b"])
+
+
+def test_resolve_provider_openai_compatible(monkeypatch):
+    config = LCMConfig(
+        embedding_provider="openai-compatible",
+        embedding_model="BAAI/bge-m3",
+        embedding_base_url="https://api.example.com/v1",
+    )
+    provider = resolve_provider(config)
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.model_id == "BAAI/bge-m3"
+    assert provider.base_url == "https://api.example.com/v1"
+
+    config.embedding_provider = "siliconflow"
+    assert isinstance(resolve_provider(config), OpenAICompatibleProvider)

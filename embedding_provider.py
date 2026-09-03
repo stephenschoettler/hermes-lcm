@@ -36,6 +36,7 @@ _VOYAGE_RERANK_URL = "https://api.voyageai.com/v1/rerank"
 # lcm_recall's cross-encoder rerank model. A lite model keeps the single extra
 # API call cheap and inside the latency-sensitive recall deadline.
 _VOYAGE_RERANK_MODEL = "rerank-2.5-lite"
+_OPENAI_COMPATIBLE_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 _VOYAGE_MAX_BATCH_TOKENS = 80_000
 _VOYAGE_MAX_DOCUMENT_TOKENS = 27_000
 # Voyage caps a single request at 1000 input items regardless of token count;
@@ -1513,12 +1514,338 @@ class OllamaProvider(_ResilientProvider):
             (text,), timeout=timeout, deadline_budget_s=timeout
         )[0]
 
-
 def _load_fastembed():
     """Import the optional dependency in one patchable location."""
     from fastembed import TextEmbedding
 
     return TextEmbedding
+
+
+class OpenAICompatibleProvider(_ResilientProvider):
+    """OpenAI-compatible ``/v1/embeddings`` provider (SiliconFlow, etc.).
+
+    Local patch (Vocllum): hermes-lcm ships only voyage/ollama/fastembed.
+    This provider reuses any OpenAI-format embeddings endpoint — e.g.
+    SiliconFlow's ``BAAI/bge-m3`` — so the operator can share the same
+    embedding service already used by OpenViking instead of running a
+    second local model server.
+
+    Env contract (via LCMConfig):
+      LCM_EMBEDDING_PROVIDER=openai-compatible
+      LCM_EMBEDDING_MODEL=BAAI/bge-m3
+      LCM_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+      LCM_EMBEDDING_API_KEY=...   (falls back to SILICONFLOW_API_KEY)
+    """
+
+    provider_id = "openai-compatible"
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        base_url: str = "",
+        api_key_env: str = "LCM_EMBEDDING_API_KEY",
+        transport: HttpTransport | None = None,
+        timeout: float = 3.0,
+        sleeper: Callable[[float], None] = time.sleep,
+        breaker: EmbeddingCircuitBreaker | None = None,
+        spend_guard: EmbeddingSpendGuard | None = None,
+        rerank_base_url: str = "",
+    ) -> None:
+        super().__init__(breaker=breaker, spend_guard=spend_guard)
+        self._model_id = str(model).strip()
+        if not self._model_id:
+            raise ValueError("OpenAI-compatible embedding model must not be empty")
+        self.base_url = str(base_url).strip().rstrip("/")
+        if not self.base_url:
+            raise ValueError(
+                "LCM_EMBEDDING_BASE_URL must be set for openai-compatible provider"
+            )
+        # Optional dedicated rerank endpoint; empty keeps rerank co-located
+        # with the embedding base_url (default behavior, wire unchanged).
+        self.rerank_base_url = str(rerank_base_url).strip().rstrip("/")
+        self.api_key_env = str(api_key_env).strip() or "LCM_EMBEDDING_API_KEY"
+        self._transport = transport or _default_http_transport
+        self.timeout = float(timeout)
+        self._sleep = sleeper
+        self._dim = 0
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @property
+    def rerank_url(self) -> str:
+        """Rerank endpoint URL; defaults to the embedding base_url."""
+        return f"{self.rerank_base_url or self.base_url}/rerank"
+
+    def _request(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout: float | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
+        deadline_budget_s: float | None = None,
+        before_transport: Callable[[], None] | None = None,
+    ) -> list[list[float]]:
+        api_key = os.environ.get(self.api_key_env, "").strip()
+        if not api_key:
+            # Convenience fallback: SiliconFlow key name used by OpenViking.
+            api_key = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+        if not api_key:
+            raise EmbeddingProviderError(
+                f"{self.api_key_env} (or SILICONFLOW_API_KEY) is not set"
+            )
+        request_timeout = self.timeout if timeout is None else max(0.001, float(timeout))
+        attempts = max(1, int(max_attempts))
+        deadline = (
+            time.monotonic() + max(0.0, float(deadline_budget_s))
+            if deadline_budget_s is not None
+            else None
+        )
+        for attempt in range(attempts):
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise EmbeddingProviderError(
+                        "OpenAI-compatible operation deadline exceeded"
+                    )
+            if before_transport is not None:
+                before_transport()
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProviderPreDispatchError(
+                        "OpenAI-compatible operation deadline exceeded before transport"
+                    )
+                attempt_timeout = min(request_timeout, remaining)
+            else:
+                attempt_timeout = request_timeout
+            try:
+                response = self._transport(
+                    url=f"{self.base_url}/embeddings",
+                    payload={
+                        "model": self.model_id,
+                        "input": list(texts),
+                    },
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=attempt_timeout,
+                )
+            except (OSError, TimeoutError, urllib.error.URLError) as exc:
+                # Transport start makes an automatic identical resend unsafe.
+                raise EmbeddingProviderError(
+                    f"OpenAI-compatible network error: {exc}"
+                ) from exc
+            if not 200 <= response.status < 300:
+                raise EmbeddingProviderError(
+                    f"OpenAI-compatible embedding request failed ({response.status})"
+                )
+            remaining = (
+                None if deadline is None else deadline - time.monotonic()
+            )
+            if remaining is not None and remaining <= 0:
+                raise EmbeddingProviderError(
+                    "OpenAI-compatible operation deadline exceeded before response processing"
+                )
+
+            def parse_success() -> list[list[float]]:
+                payload = _response_json(response, provider="OpenAI-compatible")
+                raw = payload.get("data")
+                if isinstance(raw, list):
+                    ordered = sorted(
+                        raw, key=lambda row: int(row.get("index", 0))
+                        if isinstance(row, dict)
+                        else 0
+                    )
+                    rows = [
+                        row.get("embedding")
+                        for row in ordered
+                        if isinstance(row, dict)
+                    ]
+                else:
+                    rows = None
+                parsed = _coerce_vectors(rows, provider="OpenAI-compatible")
+                if len(parsed) != len(texts):
+                    raise EmbeddingProviderError(
+                        "OpenAI-compatible returned a different number of embeddings than requested"
+                    )
+                return parsed
+
+            vectors = (
+                parse_success()
+                if remaining is None
+                else _run_blocking_with_deadline(
+                    parse_success,
+                    timeout=remaining,
+                    provider="OpenAI-compatible response processing",
+                )
+            )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise EmbeddingProviderError(
+                    "OpenAI-compatible operation deadline exceeded during response processing"
+                )
+            return vectors
+        raise EmbeddingProviderError("OpenAI-compatible embedding request failed")
+
+    def _embed(
+        self,
+        texts: Sequence[str],
+        *,
+        timeout: float | None = None,
+        max_attempts: int = _MAX_ATTEMPTS,
+        deadline_budget_s: float | None = None,
+        before_transport: Callable[[], None] | None = None,
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        vectors = self._guarded(
+            lambda: self._request(
+                tuple(str(text) for text in texts),
+                timeout=timeout,
+                max_attempts=max_attempts,
+                deadline_budget_s=deadline_budget_s,
+                before_transport=before_transport,
+            )
+        )
+        for vector in vectors:
+            if not vector:
+                raise EmbeddingProviderError(
+                    "OpenAI-compatible returned an empty embedding"
+                )
+            if self._dim and len(vector) != self._dim:
+                raise EmbeddingProviderError(
+                    "OpenAI-compatible embedding dimension changed within the process"
+                )
+            self._dim = len(vector)
+        return vectors
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return self._embed(texts, deadline_budget_s=self.timeout)
+
+    def embed_document_batches(
+        self,
+        texts: Sequence[str],
+        *,
+        before_dispatch: BeforeDispatch | None = None,
+    ) -> Iterator[EmbeddedDocumentBatch]:
+        normalized = tuple(str(text) for text in texts)
+        if not normalized:
+            return
+        indexes = tuple(range(len(normalized)))
+        vectors = self._embed(
+            normalized,
+            max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
+            deadline_budget_s=self.timeout,
+            before_transport=(
+                (lambda: before_dispatch(indexes))
+                if before_dispatch is not None
+                else None
+            ),
+        )
+        yield EmbeddedDocumentBatch(
+            indexes,
+            tuple(tuple(vector) for vector in vectors),
+        )
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed((text,), deadline_budget_s=self.timeout)[0]
+
+    def embed_query_interactive(self, text: str, *, timeout: float) -> list[float]:
+        """Embed a latency-sensitive query under one absolute time budget."""
+        return self._embed(
+            (text,), timeout=timeout, deadline_budget_s=timeout
+        )[0]
+
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_k: int | None = None,
+        timeout: float,
+        model: str = "",
+    ) -> list[tuple[int, float]]:
+        """Rerank documents through a Cohere-compatible ``/rerank`` endpoint."""
+        docs = [str(document) for document in documents]
+        if not docs:
+            return []
+        if top_k is not None and (
+            isinstance(top_k, bool) or not isinstance(top_k, int)
+        ):
+            raise ValueError("top_k must be an integer or None")
+        if top_k is not None and top_k <= 0:
+            return []
+
+        budget = max(0.001, float(timeout))
+        deadline = time.monotonic() + budget
+        api_key = os.environ.get(self.api_key_env, "").strip()
+        if not api_key:
+            api_key = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            response = self._transport(
+                url=self.rerank_url,
+                payload={
+                    "model": str(model) or _OPENAI_COMPATIBLE_RERANK_MODEL,
+                    "query": str(query),
+                    "documents": docs,
+                    "top_n": len(docs) if top_k is None else min(top_k, len(docs)),
+                },
+                headers=headers,
+                timeout=budget,
+            )
+        except (OSError, TimeoutError, urllib.error.URLError) as exc:
+            raise EmbeddingProviderError(
+                f"OpenAI-compatible rerank network error: {exc}"
+            ) from exc
+        if not 200 <= response.status < 300:
+            raise EmbeddingProviderError(
+                f"OpenAI-compatible rerank request failed ({response.status})"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise EmbeddingProviderError("OpenAI-compatible rerank deadline exceeded")
+
+        def parse() -> list[tuple[int, float]]:
+            payload = _response_json(response, provider="OpenAI-compatible rerank")
+            rows = payload.get("results")
+            if not isinstance(rows, list):
+                raise EmbeddingProviderError(
+                    "OpenAI-compatible rerank response did not contain result data"
+                )
+            ranked: list[tuple[int, float]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    raw_index = row["index"]
+                    raw_score = row["relevance_score"]
+                    if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+                        continue
+                    index = int(raw_index)
+                    score = float(raw_score)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not 0 <= index < len(docs):
+                    continue
+                ranked.append((index, score))
+            ranked.sort(key=lambda item: (-item[1], item[0]))
+            return ranked
+
+        return _run_blocking_with_deadline(
+            parse,
+            timeout=remaining,
+            provider="OpenAI-compatible rerank response processing",
+        )
 
 
 class FastembedProvider(_ResilientProvider):
@@ -1748,8 +2075,18 @@ def resolve_provider(
         return FastembedProvider(
             model, timeout=timeout, spend_guard=spend_guard
         )
+    if provider in {"openai-compatible", "openai", "siliconflow"}:
+        return OpenAICompatibleProvider(
+            model,
+            base_url=getattr(config, "embedding_base_url", ""),
+            api_key_env=getattr(config, "embedding_api_key_env", "LCM_EMBEDDING_API_KEY"),
+            timeout=timeout,
+            spend_guard=spend_guard,
+            rerank_base_url=getattr(config, "rerank_base_url", ""),
+        )
     raise ProviderUnavailable(
-        f"Unsupported embedding provider {provider!r}; use voyage, ollama, or fastembed"
+        f"Unsupported embedding provider {provider!r}; use voyage, ollama, "
+        "fastembed, or openai-compatible (SiliconFlow)"
     )
 
 
