@@ -88,6 +88,11 @@ def _preview_sha256(preview_prefix: Any) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows cannot use this POSIX directory-fsync path: os.open() cannot
+        # obtain a directory handle with FILE_FLAG_BACKUP_SEMANTICS. The
+        # payload file itself has already been flushed by the caller.
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY

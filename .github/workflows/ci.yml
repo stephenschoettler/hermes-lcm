@@ -96,3 +96,58 @@ jobs:
           python -m py_compile scripts/import_lossless_claw.py
           bash -n scripts/install.sh scripts/update.sh
           git diff --check
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: pip install pytest numpy
+
+      - name: Stub hermes-agent ABC
+        shell: bash
+        run: |
+          mkdir -p agent
+          cat > agent/__init__.py <<'STUB'
+          STUB
+          cat > agent/context_engine.py <<'STUB'
+          """Minimal stub of hermes-agent ContextEngine ABC for CI."""
+          class ContextEngine:
+              """Base class stub — just enough for LCMEngine to import."""
+              def __init__(self, **kwargs):
+                  self.compression_count = 0
+                  self.last_prompt_tokens = 0
+              def compress(self, messages, current_tokens=None, **kwargs):
+                  raise NotImplementedError
+              def on_session_start(self, session_id, **kwargs):
+                  pass
+              def on_session_end(self, **kwargs):
+                  pass
+              def on_session_reset(self):
+                  self.compression_count = 0
+                  self.last_prompt_tokens = 0
+              def get_tool_schemas(self):
+                  return []
+              def handle_tool_call(self, name, args, **kwargs):
+                  raise NotImplementedError
+              def get_status(self):
+                  return {}
+          STUB
+
+      - name: Run Windows externalization and recovery tests
+        run: >
+          python -m pytest -q
+          tests/test_windows_portability.py
+          tests/test_ingest_protection.py
+
+      - name: Run static validation
+        run: |
+          python -m compileall -q .
+          python -m py_compile scripts/import_lossless_claw.py
+          git diff --check
