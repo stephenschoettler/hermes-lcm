@@ -408,6 +408,48 @@ def test_update_model_updates_runtime_metadata_and_context_window(engine):
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
 
 
+@pytest.mark.parametrize(
+    ("raw_context_length", "expected_context_length", "expected_cap", "expected_reason"),
+    [
+        (900_000, 900_000, None, ""),
+        (1_000_000, 900_000, 900_000, "codex_oauth_context_cap"),
+    ],
+)
+def test_codex_900k_variant_preserves_named_window(
+    tmp_path,
+    monkeypatch,
+    raw_context_length,
+    expected_context_length,
+    expected_cap,
+    expected_reason,
+):
+    host_metadata = ModuleType("agent.model_metadata")
+    host_metadata.is_codex_context_variant = (
+        lambda model: model == "gpt-5.6-sol-900k"
+    )
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", host_metadata)
+
+    config = LCMConfig(
+        context_threshold=0.75,
+        database_path=str(tmp_path / f"codex-gpt56-{raw_context_length}.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="gpt-5.6-sol-900k",
+            provider="openai-codex",
+            context_length=raw_context_length,
+        )
+
+        assert engine.raw_context_length == raw_context_length
+        assert engine.context_length == expected_context_length
+        assert engine.effective_context_length_cap == expected_cap
+        assert engine.effective_context_length_reason == expected_reason
+        assert engine.threshold_tokens == int(expected_context_length * 0.75)
+    finally:
+        engine.shutdown()
+
+
 def test_codex_gpt55_uses_route_cap_and_hermes_autoraise_threshold(tmp_path):
     config = LCMConfig(
         context_threshold=0.68,

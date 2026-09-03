@@ -16,6 +16,11 @@ from __future__ import annotations
 # when that value was explicitly overridden above the real Codex OAuth window,
 # we still have to budget against the effective provider window or compaction
 # fires too late and provider requests can overflow.
+# Hermes-side marker for explicitly selected, host-validated long-context aliases.
+_CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"
+_CODEX_CONTEXT_VARIANT_CAP = 900_000
+
+
 _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
@@ -39,19 +44,45 @@ def _is_openai_codex_route(provider: str | None) -> bool:
     return (provider or "").strip().lower() == "openai-codex"
 
 
+def _is_host_verified_codex_context_variant(model: str | None) -> bool:
+    """Return whether Hermes recognises *model* as a valid context variant.
+
+    Newer Hermes hosts expose ``is_codex_context_variant`` as the single source
+    of truth for ``-900k`` eligibility.  Older hosts do not, so fail closed and
+    retain LCM's conservative Codex OAuth cap rather than trusting the suffix
+    alone.
+    """
+    try:
+        from agent.model_metadata import is_codex_context_variant
+    except (ImportError, AttributeError):
+        return False
+
+    try:
+        return bool(is_codex_context_variant(model))
+    except Exception:
+        return False
+
+
 def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | None:
     """Return LCM's best-known Codex OAuth effective context cap.
 
     This intentionally mirrors Hermes Agent's hardcoded fallback policy, not the
     direct OpenAI model catalog. A host-provided context_length may be a user
     override or stale cache entry; Codex OAuth still enforces these lower route
-    windows.
+    windows. Explicit long-context variants validated by Hermes use their named
+    900K ceiling so LCM preserves the host-resolved window without accepting a
+    stale value above the provider limit.
     """
     if not _is_openai_codex_route(provider):
         return None
     bare_model = _bare_model_slug(model)
     if not bare_model:
         return None
+    if (
+        bare_model.endswith(_CODEX_CONTEXT_VARIANT_SUFFIX)
+        and _is_host_verified_codex_context_variant(model)
+    ):
+        return _CODEX_CONTEXT_VARIANT_CAP
     for slug, cap in sorted(
         _CODEX_OAUTH_CONTEXT_CAPS.items(), key=lambda item: len(item[0]), reverse=True
     ):
