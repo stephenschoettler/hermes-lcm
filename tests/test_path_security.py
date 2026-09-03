@@ -48,7 +48,11 @@ def test_configured_externalization_path_inside_allowed_base_accepted():
 
             path = get_large_output_storage_dir(FakeConfig(), "", create=False)
             assert path.is_absolute()
-            assert str(path).startswith(tmpdir)
+            # Compare against the RESOLVED base: on macOS tempfile hands back
+            # /var/folders/... while the implementation resolves symlinks to
+            # /private/var/folders/..., so a raw startswith on the unresolved
+            # tmpdir fails there while passing on Linux.
+            assert str(path).startswith(str(Path(tmpdir).resolve()))
         finally:
             del os.environ["LCM_HERMES_BASE_DIR"]
 

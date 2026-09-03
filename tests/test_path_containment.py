@@ -22,7 +22,11 @@ def test_path_containment_within_allowed_base(monkeypatch):
         # Should succeed without raising
         path = _state_db_path_for_engine(engine)
         assert path.is_absolute()
-        assert str(path).startswith(tmpdir)
+        # Compare against the RESOLVED base: on macOS tempfile hands back
+        # /var/folders/... while the implementation resolves symlinks to
+        # /private/var/folders/..., so a raw startswith on the unresolved
+        # tmpdir fails there while passing on Linux.
+        assert str(path).startswith(str(Path(tmpdir).resolve()))
 
 
 def test_path_containment_outside_allowed_base(monkeypatch):
