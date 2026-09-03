@@ -390,7 +390,7 @@ def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
     monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
 
     assert engine.should_compress_preflight(messages) is True
-    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
+    assert engine._preflight_cleanup_only is True
 
 
 def test_flag_off_replay_cleanup_cooldown_publishes_without_summary_llm(
@@ -453,6 +453,40 @@ def test_live_stub_cooldown_adoption_skips_eligible_leaf_work(make_engine, monke
     result = engine.compress(messages, current_tokens=1_000)
 
     assert assembled_tool(result, "cooldown-eligible-call")["content"].startswith(
+        "[Externalized tool output:"
+    )
+    assert any(message.get("content") == "old request with eligible raw backlog" for message in result)
+    assert engine._dag.get_session_node_count(engine._session_id) == 0
+    assert engine.last_compression_status == "sanitized"
+
+
+def test_live_stub_subthreshold_adoption_skips_eligible_leaf_work(make_engine, monkeypatch):
+    """Replay cleanup must not smuggle in an early summary compaction.
+
+    Hermes calls ``should_compress_preflight`` only after its normal threshold
+    path declined to run.  A large-output stub may still need immediate
+    adoption, but that deterministic cleanup must not piggyback eligible leaf
+    work and rewrite the conversation hundreds of thousands of tokens early.
+    """
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    payload = "fresh durable payload with old eligible backlog " * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("subthreshold-eligible-call", payload),
+    ]
+
+    def fail_if_summarized(**_kwargs):
+        raise AssertionError("subthreshold replay cleanup must not summarize")
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_if_summarized)
+
+    assert engine.should_compress_preflight(messages) is True
+    result = engine.compress(messages, current_tokens=1_000)
+
+    assert assembled_tool(result, "subthreshold-eligible-call")["content"].startswith(
         "[Externalized tool output:"
     )
     assert any(message.get("content") == "old request with eligible raw backlog" for message in result)
