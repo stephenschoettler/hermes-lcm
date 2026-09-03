@@ -1146,6 +1146,7 @@ LCM_EXPAND_QUERY = {
         "query matching summaries/raw messages to expand or explicit node_ids to inspect. Uses the expansion path "
         "instead of the summarization path so retrieval/synthesis can use a different model or timeout. "
         "When expanding parent summary nodes, it recursively descends the DAG under the context budget to include leaf evidence where possible. "
+        "The response includes a nested, default-JSON-bounded, tool-extracted evidence provenance object with locator coverage, while marking locator replay and semantic entailment as unverified and identifiers as non-authoritative. This adds no authorization: node_id and externalized_ref retain current-session checks, store_id remains an intentional cross-session locator, and hosts must authorize expansion before invoking it. "
         "Prefer this for questions about the active conversation after compaction; for cross-session recall, use session_search first."
     ),
     "parameters": {
