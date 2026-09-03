@@ -11,10 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_lcm.db_bootstrap as db_bootstrap_module
 import hermes_lcm.maintenance as maintenance_module
 import hermes_lcm.sqlite_util as sqlite_util_module
 from hermes_lcm.maintenance import backup_database, rotate_backup_database
-from hermes_lcm.store import MessageStore
+from hermes_lcm.store import MessageStore, build_message_fts_spec
 
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -44,6 +45,33 @@ def _assert_private_sqlite_artifacts(path: Path) -> None:
     assert {artifact.name: _mode(artifact) for artifact in artifacts} == {
         artifact.name: 0o600 for artifact in artifacts
     }
+
+
+def _seed_searchable_store(db_path: Path) -> None:
+    store = MessageStore(db_path)
+    try:
+        store.append(
+            "sidecar-race",
+            {"role": "user", "content": "durable sidecar lifecycle token"},
+        )
+        store.commit()
+    finally:
+        store.close()
+
+
+def _assert_searchable_store_integrity(store: MessageStore) -> None:
+    conn = store.connection
+    assert conn is not None
+    assert conn.execute("SELECT content FROM messages").fetchone()[0] == (
+        "durable sidecar lifecycle token"
+    )
+    assert store.search("lifecycle", limit=10)[0]["content"] == (
+        "durable sidecar lifecycle token"
+    )
+    assert db_bootstrap_module.check_external_content_fts_integrity(
+        conn, build_message_fts_spec()
+    )["status"] == "pass"
+    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
 def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp_path):
@@ -201,6 +229,101 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
 
     assert swapped is True
     assert _mode(target) == 0o644
+
+
+def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "lcm.db"
+    sidecar = db_path.with_name(db_path.name + "-journal")
+    replacement = tmp_path / "replacement-journal"
+    sidecar.write_bytes(b"replace me")
+    replacement.write_bytes(b"unrelated")
+    sidecar.chmod(0o644)
+    replacement.chmod(0o644)
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if not swapped and dir_fd is not None and path == sidecar.name:
+            swapped = True
+            sidecar.unlink()
+            replacement.rename(sidecar)
+        return fd
+
+    monkeypatch.setattr(sqlite_util_module.os, "open", swapping_open)
+
+    with pytest.raises(OSError, match="directory entry changed while opening"):
+        MessageStore(db_path)
+
+    assert swapped is True
+    assert _mode(sidecar) == 0o644
+
+
+def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "lcm.db"
+    _seed_searchable_store(db_path)
+    journal = db_path.with_name(db_path.name + "-journal")
+    journal.write_bytes(b"transient rollback journal")
+    real_open = os.open
+    disappeared = False
+
+    def disappearing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal disappeared
+        if not disappeared and dir_fd is not None and path == journal.name:
+            disappeared = True
+            journal.unlink()
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(sqlite_util_module.os, "open", disappearing_open)
+
+    store = MessageStore(db_path)
+    try:
+        assert disappeared is True
+        _assert_searchable_store_integrity(store)
+    finally:
+        store.close()
+
+
+def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "lcm.db"
+    _seed_searchable_store(db_path)
+    journal = db_path.with_name(db_path.name + "-journal")
+    journal.write_bytes(b"transient rollback journal")
+    real_open = os.open
+    unlinked = False
+
+    def unlinking_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal unlinked
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if not unlinked and path == journal.name:
+            unlinked = True
+            journal.unlink()
+        return fd
+
+    monkeypatch.setattr(sqlite_util_module.os, "open", unlinking_open)
+
+    store = MessageStore(db_path)
+    try:
+        assert unlinked is True
+        _assert_searchable_store_integrity(store)
+    finally:
+        store.close()
 
 
 def test_message_store_preserves_sqlite_memory_sentinel_and_cwd_permissions(tmp_path, monkeypatch):

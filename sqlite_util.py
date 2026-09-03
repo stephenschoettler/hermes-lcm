@@ -36,6 +36,16 @@ def _validate_sqlite_artifact(path: Path, file_stat: os.stat_result) -> None:
         raise _sqlite_artifact_error(path, "link count is not one")
 
 
+def _require_sqlite_artifact_absent(path: Path, *, directory_fd: int) -> None:
+    """Accept a vanished sidecar only while its directory entry stays absent."""
+    try:
+        current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    _validate_sqlite_artifact(path, current)
+    raise _sqlite_artifact_error(path, "directory entry changed while opening")
+
+
 def _open_private_sqlite_directory(path: Path) -> int:
     directory = path.parent
     expected = os.stat(directory, follow_symlinks=False)
@@ -58,6 +68,7 @@ def _chmod_sqlite_artifact_at(
     *,
     directory_fd: int,
     create: bool,
+    allow_sidecar_disappearance: bool = False,
 ) -> bool:
     expected: os.stat_result | None
     try:
@@ -83,13 +94,27 @@ def _chmod_sqlite_artifact_at(
             directory_fd=directory_fd,
             create=False,
         )
+    except FileNotFoundError:
+        if not allow_sidecar_disappearance:
+            raise
+        _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+        return False
     try:
         opened = os.fstat(fd)
-        _validate_sqlite_artifact(path, opened)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _sqlite_artifact_error(path, "not a regular file")
         if expected is not None and not _same_file_identity(expected, opened):
             raise _sqlite_artifact_error(path, "directory entry changed while opening")
+        if opened.st_nlink == 0 and allow_sidecar_disappearance:
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        _validate_sqlite_artifact(path, opened)
         os.fchmod(fd, 0o600)
-        if os.fstat(fd).st_nlink != 1:
+        restricted = os.fstat(fd)
+        if restricted.st_nlink == 0 and allow_sidecar_disappearance:
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        if restricted.st_nlink != 1:
             raise _sqlite_artifact_error(path, "link count changed while restricting permissions")
     finally:
         os.close(fd)
@@ -111,14 +136,17 @@ def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
 
     directory_fd = _open_private_sqlite_directory(db_path)
     try:
-        for artifact in (
+        _chmod_sqlite_artifact_at(
             db_path,
-            *(db_path.with_name(db_path.name + suffix) for suffix in _SQLITE_SIDECAR_SUFFIXES),
-        ):
+            directory_fd=directory_fd,
+            create=False,
+        )
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
             _chmod_sqlite_artifact_at(
-                artifact,
+                db_path.with_name(db_path.name + suffix),
                 directory_fd=directory_fd,
                 create=False,
+                allow_sidecar_disappearance=True,
             )
     finally:
         os.close(directory_fd)
@@ -147,6 +175,7 @@ def _prepare_private_sqlite_file(path: Path) -> None:
                 path.with_name(path.name + suffix),
                 directory_fd=directory_fd,
                 create=False,
+                allow_sidecar_disappearance=True,
             )
     finally:
         os.close(directory_fd)
