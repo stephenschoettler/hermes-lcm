@@ -64,6 +64,7 @@ from .ingest_protection import (
     _persisted_output_preview_prefix_digest,
     _persisted_output_saved_path,
     assistant_output_quarantine_reason,
+    attach_retained_raw_content,
     extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     protect_inline_payloads_in_text,
@@ -4845,6 +4846,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             config=self._config,
             hermes_home=self._hermes_home,
         )
+        # `replay_messages` were already sensitive-redacted above so active
+        # replay never carries a secret, which means ingest protection saw the
+        # redacted form and could not capture the original text. Re-supply it
+        # from the untouched caller-provided `messages`, by absolute index.
+        for (absolute_idx, _replay_msg), protected_msg in zip(
+            messages_to_store_with_index,
+            protected_messages,
+        ):
+            if 0 <= absolute_idx < len(messages):
+                attach_retained_raw_content(
+                    protected_msg,
+                    self._config,
+                    messages[absolute_idx].get("content"),
+                )
         recovery_tool_call_ids = self._active_replay_recovery_tool_call_ids(
             active_replay_messages
         )
