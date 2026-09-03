@@ -16,6 +16,7 @@ import threading
 import time
 from collections import deque
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -26,6 +27,7 @@ from .codex_routing import (
     _is_codex_gpt55_route,
 )
 from .config import LCMConfig
+from .db_bootstrap import join_background_integrity_scans
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
@@ -89,6 +91,7 @@ from .assertion_extraction import ModelAssertionExtractor
 from .assertion_store import AssertionStore, SourceSnapshot
 from .adaptive_retrieval import AdaptiveRetrievalRegistry
 from .query_view_store import QueryViewStore
+from .retrieval_core import _close_vector_store_pool
 from .schemas import (
     LCM_DESCRIBE,
     LCM_DOCTOR,
@@ -369,6 +372,177 @@ def _normalize_total_compactions(value: Any) -> int:
     return value
 
 
+class _EngineShutdownGroup:
+    """Track one plugin prototype and every live agent clone it creates."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition(threading.RLock())
+        self._engines = weakref.WeakSet()
+        self._background_work: dict[tuple[object, threading.Event], int] = {}
+        self._closed = False
+        self._clones_in_flight = 0
+        self._background_schedules_in_flight = 0
+
+    def add(self, engine: "LCMEngine") -> bool:
+        with self._condition:
+            if not self._closed:
+                self._engines.add(engine)
+                return True
+        engine.shutdown(wait_for_background_work=True)
+        return False
+
+    def begin_clone(self) -> bool:
+        """Reserve one clone construction before unload can take its snapshot."""
+        with self._condition:
+            if self._closed:
+                return False
+            self._clones_in_flight += 1
+            return True
+
+    def begin_background_schedule(self) -> bool:
+        """Reserve one schedule attempt before unload closes the group gate."""
+        with self._condition:
+            if self._closed:
+                return False
+            self._background_schedules_in_flight += 1
+            return True
+
+    def end_background_schedule(self) -> None:
+        with self._condition:
+            self._background_schedules_in_flight -= 1
+            self._condition.notify_all()
+
+    def complete_clone(self, engine: "LCMEngine") -> bool:
+        """Publish a fully initialized clone, or close it after unload starts."""
+        with self._condition:
+            if not self._closed:
+                self._engines.add(engine)
+                self._clones_in_flight -= 1
+                self._condition.notify_all()
+                return True
+        try:
+            engine.shutdown(wait_for_background_work=True)
+        finally:
+            with self._condition:
+                self._clones_in_flight -= 1
+                self._condition.notify_all()
+        return False
+
+    def abort_clone(
+        self,
+        engine: "LCMEngine | None",
+        *,
+        initialized: bool,
+    ) -> None:
+        """Release a failed clone reservation after closing opened resources."""
+        try:
+            if engine is not None:
+                if initialized:
+                    engine.shutdown(wait_for_background_work=True)
+                else:
+                    engine._close_failed_initialization()
+        finally:
+            with self._condition:
+                self._clones_in_flight -= 1
+                self._condition.notify_all()
+
+    def discard(self, engine: "LCMEngine") -> None:
+        with self._condition:
+            self._engines.discard(engine)
+
+    def _start_background_waiter(
+        self,
+        record: tuple[object, threading.Event],
+    ) -> None:
+        waiter = threading.Thread(
+            target=self._drain_background,
+            args=(record,),
+            name="lcm-background-drain",
+            daemon=True,
+        )
+        try:
+            waiter.start()
+        except Exception:
+            # Keep the record for shutdown_all(); failure to start a cleanup
+            # waiter must not make accepted work invisible to plugin unload.
+            logger.warning("LCM could not start background drain", exc_info=True)
+
+    def track_background(
+        self,
+        rollup_owner: object,
+        assertion_idle: threading.Event,
+    ) -> None:
+        """Track accepted work independently of the engine's weak lifetime."""
+        record = (rollup_owner, assertion_idle)
+        with self._condition:
+            generation = self._background_work.get(record, 0) + 1
+            self._background_work[record] = generation
+            start_waiter = generation == 1
+        if start_waiter:
+            self._start_background_waiter(record)
+
+    def retire(
+        self,
+        engine: "LCMEngine",
+        rollup_owner: object,
+        assertion_idle: threading.Event,
+        *,
+        background_pending: bool,
+    ) -> None:
+        """Remove a closed engine while keeping its outstanding work visible."""
+        if background_pending:
+            self.track_background(rollup_owner, assertion_idle)
+        with self._condition:
+            self._engines.discard(engine)
+
+    def _drain_background(
+        self,
+        record: tuple[object, threading.Event],
+    ) -> None:
+        rollup_owner, assertion_idle = record
+        while True:
+            with self._condition:
+                generation = self._background_work.get(record)
+                if generation is None:
+                    return
+            _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(rollup_owner)
+            assertion_idle.wait()
+            with self._condition:
+                if self._background_work.get(record) != generation:
+                    continue
+                if not _ROLLUP_MAINTENANCE_SCHEDULER.drain_owner(
+                    rollup_owner, timeout=0
+                ) or not assertion_idle.is_set():
+                    continue
+                self._background_work.pop(record, None)
+                self._condition.notify_all()
+                return
+
+    def shutdown_all(self) -> None:
+        with self._condition:
+            self._closed = True
+            while self._clones_in_flight or self._background_schedules_in_flight:
+                self._condition.wait()
+            engines = list(self._engines)
+        first_error: Exception | None = None
+        for engine in engines:
+            try:
+                engine.shutdown(wait_for_background_work=True)
+            except Exception as exc:  # pragma: no cover - defensive unload path
+                logger.exception("LCM engine shutdown failed during plugin unload")
+                if first_error is None:
+                    first_error = exc
+        with self._condition:
+            background_work = list(self._background_work)
+        for record in background_work:
+            self._drain_background(record)
+        join_background_integrity_scans()
+        lcm_tools._close_and_join_deadline_workers()
+        _close_vector_store_pool()
+        if first_error is not None:
+            raise first_error
+
+
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -389,8 +563,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
+        self._shutdown_group = _EngineShutdownGroup()
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
+        self._background_work_condition = threading.Condition(threading.RLock())
+        self._background_schedules_in_flight = 0
+        self._background_shutdown_started = False
+        self._shutdown_lock = threading.RLock()
+        self._primary_shutdown_complete = False
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -621,6 +801,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # The scheduler associates this identity only with outstanding work, so
         # diagnostic drains do not retain every historical session key forever.
         self._rollup_maintenance_owner = object()
+        self._shutdown_group.add(self)
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -637,36 +818,59 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         model and context-window metadata is copied so the clone is immediately
         budget-aware even before a compatible Hermes host calls update_model().
         """
-        clone = type(self)(
-            config=copy.deepcopy(self._config),
-            hermes_home=self._hermes_home,
-        )
-        clone.model = self.model
-        clone.base_url = self.base_url
-        clone.api_key = self.api_key
-        clone.provider = self.provider
-        clone.api_mode = self.api_mode
-        if self._context_length_source:
-            clone._set_context_length(
-                self.raw_context_length,
-                source=self._context_length_source,
-                model=self.model,
-                provider=self.provider,
+        shutdown_group = self._shutdown_group
+        if not shutdown_group.begin_clone():
+            raise RuntimeError("Cannot clone LCM engine while plugin is unloading")
+        clone = None
+        initialized = False
+        reservation_open = True
+        try:
+            clone_type = type(self)
+            clone = clone_type.__new__(clone_type)
+            clone_type.__init__(
+                clone,
+                config=copy.deepcopy(self._config),
+                hermes_home=self._hermes_home,
             )
-        elif self.raw_context_length or self.context_length:
-            clone._set_context_length(
-                self.raw_context_length or self.context_length,
-                source="clone_for_agent",
-                model=self.model,
-                provider=self.provider,
-            )
-        # ``update_model()`` authority is a per-runtime lifecycle edge, not
-        # durable metadata.  Compatible hosts call update_model() on the clone
-        # before binding it; hosts that bind only through on_session_start()
-        # must still be able to replace the copied prototype route.
-        clone._update_model_pending_session_start = False
-        clone._lcm_current_start_allows_bypass_lineage = False
-        return clone
+            initialized = True
+            clone._shutdown_group.discard(clone)
+            clone._shutdown_group = shutdown_group
+            clone.model = self.model
+            clone.base_url = self.base_url
+            clone.api_key = self.api_key
+            clone.provider = self.provider
+            clone.api_mode = self.api_mode
+            if self._context_length_source:
+                clone._set_context_length(
+                    self.raw_context_length,
+                    source=self._context_length_source,
+                    model=self.model,
+                    provider=self.provider,
+                )
+            elif self.raw_context_length or self.context_length:
+                clone._set_context_length(
+                    self.raw_context_length or self.context_length,
+                    source="clone_for_agent",
+                    model=self.model,
+                    provider=self.provider,
+                )
+            # ``update_model()`` authority is a per-runtime lifecycle edge, not
+            # durable metadata.  Compatible hosts call update_model() on the clone
+            # before binding it; hosts that bind only through on_session_start()
+            # must still be able to replace the copied prototype route.
+            clone._update_model_pending_session_start = False
+            clone._lcm_current_start_allows_bypass_lineage = False
+            try:
+                accepted = shutdown_group.complete_clone(clone)
+            finally:
+                reservation_open = False
+            if not accepted:
+                raise RuntimeError("Cannot clone LCM engine while plugin is unloading")
+            return clone
+        except BaseException:
+            if reservation_open:
+                shutdown_group.abort_clone(clone, initialized=initialized)
+            raise
 
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
         """Copy the plugin runtime without pickling SQLite-backed helpers.
@@ -820,6 +1024,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._reset_session_scoped_runtime_state()
 
     def _rebind_storage_for_home(self, hermes_home: str = "") -> bool:
+        """Serialize profile storage rebinding with engine shutdown."""
+        if not hermes_home:
+            return False
+        with self._shutdown_lock:
+            if self._background_shutdown_started or self._primary_shutdown_complete:
+                raise RuntimeError("Cannot rebind LCM storage while plugin is unloading")
+            return self._rebind_storage_for_home_locked(hermes_home)
+
+    def _rebind_storage_for_home_locked(self, hermes_home: str) -> bool:
         """Switch SQLite-backed state when a reused engine serves another profile.
 
         Hermes core passes the active ``hermes_home`` on session start.  Older
@@ -827,8 +1040,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         after ``HERMES_HOME`` changes, so the plugin must not assume the store
         captured during ``register()`` is still correct.
         """
-        if not hermes_home:
-            return False
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
@@ -1763,7 +1974,33 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def release_rollup_operator_lease(self, key: tuple[str, str]) -> None:
         _ROLLUP_MAINTENANCE_SCHEDULER.release_exclusive(key)
 
+    def _begin_background_schedule(self) -> bool:
+        """Reserve scheduling work unless engine or plugin shutdown has started."""
+        shutdown_group = self._shutdown_group
+        if not shutdown_group.begin_background_schedule():
+            return False
+        with self._background_work_condition:
+            if self._background_shutdown_started:
+                shutdown_group.end_background_schedule()
+                return False
+            self._background_schedules_in_flight += 1
+            return True
+
+    def _end_background_schedule(self) -> None:
+        with self._background_work_condition:
+            self._background_schedules_in_flight -= 1
+            self._background_work_condition.notify_all()
+        self._shutdown_group.end_background_schedule()
+
     def _schedule_rollup_maintenance(self, scope: str) -> None:
+        if not self._begin_background_schedule():
+            return
+        try:
+            self._schedule_rollup_maintenance_active(scope)
+        finally:
+            self._end_background_schedule()
+
+    def _schedule_rollup_maintenance_active(self, scope: str) -> None:
         """Enqueue one best-effort rollup pass using private SQLite helpers."""
         try:
             raw_database_path = str(self._dag.db_path)
@@ -1792,11 +2029,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 finally:
                     private_dag.close()
 
-            _ROLLUP_MAINTENANCE_SCHEDULER.schedule(
+            accepted = _ROLLUP_MAINTENANCE_SCHEDULER.schedule(
                 key,
                 maintain,
                 owner=self._rollup_maintenance_owner,
             )
+            if accepted:
+                self._shutdown_group.track_background(
+                    self._rollup_maintenance_owner,
+                    self._assertion_extraction_idle,
+                )
         except Exception:
             # Maintenance is opportunistic; a scheduler/setup failure must never
             # turn a successful foreground session bind into a host failure.
@@ -5012,6 +5254,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _schedule_pre_compaction_assertions(
         self, messages: List[Dict[str, Any]]
     ) -> bool:
+        if not self._begin_background_schedule():
+            return False
+        try:
+            return self._schedule_pre_compaction_assertions_active(messages)
+        finally:
+            self._end_background_schedule()
+
+    def _schedule_pre_compaction_assertions_active(
+        self, messages: List[Dict[str, Any]]
+    ) -> bool:
         """Queue exact persisted rows without blocking the compaction path."""
         if (
             not bool(getattr(self._config, "assertion_extraction_enabled", False))
@@ -5079,6 +5331,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 last_error,
             )
             return False
+        self._shutdown_group.track_background(
+            self._rollup_maintenance_owner,
+            self._assertion_extraction_idle,
+        )
         return True
 
     def _maybe_gc_compacted_tool_results(
@@ -6653,14 +6909,70 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Lifecycle ---------------------------------------------------------
 
-    def shutdown(self):
-        self._unregister_active_engine_binding()
-        if self._adaptive_retrieval is not None:
-            self._adaptive_retrieval.close()
-        self._store.close()
-        self._dag.close()
-        self._lifecycle.close()
-        if self._assertions is not None:
-            self._assertions.close()
-        if self._query_views is not None:
-            self._query_views.close()
+    def _close_failed_initialization(self) -> None:
+        """Best-effort cleanup for an object whose ``__init__`` raised."""
+        shutdown_group = getattr(self, "_shutdown_group", None)
+        if shutdown_group is not None:
+            shutdown_group.discard(self)
+        for name in (
+            "_adaptive_retrieval",
+            "_store",
+            "_dag",
+            "_lifecycle",
+            "_assertions",
+            "_query_views",
+        ):
+            resource = getattr(self, name, None)
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # pragma: no cover - defensive cleanup path
+                    logger.exception(
+                        "LCM failed to close %s after engine initialization error",
+                        name,
+                    )
+        if hasattr(self, "_primary_shutdown_complete"):
+            self._primary_shutdown_complete = True
+
+    def shutdown_all_instances(self) -> None:
+        """Close this plugin prototype and all live per-agent clones."""
+        self._shutdown_group.shutdown_all()
+
+    def _stop_background_work(self, *, wait: bool) -> None:
+        """Reject new background jobs and optionally drain accepted work."""
+        with self._background_work_condition:
+            self._background_shutdown_started = True
+            while self._background_schedules_in_flight:
+                self._background_work_condition.wait()
+        if wait:
+            self.drain_rollup_maintenance()
+            self._assertion_extraction_idle.wait()
+
+    def shutdown(self, *, wait_for_background_work: bool = False):
+        shutdown_group = self._shutdown_group
+        with self._shutdown_lock:
+            self._stop_background_work(wait=wait_for_background_work)
+            if not self._primary_shutdown_complete:
+                self._unregister_active_engine_binding()
+                if self._adaptive_retrieval is not None:
+                    self._adaptive_retrieval.close()
+                self._store.close()
+                self._dag.close()
+                self._lifecycle.close()
+                if self._assertions is not None:
+                    self._assertions.close()
+                if self._query_views is not None:
+                    self._query_views.close()
+                self._primary_shutdown_complete = True
+            if wait_for_background_work:
+                shutdown_group.discard(self)
+                return
+            rollup_pending = not self.drain_rollup_maintenance(timeout=0)
+            assertion_pending = not self._assertion_extraction_idle.is_set()
+            shutdown_group.retire(
+                self,
+                self._rollup_maintenance_owner,
+                self._assertion_extraction_idle,
+                background_pending=rollup_pending or assertion_pending,
+            )
