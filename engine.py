@@ -872,6 +872,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
+        # Per-model threshold overrides take priority over everything else.
+        # Longest substring match wins (so "glm-5.2-1M" beats "glm-5.2").
+        if self._config.model_thresholds and route_model:
+            best_key = ""
+            for key in self._config.model_thresholds:
+                if key in route_model and len(key) > len(best_key):
+                    best_key = key
+            if best_key:
+                override = float(self._config.model_thresholds[best_key])
+                return (
+                    override,
+                    f"model_thresholds:{best_key}",
+                    {"from": configured, "to": override},
+                )
         if (
             _is_codex_gpt55_route(route_model, route_provider)
             and self._config.codex_gpt55_autoraise_enabled
