@@ -389,8 +389,8 @@ def register(ctx):
     try:
         from hermes_cli.config import get_hermes_home
         hermes_home = str(get_hermes_home())
-    except Exception:
-        import os
+    except Exception as exc:
+        logger.warning("hermes-lcm: could not import get_hermes_home (%s); falling back to env", exc)
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
     engine = LCMEngine(config=config, hermes_home=hermes_home)
