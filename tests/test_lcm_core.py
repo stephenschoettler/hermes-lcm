@@ -83,6 +83,18 @@ class TestModelRouting:
         assert route.provider == "cerebras"
         assert route.model == "gpt-oss-120b"
 
+    def test_minimax_model_is_split_when_registered(self, monkeypatch):
+        from hermes_lcm.model_routing import parse_lcm_model_override
+
+        self._install_fake_provider_modules(
+            monkeypatch, registry={"minimax": {}}
+        )
+
+        route = parse_lcm_model_override("minimax/MiniMax-M3")
+
+        assert route.provider == "minimax"
+        assert route.model == "MiniMax-M3"
+
     def test_custom_provider_prefixed_model_is_split_when_provider_resolves(self):
         from hermes_lcm.model_routing import parse_lcm_model_override
 
