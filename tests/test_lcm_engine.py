@@ -1678,6 +1678,142 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_provider_metadata_replay_diff_does_not_bypass_configured_threshold(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_metadata_replay_diff.db"),
+            context_threshold=0.5,
+            fresh_tail_count=2,
+            leaf_chunk_tokens=10,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "test-session",
+            platform="api_server",
+            context_length=1_000_000,
+        )
+        first_turn = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"historical turn {index} " + "replay backlog segment " * 40,
+            }
+            for index in range(12)
+        ]
+        try:
+            assert instance.threshold_tokens == 500_000
+            assert count_messages_tokens(first_turn) < instance.threshold_tokens
+            assert instance._leaf_compaction_candidate_status(first_turn)[0] is True
+            assert instance.should_compress_preflight(first_turn) is False
+
+            second_turn = [dict(message) for message in first_turn]
+            # Hermes attaches provider transport metadata after the response.
+            # The semantic replay identity is unchanged, so LCM restores its
+            # cached prefix and the two dictionaries compare unequal.
+            second_turn[1]["reasoning"] = "provider reasoning envelope"
+            second_turn.extend(
+                [
+                    {"role": "assistant", "content": "first turn answer"},
+                    {"role": "user", "content": "next turn request"},
+                ]
+            )
+            observed: dict[str, object] = {}
+            ingest = instance._ingest_messages
+
+            def capture_ingest(messages):
+                replay = ingest(messages)
+                observed["original"] = messages
+                observed["replay"] = replay
+                return replay
+
+            monkeypatch.setattr(instance, "_ingest_messages", capture_ingest)
+
+            assert count_messages_tokens(second_turn) < instance.threshold_tokens
+            assert instance._leaf_compaction_candidate_status(second_turn)[0] is True
+            assert instance.should_compress_preflight(second_turn) is False
+            assert observed["replay"] != observed["original"]
+            assert instance._replay_diff_requests_ingest_cleanup(
+                observed["original"],
+                observed["replay"],
+            ) is False
+            assert instance._dag.get_session_node_count("test-session") == 0
+        finally:
+            instance.shutdown()
+
+    def test_smaller_cached_replay_cannot_hide_original_threshold_pressure(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_cached_replay_pressure.db"),
+            context_threshold=0.5,
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "test-session",
+            platform="api_server",
+            context_length=400,
+        )
+
+        def messages_with_arguments(arguments: str):
+            return [
+                {"role": "user", "content": "old backlog that is eligible"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-pressure",
+                            "type": "function",
+                            "function": {"name": "probe", "arguments": arguments},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-pressure",
+                    "content": "small result",
+                },
+                {"role": "user", "content": "fresh request"},
+            ]
+
+        compact_messages = messages_with_arguments('{"a":1}')
+        expanded_messages = messages_with_arguments('{"a":' + " \n" * 1_000 + "1}")
+        try:
+            assert instance.threshold_tokens == 200
+            assert count_messages_tokens(compact_messages) < instance.threshold_tokens
+            assert count_messages_tokens(expanded_messages) >= instance.threshold_tokens
+            assert instance._message_replay_identity(compact_messages[1]) == (
+                instance._message_replay_identity(expanded_messages[1])
+            )
+            assert instance.should_compress_preflight(compact_messages) is False
+
+            observed: dict[str, object] = {}
+            ingest = instance._ingest_messages
+
+            def capture_ingest(messages):
+                replay = ingest(messages)
+                observed["original"] = messages
+                observed["replay"] = replay
+                return replay
+
+            monkeypatch.setattr(instance, "_ingest_messages", capture_ingest)
+
+            assert instance.should_compress_preflight(expanded_messages) is True
+            assert observed["replay"] != observed["original"]
+            assert count_messages_tokens(observed["replay"]) < instance.threshold_tokens
+            assert instance._replay_diff_requests_ingest_cleanup(
+                observed["original"],
+                observed["replay"],
+            ) is False
+        finally:
+            instance.shutdown()
+
     def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),
@@ -5586,6 +5722,40 @@ class TestMessageFiltering:
         assert nodes == []
         assert engine._ignored_message_count == 1
 
+    def test_subthreshold_ignore_cleanup_does_not_create_summary_node(self, tmp_path, monkeypatch):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_subthreshold_cleanup.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        engine.context_length = 1_000_000
+        engine.threshold_tokens = 500_000
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog " + "x" * 200},
+            {"role": "user", "content": "visible backlog must stay raw " + "y" * 200},
+            {"role": "assistant", "content": "fresh tail response"},
+        ]
+
+        def fail_summary(**_kwargs):
+            raise AssertionError("sub-threshold ignore cleanup must not summarize")
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_summary)
+
+        assert engine.should_compress_preflight(messages) is True
+        result = engine.compress(
+            messages,
+            current_tokens=engine.threshold_tokens // 4,
+        )
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+
+        assert "SECRET" not in result_text
+        assert "visible backlog must stay raw" in result_text
+        assert engine._dag.get_session_nodes("user-123") == []
+        assert engine.compression_count == 0
+        assert engine.last_compression_status == "sanitized"
+
     def test_ignored_backlog_is_filtered_before_auto_focus_derivation(self, tmp_path, monkeypatch):
         engine = self._make_engine(
             tmp_path,
@@ -5608,7 +5778,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "SECRET" not in captured["text"]
@@ -5640,7 +5810,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "SECRET" not in captured["text"]
@@ -5691,6 +5861,67 @@ class TestMessageFiltering:
         assert "fresh visible request" in result_text
         assert "SECRET" not in result_text
 
+    def test_subthreshold_cleanup_rebuilds_live_dag_after_dropping_stale_scaffold(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_rebuild_live_dag.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10,
+            ignore_message_patterns=["SECRET"],
+        )
+        engine.context_length = 1_000_000
+        engine.threshold_tokens = 500_000
+        now = time.time()
+        live_node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="user-123",
+                depth=0,
+                summary="LIVE_DAG_SUMMARY",
+                token_count=4,
+                source_token_count=40,
+                source_ids=[1],
+                source_type="messages",
+                created_at=now,
+                earliest_at=now,
+                latest_at=now,
+                expand_hint="live dag details",
+            )
+        )
+        stale_scaffold = (
+            "[Recent Summary (d0, node 999)]\n"
+            "STALE_REPLAY_SCAFFOLD\n"
+            "[Expand for details: stale replay]"
+        )
+        messages = [
+            {"role": "user", "content": stale_scaffold},
+            {"role": "user", "content": "SECRET ignored backlog"},
+            {"role": "user", "content": "fresh visible request"},
+        ]
+
+        def fail_summary(**_kwargs):
+            raise AssertionError("sub-threshold cleanup must rebuild, not summarize")
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_summary)
+
+        assert engine.should_compress_preflight(messages) is True
+        result = engine.compress(
+            messages,
+            current_tokens=engine.threshold_tokens // 4,
+        )
+        result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+
+        assert result_text.count("LIVE_DAG_SUMMARY") == 1
+        assert "STALE_REPLAY_SCAFFOLD" not in result_text
+        assert "SECRET" not in result_text
+        nodes = engine._dag.get_session_nodes("user-123")
+        assert [node.node_id for node in nodes] == [live_node_id]
+        assert engine.compression_count == 0
+        assert engine.last_compression_status == "sanitized"
+
     def test_original_ignore_decision_survives_sensitive_active_redaction(self, tmp_path, monkeypatch):
         engine = self._make_engine(
             tmp_path,
@@ -5714,7 +5945,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "api_key" not in captured["text"]
@@ -7204,7 +7435,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog should extract" in captured["serialized"]
         assert "visible backlog should extract" in captured["summary_text"]
@@ -7255,7 +7486,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible historical backlog " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(messages, current_tokens=second.threshold_tokens)
 
             nodes = second._dag.get_session_nodes("session")
             assert nodes
@@ -7314,7 +7545,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible historical backlog " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(messages, current_tokens=second.threshold_tokens)
 
             assert "visible historical backlog" in captured["text"]
             assert "SECRET_PAYLOAD_MARKER" not in captured["text"]
@@ -7432,7 +7663,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(messages, current_tokens=second.threshold_tokens)
 
             rows = second._store.get_session_messages("session")
             assert rows[1]["content"].startswith("visible backlog objective")
@@ -7533,7 +7764,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(messages, current_tokens=second.threshold_tokens)
 
             stored_after = second._store.get_session_messages("session")
             externalized_rows = [row for row in stored_after if row["content"].startswith("[Externalized payload:")]
@@ -7614,7 +7845,7 @@ class TestMessageFiltering:
                 {"role": "user", "content": "visible backlog objective " + "v" * 200},
                 {"role": "assistant", "content": "fresh tail response"},
             ]
-            second.compress(messages, current_tokens=count_messages_tokens(messages))
+            second.compress(messages, current_tokens=second.threshold_tokens)
 
             assert "visible backlog objective" in captured["text"]
             assert "visible assistant tool call" not in captured["text"]
@@ -7761,12 +7992,12 @@ class TestMessageFiltering:
         )
         try:
             first.on_session_start("session", platform="telegram", context_length=1000)
-            active = first.compress(
-                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
-                current_tokens=10_000,
+            first._ingest_messages(
+                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}]
             )
-            active_stub = {"role": "user", "content": active[0]["content"]}
-            ignored_store_id = first._store.get_session_messages("session")[0]["store_id"]
+            stored_row = first._store.get_session_messages("session")[0]
+            active_stub = {"role": "user", "content": stored_row["content"]}
+            ignored_store_id = stored_row["store_id"]
             assert "Externalized payload:" in active_stub["content"]
         finally:
             first.shutdown()
@@ -7808,12 +8039,12 @@ class TestMessageFiltering:
         )
         try:
             first.on_session_start("session", platform="telegram", context_length=1000)
-            active = first.compress(
-                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}],
-                current_tokens=10_000,
+            first._ingest_messages(
+                [{"role": "user", "content": "SECRET_PAYLOAD_MARKER externalized row " + "x" * 200}]
             )
-            active_stub = {"role": "user", "content": active[0]["content"]}
-            ignored_store_id = first._store.get_session_messages("session")[0]["store_id"]
+            stored_row = first._store.get_session_messages("session")[0]
+            active_stub = {"role": "user", "content": stored_row["content"]}
+            ignored_store_id = stored_row["store_id"]
         finally:
             first.shutdown()
 
@@ -8033,7 +8264,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "dependent assistant reply" not in captured["text"]
@@ -8068,7 +8299,7 @@ class TestMessageFiltering:
             {"role": "user", "content": "fresh tail request"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "assistant reply derived from ignored system" not in captured["text"]
@@ -8097,7 +8328,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        result = engine.compress(messages, current_tokens=engine.threshold_tokens)
         result_text = "\n".join(str(msg.get("content", "")) for msg in result)
 
         assert "visible backlog objective" in captured["text"]
@@ -8834,7 +9065,13 @@ class TestMessageFiltering:
                 {"role": "user", "content": "oversized raw payload " + "x" * 200},
             ]
 
-            assert second.should_compress_preflight(messages) is True
+            assert second.should_compress_preflight(messages) is False
+            rows = second._store.get_session_messages("session")
+            assert any(
+                str(row.get("content", "")).startswith("[Externalized payload:")
+                for row in rows
+            )
+            assert second._dag.get_session_nodes("session") == []
         finally:
             second.shutdown()
 
@@ -9209,7 +9446,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "dependent tool result" not in captured["text"]
@@ -9237,7 +9474,7 @@ class TestMessageFiltering:
             {"role": "assistant", "content": "fresh tail response"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "assistant answer derived" not in captured["text"]
@@ -9399,7 +9636,7 @@ class TestMessageFiltering:
             {"role": "user", "content": "SECRET ignored fresh tail must not become focus"},
         ]
 
-        engine.compress(messages, current_tokens=count_messages_tokens(messages))
+        engine.compress(messages, current_tokens=engine.threshold_tokens)
 
         assert "visible backlog objective" in captured["text"]
         assert "SECRET" not in captured["text"]
