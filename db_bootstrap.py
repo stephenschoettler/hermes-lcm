@@ -2907,8 +2907,50 @@ def _fts_missing_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec
     return bool(expected - existing)
 
 
+def _normalize_trigger_sql(sql: str) -> str:
+    """Canonicalize a CREATE TRIGGER statement for body comparison.
+
+    SQLite stores a trigger's source with ``IF NOT EXISTS`` stripped and the
+    trailing ``;`` removed, so a byte compare against the spec's SQL always
+    mismatches. Normalize both sides (drop ``IF NOT EXISTS``, collapse
+    whitespace, strip the terminator, casefold) so that the only differences
+    which survive are real ones — e.g. a body that still references a column
+    that has since been renamed.
+    """
+    text = re.sub(r"(?i)\bIF\s+NOT\s+EXISTS\s+", "", sql or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.rstrip(";").strip().lower()
+
+
+def _fts_stale_triggers(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+    """True if a trigger exists by name but its body has drifted from the spec.
+
+    ``_fts_missing_triggers`` only checks existence by name, so a trigger left
+    behind by an older schema passes that check while aborting every write to
+    the content table at runtime.
+    """
+    for trigger_sql in spec.trigger_sqls:
+        name = _extract_trigger_name(trigger_sql)
+        if not name:
+            continue
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None or row[0] is None:
+            # Absent entirely — that is _fts_missing_triggers' job, not "stale".
+            continue
+        if _normalize_trigger_sql(str(row[0])) != _normalize_trigger_sql(trigger_sql):
+            return True
+    return False
+
+
 def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
-    return _fts_needs_rebuild_structural(conn, spec) or _fts_missing_triggers(conn, spec)
+    return (
+        _fts_needs_rebuild_structural(conn, spec)
+        or _fts_missing_triggers(conn, spec)
+        or _fts_stale_triggers(conn, spec)
+    )
 
 
 def repair_external_content_fts(
@@ -2953,6 +2995,12 @@ def repair_external_content_fts(
         rebuilt = True
 
     triggers_were_missing = _fts_missing_triggers(conn, spec)
+    triggers_were_stale = _fts_stale_triggers(conn, spec)
+    if triggers_were_stale:
+        # A stale trigger exists by name with a drifted body, so the spec's bare
+        # `CREATE TRIGGER IF NOT EXISTS` would no-op and leave the broken trigger
+        # in place. Drop first so the body is guaranteed to be recreated fresh.
+        _drop_fts_triggers(conn, spec.trigger_sqls)
     for trigger_sql in spec.trigger_sqls:
         conn.execute(trigger_sql)
     if rebuilt:
@@ -2965,7 +3013,11 @@ def repair_external_content_fts(
     # full interval). Without this an explicit `repair apply` left the flag stuck.
     _clear_integrity_failed(conn, spec)
     conn.commit()
-    return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
+    return {
+        "rebuilt": rebuilt,
+        "degraded": degraded,
+        "triggers_recreated": triggers_were_missing or triggers_were_stale,
+    }
 
 
 def ensure_external_content_fts(
