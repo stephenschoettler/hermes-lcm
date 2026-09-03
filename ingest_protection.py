@@ -1665,6 +1665,22 @@ def _is_quoted_placeholder_example(text: str, start: int) -> bool:
     return False
 
 
+def _is_placeholder_code_literal(text: str, start: int, end: int) -> bool:
+    suffix = text[end:end + 80]
+    prefix = text[max(0, start - 2):start]
+    for quote_token in ('"', "'"):
+        for escaped in (False, True):
+            boundary = ("\\" if escaped else "") + quote_token
+            if not prefix.endswith(boundary):
+                continue
+            if re.match(
+                rf"^{re.escape(boundary)}\s*\.(?:startswith|endswith)(?:\s*\(|(?=\n|\\n|$))",
+                suffix,
+            ):
+                return True
+    return False
+
+
 def _looks_like_json_container_string(text: str) -> bool:
     stripped = text.lstrip()
     return stripped.startswith("{") or stripped.startswith("[")
@@ -1677,21 +1693,27 @@ def _looks_like_example_payload_ref(ref: str) -> bool:
 
 def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
     refs: list[str] = []
-    for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
-        for match in pattern.finditer(text):
-            ref = match.group(1).strip()
-            if not _is_basename_ref(ref):
-                continue
-            if _looks_like_example_payload_ref(ref) and _is_escaped_placeholder_example(text, match.start()):
-                continue
-            if (
-                ignore_quoted_spans
-                and _looks_like_example_payload_ref(ref)
-                and _is_quoted_placeholder_example(text, match.start())
-            ):
-                continue
-            if ref not in refs:
-                refs.append(ref)
+    # A real placeholder is one line. Scan actual and serialized lines
+    # independently so an incomplete prefix cannot consume a later real ref.
+    segments = re.split(r"\n|\\n", text)
+    for segment in segments:
+        for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
+            for match in pattern.finditer(segment):
+                ref = match.group(1).strip()
+                if not _is_basename_ref(ref):
+                    continue
+                if _is_placeholder_code_literal(segment, match.start(), match.end()):
+                    continue
+                if _looks_like_example_payload_ref(ref) and _is_escaped_placeholder_example(segment, match.start()):
+                    continue
+                if (
+                    ignore_quoted_spans
+                    and _looks_like_example_payload_ref(ref)
+                    and _is_quoted_placeholder_example(segment, match.start())
+                ):
+                    continue
+                if ref not in refs:
+                    refs.append(ref)
     return refs
 
 
