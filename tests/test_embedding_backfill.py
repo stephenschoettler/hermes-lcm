@@ -200,6 +200,97 @@ def test_dry_run_reports_counts_tokens_and_cost_without_calls_or_writes(
     assert provider.calls == []
 
 
+def test_empty_leaf_summaries_are_not_pending_or_sent_to_provider(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    dag = SummaryDAG(engine._store.db_path)
+    try:
+        dag.add_node(SummaryNode(
+            session_id="session-a",
+            depth=0,
+            summary="",
+            created_at=3.0,
+            latest_at=3.0,
+        ))
+        dag.add_node(SummaryNode(
+            session_id="session-a",
+            depth=0,
+            summary="   \n\t",
+            created_at=2.0,
+            latest_at=2.0,
+        ))
+        dag.add_node(SummaryNode(
+            session_id="session-a",
+            depth=0,
+            summary="\v\f",
+            created_at=1.5,
+            latest_at=1.5,
+        ))
+        valid_id = dag.add_node(SummaryNode(
+            session_id="session-a",
+            depth=0,
+            summary="useful summary",
+            created_at=1.0,
+            latest_at=1.0,
+        ))
+    finally:
+        dag.close()
+    store = VectorStore(engine._store.db_path, config=engine._config)
+    try:
+        store.register_profile("model-a", "ollama", 2)
+    finally:
+        store.close()
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    preview = handle_lcm_command("embed backfill", engine)
+    applied = handle_lcm_command("embed backfill --apply", engine)
+
+    assert "pending: 1" in preview
+    assert "selected: 1" in preview
+    assert "embedded: 1" in applied
+    assert "remaining: 0" in applied
+    assert provider.calls == [["useful summary"]]
+    assert _meta_ids(engine) == [str(valid_id)]
+
+
+def test_retry_uncertain_does_not_resend_empty_summary(monkeypatch, tmp_path):
+    engine = _engine(tmp_path)
+    dag = SummaryDAG(engine._store.db_path)
+    try:
+        blank_id = dag.add_node(SummaryNode(
+            session_id="session-a",
+            depth=0,
+            summary="\t\n",
+            created_at=2.0,
+            latest_at=2.0,
+        ))
+        valid_id = dag.add_node(SummaryNode(
+            session_id="session-a",
+            depth=0,
+            summary="retry this summary",
+            created_at=1.0,
+            latest_at=1.0,
+        ))
+    finally:
+        dag.close()
+    store = VectorStore(engine._store.db_path, config=engine._config)
+    try:
+        store.register_profile("model-a", "ollama", 2)
+    finally:
+        store.close()
+    _mark_uncertain(engine, [blank_id, valid_id])
+    provider = FakeProvider()
+    monkeypatch.setattr(command_mod, "resolve_provider", lambda _config, **_kw: provider)
+
+    result = handle_lcm_command("embed backfill --apply --retry-uncertain", engine)
+
+    assert "selected: 1" in result
+    assert "embedded: 1" in result
+    assert provider.calls == [["retry this summary"]]
+    assert _meta_ids(engine) == [str(valid_id)]
+    assert _inflight_rows(engine) == [(str(blank_id), "uncertain")]
+
+
 def test_apply_batches_records_correct_meta_and_is_idempotent(monkeypatch, tmp_path):
     engine = _engine(tmp_path)
     node_ids = _seed(engine, 35)

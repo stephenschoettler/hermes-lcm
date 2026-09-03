@@ -2828,6 +2828,16 @@ def _embedding_current_profile(conn: sqlite3.Connection) -> sqlite3.Row | None:
         raise
 
 
+def _register_summary_has_text(conn: sqlite3.Connection) -> None:
+    """Expose Python's Unicode whitespace semantics to summary discovery SQL."""
+    conn.create_function(
+        "lcm_summary_has_text",
+        1,
+        lambda value: int(isinstance(value, str) and bool(value.strip())),
+        deterministic=True,
+    )
+
+
 def _embedding_pending_rows(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -2837,6 +2847,7 @@ def _embedding_pending_rows(
     # A dispatched/uncertain row may already have been accepted remotely, so it
     # must never be silently resent; only explicit --retry-uncertain operator
     # authorization can return it to discovery.
+    _register_summary_has_text(conn)
     inflight_exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' "
         "AND name='lcm_embedding_backfill_inflight'"
@@ -2854,6 +2865,7 @@ def _embedding_pending_rows(
     )
     where = """
         n.depth = 0
+        AND lcm_summary_has_text(n.summary) = 1
         AND NOT EXISTS (
             SELECT 1
             FROM lcm_embedding_meta AS m
@@ -2888,10 +2900,12 @@ def _embedding_authorized_uncertain_rows(
     limit: int,
 ) -> tuple[int, list[sqlite3.Row]]:
     """Select exact uncertain rows without consuming their durable markers."""
+    _register_summary_has_text(conn)
     where = """
         f.identity_hash = ?
         AND f.state = 'uncertain'
         AND n.depth = 0
+        AND lcm_summary_has_text(n.summary) = 1
         AND NOT EXISTS (
             SELECT 1
             FROM lcm_embedding_meta AS m
