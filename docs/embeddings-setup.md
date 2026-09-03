@@ -11,6 +11,7 @@ FTS-only exactly as before.
 | Voyage AI | free tier (200M tokens for the voyage-4 group), then ~$0.02–0.12 per million tokens | yes (no credit card) | none | best quality, zero local footprint |
 | fastembed | $0 | no | `pip install fastembed` (ONNX, no torch) | local default — no accounts, no daemon |
 | Ollama | $0 | no | Ollama app/daemon | you already run Ollama |
+| OpenAI-compatible | provider pricing | yes (per provider) | none | reuse an existing `/v1/embeddings` service (SiliconFlow, llama.cpp, vLLM) |
 
 All providers feed the same store. Switching provider/model is one config change plus a backfill;
 each full identity keeps its own vectors, so switching **back** to a
@@ -98,6 +99,33 @@ batch or local model load is not aborted by the interactive query policy. The
 optional `LCM_EMBEDDING_BACKFILL_BUDGET_S` still caps the whole apply run
 between batches (`0`, the default, means no whole-run cap); the lease and
 post-call ownership CAS remain authoritative independently of both timeouts.
+
+## Option 4 — OpenAI-compatible API (reuse an existing embeddings service)
+
+If you already run any OpenAI-format `/v1/embeddings` endpoint — SiliconFlow,
+llama.cpp server, vLLM, or a local embedding model on a workstation — point
+LCM at it instead of running a second embedding stack:
+
+```bash
+export LCM_EMBEDDINGS_ENABLED=true
+export LCM_EMBEDDING_PROVIDER=openai-compatible
+export LCM_EMBEDDING_MODEL=BAAI/bge-m3     # any model id your endpoint serves
+export LCM_EMBEDDING_BASE_URL=https://api.siliconflow.cn/v1
+export LCM_EMBEDDING_API_KEY=sk-...        # falls back to SILICONFLOW_API_KEY
+/lcm embed warmup && /lcm embed backfill --apply
+```
+
+`LCM_EMBEDDING_BASE_URL` is the API root (a trailing slash is stripped) and
+`/embeddings` is appended. The request body is the standard OpenAI shape —
+`{"model": ..., "input": [...]}` with a `Bearer` authorization header — so any
+compatible server works, including local llama.cpp/vLLM instances that cost
+nothing per call.
+
+The same deadline, spend-guard, and identity rules apply as for the other
+remote providers: `LCM_EMBEDDING_QUERY_TIMEOUT_S` bounds interactive queries,
+`LCM_EMBEDDING_BACKFILL_TIMEOUT_S` bounds each backfill batch, and vectors are
+stored under the full `(provider, model, ...)` identity so switching back to
+this provider reactivates existing vectors without re-backfilling.
 
 ## What you get
 

@@ -18,6 +18,7 @@ from hermes_lcm.embedding_provider import (
     EmbeddingSpendGuard,
     FastembedProvider,
     HttpResponse,
+    OpenAICompatibleProvider,
     OllamaProvider,
     ProviderCircuitOpen,
     ProviderNotWarmedUp,
@@ -1323,3 +1324,135 @@ def test_voyage_rerank_empty_documents_short_circuits(monkeypatch):
 
     assert provider.rerank("q", [], timeout=5.0) == []
     assert transport.calls == []
+
+
+def _openai_compatible_success(count: int, dim: int = 3) -> HttpResponse:
+    return _response(
+        200,
+        {
+            "data": [
+                {"index": index, "embedding": [float(index + 1)] * dim}
+                for index in range(count)
+            ]
+        },
+    )
+
+
+def test_openai_compatible_request_shape_and_success(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(_openai_compatible_success(2))
+    provider = OpenAICompatibleProvider(
+        "BAAI/bge-m3",
+        base_url="https://api.example.com/v1/",
+        transport=transport,
+    )
+
+    vectors = provider.embed_documents(["first", "second"])
+
+    assert len(vectors) == 2
+    assert provider.dim == 3
+    assert len(transport.calls) == 1
+    call = transport.calls[0]
+    # Trailing slash on the base URL is stripped before joining.
+    assert call["url"] == "https://api.example.com/v1/embeddings"
+    assert call["payload"] == {
+        "model": "BAAI/bge-m3",
+        "input": ["first", "second"],
+    }
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_openai_compatible_query_and_interactive(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(
+        _openai_compatible_success(1, dim=4),
+        _openai_compatible_success(1, dim=4),
+    )
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="http://localhost:8080/v1", transport=transport
+    )
+
+    assert provider.embed_query("question") == [1.0, 1.0, 1.0, 1.0]
+    assert provider.embed_query_interactive("q", timeout=5.0) == [1.0, 1.0, 1.0, 1.0]
+
+    assert [call["url"] for call in transport.calls] == [
+        "http://localhost:8080/v1/embeddings",
+        "http://localhost:8080/v1/embeddings",
+    ]
+
+
+def test_openai_compatible_missing_api_key_raises(monkeypatch):
+    monkeypatch.delenv("LCM_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
+    transport = FakeTransport(_openai_compatible_success(1))
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="LCM_EMBEDDING_API_KEY"):
+        provider.embed_query("q")
+
+    assert transport.calls == []
+
+
+def test_openai_compatible_siliconflow_key_fallback(monkeypatch):
+    monkeypatch.delenv("LCM_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "fallback-key")
+    transport = FakeTransport(_openai_compatible_success(1))
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    provider.embed_query("q")
+
+    assert transport.calls[0]["headers"]["Authorization"] == "Bearer fallback-key"
+
+
+def test_openai_compatible_empty_base_url_raises():
+    with pytest.raises(ValueError, match="LCM_EMBEDDING_BASE_URL"):
+        OpenAICompatibleProvider("bge-m3", base_url="   ")
+
+
+def test_openai_compatible_empty_model_raises():
+    with pytest.raises(ValueError, match="must not be empty"):
+        OpenAICompatibleProvider("  ", base_url="https://api.example.com/v1")
+
+
+def test_openai_compatible_network_error_is_not_retried(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(OSError("boom"))
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="network error"):
+        provider.embed_documents(["doc"])
+
+    # The transport start makes an automatic identical resend unsafe.
+    assert len(transport.calls) == 1
+
+
+def test_openai_compatible_response_count_mismatch_raises(monkeypatch):
+    monkeypatch.setenv("LCM_EMBEDDING_API_KEY", "test-key")
+    transport = FakeTransport(_openai_compatible_success(1))  # 1 vector for 2 texts
+    provider = OpenAICompatibleProvider(
+        "bge-m3", base_url="https://api.example.com/v1", transport=transport
+    )
+
+    with pytest.raises(EmbeddingProviderError, match="different number of embeddings"):
+        provider.embed_documents(["a", "b"])
+
+
+def test_resolve_provider_openai_compatible(monkeypatch):
+    config = LCMConfig(
+        embedding_provider="openai-compatible",
+        embedding_model="BAAI/bge-m3",
+        embedding_base_url="https://api.example.com/v1",
+    )
+    provider = resolve_provider(config)
+    assert isinstance(provider, OpenAICompatibleProvider)
+    assert provider.model_id == "BAAI/bge-m3"
+    assert provider.base_url == "https://api.example.com/v1"
+
+    config.embedding_provider = "siliconflow"
+    assert isinstance(resolve_provider(config), OpenAICompatibleProvider)
