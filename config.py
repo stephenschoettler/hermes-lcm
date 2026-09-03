@@ -496,9 +496,10 @@ class LCMConfig:
     # -- Assembly guardrails ---
     # Hard cap for the assembled active context (0 = disabled)
     max_assembly_tokens: int = 0
-    # Reserve this many tokens from the model context window before assembly
-    # (0 = disabled). Effective cap becomes context_length - reserve_tokens_floor.
-    reserve_tokens_floor: int = 0
+    # Reserve this many tokens from the model context window before assembly.
+    # -1 = automatic reserve for large model windows, 0 = disabled, >0 = explicit.
+    # Effective cap becomes context_length - reserve_tokens_floor.
+    reserve_tokens_floor: int = -1
 
     # -- Session and message filtering ---
     # Sessions to exclude from LCM storage entirely.
