@@ -145,7 +145,7 @@ class CompactionMixin:
             if self._compression_boundary_cooldown_active():
                 return False
             if pre_ingest_placeholder_ambiguous_noop:
-                self._last_compression_status = "noop"
+                self._last_compression_status = "deferred"
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
@@ -164,7 +164,7 @@ class CompactionMixin:
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
                     return self._mark_preflight_compression_requested()
-                self._last_compression_status = "noop"
+                self._last_compression_status = "deferred"
                 self._last_compression_noop_reason = reason
                 logger.info("LCM preflight compression no-op: %s", reason)
                 return False
@@ -178,7 +178,7 @@ class CompactionMixin:
             return self._mark_preflight_compression_requested()
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             if pre_ingest_placeholder_ambiguous_noop:
-                self._last_compression_status = "noop"
+                self._last_compression_status = "deferred"
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
@@ -192,7 +192,7 @@ class CompactionMixin:
                 return self._mark_preflight_compression_requested()
             if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
                 return self._mark_preflight_compression_requested()
-            self._last_compression_status = "noop"
+            self._last_compression_status = "deferred"
             self._last_compression_noop_reason = reason
             logger.info("LCM preflight compression no-op: %s", reason)
             return False
@@ -902,7 +902,22 @@ class CompactionMixin:
                     # written. Keep the cursor aligned with the returned context
                     # so the next appended turn is ingested instead of skipped.
                     self._ingest_cursor = len(sanitized_messages)
-                self._last_compression_status = "noop"
+                self._last_compression_status = (
+                    "deferred"
+                    if (
+                        (
+                            "no eligible raw backlog" in noop_reason
+                            and getattr(self, "threshold_tokens", 0) > 0
+                            and estimated_active_tokens >= getattr(self, "threshold_tokens", 0)
+                        )
+                        or (
+                            "below leaf chunk threshold" in noop_reason
+                            and getattr(self, "threshold_tokens", 0) > 0
+                            and estimated_active_tokens >= getattr(self, "threshold_tokens", 0)
+                        )
+                    )
+                    else "noop"
+                )
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)
             if threshold_full_sweep_active:
