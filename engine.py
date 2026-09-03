@@ -4550,6 +4550,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
+        reconciled_existing_session = self._ingest_cursor_needs_reconcile
+        reconcile_messages = replay_messages
         if self._ingest_cursor_needs_reconcile:
             reconcile_messages = [
                 original_msg
@@ -4572,6 +4574,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
+        replayed_tool_segment_indexes = (
+            self._replayed_tool_segment_indexes_after_cursor(reconcile_messages, cursor)
+            if reconciled_existing_session
+            else set()
+        )
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4681,6 +4688,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
                 absolute_idx = cursor + offset
+                if absolute_idx in replayed_tool_segment_indexes:
+                    continue
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(

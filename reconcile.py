@@ -445,6 +445,12 @@ class ReconcileMixin:
                     "tool_calls": decoded_tool_calls,
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
+        stored_tool_identities = {
+            identity
+            for identity in stored_tail
+            for role, _content, tool_call_id, _tool_calls in [identity]
+            if role == "tool" and tool_call_id
+        }
         empty_prefix_cursor: int | None = None
         for cursor in range(len(messages), -1, -1):
             candidate_messages = messages[:cursor]
@@ -509,6 +515,47 @@ class ReconcileMixin:
                 and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix)
             )
             matches_raw_tail = self._matches_store_tail_suffix(stored_tail, candidate_prefix)
+            candidate_has_tool_anchor = any(
+                role == "tool" and bool(tool_call_id)
+                for role, _content, tool_call_id, _tool_calls in candidate_prefix
+            )
+            candidate_tool_anchor_indexes = [
+                index
+                for index, (role, _content, tool_call_id, _tool_calls) in enumerate(candidate_prefix)
+                if role == "tool" and bool(tool_call_id)
+            ]
+            candidate_tool_identities = {
+                candidate_prefix[index]
+                for index in candidate_tool_anchor_indexes
+            }
+            candidate_ends_with_replayed_tool_result = (
+                len(candidate_tool_anchor_indexes) == 1
+                and candidate_tool_identities.issubset(stored_tool_identities)
+                and candidate_tool_anchor_indexes[0] == len(candidate_prefix) - 1
+                and all(
+                    identity[0] == "assistant" and not identity[1]
+                    for identity in candidate_prefix[: candidate_tool_anchor_indexes[0]]
+                )
+            )
+            candidate_has_user_after_tool_anchor = any(
+                identity[0] == "user"
+                for identity in candidate_prefix[candidate_tool_anchor_indexes[-1] + 1 :]
+            ) if candidate_tool_anchor_indexes else False
+            matches_tool_anchored_stale_window = (
+                candidate_has_tool_anchor
+                and not candidate_has_user_after_tool_anchor
+                and (
+                    any(
+                        sanitized_replay_tail[start : start + len(candidate_prefix)] == candidate_prefix
+                        for start in range(len(sanitized_replay_tail) - len(candidate_prefix) + 1)
+                    )
+                    or any(
+                        stored_tail[start : start + len(candidate_prefix)] == candidate_prefix
+                        for start in range(len(stored_tail) - len(candidate_prefix) + 1)
+                    )
+                )
+            )
+
             matches_visible_sanitized_tail = (
                 filtered_candidate_placeholders
                 and bool(candidate_visible_prefix)
@@ -573,6 +620,8 @@ class ReconcileMixin:
             if (
                 not matches_sanitized_tail
                 and not matches_raw_tail
+                and not candidate_ends_with_replayed_tool_result
+                and not matches_tool_anchored_stale_window
                 and not matches_inline_generation_cleanup_tail
                 and not matches_durable_persisted_output_full_replay
             ):
@@ -673,6 +722,22 @@ class ReconcileMixin:
                 and matches_raw_tail
                 and candidate_prefix == stored_tail[-len(candidate_prefix) :]
             )
+            # Tool results carry stable execution identities. A stale exact
+            # window may be skipped through matching assistant rows, but never
+            # through a user turn after the final tool anchor. If surrounding
+            # content changed, only skip through the final durable tool result;
+            # later assistant/user messages may be genuinely new after recovery.
+            has_tool_id_anchored_replay = (
+                not candidate_has_persisted_marker
+                and candidate_has_tool_anchor
+                and (
+                    matches_sanitized_tail
+                    or matches_raw_tail
+                    or matches_tool_anchored_stale_window
+                    or candidate_ends_with_replayed_tool_result
+                )
+            )
+
             has_persisted_marker_specific_replay_evidence = (
                 not candidate_has_persisted_marker
                 or has_durable_persisted_marker_suffix_replay
@@ -734,6 +799,7 @@ class ReconcileMixin:
                 or matches_durable_persisted_output_full_replay
                 or has_inline_generation_cleanup_replay
                 or has_inline_persisted_generation_suffix_replay
+                or has_tool_id_anchored_replay
                 or has_raw_full_replay
                 or has_scaffold_suffix_replay
                 or has_raw_cleanup_replay
@@ -943,6 +1009,60 @@ class ReconcileMixin:
             effective_incoming=len(incoming_identities),
         )
         return 0
+
+    def _replayed_tool_segment_indexes_after_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        cursor: int,
+    ) -> set[int]:
+        """Find exact durable tool pairs replayed after a preserved new delta."""
+        if not self._session_id or cursor >= len(messages):
+            return set()
+        session_count = self._store.get_session_count(self._session_id)
+        if session_count <= 0:
+            return set()
+        tail_limit = min(max(len(messages) * 4, 64), session_count)
+        stored_rows = self._store.get_session_tail(self._session_id, limit=tail_limit)
+        stored_identities = {
+            self._message_replay_identity(row, stored_row=True)
+            for row in stored_rows
+            if not self._matches_ignore_message_patterns(row, stored_row=True)
+        }
+        replayed: set[int] = set()
+        index = max(0, cursor)
+        while index < len(messages):
+            assistant = messages[index]
+            if str(assistant.get("role") or "") != "assistant" or not assistant.get("tool_calls"):
+                index += 1
+                continue
+            assistant_identity = self._message_replay_identity(assistant)
+            call_ids = {
+                str(call.get("id") or "")
+                for call in assistant.get("tool_calls") or []
+                if isinstance(call, dict) and str(call.get("id") or "")
+            }
+            result_indexes: dict[str, int] = {}
+            probe = index + 1
+            while probe < len(messages) and str(messages[probe].get("role") or "") == "tool":
+                result = messages[probe]
+                tool_call_id = str(result.get("tool_call_id") or "")
+                content = normalize_content_value(result.get("content")) or ""
+                if (
+                    tool_call_id in call_ids
+                    and not _is_hermes_persisted_output_marker(content)
+                    and self._message_replay_identity(result) in stored_identities
+                ):
+                    result_indexes[tool_call_id] = probe
+                probe += 1
+            if (
+                call_ids
+                and assistant_identity in stored_identities
+                and call_ids.issubset(result_indexes)
+            ):
+                replayed.add(index)
+                replayed.update(result_indexes.values())
+            index = max(index + 1, probe)
+        return replayed
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (
