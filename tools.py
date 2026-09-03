@@ -2375,7 +2375,10 @@ def _lcm_grep_full_text(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    query = args.get("query", "").strip()
+    # Coerce defensively: a model can emit `{"query": null}` (or a number), and
+    # `.strip()` on a non-string escapes the tool as an unhandled AttributeError
+    # instead of the "No query provided" error the sibling tools return.
+    query = str(args.get("query") or "").strip()
     if not query:
         return json.dumps({"error": "No query provided"})
 
@@ -3064,7 +3067,7 @@ def _lcm_grep_semantic(
     mode = str(args.get("mode") or "semantic").lower()
     if time.monotonic() >= deadline:
         return _lcm_grep_deadline_error(mode, "semantic_entry")
-    query = str(args.get("query", "")).strip()
+    query = str(args.get("query") or "").strip()
     if not query:
         return {"error": "No query provided"}
 
@@ -4595,7 +4598,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
 
-    query = str(args.get("query", "")).strip()
+    query = str(args.get("query") or "").strip()
     if not query:
         return json.dumps({"error": "No query provided"})
 
