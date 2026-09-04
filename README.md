@@ -257,7 +257,7 @@ corresponding opt-in is enabled, and stored in the same profile database under
 named feature markers. The five new query/evidence tool schemas are visible in
 the tool list on stock installs, but automatic extraction, pre-answer evidence,
 assertion storage, query-view storage, and adaptive retrieval remain off. See
-[the operator upgrade and opt-in notes](docs/operator-guide.md#upgrade-from-v0210-rc2-to-v100-rc1)
+[the operator upgrade and opt-in notes](docs/operator-guide.md#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1)
 before enabling them.
 
 ## Commands and tools

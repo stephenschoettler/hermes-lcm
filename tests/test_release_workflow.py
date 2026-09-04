@@ -55,6 +55,29 @@ def test_upgrade_guide_requires_sqlite_safe_backup_semantics():
     assert "one quiescent snapshot" in operator_guide
 
 
+def test_upgrade_guide_covers_stable_and_prerelease_paths():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    operator_guide = " ".join(
+        (REPO_ROOT / "docs" / "operator-guide.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "## Upgrade from v0.20.0 or v0.21.0-rc2 to v1.0.0-rc.1" in operator_guide
+    assert (
+        "A database created by either v0.20.0 or v0.21.0-rc2 opens in place"
+        in operator_guide
+    )
+    assert (
+        "For rollback to either v0.20.0 or v0.21.0-rc2, restore the pre-upgrade "
+        "backup" in operator_guide
+    )
+    assert (
+        "docs/operator-guide.md#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1"
+        in readme
+    )
+
+
 def test_preanswer_guide_discloses_inherited_embedding_provider_behavior():
     operator_guide = " ".join(
         (REPO_ROOT / "docs" / "operator-guide.md")
