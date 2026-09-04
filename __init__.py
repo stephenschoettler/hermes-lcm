@@ -256,8 +256,6 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
             question_date=question_date,
             enabled=True,
         )
-        if mode == "sufficiency_v1":
-            _apply_hook_sufficiency_gate(config, result)
         compiler_result = None
         selector_usage = None
         if bool(getattr(config, "selective_compiler_enabled", False)):

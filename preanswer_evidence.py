@@ -501,7 +501,15 @@ def build_preanswer_evidence(
         budgets=budgets,
     )
     if sufficiency_gate and isinstance(result, dict):
-        apply_sufficiency_gate(result, enabled=True, started=gate_started)
+        try:
+            apply_sufficiency_gate(result, enabled=True, started=gate_started)
+        except Exception:  # noqa: BLE001 - the gate must stay fail-open
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "LCM sufficiency gate failed open in build_preanswer_evidence",
+                exc_info=True,
+            )
     return result
 
 

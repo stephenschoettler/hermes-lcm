@@ -122,21 +122,35 @@ def _refine_unknown_state(state: str, result: Mapping[str, Any]) -> str:
 def _classify_legacy_result(result: Mapping[str, Any]) -> tuple[str, str] | None:
     """Map legacy (status, reason_code) pairs onto the state vocabulary.
 
-    Unknown future reason codes make no claim: the gate stays silent rather
-    than guessing a state the pipeline did not define.
+    A recognized delivered ``state`` is always honored before any
+    reason-code table: the compiler's own verdict is never overridden by a
+    later classification table (e.g. a no-claim code that was recorded on a
+    result whose state was already delivered).  Unknown future reason codes
+    make no claim: the gate stays silent rather than guessing a state the
+    pipeline did not define.
     """
     status = str(result.get("status") or "")
     reason_code = str(result.get("reason_code") or "")
+    state = result.get("state")
+    if isinstance(state, str) and state in _KNOWN_STATES:
+        if state == "unknown":
+            # ``unknown`` is the compiler's BASE state, not always a verdict:
+            # refusal paths and budget truncation leave it untouched.
+            if reason_code in _NO_CLAIM_REASON_CODES:
+                # No evidence work happened; the reason code is the honest
+                # classification and the result stays unmarked.
+                return None
+            if reason_code == "context_budget_exhausted":
+                return ("partial", "answer_with_disclosure")
+            # Only the compiler's blanket ``unknown`` needs refinement;
+            # delivered states are the pipeline's own verdict and are never
+            # overridden.
+            return _policy_for_state(_refine_unknown_state(state, result))
+        return _policy_for_state(state)
     if reason_code in _NO_CLAIM_REASON_CODES:
         return None
     if reason_code == "context_budget_exhausted":
         return ("partial", "answer_with_disclosure")
-    state = result.get("state")
-    if isinstance(state, str) and state in _KNOWN_STATES:
-        # Only the compiler's blanket ``unknown`` needs refinement; delivered
-        # states are the pipeline's own verdict and are never overridden.
-        refined = _refine_unknown_state(state, result) if state == "unknown" else state
-        return _policy_for_state(refined)
     if status == "computed":
         return ("computation_sufficient", "answer")
     if status == "augmented":
@@ -236,9 +250,19 @@ def apply_sufficiency_gate(
 
     With ``enabled=False`` the result is returned untouched.  With the gate
     enabled, non-sufficient states with an empty context get their disclosure
-    rendered as the ephemeral context block; the trace digest and context
-    metrics are kept consistent with that block.  Existing evidence,
-    computation, and status fields are never modified.
+    rendered as the ephemeral context block; ``trace.context_sha256`` (which
+    is not part of the compiler trace digest material) is kept consistent
+    with that block.  Existing evidence, computation, status, and metrics are
+    never modified, so the compiler's ``trace.digest_sha256`` remains
+    re-derivable from every gated result.  Budget metrics describe the
+    compiler-delivered context only; the disclosure's size is recorded in the
+    gate-owned section (``disclosure_context_chars``).
+
+    The gate is ATOMIC: all verdict writes happen on a shallow copy and are
+    copied back only if the whole operation completes, so a crash can never
+    leave a partially marked result behind.  Exceptions from classification
+    or rendering propagate to the caller; the hook path converts them into
+    fail-open behavior.
     """
     if not enabled:
         return result
@@ -250,21 +274,29 @@ def apply_sufficiency_gate(
     disclosure: str | None = None
     if policy_action != "answer":
         disclosure = render_disclosure(result, state, policy_action)
-    result["sufficiency"] = {
+    marked = dict(result)
+    marked["sufficiency"] = {
         "version": SUFFICIENCY_GATE_VERSION,
         "state": state,
         "policy_action": policy_action,
         "disclosure_context": disclosure,
+        "disclosure_context_chars": len(disclosure) if disclosure else 0,
+        "gate_latency_ms": round(
+            (time.perf_counter() - gate_started) * 1_000.0, 3
+        ),
     }
     if disclosure is not None and not isinstance(result.get("context"), str):
-        result["context"] = disclosure
-        result["trace"]["context_sha256"] = hashlib.sha256(
-            disclosure.encode("utf-8")
-        ).hexdigest()
-        result["metrics"]["context_chars"] = len(disclosure)
-    result["metrics"]["sufficiency_gate_latency_ms"] = round(
-        (time.perf_counter() - gate_started) * 1_000.0, 3
-    )
+        marked["context"] = disclosure
+        trace = result.get("trace")
+        if isinstance(trace, dict):
+            marked["trace"] = {
+                **trace,
+                "context_sha256": hashlib.sha256(
+                    disclosure.encode("utf-8")
+                ).hexdigest(),
+            }
+    result.clear()
+    result.update(marked)
     return result
 
 

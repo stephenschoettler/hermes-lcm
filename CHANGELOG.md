@@ -16,8 +16,12 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
   performed no evidence work (feature boundaries, unsupported questions,
   ordinary routes) receive no claim at all: unmarked stays unmarked.
   The gate never calls a provider and never mutates evidence, computation,
-  or the delivered context of sufficient results.  Default-off; every other
-  mode is byte-identical to its previous behavior.
+  or the delivered context of sufficient results.  Gate application is
+  atomic (a gate crash can never leave a partially marked result; the
+  wrapper fails open to the legacy result), delivered compiler states are
+  never overridden by reason-code classification, and the compiler's trace
+  digest remains re-derivable from every gated result.  Default-off; every
+  other mode is byte-identical to its previous behavior.
 
 ## v1.0.0-rc.1 - 2026-09-03
 
