@@ -184,9 +184,12 @@ def test_gate_failure_is_atomic_and_wrapper_fails_open(
     def _boom_classify(_result):
         raise RuntimeError("classify boom")
 
-    monkeypatch.setattr(sg, "classify_preanswer_result", _boom_classify)
-    with pytest.raises(RuntimeError):
-        sg.apply_sufficiency_gate(broken, enabled=True)
+    # (a) Classification crash: zero mutation, zero partial marking.  The
+    # patch lives in its own scope so (b) can exercise the real classifier.
+    with monkeypatch.context() as m:
+        m.setattr(sg, "classify_preanswer_result", _boom_classify)
+        with pytest.raises(RuntimeError, match="classify boom"):
+            sg.apply_sufficiency_gate(broken, enabled=True)
     assert broken == {
         "status": "no_augmentation",
         "state": None,
@@ -197,7 +200,9 @@ def test_gate_failure_is_atomic_and_wrapper_fails_open(
     }
 
     # (b) Render crash after classification: still no mutation, because the
-    # verdict writes happen on a copy that is only committed on success.
+    # verdict writes happen on a copy that is only committed on success.  The
+    # classifier patch from (a) is scoped to (a) only, so this call actually
+    # exercises the render path.
     partial = {
         "status": "no_augmentation",
         "state": "unknown",
@@ -210,12 +215,27 @@ def test_gate_failure_is_atomic_and_wrapper_fails_open(
     def _boom_render(*_args, **_kwargs):
         raise RuntimeError("render boom")
 
-    monkeypatch.setattr(sg, "render_disclosure", _boom_render)
-    with pytest.raises(RuntimeError):
-        sg.apply_sufficiency_gate(partial, enabled=True)
+    with monkeypatch.context() as m:
+        m.setattr(sg, "render_disclosure", _boom_render)
+        with pytest.raises(RuntimeError, match="render boom"):
+            sg.apply_sufficiency_gate(partial, enabled=True)
     assert partial["context"] is None
     assert partial["trace"]["context_sha256"] is None
     assert "sufficiency" not in partial
+
+    # (b2) Missing ``trace`` (the original F2 failure mode): the gate marks
+    # the result, skips the trace update, and never partially mutates.
+    untraced = {
+        "status": "no_augmentation",
+        "state": "unknown",
+        "reason_code": "no_hit",
+        "context": None,
+        "metrics": {"latency_ms": 1.0},
+    }
+    assert sg.apply_sufficiency_gate(untraced, enabled=True) is untraced
+    assert untraced["sufficiency"]["state"] == "unknown"
+    assert untraced["context"] == untraced["sufficiency"]["disclosure_context"]
+    assert "trace" not in untraced
 
     # (c) The wrapper fails open: a gate crash inside
     # ``build_preanswer_evidence`` still returns the legacy result.  The
