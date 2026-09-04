@@ -12,7 +12,9 @@ row identity (`store_id`) for DAG/source lookup.
 import json
 import logging
 import math
+import os
 import sqlite3
+import stat
 import threading
 import time
 from datetime import datetime, timezone
@@ -49,7 +51,11 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
-from .sqlite_util import _temporary_sqlite_busy_timeout
+from .sqlite_util import (
+    _prepare_private_sqlite_file,
+    _restrict_existing_sqlite_artifacts,
+    _temporary_sqlite_busy_timeout,
+)
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -63,6 +69,65 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+
+
+def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _restrict_created_sqlite_directory(path: Path) -> None:
+    """Restrict a newly created directory without following a replacement."""
+    if os.name != "posix":  # pragma: no cover - Windows compatibility fallback
+        path.chmod(0o700)
+        return
+
+    parent = path.parent
+    expected_parent = os.stat(parent, follow_symlinks=False)
+    if not stat.S_ISDIR(expected_parent.st_mode):
+        raise OSError(f"database directory parent is not a real directory: {parent}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    parent_fd = os.open(parent, flags)
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or not _same_directory_identity(expected_parent, opened_parent)
+        ):
+            raise OSError(f"database directory parent changed during validation: {parent}")
+
+        expected = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise OSError(f"database directory is not a real directory: {path}")
+        fd = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not _same_directory_identity(expected, opened)
+            ):
+                raise OSError(f"database directory changed during validation: {path}")
+            os.fchmod(fd, 0o700)
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _same_directory_identity(opened, current):
+                raise OSError(f"database directory changed while restricting permissions: {path}")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _prepare_private_sqlite_storage(db_path: Path) -> None:
+    """Create or tighten one SQLite database path before SQLite opens it."""
+    try:
+        db_path.parent.mkdir(parents=True, mode=0o700)
+    except FileExistsError:
+        pass
+    else:
+        _restrict_created_sqlite_directory(db_path.parent)
+
+    _prepare_private_sqlite_file(db_path)
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -264,7 +329,9 @@ class MessageStore:
 
     def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._is_memory_database = str(self.db_path) == ":memory:"
+        if not self._is_memory_database:
+            _prepare_private_sqlite_storage(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
@@ -291,6 +358,8 @@ class MessageStore:
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
+        if not self._is_memory_database:
+            _restrict_existing_sqlite_artifacts(self.db_path)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
