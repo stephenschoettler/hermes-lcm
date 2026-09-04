@@ -12,12 +12,25 @@ subsequent startups of an existing, structurally-sound index. The tests build
 the index first, then exercise the existing-index path.
 """
 
+import json
+import multiprocessing as mp
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+import traceback
 import types
+from pathlib import Path
 
 import pytest
+
+
+if "hermes_lcm" not in sys.modules:
+    package = types.ModuleType("hermes_lcm")
+    package.__path__ = [str(Path(__file__).resolve().parents[1])]
+    package.__package__ = "hermes_lcm"
+    sys.modules["hermes_lcm"] = package
 
 from hermes_lcm import command, db_bootstrap
 from hermes_lcm.db_bootstrap import (
@@ -52,6 +65,218 @@ def _spec():
         indexed_column="content",
         trigger_sqls=(),
     )
+
+
+def _spawn_message_store_worker(db_path, start_barrier, repair_barrier, queue, worker):
+    """Construct and append after all children observe incomplete FTS state."""
+    store = None
+    try:
+        start_barrier.wait(timeout=30)
+        from hermes_lcm import db_bootstrap as worker_db_bootstrap
+        from hermes_lcm.store import MessageStore
+
+        original_structural_check = worker_db_bootstrap._fts_needs_rebuild_structural
+        synchronized = False
+
+        def synchronized_structural_check(conn, spec):
+            nonlocal synchronized
+            result = original_structural_check(conn, spec)
+            if result and not synchronized:
+                synchronized = True
+                repair_barrier.wait(timeout=30)
+            return result
+
+        worker_db_bootstrap._fts_needs_rebuild_structural = synchronized_structural_check
+        store = MessageStore(db_path)
+        messages = [
+            {
+                "role": "user",
+                "content": f"ftsbootstrapworker{worker} token{index}",
+            }
+            for index in range(4)
+        ]
+        ids = store.append_batch(
+            f"session-{worker}",
+            messages,
+            [1] * len(messages),
+            source="spawn-regression",
+            conversation_id=f"conversation-{worker}",
+        )
+        queue.put({"ok": True, "worker": worker, "ids": ids})
+    except BaseException as exc:  # pragma: no cover - exercised in child
+        queue.put(
+            {
+                "ok": False,
+                "worker": worker,
+                "error": repr(exc),
+                "trace": traceback.format_exc(),
+            }
+        )
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _run_spawn_message_store_probe(db_path):
+    workers = 6
+    ctx = mp.get_context("spawn")
+    start_barrier = ctx.Barrier(workers + 1)
+    repair_barrier = ctx.Barrier(workers)
+    queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_spawn_message_store_worker,
+            args=(db_path, start_barrier, repair_barrier, queue, worker),
+        )
+        for worker in range(workers)
+    ]
+    started_processes = []
+    results = []
+    deadline = time.monotonic() + 90
+    try:
+        for process in processes:
+            process.start()
+            started_processes.append(process)
+        start_barrier.wait(timeout=max(0.1, min(30, deadline - time.monotonic())))
+        while len(results) < workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for workers: {results!r}")
+            results.append(queue.get(timeout=remaining))
+    finally:
+        join_deadline = time.monotonic() + 10
+        for process in started_processes:
+            process.join(timeout=max(0, join_deadline - time.monotonic()))
+        alive = [process for process in started_processes if process.is_alive()]
+        for process in alive:
+            process.terminate()
+        terminate_deadline = time.monotonic() + 10
+        for process in alive:
+            process.join(timeout=max(0, terminate_deadline - time.monotonic()))
+        queue.close()
+        queue.join_thread()
+
+    return {
+        "results": results,
+        "exitcodes": [process.exitcode for process in started_processes],
+    }
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["--spawn-fts-bootstrap"]:
+    print(json.dumps(_run_spawn_message_store_probe(sys.argv[2])))
+    raise SystemExit(0)
+
+
+def test_spawned_message_store_startup_serializes_fresh_fts_repair(tmp_path):
+    """Independent constructors accept one winner's complete FTS state."""
+    from hermes_lcm.store import MessageStore, build_message_fts_spec
+
+    workers = 6
+    db_path = str(tmp_path / "spawn-fresh-fts.db")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--spawn-fts-bootstrap",
+            db_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    probe = json.loads(completed.stdout)
+    results = probe["results"]
+    assert all(result["ok"] for result in results), results
+    assert all(exitcode == 0 for exitcode in probe["exitcodes"]), probe["exitcodes"]
+
+    # This is a fresh product-store reopen after the contention round, not only
+    # a direct SQLite audit of the winner's file.
+    store = MessageStore(db_path)
+    try:
+        conn = store.connection
+        assert conn is not None
+        spec = build_message_fts_spec()
+        assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == workers * 4
+        assert conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0] == workers * 4
+        assert conn.execute("SELECT COUNT(*) FROM messages_fts_docsize").fetchone()[0] == workers * 4
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        for worker in range(workers):
+            matches = store.search(f"ftsbootstrapworker{worker}", limit=10)
+            assert len(matches) == 4
+            assert all(f"ftsbootstrapworker{worker}" in row["content"] for row in matches)
+    finally:
+        store.close()
+
+
+def test_trigger_disappearing_on_fast_path_reenters_repair_ownership(
+    tmp_path, monkeypatch
+):
+    """Trigger DDL observed after the healthy precheck runs only under ownership."""
+    from hermes_lcm.store import MessageStore, build_message_fts_spec
+
+    db_path = str(tmp_path / "trigger-race.db")
+    store = MessageStore(db_path)
+    try:
+        conn = store.connection
+        assert conn is not None
+        assert conn.in_transaction is False
+        spec = build_message_fts_spec()
+        trigger_name = db_bootstrap._extract_trigger_name(spec.trigger_sqls[0])
+        assert trigger_name is not None
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is False
+
+        original_deep_check = db_bootstrap._fts_needs_rebuild
+        trigger_dropped = False
+
+        def deep_check_then_drop_trigger(conn_arg, spec_arg, *, now=None, throttle=False):
+            nonlocal trigger_dropped
+            result = original_deep_check(
+                conn_arg, spec_arg, now=now, throttle=throttle
+            )
+            if not trigger_dropped:
+                trigger_dropped = True
+                other = sqlite3.connect(db_path)
+                try:
+                    other.execute(
+                        f"DROP TRIGGER {db_bootstrap.quote_sql_identifier(trigger_name)}"
+                    )
+                    other.commit()
+                finally:
+                    other.close()
+            return result
+
+        monkeypatch.setattr(
+            db_bootstrap, "_fts_needs_rebuild", deep_check_then_drop_trigger
+        )
+        trigger_create_transaction_states = []
+
+        def trace_trigger_ddl(sql):
+            if sql.lstrip().upper().startswith("CREATE TRIGGER"):
+                trigger_create_transaction_states.append(conn.in_transaction)
+
+        conn.set_trace_callback(trace_trigger_ddl)
+        try:
+            result = db_bootstrap.repair_external_content_fts(
+                conn, spec, throttle=True
+            )
+        finally:
+            conn.set_trace_callback(None)
+
+        assert trigger_dropped is True
+        assert result == {
+            "rebuilt": False,
+            "degraded": False,
+            "triggers_recreated": True,
+        }
+        assert trigger_create_transaction_states
+        assert all(trigger_create_transaction_states)
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is False
+    finally:
+        store.close()
 
 
 def _make_future_schema_db(db_path):
@@ -278,6 +503,142 @@ def test_explicit_repair_clears_stuck_integrity_failed_flag(tmp_path, monkeypatc
     conn.close()
 
 
+def test_explicit_repair_rebuilds_same_count_corruption_with_missing_triggers(tmp_path):
+    """Explicit repair must fix index drift even while recreating triggers."""
+    from hermes_lcm.store import build_message_fts_spec
+
+    conn = _make_conn(tmp_path)
+    spec = build_message_fts_spec()
+    ensure_external_content_fts(conn, spec)
+
+    for trigger_sql in spec.trigger_sqls:
+        trigger_name = db_bootstrap._extract_trigger_name(trigger_sql)
+        assert trigger_name is not None
+        conn.execute(f"DROP TRIGGER {db_bootstrap.quote_sql_identifier(trigger_name)}")
+    conn.execute(
+        "UPDATE messages SET content = 'completely different searchable text' WHERE store_id = 1"
+    )
+    assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is False
+    assert db_bootstrap._fts_missing_triggers(conn, spec) is True
+    assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "fail"
+
+    repaired = db_bootstrap.repair_external_content_fts(conn, spec)
+
+    assert repaired["rebuilt"] is True
+    assert repaired["triggers_recreated"] is True
+    assert db_bootstrap._fts_missing_triggers(conn, spec) is False
+    assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+    conn.close()
+
+
+def test_startup_structural_repair_does_not_deep_check_incomplete_fts(
+    tmp_path, monkeypatch
+):
+    """Missing FTS tables are rebuilt before any deep integrity operation."""
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("deep integrity route must not inspect incomplete FTS")
+
+    monkeypatch.setattr(db_bootstrap, "_fts_needs_rebuild", fail_if_called)
+
+    repaired = db_bootstrap.repair_external_content_fts(
+        conn, spec, throttle=True
+    )
+
+    assert repaired == {
+        "rebuilt": True,
+        "degraded": False,
+        "triggers_recreated": False,
+    }
+    assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+    conn.close()
+
+
+def test_due_startup_repair_rebuilds_same_count_drift_with_one_missing_trigger(
+    tmp_path, monkeypatch
+):
+    """A missing trigger must not suppress a due synchronous deep check."""
+    from hermes_lcm.store import MessageStore, build_message_fts_spec
+
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", "false")
+    db_path = str(tmp_path / "due-trigger-drift.db")
+    store = MessageStore(db_path)
+    try:
+        ids = store.append_batch(
+            "session",
+            [{"role": "user", "content": "oldtoken stable payload"}],
+            [3],
+            source="trigger-drift-regression",
+            conversation_id="conversation",
+        )
+        conn = store.connection
+        assert conn is not None
+        spec = build_message_fts_spec()
+        conn.execute("DROP TRIGGER msg_fts_update")
+        conn.execute(
+            "UPDATE messages SET content = 'newtoken stable payload' WHERE store_id = ?",
+            (ids[0],),
+        )
+        conn.execute(
+            "UPDATE metadata SET value = ? WHERE key = ?",
+            (
+                str(time.time() - 100 * 3600),
+                db_bootstrap._integrity_marker_key(spec),
+            ),
+        )
+        conn.commit()
+
+        assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is False
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is True
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'oldtoken'"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'newtoken'"
+        ).fetchone()[0] == 0
+
+        repaired = db_bootstrap.repair_external_content_fts(
+            conn, spec, throttle=True
+        )
+
+        assert repaired == {
+            "rebuilt": True,
+            "degraded": False,
+            "triggers_recreated": True,
+        }
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'oldtoken'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'newtoken'"
+        ).fetchone()[0] == 1
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is False
+        assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        store.close()
+
+    reopened = MessageStore(db_path)
+    try:
+        assert reopened.search("oldtoken") == []
+        matches = reopened.search("newtoken")
+        assert len(matches) == 1
+        assert matches[0]["content"] == "newtoken stable payload"
+        conn = reopened.connection
+        assert conn is not None
+        spec = build_message_fts_spec()
+        assert db_bootstrap._fts_missing_triggers(conn, spec) is False
+        assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        reopened.close()
+
+
 def test_repair_without_rebuild_still_clears_integrity_failed_flag(tmp_path, monkeypatch):
     """Even a no-op repair (nothing to rebuild) clears a stale corruption flag."""
     monkeypatch.setenv(INTERVAL_ENV, "24")
@@ -325,6 +686,33 @@ def test_is_fts_corruption_error_classification():
     assert not db_bootstrap._is_fts_corruption_error("query timeout expired")
 
 
+def test_sqlite_lock_error_classification_uses_codes_and_lock_messages():
+    coded_busy = sqlite3.OperationalError("synthetic non-lock message")
+    coded_busy.sqlite_errorcode = sqlite3.SQLITE_BUSY | (1 << 8)
+    assert db_bootstrap._is_sqlite_lock_error(coded_busy)
+
+    assert db_bootstrap._is_sqlite_lock_error(
+        sqlite3.OperationalError("database is locked")
+    )
+    assert db_bootstrap._is_sqlite_lock_error(
+        sqlite3.OperationalError("database table is locked: sqlite_master")
+    )
+
+    wrapped = RuntimeError("startup failed")
+    wrapped.__cause__ = sqlite3.OperationalError("database schema is locked")
+    assert db_bootstrap._is_sqlite_lock_error(wrapped)
+
+
+def test_sqlite_lock_error_classification_rejects_unrelated_timeout_text():
+    assert not db_bootstrap._is_sqlite_lock_error(
+        sqlite3.IntegrityError("constraint timeout while validating data")
+    )
+    assert not db_bootstrap._is_sqlite_lock_error(
+        sqlite3.OperationalError("busy parsing application expression")
+    )
+    assert not db_bootstrap._is_sqlite_lock_error(TimeoutError("query timeout"))
+
+
 def test_integrity_check_lock_error_is_unchecked_not_corruption(tmp_path, monkeypatch):
     """A transient lock/busy error classifies as 'unchecked', never 'fail' (F3).
 
@@ -353,6 +741,116 @@ def test_integrity_check_malformed_error_is_fail(tmp_path, monkeypatch):
     result = db_bootstrap.check_external_content_fts_integrity(fake, spec)
     assert result["status"] == "fail"
     conn.close()
+
+
+def test_fts_repair_lock_budget_propagates_without_destructive_repair(tmp_path, monkeypatch):
+    """A bounded ownership failure is not reclassified as FTS corruption."""
+    conn = _make_conn(tmp_path)
+    locker = sqlite3.connect(_db_file(tmp_path), timeout=1.0)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        monkeypatch.setattr(db_bootstrap, "SQLITE_BUSY_TIMEOUT_MS", 25)
+        with pytest.raises(sqlite3.OperationalError, match="locked|busy"):
+            ensure_external_content_fts(conn, _spec())
+
+        tables = _table_names(_db_file(tmp_path))
+        assert "messages_fts" not in tables
+        assert "messages_fts_docsize" not in tables
+    finally:
+        conn.close()
+        locker.rollback()
+        locker.close()
+
+
+def test_fts_repair_owned_transaction_commits_and_restores_busy_timeout(tmp_path):
+    conn = _make_conn(tmp_path)
+    conn.execute("PRAGMA busy_timeout=1234")
+
+    ensure_external_content_fts(conn, _spec())
+
+    assert conn.in_transaction is False
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1234
+    verify = sqlite3.connect(_db_file(tmp_path))
+    try:
+        assert "messages_fts" in _table_names(_db_file(tmp_path))
+        assert verify.execute("SELECT COUNT(*) FROM messages_fts_docsize").fetchone()[0] == 2
+    finally:
+        verify.close()
+        conn.close()
+
+
+def test_fts_repair_owned_transaction_rolls_back_and_restores_busy_timeout(
+    tmp_path, monkeypatch
+):
+    conn = _make_conn(tmp_path)
+    conn.execute("PRAGMA busy_timeout=1234")
+
+    def fail_after_rebuild(*args, **kwargs):
+        raise RuntimeError("synthetic post-rebuild failure")
+
+    monkeypatch.setattr(db_bootstrap, "_record_integrity_checked", fail_after_rebuild)
+    with pytest.raises(RuntimeError, match="synthetic post-rebuild failure"):
+        ensure_external_content_fts(conn, _spec())
+
+    assert conn.in_transaction is False
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 1234
+    tables = _table_names(_db_file(tmp_path))
+    assert "messages_fts" not in tables
+    assert "messages_fts_docsize" not in tables
+    conn.close()
+
+
+def test_fts_repair_preserves_caller_transaction_commit_behavior(tmp_path):
+    conn = _make_conn(tmp_path)
+    db_bootstrap.ensure_metadata_table(conn)
+    conn.commit()
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO metadata(key, value) VALUES('caller-write', 'committed')")
+
+    ensure_external_content_fts(conn, _spec())
+
+    assert conn.in_transaction is False
+    verify = sqlite3.connect(_db_file(tmp_path))
+    try:
+        assert verify.execute(
+            "SELECT value FROM metadata WHERE key='caller-write'"
+        ).fetchone()[0] == "committed"
+        assert verify.execute("SELECT COUNT(*) FROM messages_fts_docsize").fetchone()[0] == 2
+    finally:
+        verify.close()
+        conn.close()
+
+
+def test_fts_repair_failure_rolls_back_savepoint_not_caller_transaction(
+    tmp_path, monkeypatch
+):
+    conn = _make_conn(tmp_path)
+    db_bootstrap.ensure_metadata_table(conn)
+    conn.commit()
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO metadata(key, value) VALUES('caller-write', 'active')")
+
+    def fail_after_rebuild(*args, **kwargs):
+        raise RuntimeError("synthetic post-rebuild failure")
+
+    monkeypatch.setattr(db_bootstrap, "_record_integrity_checked", fail_after_rebuild)
+    with pytest.raises(RuntimeError, match="synthetic post-rebuild failure"):
+        ensure_external_content_fts(conn, _spec())
+
+    assert conn.in_transaction is True
+    assert conn.execute(
+        "SELECT value FROM metadata WHERE key='caller-write'"
+    ).fetchone()[0] == "active"
+    assert "messages_fts" not in _table_names(_db_file(tmp_path))
+    verify = sqlite3.connect(_db_file(tmp_path))
+    try:
+        assert verify.execute(
+            "SELECT value FROM metadata WHERE key='caller-write'"
+        ).fetchone() is None
+    finally:
+        verify.close()
+        conn.rollback()
+        conn.close()
 
 
 def test_doctor_repair_apply_joins_background_scans_first(tmp_path, monkeypatch):
