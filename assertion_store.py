@@ -21,6 +21,7 @@ from typing import Any, Iterable, Sequence
 from urllib.parse import quote
 
 from .db_bootstrap import (
+    ASSERTION_EPISTEMIC_VALUES,
     ASSERTION_MIGRATION_STEP,
     configure_connection,
     ensure_assertion_tables,
@@ -28,6 +29,7 @@ from .db_bootstrap import (
     refuse_schema_version_too_new,
     run_versioned_migrations,
     verify_assertion_schema,
+    _quote_hash,
 )
 
 
@@ -107,6 +109,9 @@ class AssertionCandidate:
     valid_from: float | None = None
     valid_to: float | None = None
     confidence: float = 1.0
+    # AMR §4.2 epistemic status marking. ``None`` means the unmarked state
+    # (absent is not fact); valid values are the closed AMR vocabulary.
+    epistemic: str | None = None
 
 
 @dataclass(frozen=True)
@@ -443,6 +448,17 @@ class AssertionStore:
         valid_to = _finite_number(candidate.valid_to, "valid_to")
         if valid_from is not None and valid_to is not None and valid_to <= valid_from:
             raise ValueError("valid_to must be greater than valid_from")
+        epistemic = candidate.epistemic
+        if epistemic is not None:
+            epistemic = str(epistemic).strip()
+            if epistemic == "":
+                epistemic = None
+            elif epistemic not in ASSERTION_EPISTEMIC_VALUES:
+                # AMR §4.2: values are case-sensitive and the vocabulary is
+                # closed — reject rather than coercing to a known value.
+                raise ValueError(
+                    f"unsupported epistemic value: {candidate.epistemic!r}"
+                )
         payload = {
             "source_store_id": snapshot.store_id,
             "extraction_version": version,
@@ -466,6 +482,11 @@ class AssertionStore:
             "confidence": confidence,
         }
         payload["assertion_id"] = _sha256_text(_canonical_json(payload))
+        # AMR quote anchor is bound post-digest: the identity digest covers
+        # the same fields as before this slice, so existing assertion ids
+        # remain stable across the migration.
+        payload["source_quote_hash"] = _quote_hash(payload["source_quote"])
+        payload["epistemic"] = epistemic
         return payload
 
     def assertion_id_for(
@@ -516,6 +537,7 @@ class AssertionStore:
             "confidence": confidence,
         }
         payload["relation_id"] = _sha256_text(_canonical_json(payload))
+        payload["source_quote_hash"] = _quote_hash(payload["source_quote"])
         return payload
 
     def publish_source(
@@ -691,14 +713,16 @@ class AssertionStore:
                             object_json, value_text, kind, polarity, strength,
                             scope_key, speaker_role, observed_at, event_at,
                             valid_from, valid_to, source_span_start, source_span_end,
-                            source_quote, confidence, created_at
+                            source_quote, source_quote_hash, epistemic,
+                            confidence, created_at
                         ) VALUES(
                             :assertion_id, :source_store_id, :extraction_version,
                             :source_content_sha256, :subject_key, :predicate_key,
                             :object_json, :value_text, :kind, :polarity, :strength,
                             :scope_key, :speaker_role, :observed_at, :event_at,
                             :valid_from, :valid_to, :source_span_start, :source_span_end,
-                            :source_quote, :confidence, :created_at
+                            :source_quote, :source_quote_hash, :epistemic,
+                            :confidence, :created_at
                         )
                         """,
                         {**row, "created_at": time.time()},
@@ -729,12 +753,12 @@ class AssertionStore:
                             relation_id, source_store_id, extraction_version,
                             source_content_sha256, from_assertion_id, relation_type,
                             to_assertion_id, source_span_start, source_span_end,
-                            source_quote, confidence, created_at
+                            source_quote, source_quote_hash, confidence, created_at
                         ) VALUES(
                             :relation_id, :source_store_id, :extraction_version,
                             :source_content_sha256, :from_assertion_id, :relation_type,
                             :to_assertion_id, :source_span_start, :source_span_end,
-                            :source_quote, :confidence, :created_at
+                            :source_quote, :source_quote_hash, :confidence, :created_at
                         )
                         """,
                         {**row, "created_at": time.time()},
