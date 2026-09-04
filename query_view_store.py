@@ -532,13 +532,13 @@ def _verify_query_view_schema(conn: sqlite3.Connection) -> list[str]:
 class QueryViewStore:
     """Versioned, exact-provenance materialized evidence views."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, db_lock: Any | None = None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
-        self._write_lock = threading.RLock()
+        self._write_lock = db_lock or threading.RLock()
         try:
             refuse_schema_version_too_new(self._conn)
             configure_connection(self._conn)
@@ -1272,3 +1272,28 @@ class QueryViewStore:
             self.close()
         except Exception:
             pass
+
+
+def _synchronized(method):
+    """Serialize operations that share one SQLite connection across clones."""
+    def locked(self, *args, **kwargs):
+        with self._write_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+for _method_name in (
+    "corpus_snapshot",
+    "snapshot_dependency",
+    "claim_build",
+    "publish_ready",
+    "mark_failed",
+    "reclaim_expired_builds",
+    "delta_events",
+    "lookup",
+    "expire_views",
+    "purge_expired",
+    "prune_corpus_events",
+):
+    setattr(QueryViewStore, _method_name, _synchronized(getattr(QueryViewStore, _method_name)))
