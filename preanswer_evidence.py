@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .evidence_pack import build_evidence_pack, normalize_question_date
 from .reasoning import EvidencePlan, compile_evidence_plan
+from .sufficiency_gate import apply_sufficiency_gate
 
 
 PREANSWER_EVIDENCE_VERSION = "preanswer-evidence-v1"
@@ -477,13 +478,53 @@ def build_preanswer_evidence(
     enabled: bool = False,
     context_engine_enabled: bool = True,
     budgets: Mapping[str, Any] | None = None,
+    sufficiency_gate: bool = False,
 ) -> dict[str, Any]:
     """Return one bounded ephemeral context addition, or no augmentation.
 
     Runtime inputs are restricted to the question, its explicit date anchor,
     bounded exact refs, and product retrieval.  The function is fail-open for
-    the host: it converts every error into ``context=None``.
+    the host: it converts every error into ``context=None``.  With
+    ``sufficiency_gate=True`` the finished result passes through the
+    sufficiency policy at the finalize seam (default-off preserves the exact
+    legacy result bytes).
     """
+    gate_started = time.perf_counter()
+    result = _build_preanswer_evidence_inner(
+        question,
+        engine=engine,
+        baseline_refs=baseline_refs,
+        question_date=question_date,
+        retrieve=retrieve,
+        enabled=enabled,
+        context_engine_enabled=context_engine_enabled,
+        budgets=budgets,
+    )
+    if sufficiency_gate and isinstance(result, dict):
+        try:
+            apply_sufficiency_gate(result, enabled=True, started=gate_started)
+        except Exception:  # noqa: BLE001 - the gate must stay fail-open
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "LCM sufficiency gate failed open in build_preanswer_evidence",
+                exc_info=True,
+            )
+    return result
+
+
+def _build_preanswer_evidence_inner(
+    question: Any,
+    *,
+    engine: Any,
+    baseline_refs: Sequence[Any] = (),
+    question_date: Any = None,
+    retrieve: Callable[[dict[str, Any]], Any] | None = None,
+    enabled: bool = False,
+    context_engine_enabled: bool = True,
+    budgets: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Legacy body: every return path below is the pre-gate contract."""
 
     started = time.perf_counter()
     limits = _budgets(budgets)

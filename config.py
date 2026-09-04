@@ -695,8 +695,8 @@ class LCMConfig:
     preanswer_evidence_enabled: bool = False
     # Empty preserves the historical boolean-only behavior: when the master
     # flag is true it resolves to ``legacy_selective``. Explicit values are
-    # off | legacy_selective | requirements_v1. The master flag remains the
-    # default-off activation boundary.
+    # off | legacy_selective | requirements_v1 | sufficiency_v1. The master
+    # flag remains the default-off activation boundary.
     preanswer_evidence_mode: str = ""
     # Optional minimal semantic selector for code-derived closed operations.
     # It is independent and default-off; enabling pre-answer evidence alone
