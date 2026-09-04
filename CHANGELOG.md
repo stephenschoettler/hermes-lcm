@@ -6,6 +6,50 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 No additional changes yet.
 
+## v1.0.0-rc.1 - 2026-09-03
+
+### Highlights
+
+- Harden untrusted prompt, externalized-payload, dependency, and SQLite file
+  boundaries while keeping optional assertion, query-view, pre-answer evidence,
+  embedding, and adaptive-retrieval paths disabled by default (#557).
+- Preserve active-runtime slash-command routing and durable cumulative
+  compaction telemetry across session rollover, restart, concurrent updates,
+  and response-hook persistence (#526).
+- Make concurrent startup safer by serializing deep FTS bootstrap repair and by
+  reconciling legitimate transient SQLite rollback-journal disappearance
+  without relaxing stable symlink, hardlink, or path-swap rejection (#570,
+  `c368323`).
+
+### Changed
+
+- #526 binds slash commands to the active runtime and makes cumulative
+  compaction counts durable across restart and session rollover.
+- #557 adds exact 900,000-token caps for the three proven bare Codex routes on
+  `openai-codex`, publishes the host-owned dependency assurance contract, and
+  hardens prompt, payload, storage, backup, and sidecar boundaries.
+- #570 serializes constructor-time FTS repair, rechecks the complete FTS state
+  after acquiring ownership, and preserves caller-owned transaction behavior.
+- `c368323` tolerates only verified transient rollback-journal disappearance or
+  unlink windows during SQLite artifact restriction. It also replaces a
+  scheduler-sensitive Voyage timing assertion with deterministic bounded-return
+  and exactly-once-dispatch synchronization; production provider behavior is
+  unchanged.
+
+### Upgrade and rollback notes
+
+- This is a prerelease candidate, not the stable v1.0.0 release. The tag-driven
+  workflow marks it as a prerelease and does not make it the latest release.
+- Before updating, use `/lcm backup` while Hermes is live, or stop every SQLite
+  writer and copy `lcm.db`, `lcm.db-wal`, and `lcm.db-shm` together as one
+  quiescent snapshot. Update the plugin, restart Hermes, send one normal
+  message, then verify `plugin_version: 1.0.0-rc.1` and the expected database
+  path with `lcm_status`.
+- The core schema remains version 5. No manual migration or embedding backfill
+  is required, and a stock/default-off upgrade creates no optional feature
+  tables. Restore the pre-upgrade snapshot before downgrading if an optional
+  store was enabled after the update.
+
 ## v0.21.0-rc2 - 2026-08-05
 
 ### Changed

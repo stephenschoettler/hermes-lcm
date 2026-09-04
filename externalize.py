@@ -9,6 +9,7 @@ recoverable through the LCM inspection and expansion tools.
 from __future__ import annotations
 
 import codecs
+import errno
 import hashlib
 import json
 import logging
@@ -26,6 +27,11 @@ _EXTERNALIZED_REF_RE = re.compile(
 )
 _EXTERNALIZED_SEARCH_HEADER_BYTES = 64 * 1024
 _EXTERNALIZED_SEARCH_TAIL_BYTES = 64 * 1024
+# Legacy readers need the whole JSON document, but must never allocate from an
+# attacker-controlled file size without a ceiling. This is deliberately larger
+# than normal provider-visible payloads while keeping one read memory-bounded.
+_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES = 64 * 1024 * 1024
+_SESSION_ID_VALUE_SPAN_KEY = "_session_id_value_span"
 
 
 def _placeholder_metadata(value: Any) -> str:
@@ -35,6 +41,31 @@ def _placeholder_metadata(value: Any) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+
+_UNSUPPORTED_FILESYSTEM_ERRNOS = {
+    value
+    for value in (
+        getattr(errno, "ENOSYS", None),
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if value is not None
+}
+
+
+def _is_unsupported_filesystem_capability(
+    exc: BaseException,
+    *,
+    windows_directory_access: bool = False,
+) -> bool:
+    if isinstance(exc, (TypeError, NotImplementedError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno in _UNSUPPORTED_FILESYSTEM_ERRNOS:
+        return True
+    return windows_directory_access and os.name == "nt" and isinstance(exc, PermissionError)
 
 
 def _tool_call_stub(tool_call_id: str) -> str:
@@ -60,9 +91,24 @@ def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    dir_fd = os.open(path, flags)
     try:
-        os.fsync(dir_fd)
+        dir_fd = os.open(path, flags)
+    except (OSError, TypeError, NotImplementedError) as exc:
+        if _is_unsupported_filesystem_capability(
+            exc,
+            windows_directory_access=True,
+        ):
+            return
+        raise
+    try:
+        try:
+            os.fsync(dir_fd)
+        except (OSError, TypeError, NotImplementedError) as exc:
+            if not _is_unsupported_filesystem_capability(
+                exc,
+                windows_directory_access=True,
+            ):
+                raise
     finally:
         os.close(dir_fd)
 
@@ -148,9 +194,20 @@ def _unlink_partial_payload(path: Path) -> None:
         logger.warning("Could not remove partial LCM externalized payload %s: %s", path, exc)
 
 
+def _unlink_partial_payload_at(name: str, *, dir_fd: int) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    except (OSError, TypeError, NotImplementedError) as exc:
+        logger.warning("Could not remove partial LCM externalized payload %s: %s", name, exc)
+
+
 def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
     data = json.dumps(payload, ensure_ascii=False, indent=2)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
@@ -166,13 +223,77 @@ def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
             os.close(fd)
 
 
-def _replace_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
+def _write_externalized_payload_at(name: str, payload: Dict[str, Any], *, dir_fd: int) -> None:
+    data = json.dumps(payload, ensure_ascii=False, indent=2)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.fsync(dir_fd)
+    except (OSError, TypeError, NotImplementedError):
+        _unlink_partial_payload_at(name, dir_fd=dir_fd)
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _revalidate_payload_name(
+    name: str,
+    *,
+    dir_fd: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != expected_identity:
+        raise OSError("externalized payload directory entry changed before replacement")
+
+
+def _replace_externalized_payload(
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    dir_fd: int | None = None,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    if dir_fd is not None:
+        try:
+            _write_externalized_payload_at(tmp_path.name, payload, dir_fd=dir_fd)
+            if expected_identity is not None:
+                _revalidate_payload_name(
+                    path.name,
+                    dir_fd=dir_fd,
+                    expected_identity=expected_identity,
+                )
+            os.replace(tmp_path.name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.fsync(dir_fd)
+        except (OSError, TypeError, NotImplementedError):
+            _unlink_partial_payload_at(tmp_path.name, dir_fd=dir_fd)
+            raise
+        return
     try:
         _write_externalized_payload(tmp_path, payload)
-        tmp_path.replace(path)
+        tmp_stat = _legacy_payload_path_snapshot(
+            tmp_path,
+            storage_dir=path.parent,
+        )[1]
+        if expected_identity is not None:
+            _revalidate_legacy_payload_path(
+                path,
+                expected_identity=expected_identity,
+            )
+        _revalidate_legacy_payload_path(
+            tmp_path,
+            expected_identity=(tmp_stat.st_dev, tmp_stat.st_ino),
+        )
+        os.replace(tmp_path, path)
         _fsync_directory(path.parent)
-    except OSError:
+    except (OSError, TypeError, NotImplementedError):
         _unlink_partial_payload(tmp_path)
         raise
 
@@ -535,6 +656,244 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def _same_file_identity(left, right) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _owned_by_effective_user(file_stat) -> bool:
+    file_uid = getattr(file_stat, "st_uid", None)
+    get_effective_uid = getattr(os, "geteuid", None)
+    return file_uid is None or get_effective_uid is None or file_uid == get_effective_uid()
+
+
+def _has_single_link(file_stat) -> bool:
+    return getattr(file_stat, "st_nlink", 1) == 1
+
+
+def _is_symlink_or_reparse_point(file_stat) -> bool:
+    if stat.S_ISLNK(file_stat.st_mode):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(file_stat, "st_file_attributes", 0) & reparse_flag)
+
+
+def _legacy_payload_path_snapshot(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> tuple[os.stat_result, os.stat_result]:
+    """Validate a path-based lookup used only without ``dir_fd`` support.
+
+    The descriptor-backed POSIX path remains authoritative. This fallback
+    rechecks containment, reparse/symlink state, ownership, link count, and
+    file identities around every open or replacement.
+    """
+    if path.parent != storage_dir or not path.name or Path(path.name).name != path.name:
+        raise OSError("externalized payload path is outside its configured store")
+    storage_stat = os.lstat(storage_dir)
+    if _is_symlink_or_reparse_point(storage_stat) or not stat.S_ISDIR(storage_stat.st_mode):
+        raise OSError("externalized payload store is not a plain directory")
+    resolved_storage = storage_dir.resolve(strict=True)
+    if path.parent.resolve(strict=True) != resolved_storage:
+        raise OSError("externalized payload parent escaped its configured store")
+    payload_stat = os.lstat(path)
+    if (
+        _is_symlink_or_reparse_point(payload_stat)
+        or not stat.S_ISREG(payload_stat.st_mode)
+        or not _owned_by_effective_user(payload_stat)
+        or not _has_single_link(payload_stat)
+        or payload_stat.st_size < 0
+    ):
+        raise OSError("externalized payload is not a safe regular file")
+    resolved_payload = path.resolve(strict=True)
+    if resolved_payload.parent != resolved_storage or resolved_payload.name != path.name:
+        raise OSError("externalized payload escaped its configured store")
+    return storage_stat, payload_stat
+
+
+def _revalidate_legacy_payload_path(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    _storage_stat, payload_stat = _legacy_payload_path_snapshot(
+        path,
+        storage_dir=path.parent,
+    )
+    if (payload_stat.st_dev, payload_stat.st_ino) != expected_identity:
+        raise OSError("externalized payload directory entry changed before replacement")
+
+
+def _open_legacy_externalized_payload_fallback(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> tuple[int, None, os.stat_result] | None:
+    """Open a sidecar safely when directory-relative descriptors are unavailable."""
+    payload_fd = -1
+    try:
+        expected_dir, expected_payload = _legacy_payload_path_snapshot(
+            path,
+            storage_dir=storage_dir,
+        )
+        payload_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        payload_flags |= getattr(os, "O_BINARY", 0)
+        payload_fd = os.open(path, payload_flags)
+        opened_payload = os.fstat(payload_fd)
+        current_dir, current_payload = _legacy_payload_path_snapshot(
+            path,
+            storage_dir=storage_dir,
+        )
+        if (
+            not stat.S_ISREG(opened_payload.st_mode)
+            or not _same_file_identity(expected_payload, opened_payload)
+            or not _same_file_identity(current_payload, opened_payload)
+            or not _same_file_identity(expected_dir, current_dir)
+            or not _owned_by_effective_user(opened_payload)
+            or not _has_single_link(opened_payload)
+            or opened_payload.st_size < 0
+        ):
+            return None
+        result = (payload_fd, None, opened_payload)
+        payload_fd = -1
+        return result
+    except (OSError, TypeError, NotImplementedError):
+        return None
+    finally:
+        if payload_fd >= 0:
+            os.close(payload_fd)
+
+
+def _open_legacy_externalized_payload(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> tuple[int, int | None, os.stat_result] | None:
+    """Open one legacy sidecar through verified directory-relative descriptors.
+
+    The pre-open ``stat`` and post-open ``fstat`` identity check closes the
+    regular-file-to-symlink replacement window even where ``O_NOFOLLOW`` is not
+    available. Opening relative to the already verified directory descriptor
+    keeps the object lookup contained to the configured payload store. The
+    caller owns both returned descriptors.
+    """
+    if path.parent != storage_dir or not path.name or Path(path.name).name != path.name:
+        return None
+
+    if os.name == "nt":
+        return _open_legacy_externalized_payload_fallback(
+            path,
+            storage_dir=storage_dir,
+        )
+
+    dir_fd = -1
+    payload_fd = -1
+    capability_failure = False
+    try:
+        expected_dir = os.lstat(storage_dir)
+        if stat.S_ISLNK(expected_dir.st_mode) or not stat.S_ISDIR(expected_dir.st_mode):
+            return None
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        dir_flags |= getattr(os, "O_BINARY", 0)
+        dir_fd = os.open(storage_dir, dir_flags)
+        opened_dir = os.fstat(dir_fd)
+        if not stat.S_ISDIR(opened_dir.st_mode) or not _same_file_identity(expected_dir, opened_dir):
+            return None
+
+        expected_payload = os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(expected_payload.st_mode)
+            or not _owned_by_effective_user(expected_payload)
+            or not _has_single_link(expected_payload)
+        ):
+            return None
+
+        if expected_payload.st_size < 0:
+            return None
+
+        payload_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        payload_flags |= getattr(os, "O_BINARY", 0)
+        payload_fd = os.open(path.name, payload_flags, dir_fd=dir_fd)
+        opened_payload = os.fstat(payload_fd)
+        if (
+            not stat.S_ISREG(opened_payload.st_mode)
+            or not _same_file_identity(expected_payload, opened_payload)
+            or not _owned_by_effective_user(opened_payload)
+            or not _has_single_link(opened_payload)
+            or opened_payload.st_size < 0
+        ):
+            return None
+
+        result = (payload_fd, dir_fd, opened_payload)
+        payload_fd = -1
+        dir_fd = -1
+        return result
+    except (OSError, TypeError, NotImplementedError) as exc:
+        capability_failure = _is_unsupported_filesystem_capability(exc)
+    finally:
+        if payload_fd >= 0:
+            os.close(payload_fd)
+        if dir_fd >= 0:
+            os.close(dir_fd)
+    if capability_failure:
+        return _open_legacy_externalized_payload_fallback(
+            path,
+            storage_dir=storage_dir,
+        )
+    return None
+
+
+def _read_legacy_externalized_payload_json_with_directory(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> tuple[Dict[str, Any], int | None, os.stat_result] | None:
+    """Read one legacy sidecar fully, subject to the allocation ceiling."""
+    opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
+    if opened is None:
+        return None
+    payload_fd, dir_fd, opened_payload = opened
+    try:
+        max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
+        if opened_payload.st_size > max_bytes:
+            return None
+
+        with os.fdopen(payload_fd, "rb") as handle:
+            payload_fd = -1
+            raw = handle.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            return None
+        decoded = json.loads(raw.decode("utf-8"))
+        if not isinstance(decoded, dict):
+            return None
+        result = (decoded, dir_fd, opened_payload)
+        dir_fd = None
+        return result
+    except (OSError, TypeError, UnicodeDecodeError, ValueError, json.JSONDecodeError, NotImplementedError):
+        return None
+    finally:
+        if payload_fd >= 0:
+            os.close(payload_fd)
+        if dir_fd is not None and dir_fd >= 0:
+            os.close(dir_fd)
+
+
+def _read_legacy_externalized_payload_json(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> Dict[str, Any] | None:
+    opened = _read_legacy_externalized_payload_json_with_directory(path, storage_dir=storage_dir)
+    if opened is None:
+        return None
+    payload, dir_fd, _payload_stat = opened
+    try:
+        return payload
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
 def _build_externalized_placeholder(summary: Dict[str, Any]) -> str:
     kind = _placeholder_metadata(summary.get("kind", "tool_result") or "tool_result")
     if kind != "tool_result":
@@ -647,9 +1006,9 @@ def _normalized_content_size(value: int | float | None) -> int | None:
     return normalized if normalized >= 0 else None
 
 
-def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], int | None]:
+def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, Any], int | None]:
     decoder = json.JSONDecoder()
-    fields: dict[str, str] = {}
+    fields: dict[str, Any] = {}
     length = len(text)
     index = 0
 
@@ -684,14 +1043,25 @@ def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[
             return fields, index if index < length and text[index] == '"' else None
         if index >= length:
             return fields, None
+        value_start = index
         try:
             value, index = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
             return fields, None
         if isinstance(value, str):
             fields[key] = value
+            if key == "session_id":
+                fields[_SESSION_ID_VALUE_SPAN_KEY] = (
+                    len(text[:value_start].encode("utf-8")),
+                    len(text[:index].encode("utf-8")),
+                )
+        elif key == "kind":
+            # Preserve an explicitly invalid kind so oversized readers cannot
+            # mistake it for the supported missing-kind legacy shape.
+            fields[key] = value
         elif key == "session_id":
             fields.pop(key, None)
+            fields[_SESSION_ID_VALUE_SPAN_KEY] = None
         index = skip_json_whitespace(index)
         if index >= length:
             return fields, None
@@ -703,7 +1073,7 @@ def _parse_top_level_json_string_fields_before_content(text: str) -> tuple[dict[
         return fields, None
 
 
-def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, str], bool]:
+def _inspect_top_level_json_string_fields_before_content(text: str) -> tuple[dict[str, Any], bool]:
     fields, content_quote_index = _parse_top_level_json_string_fields_before_content(text)
     return fields, content_quote_index is not None
 
@@ -712,14 +1082,14 @@ def _read_externalized_payload_metadata_prefix_from_handle(
     handle: BinaryIO,
     *,
     max_read_bytes: int,
-) -> tuple[str, dict[str, str], bool, bool]:
+) -> tuple[str, dict[str, Any], bool, bool]:
     """Read through the opening quote of the top-level content string."""
     prefix = bytearray()
     text_parts: list[str] = []
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     prefix_truncated = False
     read_limit = max(1, int(max_read_bytes))
-    fields: dict[str, str] = {}
+    fields: dict[str, Any] = {}
 
     while len(prefix) < read_limit:
         chunk = handle.read(min(4096, read_limit - len(prefix)))
@@ -875,6 +1245,574 @@ def read_externalized_payload_search_prefix(
     }
 
 
+class _StreamingJSONReader:
+    """Small bounded-memory byte reader for validating oversized sidecars."""
+
+    def __init__(self, handle: BinaryIO, *, start: int) -> None:
+        handle.seek(start)
+        self._handle = handle
+        self._buffer = b""
+        self._index = 0
+
+    def peek(self) -> int | None:
+        if self._index >= len(self._buffer):
+            self._buffer = self._handle.read(64 * 1024)
+            self._index = 0
+            if not self._buffer:
+                return None
+        return self._buffer[self._index]
+
+    def read(self) -> int | None:
+        byte = self.peek()
+        if byte is not None:
+            self._index += 1
+        return byte
+
+    def tell(self) -> int:
+        return self._handle.tell() - len(self._buffer) + self._index
+
+
+def _stream_json_skip_whitespace(reader: _StreamingJSONReader) -> None:
+    while (byte := reader.peek()) is not None and byte in b" \t\n\r":
+        reader.read()
+
+
+def _stream_json_is_digit(byte: int | None) -> bool:
+    return byte is not None and ord("0") <= byte <= ord("9")
+
+
+def _stream_json_read_string(
+    reader: _StreamingJSONReader,
+    *,
+    capture_limit: int = 4096,
+) -> str | None:
+    if reader.read() != ord('"'):
+        raise ValueError("invalid_json_string")
+    raw = bytearray()
+    truncated = False
+    escaped = False
+    unicode_digits_remaining = 0
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    while True:
+        byte = reader.read()
+        if byte is None:
+            raise ValueError("truncated_json_string")
+        if unicode_digits_remaining:
+            if byte not in b"0123456789abcdefABCDEF":
+                raise ValueError("invalid_json_unicode_escape")
+            unicode_digits_remaining -= 1
+        elif escaped:
+            if byte == ord("u"):
+                unicode_digits_remaining = 4
+            elif byte not in b'"\\/bfnrt':
+                raise ValueError("invalid_json_escape")
+            escaped = False
+        elif byte == ord("\\"):
+            escaped = True
+        elif byte == ord('"'):
+            decoder.decode(b"", final=True)
+            if truncated:
+                return None
+            value, end = json.JSONDecoder().raw_decode(
+                (b'"' + bytes(raw) + b'"').decode("utf-8")
+            )
+            if end != len(raw) + 2 or not isinstance(value, str):
+                raise ValueError("invalid_json_string")
+            return value
+        elif byte < 0x20:
+            raise ValueError("invalid_json_control_character")
+        decoder.decode(bytes((byte,)), final=False)
+        if len(raw) < capture_limit:
+            raw.append(byte)
+        else:
+            truncated = True
+
+
+def _stream_json_read_number(reader: _StreamingJSONReader) -> str | None:
+    captured = bytearray()
+    truncated = False
+
+    def consume() -> int:
+        nonlocal truncated
+        byte = reader.read()
+        if byte is None:
+            raise ValueError("truncated_json_number")
+        if len(captured) < 128:
+            captured.append(byte)
+        else:
+            truncated = True
+        return byte
+
+    if reader.peek() == ord("-"):
+        consume()
+    first = reader.peek()
+    if first == ord("0"):
+        consume()
+        if _stream_json_is_digit(reader.peek()):
+            raise ValueError("invalid_json_number")
+    elif first is not None and ord("1") <= first <= ord("9"):
+        consume()
+        while _stream_json_is_digit(reader.peek()):
+            consume()
+    else:
+        raise ValueError("invalid_json_number")
+    if reader.peek() == ord("."):
+        consume()
+        if not _stream_json_is_digit(reader.peek()):
+            raise ValueError("invalid_json_number")
+        while _stream_json_is_digit(reader.peek()):
+            consume()
+    if reader.peek() in (ord("e"), ord("E")):
+        consume()
+        if reader.peek() in (ord("+"), ord("-")):
+            consume()
+        if not _stream_json_is_digit(reader.peek()):
+            raise ValueError("invalid_json_number")
+        while _stream_json_is_digit(reader.peek()):
+            consume()
+    return None if truncated else captured.decode("ascii")
+
+
+def _stream_json_consume_literal(reader: _StreamingJSONReader, literal: bytes) -> None:
+    for expected in literal:
+        if reader.read() != expected:
+            raise ValueError("invalid_json_literal")
+
+
+def _stream_json_skip_value(reader: _StreamingJSONReader, *, depth: int = 0) -> None:
+    if depth > 64:
+        raise ValueError("json_nesting_too_deep")
+    _stream_json_skip_whitespace(reader)
+    byte = reader.peek()
+    if byte == ord('"'):
+        _stream_json_read_string(reader, capture_limit=0)
+        return
+    if byte == ord("{"):
+        reader.read()
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() == ord("}"):
+            reader.read()
+            return
+        while True:
+            _stream_json_read_string(reader, capture_limit=0)
+            _stream_json_skip_whitespace(reader)
+            if reader.read() != ord(":"):
+                raise ValueError("invalid_json_object")
+            _stream_json_skip_value(reader, depth=depth + 1)
+            _stream_json_skip_whitespace(reader)
+            separator = reader.read()
+            if separator == ord("}"):
+                return
+            if separator != ord(","):
+                raise ValueError("invalid_json_object")
+            _stream_json_skip_whitespace(reader)
+    if byte == ord("["):
+        reader.read()
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() == ord("]"):
+            reader.read()
+            return
+        while True:
+            _stream_json_skip_value(reader, depth=depth + 1)
+            _stream_json_skip_whitespace(reader)
+            separator = reader.read()
+            if separator == ord("]"):
+                return
+            if separator != ord(","):
+                raise ValueError("invalid_json_array")
+            _stream_json_skip_whitespace(reader)
+    if byte in (ord("-"), *range(ord("0"), ord("9") + 1)):
+        _stream_json_read_number(reader)
+        return
+    if byte == ord("t"):
+        _stream_json_consume_literal(reader, b"true")
+        return
+    if byte == ord("f"):
+        _stream_json_consume_literal(reader, b"false")
+        return
+    if byte == ord("n"):
+        _stream_json_consume_literal(reader, b"null")
+        return
+    raise ValueError("invalid_json_value")
+
+
+def _stream_json_read_marker_object(reader: _StreamingJSONReader) -> Dict[str, Any] | None:
+    if reader.read() != ord("{"):
+        raise ValueError("invalid_marker_object")
+    marker: Dict[str, Any] = {}
+    _stream_json_skip_whitespace(reader)
+    if reader.peek() == ord("}"):
+        reader.read()
+        return None
+    while True:
+        key = _stream_json_read_string(reader, capture_limit=256)
+        _stream_json_skip_whitespace(reader)
+        if reader.read() != ord(":"):
+            raise ValueError("invalid_marker_object")
+        _stream_json_skip_whitespace(reader)
+        if key == "source_path":
+            marker[key] = None
+            if reader.peek() == ord('"'):
+                marker[key] = _stream_json_read_string(reader)
+            else:
+                _stream_json_skip_value(reader, depth=1)
+        elif key == "expected_chars":
+            marker[key] = None
+            if reader.peek() == ord('"'):
+                marker[key] = _stream_json_read_string(reader, capture_limit=128)
+            elif reader.peek() in (
+                ord("-"),
+                *range(ord("0"), ord("9") + 1),
+            ):
+                marker[key] = _stream_json_read_number(reader)
+            else:
+                _stream_json_skip_value(reader, depth=1)
+        else:
+            _stream_json_skip_value(reader, depth=1)
+        _stream_json_skip_whitespace(reader)
+        separator = reader.read()
+        if separator == ord("}"):
+            break
+        if separator != ord(","):
+            raise ValueError("invalid_marker_object")
+        _stream_json_skip_whitespace(reader)
+    return _persisted_output_marker_entry_from_metadata(
+        {
+            "persisted_output_source_path": marker.get("source_path"),
+            "persisted_output_expected_chars": marker.get("expected_chars"),
+        }
+    )
+
+
+def _stream_json_read_marker_array(reader: _StreamingJSONReader) -> Dict[str, Any] | None:
+    if reader.read() != ord("["):
+        raise ValueError("invalid_marker_array")
+    first_valid: Dict[str, Any] | None = None
+    _stream_json_skip_whitespace(reader)
+    if reader.peek() == ord("]"):
+        reader.read()
+        return None
+    while True:
+        if reader.peek() == ord("{"):
+            marker = _stream_json_read_marker_object(reader)
+            if first_valid is None and marker is not None:
+                first_valid = marker
+        else:
+            _stream_json_skip_value(reader, depth=1)
+        _stream_json_skip_whitespace(reader)
+        separator = reader.read()
+        if separator == ord("]"):
+            return first_valid
+        if separator != ord(","):
+            raise ValueError("invalid_marker_array")
+        _stream_json_skip_whitespace(reader)
+
+
+def _stream_externalized_content_end(handle: BinaryIO, *, content_start: int) -> int | None:
+    if content_start < 0:
+        return None
+    handle.seek(content_start)
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    escaped = False
+    unicode_digits_remaining = 0
+    while True:
+        chunk_start = handle.tell()
+        chunk = handle.read(64 * 1024)
+        if not chunk:
+            return None
+        for index, byte in enumerate(chunk):
+            if unicode_digits_remaining:
+                if byte not in b"0123456789abcdefABCDEF":
+                    return None
+                unicode_digits_remaining -= 1
+            elif escaped:
+                if byte == ord("u"):
+                    unicode_digits_remaining = 4
+                elif byte not in b'"\\/bfnrt':
+                    return None
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                decoder.decode(chunk[:index], final=True)
+                return chunk_start + index + 1
+            elif byte < 0x20:
+                return None
+        decoder.decode(chunk, final=False)
+
+
+def _stream_externalized_payload_suffix_metadata(
+    handle: BinaryIO,
+    *,
+    content_start: int,
+) -> Dict[str, Any] | None:
+    """Validate the complete sidecar and retain only bounded marker metadata."""
+    content_end = _stream_externalized_content_end(handle, content_start=content_start)
+    if content_end is None:
+        return None
+    reader = _StreamingJSONReader(handle, start=content_end)
+    metadata: Dict[str, Any] = {}
+    try:
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() == ord("}"):
+            reader.read()
+        else:
+            if reader.read() != ord(","):
+                return None
+            while True:
+                _stream_json_skip_whitespace(reader)
+                key = _stream_json_read_string(reader, capture_limit=256)
+                _stream_json_skip_whitespace(reader)
+                if reader.read() != ord(":"):
+                    return None
+                _stream_json_skip_whitespace(reader)
+                value_start = reader.tell()
+                if key == "session_id":
+                    metadata[_SESSION_ID_VALUE_SPAN_KEY] = None
+                    if reader.peek() == ord('"'):
+                        metadata[key] = _stream_json_read_string(reader)
+                        metadata[_SESSION_ID_VALUE_SPAN_KEY] = (
+                            value_start,
+                            reader.tell(),
+                        )
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
+                elif key == "persisted_output_markers":
+                    if reader.peek() == ord("["):
+                        marker = _stream_json_read_marker_array(reader)
+                        metadata[key] = [marker] if marker is not None else []
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
+                elif key == "persisted_output_source_path":
+                    if reader.peek() == ord('"'):
+                        metadata[key] = _stream_json_read_string(reader)
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
+                elif key == "persisted_output_expected_chars" and reader.peek() == ord('"'):
+                    metadata[key] = _stream_json_read_string(reader, capture_limit=128)
+                elif key == "persisted_output_expected_chars" and reader.peek() in (
+                    ord("-"),
+                    *range(ord("0"), ord("9") + 1),
+                ):
+                    metadata[key] = _stream_json_read_number(reader)
+                elif key == "kind":
+                    if reader.peek() == ord('"'):
+                        metadata[key] = _stream_json_read_string(reader, capture_limit=256)
+                    else:
+                        metadata[key] = None
+                        _stream_json_skip_value(reader, depth=1)
+                else:
+                    _stream_json_skip_value(reader, depth=1)
+                _stream_json_skip_whitespace(reader)
+                separator = reader.read()
+                if separator == ord("}"):
+                    break
+                if separator != ord(","):
+                    return None
+        _stream_json_skip_whitespace(reader)
+        if reader.peek() is not None:
+            return None
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return metadata
+
+
+def _read_oversize_externalized_payload_metadata(
+    path: Path,
+    *,
+    storage_dir: Path,
+) -> Dict[str, Any] | None:
+    """Stream-validate an oversized sidecar and retain bounded marker metadata."""
+    opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
+    if opened is None:
+        return None
+    payload_fd, dir_fd, payload_stat = opened
+    try:
+        max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
+        if payload_stat.st_size <= max_bytes:
+            return None
+        with os.fdopen(payload_fd, "rb") as handle:
+            payload_fd = -1
+            prefix, fields, content_key_seen, prefix_truncated = (
+                _read_externalized_payload_metadata_prefix_from_handle(
+                    handle,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+            )
+            if not content_key_seen or prefix_truncated:
+                return None
+            suffix = _stream_externalized_payload_suffix_metadata(
+                handle,
+                content_start=len(prefix.encode("utf-8")),
+            )
+            if suffix is None:
+                return None
+            return {**fields, **suffix}
+    except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
+        return None
+    finally:
+        if payload_fd >= 0:
+            os.close(payload_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
+def _reassign_oversize_externalized_payload(
+    path: Path,
+    *,
+    old_session_id: str,
+    new_session_id: str,
+    storage_dir: Path,
+) -> bool:
+    """Rewrite only the bounded session-id prefix and stream the payload body."""
+    opened = _open_legacy_externalized_payload(path, storage_dir=storage_dir)
+    if opened is None:
+        return False
+    payload_fd, dir_fd, payload_stat = opened
+    tmp_name = f"{path.name}.{time.time_ns():x}.tmp"
+    tmp_path = path.with_name(tmp_name)
+    tmp_fd = -1
+    tmp_identity: tuple[int, int] | None = None
+    try:
+        max_bytes = max(1, int(_LEGACY_EXTERNALIZED_PAYLOAD_READ_MAX_BYTES))
+        if payload_stat.st_size <= max_bytes:
+            return False
+        with os.fdopen(payload_fd, "rb") as source:
+            payload_fd = -1
+            prefix, fields, content_key_seen, prefix_truncated = (
+                _read_externalized_payload_metadata_prefix_from_handle(
+                    source,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+            )
+            if not content_key_seen or prefix_truncated:
+                return False
+            suffix = _stream_externalized_payload_suffix_metadata(
+                source,
+                content_start=len(prefix.encode("utf-8")),
+            )
+            if suffix is None:
+                return False
+            effective_fields = {**fields, **suffix}
+            value_span = effective_fields.get(_SESSION_ID_VALUE_SPAN_KEY)
+            if effective_fields.get("session_id") != old_session_id:
+                return False
+            if (
+                not isinstance(value_span, tuple)
+                or len(value_span) != 2
+                or not all(isinstance(offset, int) for offset in value_span)
+            ):
+                return False
+            value_start, value_end = value_span
+            if value_start < 0 or value_start >= value_end or value_end > payload_stat.st_size:
+                return False
+
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            if dir_fd is None:
+                tmp_fd = os.open(tmp_path, flags, 0o600)
+            else:
+                tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=dir_fd)
+            opened_tmp = os.fstat(tmp_fd)
+            if (
+                not stat.S_ISREG(opened_tmp.st_mode)
+                or not _owned_by_effective_user(opened_tmp)
+                or not _has_single_link(opened_tmp)
+            ):
+                raise OSError("externalized payload temporary file is not safe")
+            tmp_identity = (opened_tmp.st_dev, opened_tmp.st_ino)
+            with os.fdopen(tmp_fd, "w+b") as destination:
+                tmp_fd = -1
+                source.seek(0)
+                remaining = value_start
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("payload_changed_during_copy")
+                    destination.write(chunk)
+                    remaining -= len(chunk)
+                destination.write(json.dumps(new_session_id, ensure_ascii=False).encode("utf-8"))
+                source.seek(value_end)
+                remaining = payload_stat.st_size - value_end
+                if remaining < 0:
+                    raise ValueError("payload_changed_during_copy")
+                while remaining:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("payload_changed_during_copy")
+                    destination.write(chunk)
+                    remaining -= len(chunk)
+                if source.read(1):
+                    raise ValueError("payload_changed_during_copy")
+                destination.flush()
+                os.fsync(destination.fileno())
+
+                destination.seek(0)
+                (
+                    copied_prefix,
+                    copied_fields,
+                    copied_content_key_seen,
+                    copied_prefix_truncated,
+                ) = _read_externalized_payload_metadata_prefix_from_handle(
+                    destination,
+                    max_read_bytes=_EXTERNALIZED_SEARCH_HEADER_BYTES,
+                )
+                copied_suffix = _stream_externalized_payload_suffix_metadata(
+                    destination,
+                    content_start=len(copied_prefix.encode("utf-8")),
+                )
+                copied_effective_fields = (
+                    {**copied_fields, **copied_suffix}
+                    if copied_suffix is not None
+                    else {}
+                )
+                if (
+                    not copied_content_key_seen
+                    or copied_prefix_truncated
+                    or copied_effective_fields.get("session_id") != new_session_id
+                ):
+                    raise ValueError("copied_payload_validation_failed")
+
+        if dir_fd is None:
+            if tmp_identity is None:
+                raise OSError("externalized payload temporary identity is unavailable")
+            _revalidate_legacy_payload_path(
+                path,
+                expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
+            )
+            _revalidate_legacy_payload_path(
+                tmp_path,
+                expected_identity=tmp_identity,
+            )
+            os.replace(tmp_path, path)
+            _fsync_directory(storage_dir)
+        else:
+            _revalidate_payload_name(
+                path.name,
+                dir_fd=dir_fd,
+                expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
+            )
+            os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.fsync(dir_fd)
+        return True
+    except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
+        if dir_fd is None:
+            _unlink_partial_payload(tmp_path)
+        else:
+            _unlink_partial_payload_at(tmp_name, dir_fd=dir_fd)
+        raise
+    finally:
+        if tmp_fd >= 0:
+            os.close(tmp_fd)
+        if payload_fd >= 0:
+            os.close(payload_fd)
+        if dir_fd is not None:
+            os.close(dir_fd)
+
+
 def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, hermes_home: str = "") -> bool:
     if not ref or Path(ref).name != ref:
         return False
@@ -882,9 +1820,10 @@ def externalized_tool_result_has_persisted_output_marker(ref: str, *, config, he
     if not storage_dir.exists() or not storage_dir.is_dir():
         return False
     path = storage_dir / ref
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    payload = _read_legacy_externalized_payload_json(path, storage_dir=storage_dir)
+    if payload is None:
+        payload = _read_oversize_externalized_payload_metadata(path, storage_dir=storage_dir)
+    if payload is None:
         return False
     if payload.get("kind", "tool_result") != "tool_result":
         return False
@@ -907,28 +1846,38 @@ def reassign_externalized_payloads(
 
     moved = 0
     for path in storage_dir.glob("*.json"):
-        if not path.is_file():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if (payload.get("session_id") or "") != old_session_id:
-            continue
-        payload["session_id"] = new_session_id
-        tmp_path = path.with_name(f"{path.name}.tmp")
-        try:
-            _write_externalized_payload(tmp_path, payload)
-            tmp_path.replace(path)
-            _fsync_directory(path.parent)
-        except OSError as exc:
-            logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
+        opened = _read_legacy_externalized_payload_json_with_directory(path, storage_dir=storage_dir)
+        if opened is None:
             try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                if _reassign_oversize_externalized_payload(
+                    path,
+                    old_session_id=old_session_id,
+                    new_session_id=new_session_id,
+                    storage_dir=storage_dir,
+                ):
+                    moved += 1
+            except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError) as exc:
+                logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
             continue
-        moved += 1
+        payload, dir_fd, payload_stat = opened
+        try:
+            if (payload.get("session_id") or "") != old_session_id:
+                continue
+            payload["session_id"] = new_session_id
+            try:
+                _replace_externalized_payload(
+                    path,
+                    payload,
+                    dir_fd=dir_fd,
+                    expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
+                )
+            except (OSError, TypeError, NotImplementedError) as exc:
+                logger.warning("Externalized payload session reassignment skipped for %s: %s", path.name, exc)
+                continue
+            moved += 1
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
     return moved
 
 
