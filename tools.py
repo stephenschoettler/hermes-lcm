@@ -341,6 +341,7 @@ def _shape_assertion_state_row(row: dict[str, Any]) -> dict[str, Any]:
         "unresolved_conflict": row["unresolved_conflict"],
         "attribution": row["attribution"],
         "semantic_state": row["semantic_state"],
+        "epistemic": row.get("epistemic"),
         "source_ref": {
             "store_id": row["source_store_id"],
             "session_id": row["source_session_id"],
@@ -349,6 +350,7 @@ def _shape_assertion_state_row(row: dict[str, Any]) -> dict[str, Any]:
             "span_start": row["source_span_start"],
             "span_end": row["source_span_end"],
             "quote": row["source_quote"],
+            "quote_hash": row.get("source_quote_hash"),
             "content_sha256": row["source_content_sha256"],
         },
     }
@@ -367,6 +369,7 @@ def _shape_assertion_state_relation(row: dict[str, Any]) -> dict[str, Any]:
             "span_start": row["source_span_start"],
             "span_end": row["source_span_end"],
             "quote": row["source_quote"],
+            "quote_hash": row.get("source_quote_hash"),
             "content_sha256": row["source_content_sha256"],
         },
     }

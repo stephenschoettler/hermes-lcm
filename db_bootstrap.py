@@ -6,6 +6,7 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from functools import lru_cache
 import logging
@@ -1759,6 +1760,17 @@ def verify_chunk_schema(conn: sqlite3.Connection) -> list[str]:
 
 ASSERTION_MIGRATION_STEP = "assertion_store_v1"
 
+# AMR (auditable-memory-records 0.1, docs/research Level-1 slice) vocabulary.
+# Closed set per AMR §4.2; ``None`` (field absent) is the fifth, unmarked state
+# and is never coerced to ``fact`` — absent is not fact.
+ASSERTION_EPISTEMIC_VALUES = frozenset({
+    "fact", "inference", "open_question", "unverified",
+})
+
+# ``quote_hash`` is serialized algorithm-prefixed (AMR §5). Bare digests are
+# deprecated; verifiers must resolve the algorithm from the prefix.
+ASSERTION_QUOTE_HASH_ALGORITHM = "sha256"
+
 _ASSERTION_TABLE_COLUMNS: dict[str, frozenset[str]] = {
     "lcm_assertion_sources": frozenset({
         "source_store_id", "extraction_version", "source_content_sha256",
@@ -1771,14 +1783,15 @@ _ASSERTION_TABLE_COLUMNS: dict[str, frozenset[str]] = {
         "source_content_sha256", "subject_key", "predicate_key", "object_json",
         "value_text", "kind", "polarity", "strength", "scope_key",
         "speaker_role", "observed_at", "event_at", "valid_from", "valid_to",
-        "source_span_start", "source_span_end", "source_quote", "confidence",
+        "source_span_start", "source_span_end", "source_quote",
+        "source_quote_hash", "epistemic", "confidence",
         "created_at",
     }),
     "lcm_assertion_relations": frozenset({
         "relation_id", "source_store_id", "extraction_version",
         "source_content_sha256", "from_assertion_id", "relation_type",
         "to_assertion_id", "source_span_start", "source_span_end",
-        "source_quote", "confidence", "created_at",
+        "source_quote", "source_quote_hash", "confidence", "created_at",
     }),
 }
 
@@ -1938,6 +1951,13 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
             source_span_start INTEGER NOT NULL CHECK(source_span_start >= 0),
             source_span_end INTEGER NOT NULL CHECK(source_span_end > source_span_start),
             source_quote TEXT NOT NULL,
+            source_quote_hash TEXT NOT NULL
+                CHECK(length(source_quote_hash) = 71
+                     AND substr(source_quote_hash, 1, 7) = 'sha256:'
+                     AND substr(source_quote_hash, 8) NOT GLOB '*[^0-9a-f]*'),
+            epistemic TEXT CHECK(epistemic IS NULL OR epistemic IN (
+                'fact', 'inference', 'open_question', 'unverified'
+            )),
             confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
             created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
             CHECK(valid_from IS NULL OR valid_to IS NULL OR valid_to > valid_from)
@@ -1962,6 +1982,10 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
             source_span_start INTEGER NOT NULL CHECK(source_span_start >= 0),
             source_span_end INTEGER NOT NULL CHECK(source_span_end > source_span_start),
             source_quote TEXT NOT NULL,
+            source_quote_hash TEXT NOT NULL
+                CHECK(length(source_quote_hash) = 71
+                     AND substr(source_quote_hash, 1, 7) = 'sha256:'
+                     AND substr(source_quote_hash, 8) NOT GLOB '*[^0-9a-f]*'),
             confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
             created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
             CHECK(from_assertion_id <> to_assertion_id)
@@ -2101,6 +2125,134 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
         END;
         """
     )
+    _migrate_assertion_quote_anchors(conn)
+
+
+def _normalize_quote_for_hash(quote: str) -> str:
+    """AMR §5 normalization applied before hashing or substring matching.
+
+    Smart punctuation folds to ASCII, every whitespace run (including
+    newlines and tabs) collapses to one space, and the result is trimmed.
+    Normalization MUST stay identical across implementations for hashes to
+    interoperate and is idempotent.
+    """
+    _SMART_FOLDS = {
+        "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+        "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+        "\u2032": "'", "\u2033": '"',
+        "\u2013": "-", "\u2014": "-", "\u2212": "-",
+        "\u2026": "...",
+    }
+    folded = "".join(_SMART_FOLDS.get(ch, ch) for ch in str(quote))
+    return " ".join(folded.split())
+
+
+def _quote_hash(quote: str) -> str:
+    """Algorithm-prefixed AMR §5 quote hash (lowercase hex sha256)."""
+    digest = hashlib.sha256(
+        _normalize_quote_for_hash(quote).encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _migrate_assertion_quote_anchors(conn: sqlite3.Connection) -> None:
+    """Idempotent in-place migration adding the AMR quote-anchor columns.
+
+    Rebuilds the two rebuildable quote tables (copy out, drop, recreate via
+    this build's own DDL, copy back with per-row hash backfill) while every
+    ``lcm_assertion_sources`` row — including invalidation history — is
+    preserved untouched. Databases already in final shape are untouched.
+    The row/relation insert guards are temporarily dropped for the copy so
+    assertions of already-invalidated sources stay visible; they are
+    recreated before this function returns.
+    """
+    _OLD_NAMES = {
+        "lcm_assertions": "_lcm_amr_old_assertions",
+        "lcm_assertion_relations": "_lcm_amr_old_relations",
+    }
+
+    def _table_exists(table: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                (table,),
+            ).fetchone()
+            is not None
+        )
+
+    def _needs_rebuild(table: str) -> bool:
+        if not _table_exists(table):
+            return False
+        columns = {str(item[1]) for item in conn.execute(f"PRAGMA table_info({table})")}
+        return "source_quote_hash" not in columns
+
+    if not any(_needs_rebuild(table) for table in _OLD_NAMES):
+        return
+
+    for table in _OLD_NAMES:
+        if _needs_rebuild(table):
+            conn.execute(f"ALTER TABLE {table} RENAME TO {_OLD_NAMES[table]}")
+    # ALTER TABLE RENAME carries index names onto the renamed tables, which
+    # would make the IF NOT EXISTS index DDL below no-ops; drop them first.
+    conn.executescript(
+        """
+        DROP INDEX IF EXISTS idx_lcm_assertion_sources_current;
+        DROP INDEX IF EXISTS idx_lcm_assertions_source;
+        DROP INDEX IF EXISTS idx_lcm_assertions_state;
+        DROP INDEX IF EXISTS idx_lcm_assertion_relations_source;
+        DROP INDEX IF EXISTS idx_lcm_assertion_relations_from;
+        DROP INDEX IF EXISTS idx_lcm_assertion_relations_to;
+        """
+    )
+    try:
+        ensure_assertion_tables(conn)
+        # ensure_assertion_tables itself ends with a call to
+        # _migrate_assertion_quote_anchors. That recursion is intentional and
+        # terminates: by this point the fresh DDL exists and all data lives in
+        # the new tables, so _needs_rebuild is false on re-entry and the
+        # migration is a no-op.
+        # The insert guards reject re-inserting assertions whose source is
+        # already invalidated; the copy must preserve those rows, so the
+        # guards come down for the copy and are recreated below.
+        conn.execute("DROP TRIGGER IF EXISTS lcm_assertion_row_insert_guard")
+        conn.execute("DROP TRIGGER IF EXISTS lcm_assertion_relation_insert_guard")
+        for table, old in _OLD_NAMES.items():
+            if not _table_exists(old):
+                continue
+            new_cols = [
+                str(item[1]) for item in conn.execute(f"PRAGMA table_info({table})")
+            ]
+            old_cols = {
+                str(item[1]) for item in conn.execute(f"PRAGMA table_info({old})")
+            }
+            shared = [column for column in new_cols if column in old_cols]
+            rows = conn.execute(
+                f"SELECT {', '.join(shared)} FROM {old}"
+            ).fetchall()
+            placeholders = ", ".join("?" for _ in new_cols)
+            column_list = ", ".join(new_cols)
+            for row in rows:
+                values = dict(zip(shared, row))
+                quote = str(values.get("source_quote", ""))
+                insert_values = [
+                    (
+                        values[column]
+                        if column in values
+                        else _quote_hash(quote)
+                        if column == "source_quote_hash"
+                        else None
+                    )
+                    for column in new_cols
+                ]
+                conn.execute(
+                    f"INSERT INTO {table}({column_list}) VALUES({placeholders})",
+                    insert_values,
+                )
+            conn.execute(f"DROP TABLE {old}")
+        ensure_assertion_tables(conn)
+    finally:
+        conn.execute("DROP TABLE IF EXISTS _lcm_amr_old_assertions")
+        conn.execute("DROP TABLE IF EXISTS _lcm_amr_old_relations")
 
 
 @lru_cache(maxsize=1)
