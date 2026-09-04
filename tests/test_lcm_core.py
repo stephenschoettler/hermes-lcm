@@ -336,6 +336,9 @@ class TestProviderPrefixedAuxiliaryCalls:
             return self._fake_response("summary")
 
         self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        TestModelRouting()._install_fake_provider_modules(
+            monkeypatch, named_custom={}, registry={}
+        )
 
         result = _call_llm_for_summary("summarize", 200, model="cerebras/gpt-oss-120b")
 

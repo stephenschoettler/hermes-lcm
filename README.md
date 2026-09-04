@@ -423,10 +423,12 @@ moved back to that assistant even when doing so exceeds a configured bound.
 | Variable | Default | Use |
 |----------|---------|-----|
 | `LCM_SUMMARY_MODEL` | auxiliary | Override summarization model |
+| `LCM_SUMMARY_REASONING_EFFORT` | task/provider default | Summary reasoning override: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`; YAML key: `lcm.summary_reasoning_effort` |
 | `LCM_SUMMARY_FALLBACK_MODELS` | empty | Comma-separated summarization models tried after `LCM_SUMMARY_MODEL` or the auxiliary task default fails |
 | `LCM_SUMMARY_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `2` | Consecutive failed summarization calls before a route is skipped temporarily |
 | `LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `300` | Seconds to skip an open summary route before retrying it |
 | `LCM_EXPANSION_MODEL` | summary model / auxiliary | Override `lcm_expand_query` synthesis model |
+| `LCM_EXPANSION_REASONING_EFFORT` | task/provider default | Expansion synthesis reasoning override with the same supported values; YAML key: `lcm.expansion_reasoning_effort` |
 | `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Context budget used by the auxiliary LLM for `lcm_expand_query` |
 | `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for one summarization call |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
