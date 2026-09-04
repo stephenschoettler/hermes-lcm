@@ -159,7 +159,27 @@ def _effective_preanswer_mode(config) -> str:
     raw = str(getattr(config, "preanswer_evidence_mode", "") or "").strip().casefold()
     if not raw:
         return "legacy_selective"
-    return raw if raw in {"off", "legacy_selective", "requirements_v1"} else "off"
+    return (
+        raw
+        if raw in {"off", "legacy_selective", "requirements_v1", "sufficiency_v1"}
+        else "off"
+    )
+
+
+def _apply_hook_sufficiency_gate(config, result) -> None:
+    """Attach the sufficiency verdict to a hook-path result dict, in place.
+
+    Fail-open: any gate error leaves the result untouched so the ordinary
+    evidence path is never disturbed by policy rendering.
+    """
+    if not isinstance(result, dict):
+        return
+    try:
+        from .sufficiency_gate import apply_sufficiency_gate
+
+        apply_sufficiency_gate(result, enabled=True)
+    except Exception as exc:  # noqa: BLE001 - policy must fail open
+        logger.warning("LCM sufficiency gate failed open: %s", exc)
 
 
 def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
@@ -179,7 +199,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
             return {"context": recall_policy}
         question_date = _hook_question_date(payload)
 
-        if mode == "requirements_v1":
+        if mode in {"requirements_v1", "sufficiency_v1"}:
             from .answer_contract import compile_answer_contract
             from .evidence_compiler import compile_preanswer_evidence
 
@@ -201,6 +221,8 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
                 enabled=True,
                 render_baseline_context=baseline_was_internal,
             )
+            if mode == "sufficiency_v1":
+                _apply_hook_sufficiency_gate(config, result)
             try:
                 active_engine._last_preanswer_evidence_trace = result
             except Exception:
@@ -234,6 +256,8 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
             question_date=question_date,
             enabled=True,
         )
+        if mode == "sufficiency_v1":
+            _apply_hook_sufficiency_gate(config, result)
         compiler_result = None
         selector_usage = None
         if bool(getattr(config, "selective_compiler_enabled", False)):
