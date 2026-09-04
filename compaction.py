@@ -117,6 +117,12 @@ class CompactionMixin:
                 return False
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
+            # If ingest restores a smaller cached canonical replay, the host
+            # still retains the larger original list unless compression is
+            # requested. Use both views for pressure so semantic normalization
+            # (for example whitespace-heavy JSON tool arguments) cannot hide a
+            # prompt that has already crossed the configured threshold.
+            pressure_rough = max(rough, replay_rough)
             cleanup_requested = self._replay_diff_requests_ingest_cleanup(
                 messages,
                 replay_messages,
@@ -149,27 +155,39 @@ class CompactionMixin:
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
-            eligible, reason = self._leaf_compaction_candidate_status(
-                replay_messages,
-                allow_partial_leaf=bool(
-                    self._config.threshold_full_sweep_enabled
-                    and self.threshold_tokens > 0
-                    and replay_rough >= self.threshold_tokens
-                ),
-            )
-            if eligible:
-                return self._mark_preflight_compression_requested()
-            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
-                return self._mark_preflight_compression_requested()
-            if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
-                if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
+            if self.threshold_tokens > 0 and pressure_rough >= self.threshold_tokens:
+                # A replay can differ only because the host added provider
+                # metadata after the previous turn and ingest restored the
+                # cached canonical prefix. Equality alone is not context
+                # pressure: ordinary leaf/ignored-backlog work must remain
+                # behind the configured threshold just like the non-divergent
+                # path below. Explicit cleanup, overflow, and opt-in deferred
+                # maintenance keep their separate gates.
+                eligible, reason = self._leaf_compaction_candidate_status(
+                    replay_messages,
+                    allow_partial_leaf=self._config.threshold_full_sweep_enabled,
+                )
+                if eligible:
+                    return self._mark_preflight_compression_requested()
+                if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
+                    return self._mark_preflight_compression_requested()
+                if self._should_run_deferred_maintenance(
+                    replay_messages,
+                    observed_tokens=pressure_rough,
+                ):
                     return self._mark_preflight_compression_requested()
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = reason
                 logger.info("LCM preflight compression no-op: %s", reason)
                 return False
-            self._refresh_raw_backlog_debt(replay_messages, observed_tokens=replay_rough)
-            if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
+            self._refresh_raw_backlog_debt(
+                replay_messages,
+                observed_tokens=pressure_rough,
+            )
+            if self._should_run_deferred_maintenance(
+                replay_messages,
+                observed_tokens=pressure_rough,
+            ):
                 return self._mark_preflight_compression_requested()
             return False
         if self._compression_boundary_cooldown_active():
@@ -233,6 +251,54 @@ class CompactionMixin:
             ):
                 return True
         return False
+
+    def _cleanup_reached_normal_compaction_threshold(
+        self,
+        original_messages: List[Dict[str, Any]],
+        replay_messages: List[Dict[str, Any]],
+        *,
+        observed_tokens: Optional[int] = None,
+    ) -> bool:
+        """Return whether cleanup coincides with normal threshold pressure.
+
+        Preflight has only the message estimator, while ``compress()`` may get a
+        more accurate host-side prompt count.  When present, that observed count
+        is authoritative; otherwise use the larger original/replay estimate.
+        This prevents a preflight cleanup decision from masking real pressure.
+        """
+        if self.threshold_tokens <= 0:
+            return False
+        if observed_tokens is not None and observed_tokens > 0:
+            return observed_tokens >= self.threshold_tokens
+        token_counts = [
+            count_messages_tokens(original_messages),
+            count_messages_tokens(replay_messages),
+        ]
+        return max(token_counts, default=0) >= self.threshold_tokens
+
+    def _leading_replayed_context_scaffold_span(
+        self,
+        working_messages: List[Dict[str, Any]],
+        pressure_messages: List[Dict[str, Any]],
+    ) -> tuple[int, int, int]:
+        """Return anchor, fresh-tail, and leading-scaffold end indexes.
+
+        Replayed LCM summaries/objective anchors at the start of the compactable
+        prefix are derived context. Both summary-producing compaction and
+        cleanup-only replay adoption must replace that prefix from the DAG
+        instead of carrying stale scaffolding forward as literal user input.
+        """
+        leading_anchor_count = self._leading_anchor_count(working_messages)
+        fresh_tail_start = self._fresh_tail_start(pressure_messages)
+        scaffold_end = leading_anchor_count
+        while (
+            scaffold_end < fresh_tail_start
+            and self._is_replayed_context_scaffold_message(
+                working_messages[scaffold_end]
+            )
+        ):
+            scaffold_end += 1
+        return leading_anchor_count, fresh_tail_start, scaffold_end
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
         if not self._compiled_ignore_message_patterns or not messages:
@@ -428,34 +494,32 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        ingest_cleanup_requested = bool(
+            ingest_cleanup_changed_active_context
+            and self._replay_diff_requests_ingest_cleanup(
+                messages,
+                working_messages,
+            )
+        )
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
+            or self._compression_boundary_cooldown_active()
+        )
+        cleanup_reached_threshold = self._cleanup_reached_normal_compaction_threshold(
+            messages,
+            working_messages,
+            observed_tokens=observed_prompt_tokens,
+        )
+        ingest_cleanup_only = bool(
+            ingest_cleanup_requested
+            and not force
             and not force_overflow
+            and (
+                cleanup_only_due_to_boundary_cooldown
+                or not cleanup_reached_threshold
+            )
         )
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        if cleanup_only_due_to_boundary_cooldown:
-            sanitized_messages = self._sanitize_active_context_messages(
-                working_messages,
-                insert_missing_tool_stubs=False,
-            )
-            self._refresh_raw_backlog_debt(
-                sanitized_messages,
-                observed_tokens=observed_prompt_tokens,
-            )
-            self._ingest_cursor = len(sanitized_messages)
-            self._last_compression_status = "sanitized"
-            self._last_compression_noop_reason = ""
-            self._write_generated_ignored_placeholder_hash_counts(
-                self._generated_placeholder_digest_budget_for_active_replay(
-                    sanitized_messages
-                )
-            )
-            self._write_generated_ignored_placeholder_hash_ordinals(
-                self._generated_placeholder_digest_ordinals_for_active_replay(
-                    sanitized_messages
-                )
-            )
-            return sanitized_messages
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
@@ -468,6 +532,7 @@ class CompactionMixin:
         )
         threshold_full_sweep_active = bool(
             self._config.threshold_full_sweep_enabled
+            and not ingest_cleanup_only
             and not force_overflow
             and self.threshold_tokens > 0
             and estimated_active_tokens >= self.threshold_tokens
@@ -503,7 +568,8 @@ class CompactionMixin:
             messages=working_messages,
         )
         deferred_maintenance_active = (
-            not force_overflow
+            not ingest_cleanup_only
+            and not force_overflow
             and not threshold_full_sweep_active
             and self._should_run_deferred_maintenance(
                 working_messages,
@@ -531,13 +597,18 @@ class CompactionMixin:
             if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
                 sweep_stop_reason = "time_budget_exhausted"
                 break
-            fresh_tail_start = self._fresh_tail_start(pressure_messages)
-
             # Keep only a real system prompt anchored. Gateway sessions may
             # pass only conversation messages, so index 0 can be an old user
             # turn; that must remain eligible for compaction instead of being
             # replayed forever as fresh-looking intent.
-            leading_anchor_count = self._leading_anchor_count(working_messages)
+            (
+                leading_anchor_count,
+                fresh_tail_start,
+                candidate_start,
+            ) = self._leading_replayed_context_scaffold_span(
+                working_messages,
+                pressure_messages,
+            )
             if fresh_tail_start <= leading_anchor_count:
                 noop_reason = "no eligible raw backlog outside fresh tail"
                 if threshold_full_sweep_active:
@@ -545,12 +616,6 @@ class CompactionMixin:
                     sweep_stop_reason = "raw_prefix_drained"
                 break
 
-            candidate_start = leading_anchor_count
-            while (
-                candidate_start < fresh_tail_start
-                and self._is_replayed_context_scaffold_message(working_messages[candidate_start])
-            ):
-                candidate_start += 1
             if candidate_start > leading_anchor_count:
                 dropped_replayed_scaffold_messages = True
                 working_messages = working_messages[:leading_anchor_count] + working_messages[candidate_start:]
@@ -645,6 +710,15 @@ class CompactionMixin:
                 if dropped_ignored_backlog and fresh_tail_start <= leading_anchor_count:
                     noop_reason = "selected leaf chunk lacks raw store lineage"
                     break
+
+            if ingest_cleanup_only:
+                # The deterministic scaffold/ignore/dependent-reply cleanup
+                # above must still run, but this maintenance pass may not cross
+                # into summary-producing work below the normal threshold (or
+                # while a compression-boundary cooldown is active). The common
+                # no-leaf finalizer below sanitizes/reassembles from the DAG.
+                noop_reason = "ingest cleanup does not permit summary work"
+                break
 
             # Auto-derive focus topic from the post-filter compaction view when
             # not explicitly provided.  The derived focus is summarizer-visible,

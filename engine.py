@@ -4852,16 +4852,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages_to_store_with_index,
             protected_messages,
         ):
-            if self._protected_message_uses_raw_payload_active_stub(protected_msg):
-                if active_replay_messages is replay_messages:
-                    active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-                        replay_messages
-                    )
-                active_message = dict(active_replay_messages[absolute_idx])
-                active_message["content"] = protected_msg["content"]
-                active_replay_messages[absolute_idx] = active_message
-                continue
-
             active_message = active_replay_messages[absolute_idx]
             stubbed_message = self._maybe_stub_active_tool_result(
                 active_message,
@@ -4894,18 +4884,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._compression_boundary_stored_placeholder_digest_counts = {}
         logger.debug("Ingested %d messages into LCM store", len(messages_to_store_with_index))
         self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-        # Most ``protected_messages`` changes are storage-only: inline media and
-        # data/base64 substrings stay provider-usable in active replay. The
-        # exceptions are whole-message ``raw_payload`` externalization and the
-        # separately opt-in textual tool-result interceptor above.
+        # ``protected_messages`` is the durable-store view only: inline media,
+        # data/base64 substrings, and generic whole-message ``raw_payload``
+        # externalization must not shrink provider-visible active context before
+        # the configured compression threshold. The separately opt-in textual
+        # tool-result interceptor above remains an active-replay policy.
         return self._remember_active_replay_messages(messages, active_replay_messages)
-
-    @staticmethod
-    def _protected_message_uses_raw_payload_active_stub(message: Dict[str, Any]) -> bool:
-        content = message.get("content")
-        return isinstance(content, str) and content.startswith(
-            "[Externalized payload: kind=raw_payload;"
-        )
 
     def _get_store_ids_for_messages(self, messages: List[Dict[str, Any]]) -> List[int]:
         ids_by_message_id = self._get_store_id_map_for_messages(messages)

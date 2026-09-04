@@ -408,7 +408,7 @@ moved back to that assistant even when doing so exceeds a configured bound.
 | `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content is excluded from LCM storage |
 | `LCM_SENSITIVE_PATTERNS_ENABLED` | `false` | Opt in to deterministic redaction before LCM storage, FTS indexing, summarization, active replay, and externalized ingest payloads |
 | `LCM_SENSITIVE_PATTERNS` | `api_key,bearer_token,password_assignment,private_key` | Comma-separated named sensitive pattern catalog entries to apply when redaction is enabled |
-| `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized ingest payloads, including tool results, media blocks, and generic raw content, in plugin-managed JSON files |
+| `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized ingest payloads, including tool results, media blocks, and generic raw content, in plugin-managed JSON files; generic non-tool text remains unchanged in active replay |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for normalized payload text |
 | `LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED` | `false` | Replace token-heavy textual tool results with recoverable externalized refs in active replay; current-turn ingest is immediate and historical assembly respects the protected fresh tail; requires large-output externalization |
 | `LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUB_THRESHOLD_TOKENS` | `25000` | Token-aware threshold for active-replay tool-result stubbing |
@@ -417,6 +417,14 @@ moved back to that assistant even when doing so exceeds a configured bound.
 | `LCM_EMPTY_LIFECYCLE_GC_ENABLED` | `true` | Master toggle for automatic pruning of lifecycle rows for sessions that never ingested any messages or summary nodes |
 | `LCM_EMPTY_LIFECYCLE_GC_THRESHOLD` | `200` | Number of lifecycle rows at which the GC pass fires |
 | `LCM_EMPTY_LIFECYCLE_GC_MAX_AGE_HOURS` | `24` | Automatic GC only deletes empty lifecycle rows at least this old; set `0` only in trusted/test environments that intentionally want immediate empty-row pruning |
+
+Large-output externalization is a durable-storage policy, not an early context
+compression boundary. Generic user, assistant, system, and other non-tool text
+remains provider-visible in active replay until normal compaction selects it.
+Only `LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED` opts textual tool results
+into recoverable active-replay refs. Sensitive-value redaction, ignored-message
+filtering, and suspicious-assistant quarantine remain separate safety policies
+and may still change active replay according to their own settings.
 
 ### Model and timeout settings
 
@@ -466,6 +474,13 @@ When `context.engine: lcm` is active, `LCM_CONTEXT_THRESHOLD` is the compaction
 threshold LCM uses. Hermes core `compression.threshold` belongs to the built-in
 compressor. Hermes core `compression.enabled` is still the global gate that
 allows compaction, so leave it enabled when using LCM.
+
+During ordinary automatic preflight below this threshold, ingest protection may
+still ask the host to publish a sanitized replay (for example a recoverable
+tool-result ref or sensitive-value redaction), but that cleanup-only pass does
+not call the summarizer or create a DAG node. Manual ``force`` requests,
+overflow recovery, and explicitly enabled deferred maintenance keep their own
+compaction semantics.
 
 If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the

@@ -242,13 +242,39 @@ def test_sensitive_patterns_redact_before_summary_serialization(tmp_path, monkey
             {"role": "user", "content": f"api_key={secret} should be hidden"},
             {"role": "user", "content": "fresh tail"},
         ],
-        current_tokens=10_000,
+        current_tokens=engine.threshold_tokens,
     )
 
     assert captured["text"]
     assert "[LCM sensitive redaction:" in captured["text"]
     node = engine._dag.get_session_nodes(engine.current_session_id)[0]
     assert secret not in node.summary
+
+
+def test_sensitive_patterns_subthreshold_cleanup_does_not_summarize(tmp_path, monkeypatch):
+    engine = _sensitive_engine(tmp_path, fresh_tail_count=1, leaf_chunk_tokens=1)
+    secret = "sk-test-subthreshold-1234567890abcdef"
+    messages = [
+        {"role": "user", "content": f"api_key={secret} should be hidden"},
+        {"role": "user", "content": "fresh tail"},
+    ]
+
+    def fail_summary(**_kwargs):
+        raise AssertionError("sub-threshold redaction cleanup must not summarize")
+
+    monkeypatch.setattr(lcm_engine_module, "summarize_with_escalation", fail_summary)
+
+    assert engine.should_compress_preflight(messages) is True
+    active_context = engine.compress(
+        messages,
+        current_tokens=engine.threshold_tokens // 4,
+    )
+    active_text = "\n".join(str(message.get("content", "")) for message in active_context)
+
+    assert secret not in active_text
+    assert "[LCM sensitive redaction:" in active_text
+    assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+    assert engine.last_compression_status == "sanitized"
 
 
 def test_sensitive_patterns_visible_in_status_and_doctor(tmp_path):

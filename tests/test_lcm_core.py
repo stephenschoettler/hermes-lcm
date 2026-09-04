@@ -6665,19 +6665,21 @@ class TestIngestExternalization:
         engine, output_dir = self._engine(tmp_path)
         content = "GENERIC_RAW_NEEDLE:" + ("z" * 5000)
 
-        engine._ingest_messages([{"role": "user", "content": content}])
+        provider_replay = engine._ingest_messages([{"role": "user", "content": content}])
 
         stored = engine._store.get_session_messages("ingest-session")
         assert stored[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
         assert "GENERIC_RAW_NEEDLE" not in stored[0]["content"]
         assert engine._store.search("GENERIC_RAW_NEEDLE", session_id="ingest-session") == []
+        assert provider_replay[0]["content"] == content
+        assert engine._last_active_replay_messages[0]["content"] == content
 
         payload = json.loads(next(output_dir.glob("*.json")).read_text())
         assert payload["kind"] == "raw_payload"
         assert payload["role"] == "user"
         assert payload["content"] == content
 
-    def test_compress_returns_externalized_stub_for_oversized_active_tail(self, tmp_path):
+    def test_compress_keeps_oversized_current_user_inline_while_store_uses_ref(self, tmp_path):
         import hermes_lcm.tools as lcm_tools
         from hermes_lcm.engine import LCMEngine
 
@@ -6689,13 +6691,13 @@ class TestIngestExternalization:
 
         assert len(active_context) == 1
         active_content = active_context[0]["content"]
-        assert active_content.startswith("[Externalized payload: kind=raw_payload;")
-        assert "ACTIVE_RAW_NEEDLE" not in active_content
-        assert len(active_content) < 512
+        assert active_content == content
         assert messages[0]["content"] == content
 
         stored = engine._store.get_session_messages("ingest-session")
-        assert stored[0]["content"] == active_content
+        assert stored[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
+        assert "ACTIVE_RAW_NEEDLE" not in stored[0]["content"]
+        assert len(stored[0]["content"]) < 512
         assert engine._get_store_ids_for_messages(active_context) == [stored[0]["store_id"]]
         assert engine._store.search("ACTIVE_RAW_NEEDLE", session_id="ingest-session") == []
         payload_path = next(output_dir.glob("*.json"))
@@ -6708,32 +6710,145 @@ class TestIngestExternalization:
         assert expanded["kind"] == "raw_payload"
         assert expanded["content"] == content
 
+        assert engine._last_active_replay_messages[0]["content"] == content
+
+        durable_history = [{"role": "user", "content": stored[0]["content"]}]
         replay = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
         replay._session_id = "ingest-session"
         replay._ingest_cursor_needs_reconcile = True
-        replay._ingest_messages(active_context)
+        replay._ingest_messages(durable_history)
         assert replay._store.get_session_count("ingest-session") == 1
 
         replay_with_delta = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
         replay_with_delta._session_id = "ingest-session"
         replay_with_delta._ingest_cursor_needs_reconcile = True
-        replay_with_delta._ingest_messages(active_context + [{"role": "user", "content": "followup"}])
+        replay_with_delta._ingest_messages(
+            durable_history + [{"role": "user", "content": "followup"}]
+        )
         rows = replay_with_delta._store.get_session_messages("ingest-session")
         assert len(rows) == 2
         assert rows[-1]["content"] == "followup"
 
-    def test_preflight_requests_cleanup_for_oversized_raw_payload_stub(self, tmp_path):
+    def test_preflight_does_not_replace_oversized_current_user_with_storage_ref(self, tmp_path):
         engine, _output_dir = self._engine(tmp_path)
         content = "PREFLIGHT_RAW_NEEDLE:" + ("r" * 5000)
         messages = [{"role": "user", "content": content}]
 
-        assert engine.should_compress_preflight(messages) is True
+        assert engine.should_compress_preflight(messages) is False
 
-        active_context = engine.compress(messages)
-        assert active_context[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
-        assert "PREFLIGHT_RAW_NEEDLE" not in active_context[0]["content"]
-        assert engine._last_compression_status == "sanitized"
-        assert engine._last_compression_noop_reason == ""
+        provider_replay = engine._ingest_messages(messages)
+        stored = engine._store.get_session_messages("ingest-session")
+        assert provider_replay[0]["content"] == content
+        assert stored[0]["content"].startswith("[Externalized payload: kind=raw_payload;")
+
+    def test_current_raw_user_stays_inline_through_tool_steps_and_next_user(self, tmp_path):
+        engine, _output_dir = self._engine(tmp_path)
+        content = "CURRENT_SKILL_PAYLOAD:" + ("s" * 5000)
+        user = {"role": "user", "content": content}
+
+        first_provider_replay = engine._ingest_messages([user])
+        assert first_provider_replay[0]["content"] == content
+
+        assistant_tool_call = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_current_turn", "function": {"name": "probe", "arguments": "{}"}}
+            ],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_current_turn",
+            "content": "probe complete",
+        }
+        same_turn = [user, assistant_tool_call, tool_result]
+        continuation_replay = engine._ingest_messages(same_turn)
+
+        assert continuation_replay[0]["content"] == content
+        assert engine._last_active_replay_messages[0]["content"] == content
+
+        next_turn = same_turn + [
+            {"role": "assistant", "content": "finished"},
+            {"role": "user", "content": "What is next?"},
+        ]
+        next_turn_replay = engine._ingest_messages(next_turn)
+
+        assert next_turn_replay[0]["content"] == content
+        assert next_turn_replay[-1]["content"] == "What is next?"
+
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[0]["content"].startswith(
+            "[Externalized payload: kind=raw_payload;"
+        )
+        assert "CURRENT_SKILL_PAYLOAD" not in stored[0]["content"]
+
+    def test_restart_reconciles_provider_visible_raw_payload_history(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+
+        engine, _output_dir = self._engine(tmp_path)
+        content = "RESTARTED_RAW_HISTORY:" + ("h" * 5000)
+        active_history = [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": "completed answer"},
+        ]
+
+        provider_replay = engine._ingest_messages(active_history)
+        assert provider_replay == active_history
+        assert engine._store.get_session_count("ingest-session") == 2
+
+        restarted = LCMEngine(config=engine._config, hermes_home=str(tmp_path / "hermes"))
+        restarted._session_id = "ingest-session"
+        restarted._ingest_cursor_needs_reconcile = True
+        restarted._ingest_messages(provider_replay)
+
+        assert restarted._store.get_session_count("ingest-session") == 2
+        assert restarted._last_ingest_reconciliation["action"] == "advanced cursor"
+
+        restarted_with_delta = LCMEngine(
+            config=engine._config,
+            hermes_home=str(tmp_path / "hermes"),
+        )
+        restarted_with_delta._session_id = "ingest-session"
+        restarted_with_delta._ingest_cursor_needs_reconcile = True
+        next_turn = provider_replay + [{"role": "user", "content": "followup"}]
+        next_replay = restarted_with_delta._ingest_messages(next_turn)
+
+        assert next_replay[0]["content"] == content
+        rows = restarted_with_delta._store.get_session_messages("ingest-session")
+        assert len(rows) == 3
+        assert rows[-1]["content"] == "followup"
+
+    def test_storage_externalization_keeps_ordinary_assistant_payload_active(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import hermes_lcm.engine as lcm_engine
+
+        engine, _output_dir = self._engine(tmp_path)
+        assistant_content = "LONG_ASSISTANT_CONTEXT:" + ("a" * 5000)
+        messages = [
+            {"role": "user", "content": "Explain the result."},
+            {"role": "assistant", "content": assistant_content},
+            {"role": "user", "content": "Use that result for the next step."},
+        ]
+
+        def fail_summary(**_kwargs):
+            raise AssertionError("storage-only assistant externalization must not summarize")
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_summary)
+
+        assert engine.should_compress_preflight(messages) is False
+        provider_replay = engine._cached_active_replay_messages(messages)
+
+        assert provider_replay is not None
+        assert provider_replay[1]["content"] == assistant_content
+        assert engine._last_active_replay_messages[1]["content"] == assistant_content
+        stored = engine._store.get_session_messages("ingest-session")
+        assert stored[1]["content"].startswith(
+            "[Externalized payload: kind=raw_payload;"
+        )
+        assert "LONG_ASSISTANT_CONTEXT" not in stored[1]["content"]
 
     def test_non_tool_externalized_placeholder_sanitizes_role_metadata_for_ref_parsing(self, tmp_path):
         import hermes_lcm.tools as lcm_tools
