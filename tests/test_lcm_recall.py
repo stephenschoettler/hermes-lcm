@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import json
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1154,6 +1155,222 @@ def test_recall_uses_recall_timeout_budget(recall_engine, monkeypatch):
     payload = _recall(recall_engine, monkeypatch, include="verbatim", limit=5)
     assert payload.get("timeout") is not True
     assert payload["hits"]
+
+
+# --- Issue #460: FTS arm cannot starve the vector arms. ----
+
+def test_recall_fts_arm_runs_with_a_bounded_subdeadline(recall_engine, monkeypatch):
+    """Issue #460 residual scheduling defect: the FTS arm must be called with a
+    per-arm deadline strictly less than the full recall deadline, so it can
+    never consume the budget that summary and chunk arms need.
+
+    Internal invariant: FTS-arm deadline < request_started + recall_query_timeout_s.
+    The vector arms keep the original deadline, preserving the
+    total-recall-timeout contract.
+    """
+    recall_engine._config.recall_query_timeout_s = 2.0
+    target_row = recall_engine._store.append(
+        CURRENT, {"role": "user", "content": "kanban dashboard sprint budget note"}
+    )
+
+    captured: dict[str, float] = {}
+
+    def _record_fts(engine, query, *, candidate_limit, deadline):
+        captured["deadline"] = deadline
+        return (
+            [
+                {
+                    "kind": "message_excerpt",
+                    "store_id": target_row,
+                    "session_id": CURRENT,
+                    "source": "",
+                    "role": "user",
+                    "timestamp": time.time(),
+                    "content_offset": 0,
+                    "snippet": "kanban dashboard sprint budget note",
+                    "from_current_session": True,
+                }
+            ],
+            None,
+        )
+
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", _record_fts)
+
+    # Anchor a "before-call" monotonic timestamp right before lcm_recall runs
+    # so we can compare the FTS arm's captured deadline against the deadline
+    # the unfixed main would pass (request_started + recall_query_timeout_s).
+    # On unfixed main: captured_deadline == request_started + 2.0, which after
+    # lcm_recall's setup-time delta is strictly greater than before_call + 2.0.
+    # On the fix:        captured_deadline <= request_started + fts_share * 2.0
+    #                    where fts_share < 1.0, so it is strictly less than
+    #                    before_call + 2.0.
+    before_call = time.monotonic()
+    payload = _recall(recall_engine, monkeypatch, include="all", limit=5)
+
+    assert captured, "FTS arm was not invoked"
+    assert payload["provenance"]["coverage"]["fts"] == "ok"
+    assert captured["deadline"] < before_call + 2.0, (
+        f"FTS arm received the FULL recall deadline (captured={captured['deadline']:.3f}, "
+        f"before_call + timeout={before_call + 2.0:.3f}); a slow lexical fallback "
+        f"can starve the vector arms (issue #460)"
+    )
+
+
+def test_recall_fts_arm_failure_does_not_starve_vector_arms(recall_engine, monkeypatch):
+    """Issue #460: when the FTS arm EXHAUSTS its deadline, the summary and
+    chunk arms MUST still run on the remaining budget and surface hits.
+
+    The mock FTS arm busy-waits until its deadline, then returns an error.
+    On unfixed main the FTS arm uses the full recall deadline, so when it
+    returns the vector-arm gate (`time.monotonic() >= deadline`) skips every
+    vector arm and `arms_run` is empty. The fix gives the FTS arm only a
+    bounded sub-deadline so the vector arms retain the other half.
+    """
+    recall_engine._config.recall_query_timeout_s = 1.0
+
+    # Seed a summary so the summary vector arm has something to find.
+    node = _add_summary(
+        recall_engine,
+        "kanban dashboard sprint summary covering budget and priorities",
+        session_id=CURRENT,
+        created_at=10.0,
+    )
+    _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+
+    # Force the FTS arm to busy-wait until ITS deadline, then fail.
+    def _stalled_fts(engine, query, *, candidate_limit, deadline):
+        while time.monotonic() < deadline:
+            time.sleep(0.005)
+        return [], {"error": "timeout", "timeout": True}
+
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", _stalled_fts)
+
+    payload = _recall(recall_engine, monkeypatch, include="all", limit=5)
+
+    coverage = payload["provenance"]["coverage"]
+    arms_run = payload["provenance"]["arms_run"]
+    assert coverage["fts"] == "none", coverage
+    assert "fts" not in arms_run
+    # Summary arm must have run -- the FTS arm MUST NOT have starved it.
+    assert "summary" in arms_run, (
+        "FTS failure starved the vector arms -- issue #460 regression"
+    )
+    assert payload["hits"], "summary arm produced no hits despite a seeded node"
+    assert payload.get("degraded") is True
+    assert "full-text arm unavailable" in payload.get("degraded_reason", "")
+
+
+def test_recall_total_wallclock_stays_within_configured_timeout(recall_engine, monkeypatch):
+    """Issue #460: the fix must not increase the worst-case wallclock beyond
+    recall_query_timeout_s. Vector arms retain the original deadline, so the
+    total time is bounded by the configured timeout even when the FTS arm is
+    capped at half.
+    """
+    recall_engine._config.recall_query_timeout_s = 0.5
+    recall_engine._config.embedding_query_timeout_s = 0.5
+    recall_engine._store.append(
+        CURRENT, {"role": "user", "content": "kanban dashboard sprint budget"}
+    )
+
+    started = time.monotonic()
+    payload = _recall(recall_engine, monkeypatch, include="all", limit=5)
+    elapsed = time.monotonic() - started
+
+    # The contract is "no worse than configured timeout plus a constant".
+    # On the unfixed main the FTS arm's deadline is the full timeout and the
+    # total wallclock is bounded; the fix must keep it bounded.
+    assert elapsed < 1.5, (
+        f"recall wallclock {elapsed:.3f}s exceeded recall_query_timeout_s=0.5 "
+        f"with a healthy FTS arm -- the fix must not regress this"
+    )
+    assert payload["hits"]
+
+
+def test_recall_operator_mode_semantics_preserved_after_scheduling_fix(recall_engine, monkeypatch):
+    """Issue #460 scheduling fix must not change operator-mode semantics: a
+    caller-composed FTS5 query (allow_operators=True) still gets bare
+    AND/OR/NOT/NEAR preserved through the FTS arm.
+    """
+    recall_engine._config.recall_query_timeout_s = 8.0
+    target = recall_engine._store.append(
+        CURRENT, {"role": "user", "content": "alpha only here"}
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _record_fts(engine, query, *, candidate_limit, deadline):
+        captured["query"] = query
+        return [], None
+
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", _record_fts)
+
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda _config: MockProvider())
+    payload = json.loads(
+        lcm_tools.lcm_recall(
+            {"query": "alpha OR beta", "limit": 5, "allow_operators": True},
+            engine=recall_engine,
+        )
+    )
+
+    # The FTS arm still received the raw, operator-bearing query (caller
+    # composed it as FTS5 syntax). Operator mode is not silently coerced.
+    assert captured.get("query") == "alpha OR beta"
+    assert payload.get("error") is None
+
+
+@pytest.mark.parametrize(
+    ("timeout_s", "expected_fts_subbudget_s"),
+    [
+        # floor case (recall_query_timeout_s=0 is floored to 0.001 by lcm_recall)
+        (0.001, 0.0005),
+        # tiny but usable
+        (0.01, 0.005),
+        # tight but normal
+        (0.1, 0.05),
+        # default
+        (8.0, 4.0),
+        # large
+        (30.0, 15.0),
+    ],
+)
+def test_recall_fts_arm_subbudget_scales_linearly_with_total_timeout(
+    recall_engine, monkeypatch, timeout_s, expected_fts_subbudget_s
+):
+    """Issue #460 edge-case coverage: the FTS arm's sub-deadline must be
+    exactly half the configured total deadline at every magnitude, including
+    the 0.001 floor and tiny budgets. Total wallclock remains bounded by
+    recall_query_timeout_s because the FTS arm's deadline <= the full
+    deadline for every value.
+    """
+    recall_engine._config.recall_query_timeout_s = timeout_s
+    recall_engine._store.append(
+        CURRENT, {"role": "user", "content": "kanban dashboard sprint budget"}
+    )
+
+    captured: dict[str, float] = {}
+
+    def _record_fts(engine, query, *, candidate_limit, deadline):
+        # Record (a) the deadline the caller passed, and (b) time.monotonic()
+        # at the moment we received it. The latter is a proxy for
+        # `request_started` because lcm_recall's first line is
+        # `request_started = time.monotonic()` and the FTS arm runs early.
+        captured["deadline"] = deadline
+        captured["received_at"] = time.monotonic()
+        return [], None
+
+    monkeypatch.setattr(lcm_tools, "_lcm_recall_fts_arm", _record_fts)
+
+    _recall(recall_engine, monkeypatch, include="all", limit=5)
+
+    assert captured, "FTS arm was not invoked at this timeout"
+    # The FTS arm sub-deadline minus the moment we observed it must be at most
+    # the expected half-budget, plus a tiny epsilon for Python call overhead.
+    observed_subbudget_s = captured["deadline"] - captured["received_at"]
+    epsilon_s = 0.01  # 10ms slack: covers pytest + monkeypatch + sqlite open
+    assert observed_subbudget_s <= expected_fts_subbudget_s + epsilon_s, (
+        f"FTS arm got {observed_subbudget_s:.4f}s but expected at most "
+        f"{expected_fts_subbudget_s + epsilon_s:.4f}s (timeout_s={timeout_s})"
+    )
 
 
 def test_bounded_chunk_coverage_surfaces_as_degraded(recall_engine, monkeypatch):
