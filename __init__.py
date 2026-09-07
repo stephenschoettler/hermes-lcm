@@ -362,7 +362,7 @@ def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine)
 
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
-    from .config import LCMConfig
+    from .config import LCMConfig, _resolve_hermes_home
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
         LCM_GREP,
@@ -382,16 +382,10 @@ def register(ctx):
         LCM_DOCTOR,
     )
 
-    config = LCMConfig.from_env()
+    # Resolve the context-local routed home without mutating process-global env.
+    hermes_home = str(_resolve_hermes_home())
 
-    # Resolve hermes_home for profile-scoped storage
-    hermes_home = ""
-    try:
-        from hermes_cli.config import get_hermes_home
-        hermes_home = str(get_hermes_home())
-    except Exception:
-        import os
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    config = LCMConfig.from_env(hermes_home=hermes_home or None)
 
     engine = LCMEngine(config=config, hermes_home=hermes_home)
 
