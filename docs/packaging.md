@@ -18,9 +18,26 @@ The repository is a Hermes plugin, not a standalone Python application. Runtime 
 - `plugin.yaml` declaring the plugin name and registered tools
 - the repo root containing `__init__.py` for Hermes plugin registration
 - the operator placing or symlinking the checkout into Hermes' plugin search path
-- no required third-party runtime dependencies beyond Python 3.11+ and optional accelerators such as `tiktoken` and `regex`
+- no plugin-resolved third-party runtime dependencies beyond the host APIs, with optional features such as `tiktoken`, `regex`, NumPy, and FastEmbed supplied by the host environment
 
 There is no `pyproject.toml` or package metadata today, and that is deliberate until Hermes plugin packaging/discovery has a stable target for pip-installed plugins. Adding generic Python packaging before the host install contract is clear would create a second install story without making first-run activation simpler.
+
+## Host-owned dependency assurance
+
+[`dependency-contract.json`](../dependency-contract.json) is the authoritative,
+versioned host-owned dependency boundary. It records supported Hermes Agent and
+Python versions, the update owner, and every external import observed in shipped
+plugin, operator-script, and benchmarking sources. Validate it with:
+
+```bash
+python scripts/validate_dependency_contract.py --report-environment
+```
+
+The validator fails when runtime imports and the contract drift. Its local
+availability/version report is not a lock, SBOM, or vulnerability scan; those
+remain the responsibility of the resolved Hermes Agent host environment. See
+[Dependency assurance](dependency-assurance.md) for update and scanner evidence
+requirements.
 
 ## Next packaging step
 

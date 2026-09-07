@@ -12,7 +12,9 @@ row identity (`store_id`) for DAG/source lookup.
 import json
 import logging
 import math
+import os
 import sqlite3
+import stat
 import threading
 import time
 from datetime import datetime, timezone
@@ -49,6 +51,11 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .message_content import normalize_content_value as _normalize_content_value
+from .sqlite_util import (
+    _prepare_private_sqlite_file,
+    _restrict_existing_sqlite_artifacts,
+    _temporary_sqlite_busy_timeout,
+)
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -62,6 +69,65 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+
+
+def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _restrict_created_sqlite_directory(path: Path) -> None:
+    """Restrict a newly created directory without following a replacement."""
+    if os.name != "posix":  # pragma: no cover - Windows compatibility fallback
+        path.chmod(0o700)
+        return
+
+    parent = path.parent
+    expected_parent = os.stat(parent, follow_symlinks=False)
+    if not stat.S_ISDIR(expected_parent.st_mode):
+        raise OSError(f"database directory parent is not a real directory: {parent}")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    parent_fd = os.open(parent, flags)
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or not _same_directory_identity(expected_parent, opened_parent)
+        ):
+            raise OSError(f"database directory parent changed during validation: {parent}")
+
+        expected = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise OSError(f"database directory is not a real directory: {path}")
+        fd = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not _same_directory_identity(expected, opened)
+            ):
+                raise OSError(f"database directory changed during validation: {path}")
+            os.fchmod(fd, 0o700)
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _same_directory_identity(opened, current):
+                raise OSError(f"database directory changed while restricting permissions: {path}")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _prepare_private_sqlite_storage(db_path: Path) -> None:
+    """Create or tighten one SQLite database path before SQLite opens it."""
+    try:
+        db_path.parent.mkdir(parents=True, mode=0o700)
+    except FileExistsError:
+        pass
+    else:
+        _restrict_created_sqlite_directory(db_path.parent)
+
+    _prepare_private_sqlite_file(db_path)
 
 
 def _legacy_blank_source_clause(column: str) -> str:
@@ -263,7 +329,9 @@ class MessageStore:
 
     def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._is_memory_database = str(self.db_path) == ":memory:"
+        if not self._is_memory_database:
+            _prepare_private_sqlite_storage(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
@@ -290,6 +358,8 @@ class MessageStore:
         self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
+        if not self._is_memory_database:
+            _restrict_existing_sqlite_artifacts(self.db_path)
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1080,6 +1150,132 @@ class MessageStore:
         except (ValueError, TypeError):
             return None
         return data if isinstance(data, dict) else None
+
+    def increment_compaction_telemetry(
+        self,
+        conversation_id: str,
+        increment: int,
+        updates: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically increment and update one conversation's telemetry record."""
+        if not conversation_id:
+            return None
+        if isinstance(increment, bool) or not isinstance(increment, int) or increment < 0:
+            raise ValueError("compaction telemetry increment must be a non-negative integer")
+        conn = self._conn
+        if conn is None:
+            return None
+
+        key = self._compaction_telemetry_key(conversation_id)
+        with self._write_lock:
+            try:
+                # Separate MessageStore instances have separate Python locks.
+                # Acquire SQLite's write reservation before reading so this
+                # read-modify-write serializes across every connection. This is
+                # best-effort telemetry on the completed-compaction hot path, so
+                # permit only a tightly bounded overlap before skipping instead
+                # of inheriting the connection's 30s wait.
+                with _temporary_sqlite_busy_timeout([conn], 100):
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute(
+                        "SELECT value FROM metadata WHERE key = ?",
+                        (key,),
+                    ).fetchone()
+                    try:
+                        existing = json.loads(str(row[0])) if row and row[0] else {}
+                    except (ValueError, TypeError):
+                        existing = {}
+                    if not isinstance(existing, dict):
+                        existing = {}
+
+                # Per-runtime high-water marks make a committed increment
+                # idempotent when its caller observes an ambiguous exception.
+                # Retain enough recent epochs for overlapping runtimes without
+                # allowing this diagnostic metadata row to grow forever.
+                watermarks = []
+                raw_watermarks = existing.get("counter_epoch_watermarks", [])
+                if isinstance(raw_watermarks, list):
+                    watermarks = [
+                        item
+                        for item in raw_watermarks
+                        if (
+                            isinstance(item, list)
+                            and len(item) == 2
+                            and isinstance(item[0], str)
+                            and item[0]
+                            and isinstance(item[1], int)
+                            and not isinstance(item[1], bool)
+                            and item[1] >= 0
+                        )
+                    ]
+                effective_increment = increment
+                counter_epoch = updates.get("counter_epoch")
+                target_count = updates.get("compression_count_at_record")
+                if (
+                    isinstance(counter_epoch, str)
+                    and counter_epoch
+                    and isinstance(target_count, int)
+                    and not isinstance(target_count, bool)
+                    and target_count >= 0
+                ):
+                    prior_count = next(
+                        (item[1] for item in watermarks if item[0] == counter_epoch),
+                        0,
+                    )
+                    effective_increment = max(0, target_count - prior_count)
+                    watermarks = [item for item in watermarks if item[0] != counter_epoch]
+                    watermarks.append([counter_epoch, max(prior_count, target_count)])
+                    watermarks = watermarks[-64:]
+
+                current_total = existing.get("total_compactions", 0)
+                if (
+                    isinstance(current_total, bool)
+                    or not isinstance(current_total, int)
+                    or current_total < 0
+                ):
+                    current_total = 0
+                proposed_total = updates.get("total_compactions", current_total)
+                if (
+                    isinstance(proposed_total, bool)
+                    or not isinstance(proposed_total, int)
+                    or proposed_total < 0
+                ):
+                    proposed_total = current_total
+                stale_across_compaction = (
+                    effective_increment == 0 and proposed_total < current_total
+                )
+                record = dict(existing)
+                if stale_across_compaction:
+                    compaction_sensitive = {
+                        "turns_since_leaf_compaction",
+                        "peak_prompt_tokens_since_leaf_compaction",
+                        "last_leaf_compaction_at",
+                        "last_compaction_duration_ms",
+                    }
+                    record.update(
+                        (field, value)
+                        for field, value in updates.items()
+                        if field not in compaction_sensitive
+                    )
+                else:
+                    record.update(updates)
+                record["conversation_id"] = conversation_id
+                record["counter_epoch_watermarks"] = watermarks
+                record["total_compactions"] = current_total + effective_increment
+                conn.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES(?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, json.dumps(record, sort_keys=True)),
+                )
+                conn.commit()
+                return record
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:
         """Upsert the per-conversation compaction-telemetry record.

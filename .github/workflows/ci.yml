@@ -91,6 +91,7 @@ jobs:
 
       - name: Run static validation
         run: |
+          python scripts/validate_dependency_contract.py
           python -m compileall -q .
           python -m py_compile scripts/import_lossless_claw.py
           bash -n scripts/install.sh scripts/update.sh

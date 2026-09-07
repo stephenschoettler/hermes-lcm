@@ -79,7 +79,7 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
-## Upgrade from v0.20.0 to v0.21.0-rc2
+## Upgrade from v0.20.0 or v0.21.0-rc2 to v1.0.0-rc.1
 
 1. While the old runtime is running, run `/lcm backup`. If Hermes or any other
    SQLite writer may still be running, this is the only supported online backup
@@ -91,19 +91,19 @@ Restart Hermes after updating.
    live.
 3. Update the plugin checkout to the RC and restart Hermes.
 4. Send one normal message, then confirm `lcm_status` reports plugin version
-   `0.21.0-rc2` and the expected database path.
+   `1.0.0-rc.1` and the expected database path.
 5. For a migration-shape audit, query that database with
    `SELECT value FROM metadata WHERE key = 'schema_version';`; the expected
    result is `5`.
 
-No manual core migration, data import, or embedding backfill is required. An
-existing v0.20 database opens in place and remains on core schema version 5.
-The 0.21 assertion, query-view, and trajectory families use additive named
-feature markers and create their tables only when the corresponding store or
-workflow is invoked. A stock/default-off upgrade therefore creates none of
-those optional tables. If you later enable a 0.21-only store, treat the
-pre-upgrade backup as the downgrade path rather than opening that modified
-database with an older plugin.
+No manual core migration, data import, or embedding backfill is required. A
+database created by either v0.20.0 or v0.21.0-rc2 opens in place and remains on
+core schema version 5. The assertion, query-view, and trajectory families use
+additive named feature markers and create their tables only when the
+corresponding store or workflow is invoked. A stock/default-off upgrade
+therefore creates none of those optional tables. For rollback to either
+v0.20.0 or v0.21.0-rc2, restore the pre-upgrade backup rather than opening a
+database modified by v1.0.0-rc.1 with the older plugin.
 
 Temporal rollup settings do not change. When rollups are enabled, maintenance
 now runs through bounded eventual background work instead of blocking session
@@ -135,7 +135,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.21.0-rc2 (15 tools)
+  ✓ hermes-lcm v1.0.0-rc.1 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm

@@ -1083,12 +1083,19 @@ def test_voyage_slow_response_decode_is_inside_absolute_deadline(monkeypatch):
 def test_voyage_slow_error_body_scrub_is_bounded_and_never_resent(monkeypatch):
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
     scrub_started = threading.Event()
+    release_scrub = threading.Event()
+    scrub_finished = threading.Event()
+    request_finished = threading.Event()
+    request_errors: list[BaseException] = []
     original_scrub = provider_mod._scrub_response_body
 
     def slow_scrub(body):
         scrub_started.set()
-        time.sleep(0.05)
-        return original_scrub(body)
+        try:
+            assert release_scrub.wait(timeout=2.0)
+            return original_scrub(body)
+        finally:
+            scrub_finished.set()
 
     monkeypatch.setattr(provider_mod, "_scrub_response_body", slow_scrub)
     transport = FakeTransport(
@@ -1097,15 +1104,33 @@ def test_voyage_slow_error_body_scrub_is_bounded_and_never_resent(monkeypatch):
     )
     provider = VoyageProvider("voyage-test", transport=transport, timeout=0.01)
 
-    started = time.monotonic()
-    with pytest.raises(VoyageError) as exc_info:
-        provider.embed_query("slow error body")
+    def request():
+        try:
+            provider.embed_query("slow error body")
+        except BaseException as exc:
+            request_errors.append(exc)
+        finally:
+            request_finished.set()
 
-    assert exc_info.value.kind == "server_error"
-    assert scrub_started.is_set()
+    caller = threading.Thread(target=request, daemon=True)
+    caller.start()
+    try:
+        assert scrub_started.wait(timeout=2.0)
+        # The scrub stays blocked here. Completion before release proves the
+        # request path obeys its deadline instead of waiting for diagnostics.
+        assert request_finished.wait(timeout=2.0), "request blocked on diagnostic body scrub"
+        assert not release_scrub.is_set()
+    finally:
+        release_scrub.set()
+        caller.join(timeout=2.0)
+
+    assert not caller.is_alive()
+    assert scrub_finished.wait(timeout=2.0)
+    assert len(request_errors) == 1
+    request_error = request_errors[0]
+    assert isinstance(request_error, VoyageError)
+    assert getattr(request_error, "kind", None) == "server_error"
     assert len(transport.calls) == 1
-    assert time.monotonic() - started < 0.04
-    time.sleep(0.06)
 
 
 def test_voyage_timeout_after_possible_acceptance_is_not_resent(monkeypatch):

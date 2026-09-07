@@ -524,6 +524,8 @@ def _status_text(engine) -> str:
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",
         f"compression_count: {engine.compression_count}",
+        f"total_compactions: {status.get('total_compactions', 0)}",
+        f"total_compactions_scope: {status.get('total_compactions_scope', 'current_conversation')}",
         f"last_compression_status: {status.get('last_compression_status', 'idle')}",
         f"last_compression_noop_reason: {status.get('last_compression_noop_reason', '') or '(none)'}",
         f"context_length: {engine.context_length if session_bound else '(uninitialized)'}",

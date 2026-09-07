@@ -1037,5 +1037,12 @@ class CompactionMixin:
         self._write_generated_ignored_placeholder_hash_ordinals(
             self._generated_placeholder_digest_ordinals_for_active_replay(compressed)
         )
+        record_successful_compaction = getattr(
+            self,
+            "_record_successful_compaction_telemetry",
+            None,
+        )
+        if callable(record_successful_compaction):
+            record_successful_compaction()
 
         return compressed

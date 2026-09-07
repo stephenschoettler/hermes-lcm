@@ -205,8 +205,9 @@ if [[ -n "$DIFF_CHECK_RANGE" ]]; then
 else
   run_gate "git diff check" git diff --check
 fi
+run_gate "dependency contract" "$PYTHON_BIN" scripts/validate_dependency_contract.py --report-environment
 run_gate "python compileall" "$PYTHON_BIN" -m compileall -q .
-run_gate "script py_compile" "$PYTHON_BIN" -m py_compile scripts/backfill_externalized_tool_outputs.py scripts/import_lossless_claw.py scripts/lcm_benchmark.py scripts/lcm_stress_check.py
+run_gate "script py_compile" "$PYTHON_BIN" -m py_compile scripts/backfill_externalized_tool_outputs.py scripts/import_lossless_claw.py scripts/lcm_benchmark.py scripts/lcm_stress_check.py scripts/validate_dependency_contract.py
 run_gate "shell syntax" bash -n scripts/install.sh scripts/update.sh scripts/validate_release.sh
 run_gate "focused pytest" run_pytest tests/test_lcm_core.py tests/test_lcm_command.py tests/test_packaging_install.py tests/test_benchmarking_cli.py tests/test_stress_release_check.py tests/test_historical_externalization_backfill.py -q
 run_gate "benchmark smoke" "$PYTHON_BIN" scripts/lcm_benchmark.py --synthetic-fixture release_validation_smoke:2:1:3 --policy benchmarks/policies/pressure_smoke.yaml --output "$OUTPUT_DIR/benchmark-smoke" --allow-external-output --json
