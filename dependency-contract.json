@@ -64,6 +64,15 @@
         "gateway.session_context.get_session_env"
       ]
     },
+    "hermes_constants": {
+      "distribution": "hermes-agent",
+      "availability": "optional",
+      "scope": "context-local routed Hermes home resolution",
+      "version_policy": "Hermes Agent hosts exposing hermes_constants.get_hermes_home; falls back to hermes_cli.config, HERMES_HOME, or ~/.hermes",
+      "imported_api": [
+        "hermes_constants.get_hermes_home"
+      ]
+    },
     "hermes_cli": {
       "distribution": "hermes-agent",
       "availability": "optional",

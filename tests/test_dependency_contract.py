@@ -36,7 +36,7 @@ def test_dependency_contract_validator_accepts_repository():
 
     assert result.returncode == 0, result.stderr
     assert "dependency contract valid: version 1.0.4" in result.stdout
-    assert "9 external imports declared" in result.stdout
+    assert "10 external imports declared" in result.stdout
 
 
 def test_dependency_assurance_documentation_matches_contract_version():
@@ -957,6 +957,7 @@ def test_contract_records_host_ownership_versions_and_update_owner():
         "agent",
         "fastembed",
         "gateway",
+        "hermes_constants",
         "hermes_cli",
         "huggingface_hub",
         "numpy",
