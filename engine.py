@@ -25,7 +25,7 @@ from .codex_routing import (
     _codex_oauth_context_cap,
     _is_codex_gpt55_route,
 )
-from .config import LCMConfig
+from .config import LCMConfig, _resolve_hermes_home
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
@@ -389,8 +389,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
-        self._config = config or LCMConfig.from_env()
-        self._hermes_home = hermes_home
+        effective_home = str(hermes_home or "")
+        config_home = str(getattr(config, "config_hermes_home", "") or "")
+        if not effective_home and (
+            config is None or getattr(config, "config_sources", None)
+        ):
+            effective_home = config_home or str(_resolve_hermes_home())
+        if config is None:
+            self._config = LCMConfig.from_env(hermes_home=effective_home or None)
+        elif config_home and config_home != effective_home:
+            self._config = LCMConfig.from_env(hermes_home=effective_home)
+        else:
+            self._config = config
+        self._hermes_home = effective_home
+        self._config_hermes_home = str(
+            getattr(self._config, "config_hermes_home", "") or effective_home
+        )
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
         self._assertion_extraction_idle.set()
@@ -406,8 +420,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._assertion_extraction_last_error = ""
         self._assertion_extraction_last_model = ""
 
-        db_path = self._resolve_db_path(hermes_home)
-        self._bind_storage(db_path, hermes_home)
+        db_path = self._resolve_db_path(effective_home)
+        self._bind_storage(db_path, effective_home)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -852,6 +866,68 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._bind_storage(db_path, hermes_home)
         self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
+        return True
+
+    def _refresh_profile_config(self, hermes_home: str = "") -> bool:
+        """Reload profile-derived config for a routed Hermes home.
+
+        ``LCMConfig`` instances created manually are intentionally left alone:
+        callers that pass a config object have already supplied the operator's
+        explicit runtime policy.  Configs built by ``from_env`` retain their
+        process-global ``LCM_*`` overrides while rereading only the selected
+        profile's YAML through an explicit path argument.
+        """
+        if (
+            not hermes_home
+            or not getattr(self._config, "config_sources", None)
+            or str(self._config_hermes_home or "") == str(hermes_home)
+        ):
+            return False
+
+        self._config = LCMConfig.from_env(hermes_home=hermes_home)
+        self._config_hermes_home = str(hermes_home)
+        self._compiled_ignore_session_patterns = compile_session_patterns(
+            self._config.ignore_session_patterns
+        )
+        self._compiled_stateless_session_patterns = compile_session_patterns(
+            self._config.stateless_session_patterns
+        )
+        self._compiled_ignore_message_patterns = compile_message_patterns(
+            self._config.ignore_message_patterns
+        )
+        self.protect_last_n = self._config.fresh_tail_count
+        self.summary_model = self._config.summary_model
+        with self._summary_circuit_breaker._lock:
+            self._summary_circuit_breaker.failure_threshold = int(
+                self._config.summary_circuit_breaker_failure_threshold
+            )
+            self._summary_circuit_breaker.cooldown_seconds = int(
+                self._config.summary_circuit_breaker_cooldown_seconds
+            )
+        with self._summary_spend_guard._lock:
+            self._summary_spend_guard.max_calls = int(self._config.summary_spend_max_calls)
+            self._summary_spend_guard.window_seconds = float(
+                self._config.summary_spend_window_seconds
+            )
+            self._summary_spend_guard.backoff_seconds = float(
+                self._config.summary_spend_backoff_seconds
+            )
+        store = getattr(self, "_store", None)
+        if store is not None:
+            store._ingest_protection_config = self._config
+        if self.raw_context_length:
+            self._set_context_length(
+                self.raw_context_length,
+                source=self._context_length_source or "profile_config_refresh",
+                model=self.model,
+                provider=self.provider,
+            )
+        else:
+            self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
+                self._runtime_context_threshold(model=self.model, provider=self.provider)
+            )
+            self.threshold_percent = self.context_threshold
+        logger.info("LCM refreshed profile config for Hermes home %s", hermes_home)
         return True
 
     def _runtime_context_threshold(
@@ -2600,8 +2676,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
-        if "hermes_home" in kwargs:
-            self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
+        hermes_home = str(kwargs.get("hermes_home") or "")
+        if not hermes_home and getattr(self._config, "config_sources", None):
+            hermes_home = str(_resolve_hermes_home())
+        if hermes_home:
+            self._refresh_profile_config(hermes_home)
+            self._rebind_storage_for_home(hermes_home)
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")
