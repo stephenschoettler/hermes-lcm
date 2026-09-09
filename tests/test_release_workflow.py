@@ -3,7 +3,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
-RELEASE_VERSION = "0.21.0-rc2"
+RELEASE_VERSION = "1.0.0-rc.1"
 RELEASE_NOTES = REPO_ROOT / ".github" / "release-notes" / f"v{RELEASE_VERSION}.md"
 
 
@@ -55,6 +55,29 @@ def test_upgrade_guide_requires_sqlite_safe_backup_semantics():
     assert "one quiescent snapshot" in operator_guide
 
 
+def test_upgrade_guide_covers_stable_and_prerelease_paths():
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    operator_guide = " ".join(
+        (REPO_ROOT / "docs" / "operator-guide.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "## Upgrade from v0.20.0 or v0.21.0-rc2 to v1.0.0-rc.1" in operator_guide
+    assert (
+        "A database created by either v0.20.0 or v0.21.0-rc2 opens in place"
+        in operator_guide
+    )
+    assert (
+        "For rollback to either v0.20.0 or v0.21.0-rc2, restore the pre-upgrade "
+        "backup" in operator_guide
+    )
+    assert (
+        "docs/operator-guide.md#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1"
+        in readme
+    )
+
+
 def test_preanswer_guide_discloses_inherited_embedding_provider_behavior():
     operator_guide = " ".join(
         (REPO_ROOT / "docs" / "operator-guide.md")
@@ -72,9 +95,14 @@ def test_release_candidate_notes_cover_only_the_merged_release_scope():
     notes = RELEASE_NOTES.read_text(encoding="utf-8")
 
     assert notes.startswith(f"# hermes-lcm v{RELEASE_VERSION}\n")
-    assert "#492" in notes
+    assert "#526" in notes
+    assert "#557" in notes
+    assert "#570" in notes
+    assert "c368323" in notes
     assert "## Highlights" in notes
     assert "## Changes" in notes
     assert "## Contributors" in notes
-    assert "UTF-8 character boundaries" in notes
+    assert "release candidate" in notes.lower()
+    assert "disabled by default" in notes
+    assert "rollback-journal" in notes
     assert len(notes.splitlines()) <= 60

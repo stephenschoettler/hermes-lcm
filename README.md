@@ -133,6 +133,11 @@ token estimates. `regex` is used if available to apply timeouts to message ignor
 patterns; without it, message-level regex filtering is disabled with a warning
 rather than running unbounded stdlib `re` matches.
 
+The versioned [host-owned dependency contract](docs/dependency-assurance.md)
+lists every shipped runtime import, supported host/Python versions, ownership,
+and the mechanical validation command. It is an assurance boundary, not a claim
+that the host's resolved environment is free of known vulnerabilities.
+
 ### Install the plugin
 
 Canonical install path: clone `hermes-lcm` as a general user plugin.
@@ -205,7 +210,7 @@ Typical output:
 
 ```text
 Plugins (1):
-  ✓ hermes-lcm v0.21.0-rc2 (15 tools)
+  ✓ hermes-lcm v1.0.0-rc.1 (15 tools)
 
 Provider Plugins:
   Context Engine: lcm
@@ -244,7 +249,7 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
-For the `v0.21.0-rc2` line, take a normal backup of `lcm.db` before updating,
+For the `v1.0.0-rc.1` line, take a normal backup of `lcm.db` before updating,
 then update the checkout and restart Hermes. No manual core migration or
 backfill is required: the core schema remains version 5. New assertion,
 query-view, and adaptive-retrieval state is additive, created only after the
@@ -252,7 +257,7 @@ corresponding opt-in is enabled, and stored in the same profile database under
 named feature markers. The five new query/evidence tool schemas are visible in
 the tool list on stock installs, but automatic extraction, pre-answer evidence,
 assertion storage, query-view storage, and adaptive retrieval remain off. See
-[the operator upgrade and opt-in notes](docs/operator-guide.md#upgrade-from-v0200-to-v0210-rc2)
+[the operator upgrade and opt-in notes](docs/operator-guide.md#upgrade-from-v0200-or-v0210-rc2-to-v100-rc1)
 before enabling them.
 
 ## Commands and tools
