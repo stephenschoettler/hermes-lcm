@@ -12,7 +12,9 @@ still depends on SQLite WAL recovery.
 from __future__ import annotations
 
 import sqlite3
+import sys
 import threading
+from types import ModuleType
 from pathlib import Path
 
 import pytest
@@ -46,6 +48,59 @@ class TestConfigureConnectionPragmas:
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         conn.close()
         assert mode == "wal", f"expected journal_mode=wal, got {mode!r}"
+
+    @pytest.mark.parametrize("configured_mode", ["wal", "delete"])
+    def test_honors_hermes_journal_mode(
+        self,
+        db_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        configured_mode: str,
+    ):
+        calls = []
+        host_module = ModuleType("hermes_state_wal")
+
+        def apply_wal_with_fallback(conn, *, db_label="state.db"):
+            calls.append(db_label)
+            return conn.execute(
+                f"PRAGMA journal_mode={configured_mode.upper()}"
+            ).fetchone()[0].lower()
+
+        host_module.apply_wal_with_fallback = apply_wal_with_fallback
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", host_module)
+
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+        conn.close()
+
+        assert calls == ["lcm.db"]
+        assert mode == configured_mode
+
+    def test_delete_mode_skips_wal_specific_pragmas(
+        self,
+        db_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        host_module = ModuleType("hermes_state_wal")
+
+        def apply_wal_with_fallback(conn, *, db_label="state.db"):
+            return conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0].lower()
+
+        host_module.apply_wal_with_fallback = apply_wal_with_fallback
+        monkeypatch.setitem(sys.modules, "hermes_state_wal", host_module)
+
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        wal_autocheckpoint = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+        journal_size_limit = conn.execute("PRAGMA journal_size_limit").fetchone()[0]
+        synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+        mmap_size = conn.execute("PRAGMA mmap_size").fetchone()[0]
+        conn.close()
+
+        assert wal_autocheckpoint == 1_000
+        assert journal_size_limit == -1
+        assert synchronous == 2
+        assert mmap_size == 268_435_456
 
     def test_synchronous_is_full(self, db_path: Path):
         conn = sqlite3.connect(str(db_path))

@@ -35,8 +35,8 @@ def test_dependency_contract_validator_accepts_repository():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "dependency contract valid: version 1.0.4" in result.stdout
-    assert "9 external imports declared" in result.stdout
+    assert "dependency contract valid: version 1.0.5" in result.stdout
+    assert "10 external imports declared" in result.stdout
 
 
 def test_dependency_assurance_documentation_matches_contract_version():
@@ -940,7 +940,7 @@ def test_contract_records_host_ownership_versions_and_update_owner():
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert contract["schema_version"] == 1
-    assert contract["contract_version"] == "1.0.4"
+    assert contract["contract_version"] == "1.0.5"
     assert contract["boundary"] == "host-owned"
     assert contract["imported_api_validation"] == "observed-coverage-only"
     assert contract["ownership"]["dependency_resolver"] == "Hermes Agent host environment"
@@ -958,6 +958,7 @@ def test_contract_records_host_ownership_versions_and_update_owner():
         "fastembed",
         "gateway",
         "hermes_cli",
+        "hermes_state_wal",
         "huggingface_hub",
         "numpy",
         "regex",
@@ -965,6 +966,10 @@ def test_contract_records_host_ownership_versions_and_update_owner():
         "yaml",
     }
     assert contract["external_imports"]["agent"]["availability"] == "required"
+    assert (
+        "hermes_state_wal.apply_wal_with_fallback"
+        in contract["external_imports"]["hermes_state_wal"]["imported_api"]
+    )
     assert {
         "regex.compile",
         "regex.DOTALL",

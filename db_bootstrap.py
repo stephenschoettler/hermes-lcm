@@ -96,18 +96,21 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
 
 
 def configure_connection(conn: sqlite3.Connection) -> None:
-    """Configure SQLite connection for WAL durability and hygiene.
+    """Configure SQLite connection for host-selected durability and hygiene.
 
     In a multi-agent deployment (gateway process + CLI sessions + sub-agents),
     every process opens its own sqlite3.Connection pointing at the same
-    lcm.db file.  These settings improve committed-write durability and WAL
-    hygiene, but do NOT make sibling processes safe from an unexpected process
-    death.  Abnormal exit still depends on normal SQLite WAL recovery;
-    application-level checkpoints only run during graceful shutdown (see
-    ``MessageStore.close()`` etc.).
+    lcm.db file.  Hermes' canonical ``database.journal_mode`` setting selects
+    WAL or DELETE mode.  The settings below improve committed-write durability
+    and, when WAL is selected, WAL hygiene, but do NOT make sibling processes
+    safe from an unexpected process death.  Abnormal exit still depends on
+    normal SQLite recovery; application-level checkpoints only run during
+    graceful shutdown (see ``MessageStore.close()`` etc.).
 
     Key design decisions:
-    - journal_mode=WAL  : writes go to a separate log; readers never block.
+    - journal_mode      : delegated to Hermes so LCM follows the same policy as
+                          the host's other SQLite databases.  WAL remains the
+                          default when the host helper is unavailable.
     - synchronous=FULL  : fsync both the WAL and the WAL index before every
                           write transaction commit.  WAL + FULL is the only
                           combination SQLite guarantees survives power loss
@@ -128,10 +131,20 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                               readers cache WAL pages in RAM.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    _execute_wal_conversion_with_lock_retry(conn)
+    try:
+        from hermes_state_wal import apply_wal_with_fallback
+    except ImportError:
+        # Compatibility for older supported Hermes hosts that predate the
+        # shared helper, and for the standalone plugin test environment.
+        _execute_wal_conversion_with_lock_retry(conn)
+        mode = "wal"
+    else:
+        mode = apply_wal_with_fallback(conn, db_label="lcm.db")
+
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
-    conn.execute("PRAGMA journal_size_limit=67108864")
+    if mode == "wal":
+        conn.execute("PRAGMA wal_autocheckpoint=500")
+        conn.execute("PRAGMA journal_size_limit=67108864")
     conn.execute("PRAGMA mmap_size=268435456")
 
 
