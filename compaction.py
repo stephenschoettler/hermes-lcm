@@ -15,6 +15,8 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -31,6 +33,19 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def _replay_cleanup_request_identity(self, messages):
+        encoded = json.dumps(
+            messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return (
+            str(getattr(self, "_session_id", "") or ""),
+            hashlib.sha256(encoded.encode("utf-8", errors="replace")).hexdigest(),
+        )
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -68,7 +83,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        self._preflight_replay_cleanup_request = None
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -129,11 +144,9 @@ class CompactionMixin:
                 messages=replay_messages,
             )
             if cleanup_requested:
-                if (
-                    not force_overflow_requested
-                    and self._compression_boundary_cooldown_active()
-                ):
-                    self._preflight_cleanup_only_due_to_boundary_cooldown = True
+                self._preflight_replay_cleanup_request = (
+                    self._replay_cleanup_request_identity(messages)
+                )
                 return self._mark_preflight_compression_requested()
             if force_overflow_requested:
                 return self._mark_preflight_compression_requested()
@@ -376,6 +389,10 @@ class CompactionMixin:
         4. Check if condensation is needed
         5. Assemble new active context: summaries + fresh tail
         """
+        replay_cleanup_request = self._preflight_replay_cleanup_request
+        self._preflight_replay_cleanup_request = None
+        incoming_request_identity = self._replay_cleanup_request_identity(messages)
+
         if not messages:
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = "empty message list"
@@ -428,12 +445,35 @@ class CompactionMixin:
         # or provider context after the durable row has been written.
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
-        cleanup_only_due_to_boundary_cooldown = bool(
-            self._preflight_cleanup_only_due_to_boundary_cooldown
-            and not force_overflow
+        cleanup_still_requested = bool(
+            ingest_cleanup_changed_active_context
+            and self._replay_diff_requests_ingest_cleanup(messages, working_messages)
         )
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        if cleanup_only_due_to_boundary_cooldown:
+        estimated_active_tokens = (
+            observed_prompt_tokens
+            if observed_prompt_tokens is not None and observed_prompt_tokens > 0
+            else count_messages_tokens(messages)
+        )
+        threshold_pressure = bool(
+            self.threshold_tokens > 0
+            and estimated_active_tokens >= self.threshold_tokens
+        )
+        deferred_maintenance_requested = self._should_run_deferred_maintenance(
+            working_messages,
+            observed_tokens=observed_prompt_tokens,
+        )
+        cleanup_only_requested = bool(
+            replay_cleanup_request == incoming_request_identity
+            and cleanup_still_requested
+            and not force_overflow
+            and not force
+            and focus_topic is None
+            and (
+                self._compression_boundary_cooldown_active()
+                or not threshold_pressure and not deferred_maintenance_requested
+            )
+        )
+        if cleanup_only_requested:
             sanitized_messages = self._sanitize_active_context_messages(
                 working_messages,
                 insert_missing_tool_stubs=False,
@@ -461,11 +501,6 @@ class CompactionMixin:
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
-        estimated_active_tokens = (
-            observed_prompt_tokens
-            if observed_prompt_tokens is not None and observed_prompt_tokens > 0
-            else count_messages_tokens(messages)
-        )
         threshold_full_sweep_active = bool(
             self._config.threshold_full_sweep_enabled
             and not force_overflow

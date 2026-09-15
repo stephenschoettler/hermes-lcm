@@ -570,9 +570,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
-        # One-shot handoff from preflight: adopt an already-durable replay
-        # cleanup during boundary cooldown without running summary work.
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        # One-shot handoff from preflight identifying the exact replay-cleanup
+        # request that caused the host to call compress().
+        self._preflight_replay_cleanup_request = None
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
