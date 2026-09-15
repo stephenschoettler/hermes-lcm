@@ -481,6 +481,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._context_length_source = ""
         self._update_model_pending_session_start = False
         self.threshold_tokens = 0
+        # Compatibility with tui_gateway.session_compression._sync_live_compression:
+        # Hermes core's ContextCompressor defines _coerce_threshold_tokens_cap and
+        # threshold_tokens_cap; LCMEngine inherits from ContextEngine (ABC) instead,
+        # so these are missing. The TUI gateway calls cc._coerce_threshold_tokens_cap(...)
+        # to normalize the configured threshold_tokens value and assigns the result
+        # to cc.threshold_tokens_cap. Without these attributes, every live compression
+        # config sync emits: "'LCMEngine' object has no attribute '_coerce_threshold_tokens_cap'".
+        self.threshold_tokens_cap: int | None = None
+
+        # Cached trigger state invalidated after a config sync (same purpose as
+        # ContextCompressor._threshold_tokens / _tail_token_budget).
+        self._threshold_tokens: int | None = None
+        self._tail_token_budget: int | None = None
+
         self.context_threshold = self._config.context_threshold
         self.threshold_percent = self.context_threshold
         self._context_threshold_source = (
@@ -903,6 +917,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return raw_context_length, None, ""
 
+    @staticmethod
+    def _coerce_threshold_tokens_cap(value) -> int | None:
+        """Normalize a threshold_tokens cap to a positive int, or None for "no cap".
+
+        Mirrors ``ContextCompressor._coerce_threshold_tokens_cap`` in Hermes core
+        (= ``_coerce_max_tokens``). The TUI gateway's live compression config sync
+        calls this to normalize the configured value before assigning it to
+        ``threshold_tokens_cap``.
+        """
+        try:
+            ivalue = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
     def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
         """Return the host-visible preflight trigger token count.
 
@@ -944,6 +973,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self.effective_context_length_reason = ""
             self._context_length_source = source
             self.threshold_tokens = 0
+            self.threshold_tokens_cap = None
+            self._threshold_tokens = None
+            self._tail_token_budget = None
             self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
                 self._runtime_context_threshold(model=model, provider=provider)
             )
