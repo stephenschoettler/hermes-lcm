@@ -27,6 +27,7 @@ from .db_bootstrap import (
     configure_connection,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
+    run_message_identity_migration,
     run_versioned_migrations,
 )
 from .config import LCMConfig
@@ -69,6 +70,21 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+
+_INSERT_MESSAGE_SQL = """INSERT INTO messages
+   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+    tool_name, timestamp, token_estimate, pinned, ingested_at,
+    observed_at, observed_at_source)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+# The identity index is an EXPRESSION (COALESCE) unique index, so it cannot be
+# the target of an `ON CONFLICT(...) DO NOTHING` clause (SQLite only accepts
+# column-list unique indexes as ON CONFLICT targets, and a COALESCE index is
+# required to make NULL tool_call_id / content participate in identity). The
+# conflict-safe insert therefore uses a plain INSERT and, on the specific
+# ``UNIQUE constraint failed: index 'idx_msg_identity'`` error, re-selects the
+# canonical row. See ``_insert_message_conflict_safe``.
+_MSG_IDENTITY_INDEX = "idx_msg_identity"
 
 
 def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -382,6 +398,11 @@ class MessageStore:
                 ON messages(session_id, store_id);
             CREATE INDEX IF NOT EXISTS idx_msg_session_ts
                 ON messages(session_id, timestamp);
+            -- NOTE: the unique idx_msg_identity is deliberately NOT created
+            -- here. On a legacy DB with pre-existing duplicate clusters a
+            -- unique index cannot be built before the one-shot dedup runs,
+            -- so it is created by run_versioned_migrations() *after* the
+            -- dedup step instead.
 
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
@@ -396,6 +417,21 @@ class MessageStore:
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
+        # The identity uniqueness backstop needs ``observed_at``, which a
+        # legacy DB only gets from the time-contract column-ensure above
+        # (the DDL ``CREATE TABLE IF NOT EXISTS`` cannot add it to a table
+        # that already exists). So ``run_versioned_migrations``'s identity
+        # step self-gated to a no-op on such a DB; now that the column exists
+        # we run it again so the additive ``idx_msg_identity`` index is
+        # attempted. This pass is NON-destructive: it only creates the index
+        # (additively) and never deletes rows — on a live DB that still has
+        # pre-existing duplicate clusters the index build is skipped with a
+        # warning and retried next open. Pre-existing duplicates are removed
+        # by the explicit ``run_message_identity_dedup`` operator action, not
+        # here. The named-step marker makes the index step a no-op on re-open
+        # and on fresh DBs (which already attempted it in the migration pass
+        # above).
+        run_message_identity_migration(self._conn)
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -456,10 +492,89 @@ class MessageStore:
 
     # -- Write operations ---------------------------------------------------
 
+    def _insert_message_conflict_safe(self, row_params: tuple) -> int:
+        """Insert one message row; on an identity conflict return the
+        surviving (earliest) row's ``store_id`` instead.
+
+        ``row_params`` is the 14-tuple matching ``_INSERT_MESSAGE_SQL``
+        (indexes: 0=session_id, 3=role, 4=content, 5=tool_call_id,
+        12=observed_at). A conflict means the host re-sent an
+        already-persisted message (compaction replay, session rebind, or
+        recovery replay): the existing row is the canonical one, so
+        callers must receive its ``store_id`` rather than a fresh id.
+
+        The uniqueness backstop is the ``idx_msg_identity`` *expression*
+        index, which COALESCEs ``tool_call_id``/``content`` to ``''`` so NULL
+        values participate in identity (a column-list index would let two
+        NULLs through). That same expression nature is why this cannot use
+        ``ON CONFLICT(...) DO NOTHING`` (SQLite rejects an expression index
+        as an ON CONFLICT target), so we instead:
+
+        1. attempt a plain ``INSERT``;
+        2. if it raises the specific ``UNIQUE constraint failed: index
+           'idx_msg_identity'`` error, re-SELECT the canonical row with a
+           NULL-safe predicate (``observed_at IS ?`` + COALESCE on the two
+           nullable fields) and return its ``store_id``;
+        3. any *other* ``IntegrityError`` (e.g. a NOT NULL violation) is
+           re-raised, never swallowed.
+
+        A row with ``observed_at IS NULL`` can never collide (NULL is distinct
+        in the index), so the exception path is unreachable for it and it
+        inserts exactly as before. A failed INSERT is statement-level in
+        SQLite (it does not abort the surrounding transaction and consumes no
+        AUTOINCREMENT id), so the re-SELECT is safe mid-transaction and the
+        batch's id list stays aligned with its input messages.
+        """
+        try:
+            cur = self._conn.execute(_INSERT_MESSAGE_SQL, row_params)
+            return cur.lastrowid
+        except sqlite3.IntegrityError as err:
+            if f"index '{_MSG_IDENTITY_INDEX}'" not in str(err):
+                # Not an identity conflict (e.g. a NOT NULL violation):
+                # preserve the real error — never mask it.
+                raise
+            if row_params[12] is None:
+                # Unreachable in practice (a NULL observed_at cannot collide)
+                # but fail loudly rather than invent a row if we ever get here.
+                raise RuntimeError(
+                    "message identity conflict without an observed_at "
+                    "(session_id, role, tool_call_id, content)"
+                ) from err
+            existing = self._conn.execute(
+                "SELECT store_id FROM messages WHERE session_id = ? AND role = ? "
+                "AND observed_at IS ? "
+                "AND COALESCE(tool_call_id, '') = ? "
+                "AND COALESCE(content, '') = ? "
+                "ORDER BY store_id LIMIT 1",
+                (
+                    row_params[0],
+                    row_params[3],
+                    row_params[12],
+                    (row_params[5] if row_params[5] is not None else ""),
+                    (row_params[4] if row_params[4] is not None else ""),
+                ),
+            ).fetchone()
+            if existing is None:
+                # The identity constraint fired but no matching row exists:
+                # the state is inconsistent; fail loudly rather than invent a row.
+                raise RuntimeError(
+                    "message identity conflict without a matching stored row "
+                    "(session_id, role, observed_at, tool_call_id, content)"
+                ) from err
+            return int(existing[0])
+
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",
                conversation_id: str = "") -> int:
-        """Persist a message and return its store_id."""
+        """Persist a message and return its store_id.
+
+        If a message with the same identity 5-tuple
+        ``(session_id, role, observed_at, tool_call_id, content)`` is
+        already stored, no duplicate row is created and the pre-existing
+        (earliest) row's ``store_id`` is returned instead, keeping every
+        caller's id list aligned with the input message list (replay /
+        re-stamp protection).
+        """
         msg = protect_message_for_ingest(
             msg,
             config=self._ingest_protection_config,
@@ -472,12 +587,7 @@ class MessageStore:
         ingested_at = time.time()
 
         with self._write_lock:
-            cur = self._conn.execute(
-                """INSERT INTO messages
-                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            store_id = self._insert_message_conflict_safe(
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -493,10 +603,10 @@ class MessageStore:
                     ingested_at,
                     observed_at,
                     "host_message_timestamp" if observed_at is not None else None,
-                ),
+                )
             )
             self._conn.commit()
-            return cur.lastrowid
+            return store_id
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -540,30 +650,26 @@ class MessageStore:
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
                 observed_at = _normalize_observed_at(msg.get("timestamp"))
-                cur = self._conn.execute(
-                    """INSERT INTO messages
-                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        _normalize_source_value(source),
-                        _normalize_conversation_id_value(conversation_id),
-                        msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
-                        msg.get("tool_call_id"),
-                        tc_json,
-                        msg.get("tool_name"),
-                        ts,
-                        est,
-                        0,
-                        ts,
-                        observed_at,
-                        "host_message_timestamp" if observed_at is not None else None,
-                    ),
+                ids.append(
+                    self._insert_message_conflict_safe(
+                        (
+                            session_id,
+                            _normalize_source_value(source),
+                            _normalize_conversation_id_value(conversation_id),
+                            msg.get("role", "unknown"),
+                            _normalize_content_value(msg.get("content")),
+                            msg.get("tool_call_id"),
+                            tc_json,
+                            msg.get("tool_name"),
+                            ts,
+                            est,
+                            0,
+                            ts,
+                            observed_at,
+                            "host_message_timestamp" if observed_at is not None else None,
+                        )
+                    )
                 )
-                ids.append(cur.lastrowid)
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:

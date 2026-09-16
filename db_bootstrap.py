@@ -2287,6 +2287,200 @@ def verify_assertion_schema(conn: sqlite3.Connection) -> list[str]:
     return sorted(set(findings))
 
 
+_MESSAGES_IDENTITY_INDEX = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_identity "
+    "ON messages(session_id, role, observed_at, "
+    "COALESCE(tool_call_id, ''), COALESCE(content, ''))"
+)
+
+
+def ensure_message_identity_index(conn: sqlite3.Connection) -> None:
+    """Create the per-message identity unique index (additive, idempotent).
+
+    The index is an *expression* index: ``tool_call_id`` and ``content``
+    are COALESCEd to ``''`` so that NULL/empty values participate in
+    identity the same way the dedup's grouping and the store's conflict
+    lookup do (a plain column list would let two NULLs through, and
+    ``ON CONFLICT`` on a column list cannot see expression indexes).
+    ``observed_at`` stays raw on purpose: rows without a trusted
+    observation time are never collapsed (documented limitation, matching
+    the storage-level guard).
+    """
+    conn.execute(_MESSAGES_IDENTITY_INDEX)
+
+
+def _has_named_migration_step(conn: sqlite3.Connection, step_name: str) -> bool:
+    ensure_migration_state_table(conn)
+    row = conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = ?", (step_name,)
+    ).fetchone()
+    return row is not None
+
+
+def _earlier_cluster_member_expr(table: str) -> str:
+    """``EXISTS`` clause: an *earlier* row with the same identity 5-tuple.
+
+    Null-safe equality on the identity columns (``IS`` for
+    ``observed_at``; ``COALESCE`` to ``''`` for ``tool_call_id``/``content``
+    so NULLs and empty strings are the same identity member). (A
+    ``MIN(store_id)`` aggregate over a column of the outer table is
+    rejected by SQLite with "misuse of aggregate: MIN()", so the
+    anti-join is the portable form.)
+    """
+    return (
+        "EXISTS (SELECT 1 FROM messages m2 "
+        f"WHERE m2.store_id < {table}.store_id "
+        f"AND m2.session_id = {table}.session_id "
+        f"AND m2.role = {table}.role "
+        f"AND m2.observed_at IS {table}.observed_at "
+        f"AND COALESCE(m2.tool_call_id, '') = COALESCE({table}.tool_call_id, '') "
+        f"AND COALESCE(m2.content, '') = COALESCE({table}.content, '')"
+    )
+
+
+def _survives_identity_dedup_expr(table: str) -> str:
+    """True when a row is kept by the dedup.
+
+    Rows with ``observed_at IS NULL`` always survive: the storage-level
+    guard likewise only dedupes non-NULL ``observed_at`` rows, so
+    collapsing NULL-``observed_at`` rows here would delete legitimate
+    repeats the index does not protect (documented limitation). Non-NULL
+    rows survive iff no earlier row shares their identity
+    (``NOT (EXISTS ...)`` keeps the ``NOT`` scoped to the ``EXISTS``
+    alone, preserving the anti-join shape).
+    """
+    return (
+        f"(({table}.observed_at IS NULL) "
+        f"OR NOT ({_earlier_cluster_member_expr(table)})))"
+    )
+
+
+def dedup_message_identity_clusters(conn: sqlite3.Connection) -> int:
+    """Delete duplicate identity clusters, keeping the earliest member.
+
+    Only rows with a non-NULL ``observed_at`` participate in clustering:
+    the storage-level guard likewise only dedupes non-NULL ``observed_at``
+    rows (that column stays raw in the unique index, while
+    ``tool_call_id``/``content`` are COALESCEd to ``''``), so collapsing
+    NULL-``observed_at`` rows here would delete legitimate repeats the
+    index does not protect (documented limitation).
+
+    Precondition (checked, not assumed): no row about to be deleted is
+    referenced by ``lcm_chunk_meta.store_id``, any ``summary_nodes``
+    ``source_ids`` JSON leaf, or a lifecycle frontier. Keeping the
+    earliest row makes existing references remain valid; the newest
+    (re-stamped) copies are the ones with nothing pointing at them.
+    Returns the number of deleted rows. Refuses (raises RuntimeError) if
+    the precondition fails — the operator keeps the raw rows and can
+    inspect.
+    """
+    # Self-gating: the identity key requires ``observed_at``, which a legacy
+    # DB (pre time-contract migration) may not have yet when this runs. The
+    # column cannot exist without its sibling ``ingested_at`` (they are always
+    # added together), so gate on the pair. With neither present the dedup is
+    # a no-op and the caller's index step is likewise skipped; when the
+    # message store later opens, it materializes the columns and a subsequent
+    # migration pass completes the dedup (the named-step marker is only set
+    # after a real run).
+    _observed_present = "observed_at" in {
+        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if not _observed_present:
+        return 0
+    has_chunks = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_chunk_meta'"
+    ).fetchone()
+    if has_chunks:
+        dangling_chunks = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM lcm_chunk_meta cm
+            WHERE cm.store_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages m
+                  WHERE m.store_id = cm.store_id
+                    AND {_survives_identity_dedup_expr('m')}
+              )
+            """
+        ).fetchone()[0]
+        if dangling_chunks:
+            raise RuntimeError(
+                "refusing identity dedup: %d lcm_chunk_meta rows reference "
+                "non-earliest cluster members (investigate before re-running)"
+                % dangling_chunks
+            )
+    has_nodes = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
+    ).fetchone()
+    if has_nodes:
+        dangling_nodes = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM summary_nodes n, json_each(n.source_ids) j
+            WHERE n.source_type = 'messages'
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages m
+                  WHERE m.store_id = CAST(j.value AS INTEGER)
+                    AND {_survives_identity_dedup_expr('m')}
+              )
+            """
+        ).fetchone()[0]
+        if dangling_nodes:
+            raise RuntimeError(
+                "refusing identity dedup: summary_nodes source_ids reference "
+                "non-earliest cluster members (investigate before re-running)"
+            )
+    has_lifecycle = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_lifecycle_state'"
+    ).fetchone()
+    if has_lifecycle:
+        dangling_frontier = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT lf.store_id)
+            FROM (
+                SELECT current_frontier_store_id AS store_id FROM lcm_lifecycle_state
+                UNION
+                SELECT last_finalized_frontier_store_id AS store_id FROM lcm_lifecycle_state
+            ) lf
+            WHERE lf.store_id IS NOT NULL
+              AND lf.store_id != 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages m
+                  WHERE m.store_id = lf.store_id
+                    AND {_survives_identity_dedup_expr('m')}
+              )
+            """
+        ).fetchone()[0]
+        if dangling_frontier:
+            raise RuntimeError(
+                "refusing identity dedup: %d lifecycle frontier store_ids "
+                "reference non-earliest cluster members (investigate before re-running)"
+                % dangling_frontier
+            )
+    cursor = conn.execute(
+        """
+        DELETE FROM messages
+        WHERE observed_at IS NOT NULL
+          AND store_id NOT IN (
+              SELECT MIN(store_id) FROM messages
+              WHERE observed_at IS NOT NULL
+              GROUP BY session_id, role, observed_at,
+                       COALESCE(tool_call_id, ''),
+                       COALESCE(content, '')
+          )
+        """
+    )
+    deleted = cursor.rowcount
+    # The FTS orphan sweep only applies when an external-content FTS table is
+    # actually present. On a low-disk degradation the FTS index is skipped in
+    # favor of LIKE search, so ``messages_fts`` may not exist here.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+    ).fetchone():
+        conn.execute(
+            "DELETE FROM messages_fts WHERE rowid NOT IN (SELECT store_id FROM messages)"
+        )
+    return deleted
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(
@@ -3135,4 +3329,146 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
     # feature materialized lazily by VectorStore (recorded via the named
     # ``embeddings_v1`` marker), so a disabled install stays at v5 with no
     # embedding tables and the numeric counter is free for the temporal train.
+    # Identity-dedup feature: named steps, independent of the numeric ladder
+    # (same convention as ``temporal_rollups_v1`` / ``embeddings_v1`` above).
+    # This pass is the NON-destructive half of the fix: it only *attempts* the
+    # additive ``idx_msg_identity`` unique index and never deletes rows, so it
+    # is safe to run on every store open, including against a live database
+    # that still carries pre-existing duplicate clusters (in that case the
+    # index build is skipped with a warning and retried next open). Collapsing
+    # those existing clusters is the explicit, destructive
+    # ``run_message_identity_dedup`` operator action instead.
+    #
+    # ``run_message_identity_migration`` is self-gating on the presence of the
+    # ``observed_at``/``ingested_at`` columns (the identity key's time
+    # component). A fresh DB has them from the DDL, so this pass attempts the
+    # index; a legacy DB that predates the time-contract columns does not yet
+    # have them when the migrations run, so this pass no-ops and the message
+    # store invokes it again right after it materializes the columns.
+    run_message_identity_migration(conn)
     set_schema_version(conn, current_version)
+
+
+def run_message_identity_migration(conn: sqlite3.Connection) -> int:
+    """Prepare the message-identity uniqueness backstop for a live database.
+
+    This is the *auto* path, invoked on every store open (from
+    ``run_versioned_migrations`` and, after the time-contract columns are
+    materialized, from the store's ``_init_db``). It is **non-destructive**:
+    it only creates the additive, idempotent ``idx_msg_identity`` unique
+    index. It never deletes rows.
+
+    Why no destructive dedup here:
+        A live database (e.g. ``~/.hermes/lcm.db``) may contain duplicate
+        identity clusters from before the backstop existed. Building a
+        *unique* index over those duplicates raises ``IntegrityError`` —
+        and this path runs on every store open, against the live database,
+        on the normal (non-migration) hot path. Hard-failing here would make
+        an ordinary plugin registration raise against a perfectly healthy
+        live database (the test suite itself opens ``~/.hermes/lcm.db`` via
+        the ambient ``HERMES_HOME``), which is unacceptable for a passive
+        schema-ensure pass.
+
+    Instead, when the index cannot be built because duplicates remain, the
+    step logs a warning and records *no* marker, so the attempt is retried on
+    the next open (and so an operator who has explicitly deduplicated can
+    then land the index). The index itself is the real fix: once it exists,
+    all subsequent inserts are conflict-guarded at the store level and new
+    duplicates can no longer be written. Pre-existing duplicates must be
+    removed explicitly by the operator via ``run_message_identity_dedup``.
+
+    Self-gating: returns 0 immediately when the ``messages.observed_at`` /
+    ``ingested_at`` columns are not yet present (a legacy DB pre time-contract
+    migration). ``observed_at`` is never added without its sibling
+    ``ingested_at``, so gating on the pair is equivalent. The caller invokes
+    this again once those columns are materialized; no markers are recorded
+    on the gated path, so the work is not lost.
+
+    Returns 0 (this path never deletes).
+    """
+    _cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "observed_at" not in _cols or "ingested_at" not in _cols:
+        return 0
+
+    if not _has_named_migration_step(conn, "messages_identity_index_v1"):
+        try:
+            ensure_message_identity_index(conn)
+        except sqlite3.IntegrityError:
+            # Unique index cannot be built while duplicate identity clusters
+            # remain. This is the live-database case. Do NOT delete rows here
+            # (a passive schema-ensure pass must never mutate data), and do NOT
+            # record the marker so we retry next open. The operator removes the
+            # duplicates explicitly (``run_message_identity_dedup``), after
+            # which the next open lands the index.
+            logger.warning(
+                "LCM identity index not created: duplicate message-identity "
+                "clusters exist. Run the one-shot dedup "
+                "(db_bootstrap.run_message_identity_dedup) to remove them; "
+                "the unique index lands on the next open."
+            )
+            return 0
+        mark_migration_step_complete(conn, "messages_identity_index_v1")
+
+    return 0
+
+
+def run_message_identity_dedup(conn: sqlite3.Connection) -> int:
+    """Explicitly deduplicate message-identity clusters (operator action).
+
+    This is the *destructive* counterpart to the passive
+    ``run_message_identity_migration`` above and is intentionally NOT
+    invoked on every store open. The operator calls it (via a migration
+    tool / script) to collapse pre-existing duplicate identity clusters in a
+    live database: for each ``(session_id, role, observed_at,
+    tool_call_id, content)`` cluster it keeps the earliest ``store_id`` and
+    deletes the rest, then records the ``messages_identity_dedup_v1`` marker
+    and (if the index is not already present) creates ``idx_msg_identity``.
+
+    It is gated by the same ``lcm_chunk_meta`` / ``summary_nodes`` / lifecycle
+    precondition checks as the dedup primitive: it refuses (raises
+    ``RuntimeError``) if any row about to be deleted is referenced by a chunk,
+    a summary-node source id, or a lifecycle frontier, because those
+    references point at the *newer* (re-stamped) copies. In that situation the
+    operator must reconcile the references first (or accept that the chunk /
+    summary content is represented by the surviving earliest row and re-point
+    the references). It is idempotent: on an already-deduplicated database the
+    marker is set and the DELETE matches nothing.
+
+    Returns the number of duplicate rows deleted.
+    """
+    _cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "observed_at" not in _cols or "ingested_at" not in _cols:
+        raise RuntimeError(
+            "cannot run identity dedup: messages.observed_at/ingested_at not "
+            "materialized yet (legacy DB pre time-contract migration)"
+        )
+
+    if not _has_named_migration_step(conn, "messages_identity_dedup_v1"):
+        deleted = dedup_message_identity_clusters(conn)
+        mark_migration_step_complete(conn, "messages_identity_dedup_v1")
+        if deleted:
+            logger.info("LCM identity dedup removed %d duplicate message rows", deleted)
+    else:
+        deleted = 0
+
+    if not _has_named_migration_step(conn, "messages_identity_index_v1"):
+        attempt = 0
+        while True:
+            try:
+                ensure_message_identity_index(conn)
+                break
+            except sqlite3.IntegrityError:
+                # A concurrent writer can add fresh duplicate rows in the
+                # small window between the dedup and the index build; sweep
+                # again and retry before giving up.
+                attempt += 1
+                if attempt >= 3:
+                    raise
+                dedup_message_identity_clusters(conn)
+        mark_migration_step_complete(conn, "messages_identity_index_v1")
+
+    return deleted
