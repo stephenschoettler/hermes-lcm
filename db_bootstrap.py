@@ -3436,6 +3436,12 @@ def run_message_identity_dedup(conn: sqlite3.Connection) -> int:
     the references). It is idempotent: on an already-deduplicated database the
     marker is set and the DELETE matches nothing.
 
+    The dedup, the marker, the index build, and the FTS orphan sweep are all
+    committed in one transaction (``BEGIN IMMEDIATE`` .. ``COMMIT``): either
+    the whole one-shot step lands or none of it does. A refusal (the
+    precondition ``RuntimeError``) raises *before* any write, so a refused run
+    leaves the database untouched.
+
     Returns the number of duplicate rows deleted.
     """
     _cols = {
@@ -3447,28 +3453,56 @@ def run_message_identity_dedup(conn: sqlite3.Connection) -> int:
             "materialized yet (legacy DB pre time-contract migration)"
         )
 
-    if not _has_named_migration_step(conn, "messages_identity_dedup_v1"):
-        deleted = dedup_message_identity_clusters(conn)
-        mark_migration_step_complete(conn, "messages_identity_dedup_v1")
-        if deleted:
-            logger.info("LCM identity dedup removed %d duplicate message rows", deleted)
-    else:
-        deleted = 0
+    need_dedup = not _has_named_migration_step(conn, "messages_identity_dedup_v1")
+    need_index = not _has_named_migration_step(conn, "messages_identity_index_v1")
+    if not need_dedup and not need_index:
+        return 0
 
-    if not _has_named_migration_step(conn, "messages_identity_index_v1"):
-        attempt = 0
-        while True:
-            try:
-                ensure_message_identity_index(conn)
-                break
-            except sqlite3.IntegrityError:
-                # A concurrent writer can add fresh duplicate rows in the
-                # small window between the dedup and the index build; sweep
-                # again and retry before giving up.
-                attempt += 1
-                if attempt >= 3:
-                    raise
-                dedup_message_identity_clusters(conn)
-        mark_migration_step_complete(conn, "messages_identity_index_v1")
+    # Hold the write lock for the whole one-shot step so a concurrent
+    # writer cannot interleave fresh duplicate rows between the delete,
+    # the marker, and the index build; everything commits together. Python
+    # connections (both bare ``sqlite3.connect`` and the store's) run in
+    # deferred implicit-transaction mode, so a preceding DML may leave a
+    # transaction open; settle it first so the explicit BEGIN below always
+    # works. (If a caller's connection were truly in autocommit mode this
+    # check is a no-op.)
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if need_dedup:
+            deleted = dedup_message_identity_clusters(conn)
+            mark_migration_step_complete(conn, "messages_identity_dedup_v1")
+            if deleted:
+                logger.info(
+                    "LCM identity dedup removed %d duplicate message rows", deleted
+                )
+        else:
+            deleted = 0
 
-    return deleted
+        if need_index:
+            attempt = 0
+            while True:
+                try:
+                    ensure_message_identity_index(conn)
+                    break
+                except sqlite3.IntegrityError:
+                    # Defensive sweep-and-retry (inside the same transaction):
+                    # the dedup primitive is idempotent, so re-running it before
+                    # retrying the unique index build is always safe.
+                    attempt += 1
+                    if attempt >= 3:
+                        raise
+                    dedup_message_identity_clusters(conn)
+            mark_migration_step_complete(conn, "messages_identity_index_v1")
+
+        conn.execute("COMMIT")
+        return deleted
+    except BaseException:
+        # Refusal (precondition RuntimeError) or any other failure: roll the
+        # whole step back so the database is left exactly as found.
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        raise
