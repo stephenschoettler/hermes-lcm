@@ -422,7 +422,7 @@ class VectorStore:
             # no-ops on an already-materialized schema.
             if not self._migration_step_present("embeddings_v1"):
                 mark_migration_step_complete(self._conn, "embeddings_v1")
-                self._conn.commit()
+                self._ensure_connection().commit()
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
@@ -440,25 +440,25 @@ class VectorStore:
             with self._write_lock, self._cache_lock:
                 if self._txn_depth > 0:
                     savepoint = f"lcm_pub_sp_{self._txn_depth}"
-                    self._conn.execute(f"SAVEPOINT {savepoint}")
+                    self._ensure_connection().execute(f"SAVEPOINT {savepoint}")
                     self._txn_depth += 1
                     try:
                         yield
-                        self._conn.execute(f"RELEASE {savepoint}")
+                        self._ensure_connection().execute(f"RELEASE {savepoint}")
                     except BaseException:
-                        self._conn.execute(f"ROLLBACK TO {savepoint}")
-                        self._conn.execute(f"RELEASE {savepoint}")
+                        self._ensure_connection().execute(f"ROLLBACK TO {savepoint}")
+                        self._ensure_connection().execute(f"RELEASE {savepoint}")
                         raise
                     finally:
                         self._txn_depth -= 1
                     return
-                self._conn.execute("BEGIN IMMEDIATE")
+                self._ensure_connection().execute("BEGIN IMMEDIATE")
                 self._txn_depth = 1
                 try:
                     yield
-                    self._conn.commit()
+                    self._ensure_connection().commit()
                 except BaseException:
-                    self._conn.rollback()
+                    self._ensure_connection().rollback()
                     raise
                 finally:
                     self._txn_depth = 0
@@ -497,7 +497,7 @@ class VectorStore:
         return [value / magnitude for value in floats]
 
     def _profile_by_identity(self, identity_hash: str) -> sqlite3.Row | None:
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT identity_hash, model_name, provider, revision, dim, dtype,
                    byteorder, task, registered_at, active, archived_at, data_version
@@ -530,7 +530,7 @@ class VectorStore:
         model_name = str(model_name).strip()
         if provider is not None:
             provider = str(provider).strip().lower()
-            return self._conn.execute(
+            return self._ensure_connection().execute(
                 """
                 SELECT identity_hash, model_name, provider, revision, dim, dtype,
                        byteorder, task, registered_at, active, archived_at, data_version
@@ -542,7 +542,7 @@ class VectorStore:
                 """,
                 (model_name, provider, _DEFAULT_TASK),
             ).fetchone()
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT identity_hash, model_name, provider, revision, dim, dtype,
                    byteorder, task, registered_at, active, archived_at, data_version
@@ -571,13 +571,13 @@ class VectorStore:
     def _table_columns(self, table: str) -> set[str]:
         return {
             str(row[1])
-            for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            for row in self._ensure_connection().execute(f"PRAGMA table_info({table})").fetchall()
         }
 
     def _current_profile(self) -> sqlite3.Row | None:
         # The current SUMMARY profile. Task-scoped so a coexisting active chunk
         # profile can never be mistaken for the summary corpus's current profile.
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT identity_hash, model_name, provider, revision, dim, dtype,
                    byteorder, task, registered_at, active, archived_at, data_version
@@ -603,11 +603,11 @@ class VectorStore:
             "registered_at DESC, identity_hash DESC LIMIT 1"
         )
         if provider is not None:
-            return self._conn.execute(
+            return self._ensure_connection().execute(
                 base + " AND provider = ?" + order,
                 (str(model_name), _CHUNK_TASK, str(provider).strip().lower()),
             ).fetchone()
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             base + order, (str(model_name), _CHUNK_TASK)
         ).fetchone()
 
@@ -700,7 +700,7 @@ class VectorStore:
         with self._write_transaction():
             existing = self._profile_by_identity(identity)
             if existing is None:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_embedding_profile(
                         identity_hash, provider, model_name, revision, dim,
@@ -724,7 +724,7 @@ class VectorStore:
             else:
                 # Reactivate a previously-registered identity in place; its
                 # vectors are still valid so no re-backfill is required.
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     UPDATE lcm_embedding_profile
                     SET active = 1, archived_at = NULL
@@ -738,7 +738,7 @@ class VectorStore:
             # vectors survive a later switch back). Profiles of a DIFFERENT task
             # are untouched, so the summary and chunk corpora coexist — each has
             # its own active profile.
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "UPDATE lcm_embedding_profile SET active = 0 "
                 "WHERE identity_hash != ? AND task = ?",
                 (identity, canonical.task),
@@ -880,7 +880,7 @@ class VectorStore:
         """
         embedded_id = str(embedded_id)
         with self._write_transaction():
-            owner = self._conn.execute(
+            owner = self._ensure_connection().execute(
                 """
                 SELECT 1
                 FROM metadata
@@ -890,7 +890,7 @@ class VectorStore:
                 """,
                 (claim_key, str(lease_id), int(generation)),
             ).fetchone()
-            inflight = self._conn.execute(
+            inflight = self._ensure_connection().execute(
                 """
                 SELECT 1
                 FROM lcm_embedding_backfill_inflight
@@ -910,7 +910,7 @@ class VectorStore:
                 return EmbeddingPublishOutcome.OWNERSHIP_LOST
             profile = self._validate_embedding_write(identity, model=model)
             if int(profile["active"] or 0) != 1 or profile["archived_at"] is not None:
-                transitioned = self._conn.execute(
+                transitioned = self._ensure_connection().execute(
                     """
                     UPDATE lcm_embedding_backfill_inflight
                     SET state = 'uncertain', updated_at = ?,
@@ -928,7 +928,7 @@ class VectorStore:
                 )
                 if int(transitioned.rowcount or 0) < 1:
                     return EmbeddingPublishOutcome.OWNERSHIP_LOST
-                released = self._conn.execute(
+                released = self._ensure_connection().execute(
                     """
                     DELETE FROM metadata
                     WHERE key = ?
@@ -943,7 +943,7 @@ class VectorStore:
                     )
                 return EmbeddingPublishOutcome.IDENTITY_SUPERSEDED
             write_row(profile)
-            cleared = self._conn.execute(
+            cleared = self._ensure_connection().execute(
                 """
                 DELETE FROM lcm_embedding_backfill_inflight
                 WHERE embedded_id = ? AND identity_hash = ?
@@ -1045,7 +1045,7 @@ class VectorStore:
         normalized, packed, sign_bits = self._encode_stored_vector(vec, profile)
         numeric_id = self._as_node_id(embedded_id)
         summary = (
-            self._conn.execute(
+            self._ensure_connection().execute(
                 """
                 SELECT source_token_count
                 FROM summary_nodes
@@ -1059,33 +1059,33 @@ class VectorStore:
         if summary is None:
             raise ValueError(f"summary node does not exist: {embedded_id}")
         embedded_at = self._now()
-        self._conn.execute(
+        self._ensure_connection().execute(
             "DELETE FROM lcm_embedding_vectors "
             "WHERE embedded_id = ? AND identity_hash = ?",
             (embedded_id, identity_hash),
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "DELETE FROM lcm_embedding_meta WHERE embedded_id = ? "
             "AND embedded_kind = ? AND identity_hash = ?",
             (embedded_id, kind, identity_hash),
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "DELETE FROM lcm_embedding_binary WHERE embedded_id = ? "
             "AND identity_hash = ?",
             (embedded_id, identity_hash),
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "INSERT INTO lcm_embedding_vectors(embedded_id, identity_hash, vec) "
             "VALUES(?, ?, ?)",
             (embedded_id, identity_hash, packed),
         )
         if sign_bits is not None:
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "INSERT INTO lcm_embedding_binary(embedded_id, identity_hash, bits) "
                 "VALUES(?, ?, ?)",
                 (embedded_id, identity_hash, sign_bits),
             )
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             INSERT INTO lcm_embedding_meta(
                 embedded_id, embedded_kind, identity_hash, embedded_at,
@@ -1109,14 +1109,14 @@ class VectorStore:
         it accompanies so a cross-process reader observes the new counter and
         invalidates its NumPy matrix cache.
         """
-        self._conn.execute(
+        self._ensure_connection().execute(
             "UPDATE lcm_embedding_profile SET data_version = data_version + 1 "
             "WHERE identity_hash = ?",
             (str(identity_hash),),
         )
 
     def _bump_all_data_versions(self) -> None:
-        self._conn.execute(
+        self._ensure_connection().execute(
             "UPDATE lcm_embedding_profile SET data_version = data_version + 1"
         )
 
@@ -1134,20 +1134,20 @@ class VectorStore:
         The table is dropped in ``finally`` so it never outlives the call.
         """
         table = f"_lcm_id_scratch_{uuid.uuid4().hex}"
-        self._conn.execute(f"CREATE TEMP TABLE {table}(id TEXT PRIMARY KEY)")
+        self._ensure_connection().execute(f"CREATE TEMP TABLE {table}(id TEXT PRIMARY KEY)")
         try:
             for offset in range(0, len(ids), _ID_INSERT_CHUNK):
                 rows = [
                     (str(value),)
                     for value in ids[offset:offset + _ID_INSERT_CHUNK]
                 ]
-                self._conn.executemany(
+                self._ensure_connection().executemany(
                     f"INSERT OR IGNORE INTO {table}(id) VALUES(?)",
                     rows,
                 )
             yield table
         finally:
-            self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+            self._ensure_connection().execute(f"DROP TABLE IF EXISTS {table}")
 
     @contextmanager
     def _optional_temp_id_table(
@@ -1166,27 +1166,27 @@ class VectorStore:
             return 0
         with self._write_transaction():
             with self._temp_id_table(unique_ids) as table:
-                cur = self._conn.execute(
+                cur = self._ensure_connection().execute(
                     f"DELETE FROM lcm_embedding_vectors "
                     f"WHERE embedded_id IN (SELECT id FROM {table})"
                 )
-                self._conn.execute(
+                self._ensure_connection().execute(
                     f"DELETE FROM lcm_embedding_meta "
                     f"WHERE embedded_id IN (SELECT id FROM {table})"
                 )
-                if self._conn.execute(
+                if self._ensure_connection().execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='lcm_embedding_binary'"
                 ).fetchone() is not None:
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         f"DELETE FROM lcm_embedding_binary "
                         f"WHERE embedded_id IN (SELECT id FROM {table})"
                     )
-                if self._conn.execute(
+                if self._ensure_connection().execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='lcm_embedding_backfill_inflight'"
                 ).fetchone() is not None:
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         f"DELETE FROM lcm_embedding_backfill_inflight "
                         f"WHERE embedded_id IN (SELECT id FROM {table})"
                     )
@@ -1259,7 +1259,7 @@ class VectorStore:
         absent (nothing stamped yet).
         """
         try:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT 1 FROM lcm_migration_state WHERE step_name = ? LIMIT 1",
                 (str(step_name),),
             ).fetchone()
@@ -1278,7 +1278,7 @@ class VectorStore:
         """
         table = "lcm_chunk_vectors" if chunk else "lcm_embedding_vectors"
         try:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 f"SELECT COUNT(*) FROM {table} WHERE identity_hash = ?",
                 (str(identity_hash),),
             ).fetchone()
@@ -1287,7 +1287,7 @@ class VectorStore:
         return int(row[0]) if row is not None else None
 
     def _data_version(self, identity_hash: str) -> int:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT data_version FROM lcm_embedding_profile WHERE identity_hash = ?",
             (str(identity_hash),),
         ).fetchone()
@@ -1407,7 +1407,7 @@ class VectorStore:
                 if conversation_table is not None
                 else ""
             )
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 f"""
                 SELECT m.embedded_id
                 FROM lcm_embedding_meta m
@@ -1465,7 +1465,7 @@ class VectorStore:
         if not embedded_ids:
             return rowids, out_ids, kinds, vectors
         with self._temp_id_table(embedded_ids) as table:
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 f"""
                 SELECT v.rowid, v.embedded_id, m.embedded_kind, v.vec
                 FROM {table} t
@@ -1635,14 +1635,14 @@ class VectorStore:
         # full_text), which is the safe direction for an unverifiable filter.
         message_columns = {
             str(row[1])
-            for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+            for row in self._ensure_connection().execute("PRAGMA table_info(messages)").fetchall()
         }
         if "source" not in message_columns:
             return set()
 
         normalized_source = _normalize_source_value(source)
         legacy_blank_clause = _legacy_blank_source_clause("m.source")
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""
             WITH RECURSIVE walk(root_id, source_type, source_id) AS (
                 SELECT t.id, sn.source_type, CAST(j.value AS INTEGER)
@@ -1724,7 +1724,7 @@ class VectorStore:
                     if conversation_table is not None
                     else ""
                 )
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     f"""
                     SELECT t.id
                     FROM {table} t
@@ -1757,7 +1757,7 @@ class VectorStore:
         """Does the active identity carry a sign-bit prescreen (int8 identities)?"""
         table = "lcm_chunk_binary" if chunk else "lcm_embedding_binary"
         try:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 f"SELECT 1 FROM {table} WHERE identity_hash = ? LIMIT 1",
                 (str(identity_hash),),
             ).fetchone()
@@ -1782,11 +1782,11 @@ class VectorStore:
         binary_table = "lcm_chunk_binary" if chunk else "lcm_embedding_binary"
         vector_table = "lcm_chunk_vectors" if chunk else "lcm_embedding_vectors"
         try:
-            binary_count = self._conn.execute(
+            binary_count = self._ensure_connection().execute(
                 f"SELECT COUNT(*) FROM {binary_table} WHERE identity_hash = ?",
                 (str(identity_hash),),
             ).fetchone()
-            vector_count = self._conn.execute(
+            vector_count = self._ensure_connection().execute(
                 f"SELECT COUNT(*) FROM {vector_table} WHERE identity_hash = ?",
                 (str(identity_hash),),
             ).fetchone()
@@ -1830,7 +1830,7 @@ class VectorStore:
                 if conversation_table is not None
                 else ""
             )
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 f"""
                 SELECT b.chunk_id, b.bits
                 FROM lcm_chunk_binary b
@@ -1883,7 +1883,7 @@ class VectorStore:
                 if conversation_table is not None
                 else ""
             )
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 f"""
                 SELECT b.embedded_id, b.bits
                 FROM lcm_embedding_binary b
@@ -1957,7 +1957,7 @@ class VectorStore:
         if in_memory:
             with self._write_lock:
                 try:
-                    self._conn.set_progress_handler(interrupt_if_expired, 1000)
+                    self._ensure_connection().set_progress_handler(interrupt_if_expired, 1000)
                     loaded = loader(self)
                     if _monotonic() >= deadline:
                         raise _PrescreenDeadlineExpired()
@@ -1967,7 +1967,7 @@ class VectorStore:
                         raise _PrescreenDeadlineExpired() from exc
                     raise
                 finally:
-                    self._conn.set_progress_handler(None, 0)
+                    self._ensure_connection().set_progress_handler(None, 0)
 
         uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
         try:
@@ -2361,7 +2361,7 @@ class VectorStore:
             # already stamped and verified clean (sprint-opt-1).
             if not self._migration_step_present("chunk_vectors_v1"):
                 mark_migration_step_complete(self._conn, "chunk_vectors_v1")
-                self._conn.commit()
+                self._ensure_connection().commit()
         self._chunk_schema_ready = True
 
     def _write_chunk_row(
@@ -2380,29 +2380,29 @@ class VectorStore:
         identity_hash = identity.identity_hash
         normalized, packed, sign_bits = self._encode_stored_vector(vec, profile)
         embedded_at = self._now()
-        self._conn.execute(
+        self._ensure_connection().execute(
             "DELETE FROM lcm_chunk_vectors WHERE chunk_id = ? AND identity_hash = ?",
             (chunk_id, identity_hash),
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "DELETE FROM lcm_chunk_meta WHERE chunk_id = ? AND identity_hash = ?",
             (chunk_id, identity_hash),
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "DELETE FROM lcm_chunk_binary WHERE chunk_id = ? AND identity_hash = ?",
             (chunk_id, identity_hash),
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "INSERT INTO lcm_chunk_vectors(chunk_id, identity_hash, vec) VALUES(?, ?, ?)",
             (chunk_id, identity_hash, packed),
         )
         if sign_bits is not None:
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "INSERT INTO lcm_chunk_binary(chunk_id, identity_hash, bits) "
                 "VALUES(?, ?, ?)",
                 (chunk_id, identity_hash, sign_bits),
             )
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             INSERT INTO lcm_chunk_meta(
                 chunk_id, identity_hash, store_id, chunk_index, char_start,
@@ -2547,7 +2547,7 @@ class VectorStore:
             return 0
         with self._write_transaction():
             with self._temp_id_table([str(value) for value in unique_ids]) as table:
-                cur = self._conn.execute(
+                cur = self._ensure_connection().execute(
                     f"UPDATE lcm_chunk_meta SET archived = 1 "
                     f"WHERE archived = 0 AND store_id IN "
                     f"(SELECT CAST(id AS INTEGER) FROM {table})"
@@ -2588,7 +2588,7 @@ class VectorStore:
         return int(cur.rowcount or 0)
 
     def _chunk_tables_exist(self) -> bool:
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lcm_chunk_meta'"
         ).fetchone() is not None
 
@@ -2640,7 +2640,7 @@ class VectorStore:
                 if conversation_table is not None
                 else ""
             )
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 f"""
                 SELECT cm.chunk_id
                 FROM lcm_chunk_meta cm
@@ -2668,7 +2668,7 @@ class VectorStore:
         if not chunk_ids:
             return rowids, out_ids, kinds, vectors
         with self._temp_id_table(chunk_ids) as table:
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 f"""
                 SELECT v.rowid, v.chunk_id, v.vec
                 FROM {table} t
@@ -2929,7 +2929,7 @@ class VectorStore:
 
     def _current_chunk_profile(self) -> sqlite3.Row | None:
         """The active profile registered under task='chunk' (most recent)."""
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT identity_hash, model_name, provider, revision, dim, dtype,
                    byteorder, task, registered_at, active, archived_at, data_version
@@ -2940,6 +2940,58 @@ class VectorStore:
             """,
             (_CHUNK_TASK,),
         ).fetchone()
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if closed.
+
+        close() nulls self._conn, and a shallow-copied sibling or GC path can
+        close the same underlying handle underneath this store. Before this
+        guard any later query raised AttributeError: 'NoneType' object has no
+        attribute 'execute' permanently. Lazy reconnection here keeps the
+        store usable; the connection property stays honest (it does not
+        reconnect).
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            # A closed sqlite3 connection is still a truthy object, so probe it
+            # and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        self._init_db()
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy state but never the DB handle or locks.
+
+        Default deepcopy would pickle the sqlite3.Connection (TypeError) or a
+        shallow copy would share it so the copy's GC could close the original's
+        live handle. The copy gets _conn=None and fresh locks; it lazily
+        reconnects on first use via _ensure_connection.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                new_store.__dict__[name] = None
+            elif callable(getattr(value, "acquire", None)) and callable(
+                getattr(value, "release", None)
+            ):
+                # Re-allocate any lock object (RLock/Lock) so the copy does not
+                # share the original's lock. Use the same class rather than a
+                # hard-coded threading reference (the runtime may patch it).
+                new_store.__dict__[name] = type(value)()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        return new_store
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)

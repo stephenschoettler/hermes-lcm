@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Any, Iterator, Literal, NamedTuple, Sequence
 import uuid
+import copy
 
 from .db_bootstrap import (
     configure_connection,
@@ -562,14 +563,12 @@ class QueryViewStore:
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         with self._write_lock:
-            if self._conn is None:
-                raise RuntimeError("query-view store is closed")
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_connection().execute("BEGIN IMMEDIATE")
             try:
                 yield
-                self._conn.execute("COMMIT")
+                self._ensure_connection().execute("COMMIT")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                self._ensure_connection().execute("ROLLBACK")
                 raise
 
     @staticmethod
@@ -577,7 +576,7 @@ class QueryViewStore:
         return time.time()
 
     def corpus_snapshot(self) -> CorpusSnapshot:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT generation, max_store_id, row_count "
             "FROM lcm_query_corpus_state WHERE singleton = 1"
         ).fetchone()
@@ -606,7 +605,7 @@ class QueryViewStore:
             raise ValueError(
                 f"dependency quote must contain 1..{_MAX_QUOTE_CHARS} characters"
             )
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT store_id, session_id, conversation_id, source, role, "
             "content, timestamp FROM messages WHERE store_id = ?",
             (store_id,),
@@ -624,7 +623,7 @@ class QueryViewStore:
                 character not in "0123456789abcdef" for character in normalized_assertion
             ):
                 raise ValueError("assertion_id must be a 64-character SHA-256 value")
-            assertion = self._conn.execute(
+            assertion = self._ensure_connection().execute(
                 "SELECT source_store_id, source_span_start, source_span_end, source_quote "
                 "FROM lcm_assertions WHERE assertion_id = ?",
                 (normalized_assertion,),
@@ -666,7 +665,7 @@ class QueryViewStore:
         now = self._now()
         lease = now + _BUILD_LEASE_SECONDS
         with self._write_transaction():
-            self._conn.execute(
+            self._ensure_connection().execute(
                 """
                 INSERT INTO lcm_query_views(
                     view_id, identity_json, status, generation, current_version,
@@ -684,7 +683,7 @@ class QueryViewStore:
                 """,
                 (view_id, canonical, nonce, lease, now, now, now),
             )
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT identity_json, generation, current_version, build_nonce "
                 "FROM lcm_query_views WHERE view_id = ?",
                 (view_id,),
@@ -753,7 +752,7 @@ class QueryViewStore:
     def _validate_dependency_current(
         self, dependency: QueryEvidenceDependency
     ) -> None:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT session_id, conversation_id, source, role, content, timestamp "
             "FROM messages WHERE store_id = ?",
             (int(dependency.source_store_id),),
@@ -783,7 +782,7 @@ class QueryViewStore:
                 f"dependency source {dependency.source_store_id} metadata changed"
             )
         if dependency.assertion_id:
-            assertion = self._conn.execute(
+            assertion = self._ensure_connection().execute(
                 "SELECT 1 FROM lcm_assertions AS assertion "
                 "JOIN lcm_assertion_sources AS source "
                 "ON source.source_store_id = assertion.source_store_id "
@@ -846,7 +845,7 @@ class QueryViewStore:
         now = self._now()
         expires_at = now + ttl
         with self._write_transaction():
-            owner = self._conn.execute(
+            owner = self._ensure_connection().execute(
                 "SELECT status, generation, current_version, build_nonce "
                 "FROM lcm_query_views WHERE view_id = ?",
                 (token.view_id,),
@@ -861,7 +860,7 @@ class QueryViewStore:
                 return False
             current_corpus = self.corpus_snapshot()
             if current_corpus.generation != int(token.corpus_generation):
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "UPDATE lcm_query_views SET status='stale', generation=generation+1, "
                     "stale_reason='corpus_changed_during_build', build_nonce='', "
                     "lease_expires_at=NULL, updated_at=? WHERE view_id=? "
@@ -875,7 +874,7 @@ class QueryViewStore:
             if base_version != int(token.base_version):
                 return False
             version = base_version + 1
-            self._conn.execute(
+            self._ensure_connection().execute(
                 """
                 INSERT INTO lcm_query_view_versions(
                     view_id, version, manifest_json, trace_json, completeness,
@@ -897,7 +896,7 @@ class QueryViewStore:
                     base_version or None,
                 ),
             )
-            self._conn.executemany(
+            self._ensure_connection().executemany(
                 """
                 INSERT INTO lcm_query_view_sources(
                     view_id, version, source_store_id, source_content_sha256,
@@ -924,7 +923,7 @@ class QueryViewStore:
                     for dependency in unique_dependencies
                 ),
             )
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_query_views
                    SET status='ready', current_version=?, build_nonce='',
@@ -949,7 +948,7 @@ class QueryViewStore:
     def mark_failed(self, token: QueryViewBuildToken, error: str) -> bool:
         bounded_error = str(error or "").strip()[:1_000]
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_query_views
                    SET status='failed', stale_reason=?, build_nonce='',
@@ -970,7 +969,7 @@ class QueryViewStore:
     def reclaim_expired_builds(self, now: float | None = None) -> int:
         cutoff = self._now() if now is None else float(now)
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_query_views
                    SET status='stale', generation=generation+1,
@@ -983,7 +982,7 @@ class QueryViewStore:
         return int(cur.rowcount or 0)
 
     def _dependencies_for(self, view_id: str, version: int) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             "SELECT * FROM lcm_query_view_sources "
             "WHERE view_id=? AND version=? "
             "ORDER BY source_store_id, span_start, span_end",
@@ -995,7 +994,7 @@ class QueryViewStore:
         self, since_generation: int, *, limit: int = 256
     ) -> tuple[tuple[dict[str, Any], ...], bool]:
         bounded = min(1_000, max(1, int(limit)))
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             "SELECT * FROM lcm_query_corpus_events WHERE generation > ? "
             "ORDER BY generation LIMIT ?",
             (int(since_generation), bounded + 1),
@@ -1012,7 +1011,7 @@ class QueryViewStore:
     ) -> QueryViewLookup:
         view_id = identity.view_id
         canonical = identity.canonical_json
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT * FROM lcm_query_views WHERE view_id = ?", (view_id,)
         ).fetchone()
         if row is None:
@@ -1028,7 +1027,7 @@ class QueryViewStore:
         generation = int(row["generation"])
         if version <= 0:
             return QueryViewLookup("miss", "view has no published evidence version")
-        version_row = self._conn.execute(
+        version_row = self._ensure_connection().execute(
             "SELECT * FROM lcm_query_view_versions WHERE view_id=? AND version=?",
             (view_id, version),
         ).fetchone()
@@ -1038,7 +1037,7 @@ class QueryViewStore:
         expires_at = version_row["expires_at"]
         if expires_at is not None and float(expires_at) <= current_time:
             with self._write_transaction():
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "UPDATE lcm_query_views SET status='expired', generation=generation+1, "
                     "stale_reason='ttl_expired', updated_at=? "
                     "WHERE view_id=? AND current_version=? AND status<>'expired'",
@@ -1074,13 +1073,13 @@ class QueryViewStore:
             if negative_stale and not reason:
                 reason = "corpus advanced beyond the negative-space watermark"
             with self._write_transaction():
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "UPDATE lcm_query_views SET status='stale', generation=generation+1, "
                     "stale_reason=?, build_nonce='', lease_expires_at=NULL, updated_at=? "
                     "WHERE view_id=? AND status='ready' AND current_version=?",
                     (reason, current_time, view_id, version),
                 )
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT * FROM lcm_query_views WHERE view_id=?", (view_id,)
             ).fetchone()
             events, truncated = self.delta_events(
@@ -1101,7 +1100,7 @@ class QueryViewStore:
             )
         if record_hit:
             with self._write_transaction():
-                cur = self._conn.execute(
+                cur = self._ensure_connection().execute(
                     "UPDATE lcm_query_views SET hit_count=hit_count+1, "
                     "promotion_status=CASE WHEN hit_count+1 >= 2 THEN 'promoted' "
                     "ELSE promotion_status END, updated_at=? "
@@ -1109,7 +1108,7 @@ class QueryViewStore:
                     "AND generation=?",
                     (current_time, view_id, version, generation),
                 )
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT * FROM lcm_query_views WHERE view_id=?", (view_id,)
             ).fetchone()
             confirmed = (
@@ -1184,7 +1183,7 @@ class QueryViewStore:
         cutoff = self._now() if now is None else float(now)
         bounded = min(1_000, max(1, int(limit)))
         with self._write_transaction():
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 "SELECT view_id FROM lcm_query_views WHERE expires_at <= ? "
                 "AND status <> 'expired' ORDER BY expires_at LIMIT ?",
                 (cutoff, bounded),
@@ -1192,7 +1191,7 @@ class QueryViewStore:
             ids = [str(row["view_id"]) for row in rows]
             if ids:
                 placeholders = ",".join("?" for _ in ids)
-                self._conn.execute(
+                self._ensure_connection().execute(
                     f"UPDATE lcm_query_views SET status='expired', "
                     f"generation=generation+1, stale_reason='ttl_expired', "
                     f"updated_at=? WHERE view_id IN ({placeholders})",
@@ -1203,7 +1202,7 @@ class QueryViewStore:
     def purge_expired(self, *, older_than: float, limit: int = 256) -> int:
         bounded = min(1_000, max(1, int(limit)))
         with self._write_transaction():
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 "SELECT view_id FROM lcm_query_views WHERE status='expired' "
                 "AND updated_at < ? ORDER BY updated_at LIMIT ?",
                 (float(older_than), bounded),
@@ -1211,15 +1210,15 @@ class QueryViewStore:
             ids = [str(row["view_id"]) for row in rows]
             if ids:
                 placeholders = ",".join("?" for _ in ids)
-                self._conn.execute(
+                self._ensure_connection().execute(
                     f"DELETE FROM lcm_query_view_sources WHERE view_id IN ({placeholders})",
                     ids,
                 )
-                self._conn.execute(
+                self._ensure_connection().execute(
                     f"DELETE FROM lcm_query_view_versions WHERE view_id IN ({placeholders})",
                     ids,
                 )
-                self._conn.execute(
+                self._ensure_connection().execute(
                     f"DELETE FROM lcm_query_views WHERE view_id IN ({placeholders})",
                     ids,
                 )
@@ -1228,7 +1227,7 @@ class QueryViewStore:
     def prune_corpus_events(self, *, retain: int = 10_000) -> int:
         keep = max(1, int(retain))
         current = self.corpus_snapshot().generation
-        floor_row = self._conn.execute(
+        floor_row = self._ensure_connection().execute(
             "SELECT min(version.corpus_generation) AS floor "
             "FROM lcm_query_views AS view "
             "JOIN lcm_query_view_versions AS version "
@@ -1242,7 +1241,7 @@ class QueryViewStore:
         )
         safe_floor = min(active_floor, max(0, current - keep))
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 "DELETE FROM lcm_query_corpus_events WHERE generation <= ?",
                 (safe_floor,),
             )
@@ -1250,11 +1249,69 @@ class QueryViewStore:
 
     def commit(self) -> None:
         with self._write_lock:
-            self._conn.commit()
+            self._ensure_connection().commit()
 
     @property
     def connection(self) -> sqlite3.Connection | None:
         return getattr(self, "_conn", None)
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if closed.
+
+        close() nulls self._conn, and a shallow-copied sibling or GC path can
+        close the same underlying handle underneath this store. Before this
+        guard any later query raised AttributeError: 'NoneType' object has no
+        attribute 'execute' permanently. Lazy reconnection here keeps the
+        store usable; the connection property stays honest (it does not
+        reconnect).
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            # A closed sqlite3 connection is still a truthy object, so probe it
+            # and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(
+            str(self.db_path), timeout=5.0, check_same_thread=False
+        )
+        refuse_schema_version_too_new(self._conn)
+        configure_connection(self._conn)
+        self._conn.row_factory = sqlite3.Row
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy state but never the DB handle or locks.
+
+        Default deepcopy would pickle the sqlite3.Connection (TypeError) or a
+        shallow copy would share it so the copy's GC could close the original's
+        live handle. The copy gets _conn=None and fresh locks; it lazily
+        reconnects on first use via _ensure_connection.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                new_store.__dict__[name] = None
+            elif callable(getattr(value, "acquire", None)) and callable(
+                getattr(value, "release", None)
+            ):
+                # Re-allocate any lock object (RLock/Lock) so the copy does not
+                # share the original's lock. Use the same class rather than a
+                # hard-coded threading reference (the runtime may patch it).
+                new_store.__dict__[name] = type(value)()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        return new_store
 
     def close(self) -> None:
         with self._write_lock:

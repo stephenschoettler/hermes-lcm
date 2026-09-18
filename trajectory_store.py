@@ -31,6 +31,7 @@ from .db_bootstrap import (
 )
 from .ingest_protection import redact_sensitive_value
 from .search_query import extract_search_terms
+import copy
 
 
 TRAJECTORY_MIGRATION_STEP = "trajectory_store_v1"
@@ -628,7 +629,7 @@ class TrajectoryStore:
 
     def _validate_existing_schema_version(self) -> None:
         try:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT schema_version FROM lcm_trajectory_corpora "
                 "WHERE singleton = 1"
             ).fetchone()
@@ -652,7 +653,7 @@ class TrajectoryStore:
         if self.read_only:
             existing = {
                 str(row[0])
-                for row in self._conn.execute(
+                for row in self._ensure_connection().execute(
                     "SELECT name FROM sqlite_master WHERE name LIKE 'lcm_trajectory%'"
                 )
             }
@@ -670,10 +671,10 @@ class TrajectoryStore:
             return
 
         run_versioned_migrations(self._conn)
-        fts_preexisting = self._conn.execute(
+        fts_preexisting = self._ensure_connection().execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'lcm_trajectory_states_fts'"
         ).fetchone() is not None
-        self._conn.executescript(
+        self._ensure_connection().executescript(
             """
             CREATE TABLE IF NOT EXISTS lcm_trajectory_corpora (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -777,40 +778,40 @@ class TrajectoryStore:
             """
         )
         state_count = int(
-            self._conn.execute("SELECT COUNT(*) FROM lcm_trajectory_states").fetchone()[0]
+            self._ensure_connection().execute("SELECT COUNT(*) FROM lcm_trajectory_states").fetchone()[0]
         )
         fts_count = int(
-            self._conn.execute("SELECT COUNT(*) FROM lcm_trajectory_states_fts").fetchone()[0]
+            self._ensure_connection().execute("SELECT COUNT(*) FROM lcm_trajectory_states_fts").fetchone()[0]
         )
         fts_needs_rebuild = not fts_preexisting or state_count != fts_count
         if not fts_needs_rebuild:
             try:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts, rank) "
                     "VALUES ('integrity-check', 1)"
                 )
             except sqlite3.DatabaseError:
                 fts_needs_rebuild = True
         if fts_needs_rebuild:
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts) VALUES ('rebuild')"
             )
-        marker = self._conn.execute(
+        marker = self._ensure_connection().execute(
             "SELECT 1 FROM lcm_migration_state WHERE step_name = ?",
             (TRAJECTORY_MIGRATION_STEP,),
         ).fetchone()
         if marker is None:
             mark_migration_step_complete(self._conn, TRAJECTORY_MIGRATION_STEP)
-        self._conn.commit()
+        self._ensure_connection().commit()
 
     def _bind_identity(self) -> None:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT * FROM lcm_trajectory_corpora WHERE singleton = 1"
         ).fetchone()
         if row is None:
             if self.read_only:
                 raise CorpusIdentityError("trajectory database has no corpus identity")
-            self._conn.execute(
+            self._ensure_connection().execute(
                 """
                 INSERT INTO lcm_trajectory_corpora(
                     singleton, identity_digest, identity_json, schema_version,
@@ -824,8 +825,8 @@ class TrajectoryStore:
                     time.time(),
                 ),
             )
-            self._conn.commit()
-            row = self._conn.execute(
+            self._ensure_connection().commit()
+            row = self._ensure_connection().execute(
                 "SELECT * FROM lcm_trajectory_corpora WHERE singleton = 1"
             ).fetchone()
         if (
@@ -842,14 +843,14 @@ class TrajectoryStore:
 
     @property
     def status(self) -> str:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT status FROM lcm_trajectory_corpora WHERE singleton = 1"
         ).fetchone()
         return str(row[0])
 
     @property
     def corpus_uid(self) -> str | None:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT corpus_uid FROM lcm_trajectory_corpora WHERE singleton = 1"
         ).fetchone()
         return str(row[0]) if row and row[0] else None
@@ -993,9 +994,9 @@ class TrajectoryStore:
         normalized = protected_source["normalized"]
         trajectory_id = str(normalized["trajectory_id"])
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_connection().execute("BEGIN IMMEDIATE")
             try:
-                existing = self._conn.execute(
+                existing = self._ensure_connection().execute(
                     """
                     SELECT source_sha256, state_count
                     FROM lcm_trajectory_sources
@@ -1008,14 +1009,14 @@ class TrajectoryStore:
                         raise TrajectoryStoreError(
                             f"trajectory {trajectory_id} already exists with a different digest"
                         )
-                    self._conn.commit()
+                    self._ensure_connection().commit()
                     return TrajectoryInsertResult(
                         trajectory_id=trajectory_id,
                         source_sha256=source_sha,
                         state_count=int(existing["state_count"]),
                         already_current=True,
                     )
-                corpus_row = self._conn.execute(
+                corpus_row = self._ensure_connection().execute(
                     """
                     SELECT status, ingest_cursor
                     FROM lcm_trajectory_corpora WHERE singleton = 1
@@ -1030,7 +1031,7 @@ class TrajectoryStore:
                     )
 
                 now = time.time()
-                cursor = self._conn.execute(
+                cursor = self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_trajectory_sources(
                         trajectory_id, ordinal, source_json, source_sha256,
@@ -1060,7 +1061,7 @@ class TrajectoryStore:
                         thoughts=state["thoughts"],
                         text=str(state["text"]),
                     )
-                    state_cursor = self._conn.execute(
+                    state_cursor = self._ensure_connection().execute(
                         """
                         INSERT INTO lcm_trajectory_states(
                             source_id, state_index, sequence_ordinal, step, url,
@@ -1088,7 +1089,7 @@ class TrajectoryStore:
                     )
                     inserted_state_ids.append(int(state_cursor.lastrowid))
                     relative_path, asset_sha, asset_size = asset
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         """
                         INSERT INTO lcm_trajectory_assets(
                             state_id, relative_path, sha256, byte_size
@@ -1103,7 +1104,7 @@ class TrajectoryStore:
                     )
                 for sequence_ordinal in range(1, len(inserted_state_ids)):
                     state = protected_states[sequence_ordinal]
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         """
                         INSERT INTO lcm_trajectory_transitions(
                             source_id, sequence_ordinal, pre_state_id,
@@ -1118,7 +1119,7 @@ class TrajectoryStore:
                             state["incoming_action"],
                         ),
                     )
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_trajectory_ingest_receipts(
                         ordinal, trajectory_id, source_sha256, committed_at
@@ -1126,16 +1127,16 @@ class TrajectoryStore:
                     """,
                     (int(normalized["ordinal"]), trajectory_id, source_sha, now),
                 )
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     UPDATE lcm_trajectory_corpora
                     SET ingest_cursor = ingest_cursor + 1
                     WHERE singleton = 1
                     """
                 )
-                self._conn.commit()
+                self._ensure_connection().commit()
             except Exception:
-                self._conn.rollback()
+                self._ensure_connection().rollback()
                 raise
         return TrajectoryInsertResult(
             trajectory_id=trajectory_id,
@@ -1152,9 +1153,9 @@ class TrajectoryStore:
         if len(ordered) != len(set(ordered)):
             raise ValueError("ordered trajectory ids must be unique")
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_connection().execute("BEGIN IMMEDIATE")
             try:
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     """
                     SELECT trajectory_id, source_sha256
                     FROM lcm_trajectory_sources
@@ -1166,7 +1167,7 @@ class TrajectoryStore:
                     raise CorpusIdentityError(
                         "inserted trajectory order does not match final ordered haystack"
                     )
-                corpus_row = self._conn.execute(
+                corpus_row = self._ensure_connection().execute(
                     """
                     SELECT status, corpus_uid, ingest_cursor
                     FROM lcm_trajectory_corpora WHERE singleton = 1
@@ -1189,9 +1190,9 @@ class TrajectoryStore:
                         raise CorpusIdentityError(
                             "complete corpus source or haystack identity mismatch"
                         )
-                    self._conn.commit()
+                    self._ensure_connection().commit()
                     return corpus_uid
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     UPDATE lcm_trajectory_corpora
                     SET corpus_uid = ?, haystack_digest = ?, source_manifest_digest = ?,
@@ -1206,10 +1207,10 @@ class TrajectoryStore:
                         time.time(),
                     ),
                 )
-                self._conn.commit()
+                self._ensure_connection().commit()
                 return corpus_uid
             except Exception:
-                self._conn.rollback()
+                self._ensure_connection().rollback()
                 raise
 
     def set_embedding_provider(
@@ -1221,7 +1222,7 @@ class TrajectoryStore:
 
     def _ensure_semantic_schema(self) -> None:
         self._require_writable()
-        self._conn.executescript(
+        self._ensure_connection().executescript(
             """
             CREATE TABLE IF NOT EXISTS lcm_trajectory_embedding_profiles (
                 profile_digest TEXT PRIMARY KEY,
@@ -1254,10 +1255,10 @@ class TrajectoryStore:
             ON lcm_trajectory_embeddings(profile_digest, source_id);
             """
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
 
     def _semantic_profile(self) -> sqlite3.Row | None:
-        exists = self._conn.execute(
+        exists = self._ensure_connection().execute(
             """
             SELECT 1 FROM sqlite_master
             WHERE type = 'table' AND name = 'lcm_trajectory_embedding_profiles'
@@ -1265,7 +1266,7 @@ class TrajectoryStore:
         ).fetchone()
         if exists is None:
             return None
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT * FROM lcm_trajectory_embedding_profiles
             WHERE active = 1
@@ -1284,7 +1285,7 @@ class TrajectoryStore:
         return [rows[index] for index in sorted(indexes)]
 
     def _semantic_documents(self) -> list[tuple[int, str, str]]:
-        sources = self._conn.execute(
+        sources = self._ensure_connection().execute(
             """
             SELECT source_id, trajectory_id, goal, start_url, outcome
             FROM lcm_trajectory_sources
@@ -1293,7 +1294,7 @@ class TrajectoryStore:
         ).fetchall()
         documents: list[tuple[int, str, str]] = []
         for source in sources:
-            states = self._conn.execute(
+            states = self._ensure_connection().execute(
                 """
                 SELECT state_index, sequence_ordinal, step, url,
                        incoming_action, thoughts, text
@@ -1347,7 +1348,7 @@ class TrajectoryStore:
         if active_provider is None:
             raise TrajectoryStoreError("trajectory embedding provider is not configured")
         self._ensure_semantic_schema()
-        corpus = self._conn.execute(
+        corpus = self._ensure_connection().execute(
             """
             SELECT source_manifest_digest, trajectory_count
             FROM lcm_trajectory_corpora WHERE singleton = 1
@@ -1366,7 +1367,7 @@ class TrajectoryStore:
             and str(current["source_manifest_digest"]) == str(corpus["source_manifest_digest"])
             and int(current["document_count"]) == expected_count
         ):
-            actual_count = int(self._conn.execute(
+            actual_count = int(self._ensure_connection().execute(
                 "SELECT COUNT(*) FROM lcm_trajectory_embeddings WHERE profile_digest = ?",
                 (str(current["profile_digest"]),),
             ).fetchone()[0])
@@ -1426,13 +1427,13 @@ class TrajectoryStore:
         ]))
         now = time.time()
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_connection().execute("BEGIN IMMEDIATE")
             try:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "UPDATE lcm_trajectory_embedding_profiles SET active = 0 WHERE active = 1"
                 )
-                self._conn.execute("DELETE FROM lcm_trajectory_embeddings")
-                self._conn.execute(
+                self._ensure_connection().execute("DELETE FROM lcm_trajectory_embeddings")
+                self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_trajectory_embedding_profiles(
                         profile_digest, provider, model_name, dim,
@@ -1457,7 +1458,7 @@ class TrajectoryStore:
                         now,
                     ),
                 )
-                self._conn.executemany(
+                self._ensure_connection().executemany(
                     """
                     INSERT INTO lcm_trajectory_embeddings(
                         source_id, profile_digest, document_sha256, vector, embedded_at
@@ -1469,9 +1470,9 @@ class TrajectoryStore:
                         in zip(documents, packed)
                     ],
                 )
-                self._conn.commit()
+                self._ensure_connection().commit()
             except Exception:
-                self._conn.rollback()
+                self._ensure_connection().rollback()
                 raise
         return {
             "status": "built",
@@ -1497,7 +1498,7 @@ class TrajectoryStore:
 
     def _ensure_state_semantic_schema(self) -> None:
         self._require_writable()
-        self._conn.executescript(
+        self._ensure_connection().executescript(
             """
             CREATE TABLE IF NOT EXISTS lcm_trajectory_state_embedding_profiles (
                 profile_digest TEXT PRIMARY KEY,
@@ -1529,10 +1530,10 @@ class TrajectoryStore:
             ON lcm_trajectory_state_embeddings(profile_digest, state_id);
             """
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
 
     def _state_semantic_profile_exists(self) -> bool:
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT 1 FROM sqlite_master
             WHERE type = 'table' AND name = 'lcm_trajectory_state_embedding_profiles'
@@ -1542,7 +1543,7 @@ class TrajectoryStore:
     def active_state_semantic_profile(self) -> sqlite3.Row | None:
         if not self._state_semantic_profile_exists():
             return None
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             "SELECT * FROM lcm_trajectory_state_embedding_profiles WHERE active = 1"
         ).fetchone()
 
@@ -1678,7 +1679,7 @@ class TrajectoryStore:
         if active_provider is None:
             raise TrajectoryStoreError("trajectory embedding provider is not configured")
         self._ensure_state_semantic_schema()
-        corpus = self._conn.execute(
+        corpus = self._ensure_connection().execute(
             """
             SELECT source_manifest_digest, trajectory_count
             FROM lcm_trajectory_corpora WHERE singleton = 1
@@ -1708,7 +1709,7 @@ class TrajectoryStore:
         ):
             dim = int(source_profile["dim"])
 
-        all_states = self._conn.execute(
+        all_states = self._ensure_connection().execute(
             """
             SELECT s.state_id, s.text, s.url
             FROM lcm_trajectory_states s
@@ -1738,7 +1739,7 @@ class TrajectoryStore:
         )
         now = time.time()
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_connection().execute("BEGIN IMMEDIATE")
             try:
                 # Deactivate the serving profile BEFORE staging: the vector
                 # upsert below conflicts on state_id alone, so a staged rebuild
@@ -1747,11 +1748,11 @@ class TrajectoryStore:
                 # Availability-during-rebuild needs profile-scoped embeddings
                 # ((profile_digest, state_id) identity) first; tracked in the
                 # fork issue for the next train.
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "UPDATE lcm_trajectory_state_embedding_profiles "
                     "SET active = 0 WHERE active = 1",
                 )
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_trajectory_state_embedding_profiles(
                         profile_digest, provider, model_name, dim,
@@ -1773,21 +1774,21 @@ class TrajectoryStore:
                     ),
                 )
                 if not resume:
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         "DELETE FROM lcm_trajectory_state_embeddings "
                         "WHERE profile_digest = ?",
                         (profile_digest,),
                     )
-                self._conn.commit()
+                self._ensure_connection().commit()
             except Exception:
-                self._conn.rollback()
+                self._ensure_connection().rollback()
                 raise
 
         already: set[int] = set()
         if resume:
             already = {
                 int(row[0])
-                for row in self._conn.execute(
+                for row in self._ensure_connection().execute(
                     "SELECT state_id FROM lcm_trajectory_state_embeddings "
                     "WHERE profile_digest = ?",
                     (profile_digest,),
@@ -1833,9 +1834,9 @@ class TrajectoryStore:
 
         def _persist(rows: list[tuple[int, str, bytes]]) -> None:
             with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
+                self._ensure_connection().execute("BEGIN IMMEDIATE")
                 try:
-                    self._conn.executemany(
+                    self._ensure_connection().executemany(
                         """
                         INSERT INTO lcm_trajectory_state_embeddings(
                             state_id, profile_digest, document_sha256, vector, embedded_at
@@ -1851,9 +1852,9 @@ class TrajectoryStore:
                             for sid, sha, vec in rows
                         ],
                     )
-                    self._conn.commit()
+                    self._ensure_connection().commit()
                 except Exception:
-                    self._conn.rollback()
+                    self._ensure_connection().rollback()
                     raise
 
         # --- normal single-request states -------------------------------------
@@ -1933,7 +1934,7 @@ class TrajectoryStore:
         # A rewrite invalidates any cached query-time matrix.
         self._state_semantic_cache = None
         embedded_count = int(
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "SELECT COUNT(*) FROM lcm_trajectory_state_embeddings "
                 "WHERE profile_digest = ?",
                 (profile_digest,),
@@ -1944,20 +1945,20 @@ class TrajectoryStore:
                 "state semantic profile is incomplete after backfill"
             )
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            self._ensure_connection().execute("BEGIN IMMEDIATE")
             try:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "UPDATE lcm_trajectory_state_embedding_profiles "
                     "SET active = 0 WHERE active = 1"
                 )
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "UPDATE lcm_trajectory_state_embedding_profiles "
                     "SET active = 1 WHERE profile_digest = ?",
                     (profile_digest,),
                 )
-                self._conn.commit()
+                self._ensure_connection().commit()
             except Exception:
-                self._conn.rollback()
+                self._ensure_connection().rollback()
                 raise
         stats["status"] = "current" if not pending else "built"
         return stats
@@ -2119,7 +2120,7 @@ class TrajectoryStore:
             0,
             int(getattr(provider, "last_usage_tokens", 0) or 0),
         )
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             """
             SELECT source_id, vector
             FROM lcm_trajectory_embeddings
@@ -2145,7 +2146,7 @@ class TrajectoryStore:
         tuples for a pure-Python fallback -- the state vectors were normalized at
         backfill, so a query-vector dot product is cosine similarity either way.
         """
-        freshness_row = self._conn.execute(
+        freshness_row = self._ensure_connection().execute(
             """
             SELECT COUNT(*), COALESCE(MAX(embedded_at), 0.0)
             FROM lcm_trajectory_state_embeddings
@@ -2161,7 +2162,7 @@ class TrajectoryStore:
             and cache[1] == freshness
         ):
             return cache[2], cache[3]
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             """
             SELECT state_id, vector FROM lcm_trajectory_state_embeddings
             WHERE profile_digest = ?
@@ -3129,7 +3130,7 @@ class TrajectoryStore:
             source_clause = f" AND s.source_id IN ({placeholders})"
             params.extend(int(source_id) for source_id in source_ids)
         params.append(int(candidate_limit))
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             f"""
             SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
                    a.relative_path, a.sha256 AS asset_sha256,
@@ -3200,7 +3201,7 @@ class TrajectoryStore:
             params: list[int] = []
             for source_id, neighbor in batch:
                 params.extend((source_id, neighbor))
-            fetched = self._conn.execute(
+            fetched = self._ensure_connection().execute(
                 f"""
                 SELECT s.state_id, s.source_id, s.sequence_ordinal
                 FROM lcm_trajectory_states s
@@ -3234,7 +3235,7 @@ class TrajectoryStore:
         if not state_ids:
             return {}
         placeholders = ",".join("?" for _ in state_ids)
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""
             SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
                    a.relative_path, a.sha256 AS asset_sha256, 0.0 AS rank
@@ -3609,7 +3610,7 @@ class TrajectoryStore:
                 )
             adjacent_by_nucleus: list[list[sqlite3.Row]] = []
             for nucleus in nucleus_rows:
-                adjacent_rows = self._conn.execute(
+                adjacent_rows = self._ensure_connection().execute(
                     """
                     SELECT s.*, src.trajectory_id, src.goal, src.outcome, src.ordinal,
                            a.relative_path, a.sha256 AS asset_sha256, 0.0 AS rank
@@ -3744,7 +3745,7 @@ class TrajectoryStore:
             raise ExactTrajectoryRefError("exact trajectory ref does not match this corpus")
         trajectory_id = unquote(match.group("trajectory"))
         state_index = int(match.group("state"))
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             """
             SELECT s.*, src.trajectory_id, src.goal, src.outcome, a.relative_path,
                    a.sha256 AS asset_sha256
@@ -3774,7 +3775,7 @@ class TrajectoryStore:
         return _sha256_text(_canonical_json(portable_hits))
 
     def manifest(self) -> dict[str, Any]:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT * FROM lcm_trajectory_corpora WHERE singleton = 1"
         ).fetchone()
         semantic = self._semantic_profile()
@@ -3812,18 +3813,70 @@ class TrajectoryStore:
         if destination_path.exists():
             raise FileExistsError(destination_path)
         with self._lock:
-            self._conn.commit()
+            self._ensure_connection().commit()
             target = sqlite3.connect(str(destination_path))
             try:
-                self._conn.backup(target)
+                self._ensure_connection().backup(target)
                 target.commit()
             finally:
                 target.close()
         return destination_path
 
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if closed.
+
+        close() nulls self._conn, and a shallow-copied sibling or GC path can
+        close the same underlying handle underneath this store. Before this
+        guard any later query raised AttributeError: 'NoneType' object has no
+        attribute 'execute' permanently. Lazy reconnection here keeps the
+        store usable; the connection property stays honest (it does not
+        reconnect).
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            # A closed sqlite3 connection is still a truthy object, so probe it
+            # and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        self._conn = self._open_connection()
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy state but never the DB handle or locks.
+
+        Default deepcopy would pickle the sqlite3.Connection (TypeError) or a
+        shallow copy would share it so the copy's GC could close the original's
+        live handle. The copy gets _conn=None and fresh locks; it lazily
+        reconnects on first use via _ensure_connection.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                new_store.__dict__[name] = None
+            elif callable(getattr(value, "acquire", None)) and callable(
+                getattr(value, "release", None)
+            ):
+                # Re-allocate any lock object (RLock/Lock) so the copy does not
+                # share the original's lock. Use the same class rather than a
+                # hard-coded threading reference (the runtime may patch it).
+                new_store.__dict__[name] = type(value)()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        return new_store
+
     def close(self) -> None:
         with self._lock:
-            conn = self._conn
+            conn = self._ensure_connection()
             if conn is None:
                 return
             try:

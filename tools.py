@@ -2898,7 +2898,7 @@ def _lcm_grep_full_text_with_deadline(
             read_store = copy.copy(engine._store)
             read_dag = copy.copy(engine._dag)
             read_store._conn = message_conn
-            read_store._db_lock = threading.RLock()
+            read_store._write_lock = threading.RLock()
             read_dag._conn = dag_conn
             read_dag._db_lock = threading.RLock()
             read_engine._store = read_store
