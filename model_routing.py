@@ -17,16 +17,15 @@ class ModelRoute:
 
 ProviderResolver = Callable[[str], bool]
 
+# Model slug prefixes that map to NVIDIA NIM (when no :free suffix).
+_NVIDIA_NIM_PREFIXES = frozenset({"nvidia", "deepseek-ai"})
 
-# Conservative allowlist for built-in provider registry fallbacks. Non-canonical
-# named custom providers from the Hermes config are safe to split; registry-only
-# providers still need an allowlist because many provider IDs are also valid
-# OpenRouter model namespaces, for example ``anthropic/...``, ``google/...``
-# and ``x-ai/...``. ``custom:<name>/...`` is accepted for non-canonical named
-# custom providers because Hermes auxiliary routing normalizes ``provider`` the
-# same way, but canonical built-ins such as ``custom:openai-codex/...`` remain
-# model-only to avoid accidentally selecting the built-in provider.
-_PROVIDER_PREFIXES = frozenset({"cerebras"})
+# When a model slug doesn't match any known provider prefix, use this
+# auxiliary provider by default.
+_DEFAULT_AUXILIARY_PROVIDER = "openrouter"
+
+# Conservative allowlist for built-in provider registry fallbacks.
+_PROVIDER_PREFIXES = frozenset({"cerebras", "nvidia"})
 
 
 def _provider_route_is_resolvable(provider: str) -> bool:
@@ -65,25 +64,23 @@ def parse_lcm_model_override(
 ) -> ModelRoute:
     """Parse an LCM model override into explicit provider/model routing.
 
-    Values whose first path segment is resolvable by the Hermes host are split
-    into ``provider=<prefix>`` and ``model=<rest>``. The default resolver only
-    treats non-canonical named custom providers (plus conservative registry
-    allowlist entries) as resolvable so OpenRouter-style model slugs and
-    canonical built-in provider names remain model-only overrides.
+    - Models ending in ``:free`` route to OpenRouter with the suffix preserved.
+    - Models with ``nvidia/`` or ``deepseek-ai/`` prefixes (no ``:free`` suffix)
+      route to NVIDIA NIM, keeping the full original model string intact.
+    - Everything else passes through unchanged.
     """
     model = (value or "").strip()
     if not model:
         return ModelRoute(provider=None, model="")
 
-    provider, sep, rest = model.partition("/")
-    provider = provider.strip().lower()
-    rest = rest.strip()
-    route_provider = provider
-    if provider.startswith("custom:"):
-        route_provider = provider.split(":", 1)[1].strip()
-    can_resolve_provider = provider_resolver or _provider_route_is_resolvable
-    if sep and rest and route_provider and can_resolve_provider(route_provider):
-        return ModelRoute(provider=route_provider, model=rest)
+    # OpenRouter free-tier models keep their :free suffix — do NOT strip it.
+    if model.endswith(":free"):
+        return ModelRoute(provider="openrouter", model=model)
+
+    # NVIDIA NIM routes (nvidia/ and deepseek-ai/ prefixes, no :free).
+    for prefix in _NVIDIA_NIM_PREFIXES:
+        if model.startswith(f"{prefix}/"):
+            return ModelRoute(provider="nvidia", model=model)
 
     return ModelRoute(provider=None, model=model)
 
