@@ -336,7 +336,36 @@ def test_public_schema_adds_auto_mode_without_changing_default():
         ),
     }
     assert parameters["required"] == ["question", "baseline_refs"]
-    assert parameters["allOf"][0]["then"] == {"required": ["proposal"]}
+    # The Anthropic Messages API rejects oneOf/allOf/anyOf at the top level of a
+    # tool input_schema, which made this tool unusable on every native-Anthropic
+    # provider. The mode=proposal -> proposal requirement is enforced in
+    # lcm_compile_evidence instead; see test_proposal_mode_without_a_proposal_is_still_rejected.
+    assert not {"allOf", "oneOf", "anyOf"} & set(parameters)
+
+
+def test_proposal_mode_without_a_proposal_is_still_rejected(tmp_path):
+    """The guarantee the removed top-level allOf used to declare.
+
+    Dropping the combinator from the wire schema loses no enforcement: the
+    product compiler already refuses a proposal-mode call that carries no
+    proposal, and does so with a typed reason code rather than a schema error.
+    """
+    engine = _engine(tmp_path)
+    source = _append(engine, "You need 15 points to redeem the reward.")
+    try:
+        out = json.loads(
+            lcm_compile_evidence(
+                {
+                    "mode": "proposal",
+                    "question": "How many points do I need?",
+                    "baseline_refs": [source],
+                },
+                engine=engine,
+            )
+        )
+    finally:
+        engine._store.close()
+    assert out["reason_code"] == "selector_schema_invalid"
 
 
 def test_store_scan_is_one_bounded_snapshot_and_never_relabels_time(tmp_path):
