@@ -1,8 +1,35 @@
 # Tooling configuration for the hermes-lcm plugin.
 #
-# This file exists only to pin lint settings so `ruff` behaves identically
-# locally and in CI. It intentionally declares no [build-system] or project
-# metadata: the plugin is installed via scripts/install.sh, not pip.
+# This file pins lint settings so `ruff` behaves identically locally and in
+# CI. It intentionally declares no [build-system]: the plugin is installed via
+# scripts/install.sh, not pip.
+#
+# The minimal [project] table below is required because the Hermes package
+# manager treats every enabled plugin that ships a pyproject.toml as a uv
+# workspace member. uv rejects a [project] table without `version`, so the
+# whole `uv lock` fails and the plugin gets dropped from the environment.
+# Without a build backend the member is metadata-only (virtual): Hermes
+# rewrites `name` to a per-profile key, and `version` is a placeholder that
+# never has to track plugin.yaml.
+#
+# `dependencies` are the runtime imports the plugin actually needs at
+# import time (numpy, tiktoken, pyyaml, fastembed, huggingface-hub, regex).
+# Declaring them here lets the PM workspace union them into the managed venv
+# on every generation, so plugin startup no longer depends on whatever
+# happens to be installed in the host environment.
+
+[project]
+name = "hermes-lcm"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "tiktoken>=0.7",
+    "pyyaml>=6.0",
+    "fastembed>=0.3",
+    "huggingface-hub>=0.24",
+    "regex>=2024.4",
+]
 
 [tool.ruff]
 # Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.
