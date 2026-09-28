@@ -390,7 +390,7 @@ def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
     monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
 
     assert engine.should_compress_preflight(messages) is True
-    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
+    assert engine._preflight_cleanup_only_no_summary is True
 
 
 def test_flag_off_replay_cleanup_cooldown_publishes_without_summary_llm(
@@ -545,3 +545,94 @@ def test_live_interceptor_keeps_media_and_recovery_results_inline(make_engine):
     assert cached is not None
     assert assembled_tool(cached, "media-live-call")["content"] == media_payload
     assert assembled_tool(cached, "recovery-live-call")["content"] == "recovered payload " * 100
+
+
+def test_replay_cleanup_below_threshold_preflight_adopts_without_summarizing(
+    make_engine,
+    monkeypatch,
+):
+    """A routine ingest stub below the threshold must not buy a summarizer pass.
+
+    Regression: the replay-diff branch returned a compression request for any
+    ingest cleanup without consulting ``threshold_tokens``, so the host ran a
+    full leaf compaction (LLM summary) while the live prompt was far below the
+    configured threshold.
+    """
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    assert engine._last_boundary_skip_time == 0
+    payload = "below threshold durable payload with eligible backlog " * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("below-threshold-call", payload),
+    ]
+
+    def fail_if_summarized(**_kwargs):
+        raise AssertionError("below-threshold replay cleanup must not summarize")
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_if_summarized)
+
+    assert engine.should_compress_preflight(messages) is True
+    assert engine._preflight_cleanup_only_no_summary is True
+    result = engine.compress(messages, current_tokens=1_000)
+
+    assert assembled_tool(result, "below-threshold-call")["content"].startswith(
+        "[Externalized tool output:"
+    )
+    assert engine._dag.get_session_node_count(engine._session_id) == 0
+    assert engine.last_compression_status == "sanitized"
+
+
+def test_noncleanup_replay_diff_below_threshold_stays_noop(make_engine, monkeypatch):
+    """Below the threshold a changed replay is not a reason to summarize."""
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "original old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        {"role": "user", "content": "latest request"},
+    ]
+    replay_messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "normalized old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        {"role": "user", "content": "latest request"},
+    ]
+    monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: replay_messages)
+
+    assert engine._replay_diff_requests_ingest_cleanup(messages, replay_messages) is False
+    assert engine._should_force_overflow_recovery(messages=replay_messages) is False
+    assert engine.should_compress_preflight(messages) is False
+    assert engine.last_compression_status == "noop"
+    assert "below compaction threshold" in engine._last_compression_noop_reason
+
+
+def test_replay_cleanup_above_threshold_still_summarizes(make_engine, monkeypatch):
+    """The threshold gate must not weaken at-or-above-threshold compaction."""
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 1
+    payload = "above threshold durable payload with eligible backlog " * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("above-threshold-call", payload),
+    ]
+    monkeypatch.setattr(
+        lcm_engine,
+        "summarize_with_escalation",
+        lambda **_kwargs: ("old work summary\nExpand for details about: old work", 1),
+    )
+
+    assert engine.should_compress_preflight(messages) is True
+    result = engine.compress(messages, current_tokens=20_000)
+
+    assert engine._preflight_cleanup_only_no_summary is False
+    assert assembled_tool(result, "above-threshold-call")["content"].startswith(
+        "[Externalized tool output:"
+    )
+    assert engine._dag.get_session_node_count(engine._session_id) == 1
+    assert engine.last_compression_status == "compacted"
