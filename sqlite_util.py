@@ -98,6 +98,21 @@ def _chmod_sqlite_artifact_at(
             # process's SQLite locks on the file for no benefit.
             return True
 
+    if expected is None and _CHMOD_THROUGH_PATH_DESCRIPTOR:
+        # O_EXCL does not protect the interval between creation and close:
+        # another thread may connect and acquire SQLite locks in that window.
+        # Create a regular file without a data descriptor, then use the same
+        # validation and O_PATH permission handling as an existing artifact.
+        try:
+            os.mknod(path.name, stat.S_IFREG | _PRIVATE_SQLITE_MODE, dir_fd=directory_fd)
+        except FileExistsError:
+            pass
+        if not _chmod_sqlite_artifact_at(
+            path, directory_fd=directory_fd, create=False,
+        ):
+            raise _sqlite_artifact_error(path, "directory entry disappeared while creating")
+        return True
+
     use_path_descriptor = expected is not None and _CHMOD_THROUGH_PATH_DESCRIPTOR
     if use_path_descriptor:
         flags = _O_PATH | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
