@@ -7,6 +7,10 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 - Keep the `post_llm_call` ingest hook idempotent across repeated `register()`
   builds so superseded engines and their SQLite descriptors become collectable
   on long-lived hosts (gateway fd-leak fix).
+- Keep the test suite runnable from a self-managed Hermes checkout: the test
+  harness disables lazy source-update completion, so importing
+  `hermes_bootstrap` can no longer `os.execv` the pytest process into the PM
+  runtime mid-run.
 
 ## v1.0.0-rc.1 - 2026-09-03
 
