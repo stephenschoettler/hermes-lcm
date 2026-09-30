@@ -360,6 +360,26 @@ def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine)
     return _handler
 
 
+def _is_lcm_ingest_hook(candidate) -> bool:
+    """Return whether *candidate* is one of LCM's per-turn ingest hooks.
+
+    ``register()`` runs once per agent build on long-lived hosts, so the
+    post_llm_call hook it installs must replace the previous generation
+    instead of stacking onto it (see the registration site for the fd-leak
+    background).  Hooks created by this module are tagged with
+    ``_lcm_post_llm_ingest``; hooks created by earlier versions of the module
+    are recognised by their ``(module, qualname)`` signature so an in-place
+    update can still release the engines those stale closures pin.
+    """
+    if getattr(candidate, "_lcm_post_llm_ingest", False):
+        return True
+    return (
+        getattr(candidate, "__module__", "") == __name__
+        and getattr(candidate, "__qualname__", "")
+        == "register.<locals>._on_post_llm_call"
+    )
+
+
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
@@ -600,7 +620,20 @@ def register(ctx):
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
 
-        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
+        # register() runs once per agent build (the host loads the engine via
+        # load_context_engine() -> register(ctx)), and the manager's hook list
+        # is process-wide and never pruned.  A bare append therefore leaks one
+        # closure per build, and each stale closure pins its build's engine —
+        # engine, SQLite store/DAG/lifecycle descriptors included — for the
+        # life of the process.  Long-running gateways accumulate thousands of
+        # lcm.db descriptors this way; once open descriptors exceed
+        # FD_SETSIZE, select()-based terminal drains start failing silently.
+        # Replace any superseded LCM ingest hook so stale engines (and their
+        # descriptors) become collectable.
+        _on_post_llm_call._lcm_post_llm_ingest = True
+        _hooks = _mgr._hooks.setdefault("post_llm_call", [])
+        _hooks[:] = [h for h in _hooks if not _is_lcm_ingest_hook(h)]
+        _hooks.append(_on_post_llm_call)
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)

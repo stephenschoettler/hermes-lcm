@@ -4,7 +4,9 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+- Keep the `post_llm_call` ingest hook idempotent across repeated `register()`
+  builds so superseded engines and their SQLite descriptors become collectable
+  on long-lived hosts (gateway fd-leak fix).
 
 ## v1.0.0-rc.1 - 2026-09-03
 
