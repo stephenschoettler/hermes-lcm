@@ -25,7 +25,12 @@ from .codex_routing import (
     _codex_oauth_context_cap,
     _is_codex_gpt55_route,
 )
-from .config import LCMConfig
+from .config import (
+    LCMConfig,
+    load_hermes_compression_policy,
+    resolve_hermes_home,
+    resolve_hermes_model_threshold,
+)
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
@@ -145,6 +150,14 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+
+# Hermes Core raises the effective trigger on smaller windows before it derives
+# the token count.  Keep these values local to the adapter so hermes_config
+# follows the existing host policy without importing Hermes' private module.
+_HERMES_MINIMUM_CONTEXT_LENGTH = 64_000
+_HERMES_SMALL_CONTEXT_WINDOW_LIMIT = 512_000
+_HERMES_SMALL_CONTEXT_THRESHOLD_PERCENT = 0.75
+_HERMES_MIN_CONTEXT_TRIGGER_RATIO = 0.85
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -389,7 +402,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
-        self._config = config or LCMConfig.from_env()
+        self._config_from_env = config is None or bool(getattr(config, "_environment_backed", False))
+        self._manual_trigger_mode = None if self._config_from_env else config.trigger_mode
+        self._config = config or LCMConfig.from_env(hermes_home)
         self._hermes_home = hermes_home
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
@@ -480,6 +495,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.effective_context_length_reason = ""
         self._context_length_source = ""
         self._update_model_pending_session_start = False
+        self.threshold_tokens_cap: int | None = None
+        self._hermes_compression_policy = None
+        self._hermes_compression_policy_signature = None
         self.threshold_tokens = 0
         self.context_threshold = self._config.context_threshold
         self.threshold_percent = self.context_threshold
@@ -638,9 +656,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         budget-aware even before a compatible Hermes host calls update_model().
         """
         clone = type(self)(
-            config=copy.deepcopy(self._config),
+            config=None if self._config_from_env else copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
         )
+        clone._maybe_sync_hermes_compression_policy()
         clone.model = self.model
         clone.base_url = self.base_url
         clone.api_key = self.api_key
@@ -829,6 +848,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not hermes_home:
             return False
+        if str(self._hermes_home or "") != str(hermes_home):
+            if self._config_from_env:
+                refreshed = LCMConfig.from_env(hermes_home)
+                self._config.context_threshold = refreshed.context_threshold
+                self._config.trigger_mode = refreshed.trigger_mode
+                self._config.codex_gpt55_autoraise_enabled = refreshed.codex_gpt55_autoraise_enabled
+                for field in ("context_threshold", "trigger_mode", "codex_gpt55_autoraise_enabled"):
+                    self._config.config_sources[field] = refreshed.config_sources.get(field, "default")
+            self._hermes_compression_policy = None
+            self._hermes_compression_policy_signature = None
+            self.threshold_tokens_cap = None
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
@@ -870,6 +900,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "env:LCM_CONTEXT_THRESHOLD",
             "config_yaml:lcm.context_threshold",
         }
+        hermes_policy = getattr(self, "_hermes_compression_policy", None)
+        if (
+            hermes_policy is not None
+            and hermes_policy.trigger_mode == "hermes_config"
+        ):
+            route_model = self.model if model is None else model
+            route_provider = self.provider if provider is None else provider
+            configured = resolve_hermes_model_threshold(
+                route_model,
+                hermes_policy.model_thresholds,
+                hermes_policy.threshold,
+                route_provider,
+            )
+            return configured, "hermes_config:compression.threshold", None
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
         if (
@@ -884,6 +928,60 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 {"from": configured, "to": _CODEX_GPT55_COMPACTION_THRESHOLD},
             )
         return configured, source, None
+
+    def _maybe_sync_hermes_compression_policy(self) -> bool:
+        """Refresh the active Hermes profile policy when its YAML changes."""
+        if not self._config_from_env and self._manual_trigger_mode != "hermes_config":
+            return False
+        cfg_path = Path(self._hermes_home or resolve_hermes_home()) / "config.yaml"
+        try:
+            stat = cfg_path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            signature = None
+        policy = getattr(self, "_hermes_compression_policy", None)
+        if signature == getattr(self, "_hermes_compression_policy_signature", None) and policy is not None:
+            return False
+        try:
+            loaded = load_hermes_compression_policy(self._hermes_home)
+        except Exception as exc:
+            # Keep the last known-good policy when a live file is malformed.
+            logger.warning(
+                "LCM could not load Hermes compression policy (%s); keeping previous policy",
+                type(exc).__name__,
+            )
+            return False
+        if self._manual_trigger_mode == "hermes_config":
+            from dataclasses import replace
+            loaded = replace(loaded, trigger_mode="hermes_config", trigger_mode_source="manual:LCMConfig.trigger_mode")
+        old_policy = policy
+        old_mode = getattr(old_policy, "trigger_mode", "legacy")
+        self._hermes_compression_policy = loaded
+        self._hermes_compression_policy_signature = signature
+        self._config.trigger_mode = loaded.trigger_mode
+        self._config.config_sources["trigger_mode"] = loaded.trigger_mode_source
+        if loaded.trigger_mode == "hermes_config":
+            self.threshold_tokens_cap = loaded.threshold_tokens
+        elif old_mode == "hermes_config":
+            self.threshold_tokens_cap = None
+            refreshed = LCMConfig.from_env(self._hermes_home)
+            self._config.context_threshold = refreshed.context_threshold
+            self._config.config_sources["context_threshold"] = refreshed.config_sources.get(
+                "context_threshold", "default"
+            )
+            self._config.codex_gpt55_autoraise_enabled = refreshed.codex_gpt55_autoraise_enabled
+        if (
+            old_mode != loaded.trigger_mode
+            or loaded.trigger_mode == "hermes_config"
+            or old_policy is None
+        ) and getattr(self, "raw_context_length", 0) > 0:
+            self._set_context_length(
+                self.raw_context_length,
+                source="hermes_config" if loaded.trigger_mode == "hermes_config" else "config_reload",
+                model=self.model,
+                provider=self.provider,
+            )
+        return True
 
     def _effective_context_length(
         self,
@@ -903,21 +1001,75 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         return raw_context_length, None, ""
 
-    def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
-        """Return the host-visible preflight trigger token count.
+    @staticmethod
+    def _coerce_threshold_tokens_cap(value: Any) -> int | None:
+        """Normalize the host's optional absolute trigger cap."""
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = int(value) if value is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return parsed if parsed > 0 else None
 
-        Hermes core uses ``threshold_tokens`` as a cheap gate before it pays for
-        the full request estimate that includes system prompt and tool schemas.
-        LCM can enforce a stricter active-context assembly cap than the normal
-        context-threshold value, so expose the stricter cap here; otherwise a
-        tool/schema-heavy request can skip host preflight entirely.
+    def _effective_threshold_percent(self, context_length: int, base: float) -> float:
+        """Accept the host ratio; apply LCM priority at the sync boundary."""
+        return float(base)
+
+    @staticmethod
+    def _hermes_effective_threshold_percent(context_length: int, base: float) -> float:
+        """Apply Hermes' raise-only floor for smaller model windows.
+
+        Hermes applies this only to its own compression policy.  Keeping it
+        behind the hermes_config path preserves legacy LCM behavior while
+        making the adapter's fallback for small models match the host.
         """
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is not None and assembly_cap > 0:
-            if context_threshold_tokens > 0:
-                return min(context_threshold_tokens, assembly_cap)
-            return assembly_cap
-        return context_threshold_tokens
+        if context_length and context_length < _HERMES_SMALL_CONTEXT_WINDOW_LIMIT:
+            return max(float(base), _HERMES_SMALL_CONTEXT_THRESHOLD_PERCENT)
+        return float(base)
+
+    @staticmethod
+    def _hermes_compute_threshold_tokens(
+        context_length: int, threshold_percent: float,
+    ) -> int:
+        """Compute Hermes' ratio trigger when no output reservation is exposed.
+
+        The external LCM engine does not receive Hermes' private ``max_tokens``
+        value, so the adapter uses the same ``max_tokens=None`` branch: the
+        full active context is the input budget, followed by Hermes' minimum
+        floor and 85% small-window safety cap.
+        """
+        effective_window = max(int(context_length), 0)
+        if effective_window <= 0:
+            return 0
+        pct_value = int(effective_window * float(threshold_percent))
+        floored = max(pct_value, _HERMES_MINIMUM_CONTEXT_LENGTH)
+        trigger_cap = int(effective_window * _HERMES_MIN_CONTEXT_TRIGGER_RATIO)
+        if floored > pct_value and floored > trigger_cap:
+            floored = max(pct_value, trigger_cap)
+        if floored >= effective_window:
+            return max(1, min(trigger_cap, effective_window - 1))
+        return floored
+
+    @property
+    def _threshold_tokens(self) -> None:
+        return None
+
+    @_threshold_tokens.setter
+    def _threshold_tokens(self, value: Any) -> None:
+        if value is None and self._hermes_compression_policy is not None:
+            self._maybe_sync_hermes_compression_policy()
+            if self._hermes_compression_policy.trigger_mode == "hermes_config" and self.raw_context_length:
+                self._set_context_length(self.raw_context_length, source="host_config_reload")
+
+    def _effective_threshold_tokens(self, context_threshold_tokens: int) -> int:
+        """Return the stricter active trigger cap for host preflight."""
+        caps = [cap for cap in (
+            context_threshold_tokens,
+            self._coerce_threshold_tokens_cap(self.threshold_tokens_cap),
+            self._effective_assembly_token_cap(),
+        ) if cap is not None and cap > 0]
+        return min(caps) if caps else 0
 
     def _set_context_length(
         self,
@@ -950,6 +1102,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self.threshold_percent = self.context_threshold
             return True
         self.raw_context_length = parsed_context_length
+        policy = self._hermes_compression_policy
+        if policy is not None and policy.trigger_mode == "hermes_config":
+            self.threshold_tokens_cap = policy.threshold_tokens
         effective_context_length, cap, reason = self._effective_context_length(
             parsed_context_length,
             model=model,
@@ -962,10 +1117,26 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
             self._runtime_context_threshold(model=model, provider=provider)
         )
+        if (
+            self._hermes_compression_policy is not None
+            and self._hermes_compression_policy.trigger_mode == "hermes_config"
+        ):
+            self.context_threshold = self._hermes_effective_threshold_percent(
+                effective_context_length, self.context_threshold,
+            )
+            self._context_threshold_source = "hermes_config:effective_threshold"
         self.threshold_percent = self.context_threshold
-        context_threshold_tokens = int(
-            effective_context_length * self.context_threshold
-        )
+        if (
+            self._hermes_compression_policy is not None
+            and self._hermes_compression_policy.trigger_mode == "hermes_config"
+        ):
+            context_threshold_tokens = self._hermes_compute_threshold_tokens(
+                effective_context_length, self.context_threshold,
+            )
+        else:
+            context_threshold_tokens = int(
+                effective_context_length * self.context_threshold
+            )
         self.threshold_tokens = self._effective_threshold_tokens(
             context_threshold_tokens
         )
@@ -3867,7 +4038,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return identity
 
     def get_status(self) -> Dict[str, Any]:
+        self._maybe_sync_hermes_compression_policy()
         status = super().get_status()
+        hermes_policy = getattr(self, "_hermes_compression_policy", None)
+        hermes_model_override = None
+        if hermes_policy is not None and hermes_policy.trigger_mode == "hermes_config":
+            hermes_model_override = resolve_hermes_model_threshold(
+                self.model,
+                hermes_policy.model_thresholds,
+                hermes_policy.threshold,
+                self.provider,
+            )
         status.update({
             "compression_count": self.compression_count,
             "last_prompt_tokens": self.last_prompt_tokens,
@@ -3885,6 +4066,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "effective_context_length_cap": self.effective_context_length_cap,
             "effective_context_length_reason": self.effective_context_length_reason,
             "threshold_tokens": self.threshold_tokens,
+            "threshold_tokens_cap": self.threshold_tokens_cap,
             "last_compression_status": self._last_compression_status,
             "last_compression_noop_reason": self._last_compression_noop_reason,
             "threshold_full_sweep": dict(self._last_threshold_full_sweep),
@@ -3899,6 +4081,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_threshold": self.context_threshold,
             "context_threshold_source": self._context_threshold_source,
             "context_threshold_autoraised": self._context_threshold_autoraised,
+            "trigger_mode": getattr(self._config, "trigger_mode", "legacy"),
+            "trigger_mode_source": (
+                getattr(self._config, "config_sources", {}) or {}
+            ).get("trigger_mode", "default"),
+            "hermes_threshold_source": (
+                getattr(hermes_policy, "threshold_source", "")
+                if hermes_policy is not None else ""
+            ),
+            "hermes_threshold_tokens_source": (
+                getattr(hermes_policy, "threshold_tokens_source", "")
+                if hermes_policy is not None else ""
+            ),
+            "hermes_model_threshold": hermes_model_override,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
@@ -4061,6 +4256,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.api_key = str(api_key or "")
         self.provider = str(provider or "")
         self.api_mode = str(api_mode or "")
+        self._maybe_sync_hermes_compression_policy()
         self._set_context_length(context_length, source="update_model")
         self._update_model_pending_session_start = True
 

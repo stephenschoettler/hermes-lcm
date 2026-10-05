@@ -4,7 +4,13 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+- Add opt-in `lcm.trigger_mode: hermes_config`. The plugin reads the active
+  Hermes profile's `compression.threshold`, `compression.threshold_tokens`,
+  and `compression.model_thresholds` for messaging gateways that do not receive
+  Hermes TUI live-sync fields. Legacy host-sync behavior remains unchanged.
+- Expose trigger mode, cap, selected model ratio, and value provenance through
+  `lcm_status`; document that this is plugin-side policy reading, not a new
+  Hermes Core compaction signal.
 
 ## v1.0.0-rc.1 - 2026-09-03
 

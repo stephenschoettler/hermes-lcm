@@ -60,3 +60,5 @@ benchmarks/runs/
 # Internal documentation
 internal docs/
 docs/plans/
+
+/artifacts/
