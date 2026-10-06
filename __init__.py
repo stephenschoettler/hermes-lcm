@@ -2,6 +2,7 @@
 
 Replaces the built-in ContextCompressor with a DAG-based context engine
 that persists every message and provides structured retrieval tools.
+Registered as the active engine via register_context_engine (see register()).
 
 Based on the LCM paper by Ehrlich & Blackman (Voltropy PBC, Feb 2026).
 """
