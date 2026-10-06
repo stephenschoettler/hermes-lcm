@@ -45,6 +45,26 @@ def normalize_content_value(content: Any) -> str | None:
         return str(content)
 
 
+def extract_reasoning_text(msg: dict) -> str | None:
+    """Return the reasoning text carried by a message dict, once.
+
+    Hermes replays model reasoning to providers as ``reasoning_content``
+    (the wire key, counted and persisted because it is provider-visible
+    cost); host-side history dicts may carry the same text under the
+    internal ``reasoning`` key, which the request assembly later promotes
+    onto the wire when ``reasoning_echo`` is on.  Return one copy of the
+    reasoning text, preferring the wire key, so token accounting and raw
+    persistence never double-count identical text under both keys.
+    """
+    reasoning_content = msg.get("reasoning_content")
+    reasoning = msg.get("reasoning")
+    if isinstance(reasoning_content, str) and reasoning_content:
+        return reasoning_content
+    if isinstance(reasoning, str) and reasoning:
+        return reasoning
+    return None
+
+
 def text_content_for_pattern_matching(content: Any) -> str | None:
     """Return the operator-visible text string used by message filters.
 
