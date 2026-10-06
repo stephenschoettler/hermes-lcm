@@ -1,8 +1,14 @@
 # Tooling configuration for the hermes-lcm plugin.
-#
-# This file exists only to pin lint settings so `ruff` behaves identically
-# locally and in CI. It intentionally declares no [build-system] or project
-# metadata: the plugin is installed via scripts/install.sh, not pip.
+
+[project]
+name = "hermes-lcm"
+version = "1.0.0-rc.1"
+description = "Lossless Context Management for Hermes Agent"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
 
 [tool.ruff]
 # Match the oldest runtime CI exercises; keeps lint aligned with the 3.11 leg.

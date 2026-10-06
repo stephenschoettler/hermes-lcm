@@ -12,6 +12,7 @@ still depends on SQLite WAL recovery.
 from __future__ import annotations
 
 import sqlite3
+import sys
 import threading
 from pathlib import Path
 
@@ -55,17 +56,34 @@ class TestConfigureConnectionPragmas:
         conn.close()
         assert val == 2, f"expected synchronous=FULL (2), got {val}"
 
-    def test_busy_timeout(self, db_path: Path):
+    def test_busy_timeout(self, db_path: Path, monkeypatch):
+        monkeypatch.delenv("LCM_BUSY_TIMEOUT_MS", raising=False)
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         val = conn.execute("PRAGMA busy_timeout").fetchone()[0]
         conn.close()
         assert val == 30_000, f"expected busy_timeout=30000, got {val}"
 
+    def test_busy_timeout_override(self, db_path: Path, monkeypatch):
+        monkeypatch.setenv("LCM_BUSY_TIMEOUT_MS", "60000")
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        val = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        conn.close()
+        assert val == 60_000, f"expected busy_timeout=60000, got {val}"
+
     def test_wal_autocheckpoint(self, db_path: Path):
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         # After setting, PRAGMA wal_autocheckpoint returns the NEW value.
+        val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
+        conn.close()
+        assert val == 4000, f"expected wal_autocheckpoint=4000, got {val}"
+
+    def test_wal_autocheckpoint_override(self, db_path: Path, monkeypatch):
+        monkeypatch.setenv("LCM_WAL_AUTOCHECKPOINT", "500")
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
         val = conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0]
         conn.close()
         assert val == 500, f"expected wal_autocheckpoint=500, got {val}"
@@ -82,7 +100,17 @@ class TestConfigureConnectionPragmas:
         configure_connection(conn)
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
-        assert val == 268_435_456, f"expected mmap_size=268435456, got {val}"
+        expected = 0 if sys.platform == "darwin" else 268_435_456
+        assert val == expected, f"expected mmap_size={expected}, got {val}"
+
+    def test_mmap_size_override(self, db_path: Path, monkeypatch):
+        target = 268_435_456 if sys.platform == "darwin" else 0
+        monkeypatch.setenv("LCM_MMAP_SIZE", str(target))
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        val = conn.execute("PRAGMA mmap_size").fetchone()[0]
+        conn.close()
+        assert val == target, f"expected mmap_size={target}, got {val}"
 
 
 # --------------------------------------------------------------------------- #
@@ -265,3 +293,100 @@ class TestConcurrentStartupMigration:
         ]
         conn.close()
         assert columns.count("conversation_id") == 1
+
+
+class TestSelfHealingAndFallback:
+    def test_store_append_self_heals_on_fts_corruption(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        store = MessageStore(db)
+
+        # First insert succeeds
+        store.append("sess1", {"role": "user", "content": "hello world"})
+
+        real_conn = store._conn
+
+        class ConnProxy:
+            def __init__(self, conn):
+                self._conn = conn
+                self.call_count = 0
+
+            def execute(self, sql, *args, **kwargs):
+                if "INSERT INTO messages" in str(sql):
+                    self.call_count += 1
+                    if self.call_count == 1:
+                        raise sqlite3.DatabaseError("database disk image is malformed")
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def __enter__(self):
+                return self._conn.__enter__()
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        proxy = ConnProxy(real_conn)
+        store._conn = proxy
+        try:
+            sid = store.append("sess1", {"role": "user", "content": "healed message"})
+            assert sid is not None
+            assert proxy.call_count >= 2
+        finally:
+            store._conn = real_conn
+
+    def test_store_append_batch_self_heals_on_fts_corruption(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        store = MessageStore(db)
+
+        real_conn = store._conn
+
+        class ConnProxy:
+            def __init__(self, conn):
+                self._conn = conn
+                self.call_count = 0
+
+            def execute(self, sql, *args, **kwargs):
+                if "INSERT INTO messages" in str(sql):
+                    self.call_count += 1
+                    if self.call_count == 1:
+                        raise sqlite3.DatabaseError("database disk image is malformed")
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def __enter__(self):
+                return self._conn.__enter__()
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return self._conn.__exit__(exc_type, exc_val, exc_tb)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        proxy = ConnProxy(real_conn)
+        store._conn = proxy
+        try:
+            ids = store.append_batch("sess1", [{"role": "user", "content": "batch healed"}])
+            assert len(ids) == 1
+            assert proxy.call_count >= 2
+        finally:
+            store._conn = real_conn
+
+    def test_compaction_fallback_on_database_error(self):
+        from hermes_lcm.compaction import CompactionMixin
+
+        class DummyEngine(CompactionMixin):
+            def __init__(self):
+                self._last_compression_status = None
+                self._last_compression_noop_reason = ""
+
+            def _compress_impl(self, messages, current_tokens=None, focus_topic=None, force=False):
+                raise sqlite3.DatabaseError("database disk image is malformed")
+
+            def _compress_lcm_bypassed_session(self, messages, current_tokens=None, focus_topic=None, force=False):
+                return [{"role": "system", "content": "bypassed"}]
+
+        engine = DummyEngine()
+        messages = [{"role": "user", "content": "test"}]
+        result = engine.compress(messages)
+        assert result == [{"role": "system", "content": "bypassed"}]
+        assert engine._last_compression_status == "degraded_database_error"

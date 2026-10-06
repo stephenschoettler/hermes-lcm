@@ -79,6 +79,10 @@ def _chmod_sqlite_artifact_at(
         expected = None
     if expected is not None:
         _validate_sqlite_artifact(path, expected)
+        if stat.S_IMODE(expected.st_mode) == 0o600:
+            # Already private: opening and closing it would release this
+            # process's SQLite locks on the file for no benefit.
+            return True
 
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
@@ -119,6 +123,7 @@ def _chmod_sqlite_artifact_at(
     finally:
         os.close(fd)
     return True
+
 
 
 def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:

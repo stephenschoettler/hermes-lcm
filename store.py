@@ -23,10 +23,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
+    SQLITE_BUSY_TIMEOUT_SECONDS,
     add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
+    is_fts_corruption_error,
+    is_migration_step_complete,
+    mark_migration_step_complete,
     refuse_schema_version_too_new,
+    repair_external_content_fts,
     run_versioned_migrations,
 )
 from .config import LCMConfig
@@ -69,6 +74,7 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+_INGESTED_AT_BACKFILL_STEP = "messages_ingested_at_backfill_v1"
 
 
 def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -355,7 +361,7 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = sqlite3.connect(str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         if not self._is_memory_database:
@@ -450,9 +456,17 @@ class MessageStore:
             "observed_at_source",
             "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
         )
-        self._conn.execute(
-            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
-        )
+        # One-time legacy backfill, gated by a done-marker. Unmarked, this UPDATE
+        # is a full-table scan on every store open: no index can serve
+        # ``ingested_at IS NULL`` on a column that is NULL for zero rows, so a
+        # large DB re-reads the whole ``messages`` table at each start only to
+        # find nothing to do. New rows get ``ingested_at`` on the write path, so
+        # once the legacy rows are filled the statement never has work again.
+        if not is_migration_step_complete(self._conn, _INGESTED_AT_BACKFILL_STEP):
+            self._conn.execute(
+                "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            )
+            mark_migration_step_complete(self._conn, _INGESTED_AT_BACKFILL_STEP)
 
     # -- Write operations ---------------------------------------------------
 
@@ -471,32 +485,87 @@ class MessageStore:
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
 
+        def _insert_single() -> int:
+            deadline = time.monotonic() + 5.0
+            delay = 0.01
+            while True:
+                try:
+                    cur = self._conn.execute(
+                        """INSERT INTO messages
+                           (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                            tool_name, timestamp, token_estimate, pinned, ingested_at,
+                            observed_at, observed_at_source)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            session_id,
+                            _normalize_source_value(source),
+                            _normalize_conversation_id_value(conversation_id),
+                            msg.get("role", "unknown"),
+                            _normalize_content_value(msg.get("content")),
+                            msg.get("tool_call_id"),
+                            tc_json,
+                            msg.get("tool_name"),
+                            ingested_at,
+                            token_estimate,
+                            0,
+                            ingested_at,
+                            observed_at,
+                            "host_message_timestamp" if observed_at is not None else None,
+                        ),
+                    )
+                    self._conn.commit()
+                    return cur.lastrowid
+                except sqlite3.OperationalError as exc:
+                    msg_text = str(exc).lower()
+                    if any(k in msg_text for k in ("locked", "busy")) and time.monotonic() < deadline:
+                        time.sleep(delay)
+                        delay = min(delay * 2, 0.2)
+                        continue
+                    raise
+
         with self._write_lock:
-            cur = self._conn.execute(
-                """INSERT INTO messages
-                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    _normalize_source_value(source),
-                    _normalize_conversation_id_value(conversation_id),
-                    msg.get("role", "unknown"),
-                    _normalize_content_value(msg.get("content")),
-                    msg.get("tool_call_id"),
-                    tc_json,
-                    msg.get("tool_name"),
-                    ingested_at,
-                    token_estimate,
-                    0,
-                    ingested_at,
-                    observed_at,
-                    "host_message_timestamp" if observed_at is not None else None,
-                ),
-            )
-            self._conn.commit()
-            return cur.lastrowid
+            try:
+                return _insert_single()
+            except sqlite3.DatabaseError as exc:
+                if not is_fts_corruption_error(exc):
+                    raise
+                try:
+                    self._conn.execute("SELECT count(*) FROM metadata")
+                except sqlite3.DatabaseError:
+                    raise exc
+
+                msg_count = 0
+                try:
+                    row = self._conn.execute("SELECT count(*) FROM messages").fetchone()
+                    msg_count = row[0] if row else 0
+                except sqlite3.DatabaseError:
+                    pass
+
+                if msg_count > 1000:
+                    logger.warning(
+                        "FTS trigger corruption during append on large store (%d rows): %s. "
+                        "Temporarily disabling triggers to protect active turn.",
+                        msg_count, exc,
+                    )
+                    try:
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_insert")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_update")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_delete")
+                        self._conn.commit()
+                        return _insert_single()
+                    except Exception:
+                        pass
+
+                logger.warning(
+                    "Detected database/FTS corruption during message append (%s). Triggering self-healing repair and retrying...",
+                    exc,
+                )
+                repair_external_content_fts(
+                    self._conn,
+                    build_message_fts_spec(),
+                    force=True,
+                )
+                return _insert_single()
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -533,38 +602,94 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
-        ids = []
-        with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
-                tc = msg.get("tool_calls")
-                tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
-                observed_at = _normalize_observed_at(msg.get("timestamp"))
-                cur = self._conn.execute(
-                    """INSERT INTO messages
-                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        _normalize_source_value(source),
-                        _normalize_conversation_id_value(conversation_id),
-                        msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
-                        msg.get("tool_call_id"),
-                        tc_json,
-                        msg.get("tool_name"),
-                        ts,
-                        est,
-                        0,
-                        ts,
-                        observed_at,
-                        "host_message_timestamp" if observed_at is not None else None,
-                    ),
+        def _execute_batch():
+            deadline = time.monotonic() + 5.0
+            delay = 0.01
+            while True:
+                try:
+                    batch_ids = []
+                    with self._conn:
+                        for msg, est in zip(messages, token_estimates):
+                            tc = msg.get("tool_calls")
+                            tc_json = json.dumps(tc) if tc else None
+                            ts = time.time()
+                            observed_at = _normalize_observed_at(msg.get("timestamp"))
+                            cur = self._conn.execute(
+                                """INSERT INTO messages
+                                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                                    tool_name, timestamp, token_estimate, pinned, ingested_at,
+                                    observed_at, observed_at_source)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    session_id,
+                                    _normalize_source_value(source),
+                                    _normalize_conversation_id_value(conversation_id),
+                                    msg.get("role", "unknown"),
+                                    _normalize_content_value(msg.get("content")),
+                                    msg.get("tool_call_id"),
+                                    tc_json,
+                                    msg.get("tool_name"),
+                                    ts,
+                                    est,
+                                    0,
+                                    ts,
+                                    observed_at,
+                                    "host_message_timestamp" if observed_at is not None else None,
+                                ),
+                            )
+                            batch_ids.append(cur.lastrowid)
+                    return batch_ids
+                except sqlite3.OperationalError as exc:
+                    msg_text = str(exc).lower()
+                    if any(k in msg_text for k in ("locked", "busy")) and time.monotonic() < deadline:
+                        time.sleep(delay)
+                        delay = min(delay * 2, 0.2)
+                        continue
+                    raise
+
+        with self._write_lock:
+            try:
+                return _execute_batch()
+            except sqlite3.DatabaseError as exc:
+                if not is_fts_corruption_error(exc):
+                    raise
+                try:
+                    self._conn.execute("SELECT count(*) FROM metadata")
+                except sqlite3.DatabaseError:
+                    raise exc
+
+                msg_count = 0
+                try:
+                    row = self._conn.execute("SELECT count(*) FROM messages").fetchone()
+                    msg_count = row[0] if row else 0
+                except sqlite3.DatabaseError:
+                    pass
+
+                if msg_count > 1000:
+                    logger.warning(
+                        "FTS trigger corruption during batch append on large store (%d rows): %s. "
+                        "Temporarily disabling triggers to protect active turn.",
+                        msg_count, exc,
+                    )
+                    try:
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_insert")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_update")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_delete")
+                        self._conn.commit()
+                        return _execute_batch()
+                    except Exception:
+                        pass
+
+                logger.warning(
+                    "Detected database/FTS corruption during message batch append (%s). Triggering self-healing repair and retrying...",
+                    exc,
                 )
-                ids.append(cur.lastrowid)
-        return ids
+                repair_external_content_fts(
+                    self._conn,
+                    build_message_fts_spec(),
+                    force=True,
+                )
+                return _execute_batch()
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""
@@ -1742,13 +1867,6 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
 

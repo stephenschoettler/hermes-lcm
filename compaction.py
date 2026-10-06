@@ -16,6 +16,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
@@ -359,6 +360,26 @@ class CompactionMixin:
                 focus_topic=focus_topic,
                 force=force,
             )
+        except sqlite3.DatabaseError as exc:
+            logger.error(
+                "LCM DatabaseError during compaction: %s. Falling back to bypassed context management to keep session alive.",
+                exc,
+                exc_info=True,
+            )
+            self._last_compression_status = "degraded_database_error"
+            self._last_compression_noop_reason = f"sqlite error: {exc}"
+            try:
+                compress_bypassed = getattr(self, "_compress_lcm_bypassed_session", None)
+                if callable(compress_bypassed):
+                    return compress_bypassed(
+                        messages,
+                        current_tokens=current_tokens,
+                        focus_topic=focus_topic,
+                        force=force,
+                    )
+            except Exception as fallback_exc:
+                logger.error("LCM bypassed compression fallback also failed: %s", fallback_exc)
+            return messages
         except BaseException:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""

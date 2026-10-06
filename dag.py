@@ -22,10 +22,13 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
+    SQLITE_BUSY_TIMEOUT_SECONDS,
     add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
+    is_fts_corruption_error,
     refuse_schema_version_too_new,
+    repair_external_content_fts,
     run_versioned_migrations,
 )
 
@@ -180,7 +183,7 @@ class SummaryDAG:
         return self._conn
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = sqlite3.connect(str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
@@ -246,7 +249,7 @@ class SummaryDAG:
 
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
-        with self._db_lock:
+        def _insert_node() -> int:
             cur = self._conn.execute(
                 """INSERT INTO summary_nodes
                    (session_id, depth, summary, token_count, source_token_count,
@@ -269,6 +272,23 @@ class SummaryDAG:
             self._conn.commit()
             node.node_id = cur.lastrowid
             return node.node_id
+
+        with self._db_lock:
+            try:
+                return _insert_node()
+            except sqlite3.DatabaseError as exc:
+                if not is_fts_corruption_error(exc):
+                    raise
+                logger.warning(
+                    "Detected database/FTS corruption during node insert (%s). Triggering self-healing repair and retrying...",
+                    exc,
+                )
+                repair_external_content_fts(
+                    self._conn,
+                    build_nodes_fts_spec(),
+                    force=True,
+                )
+                return _insert_node()
 
     @staticmethod
     def stage_delete_session_scope(
@@ -877,10 +897,6 @@ class SummaryDAG:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
             conn.close()
             self._conn = None
 
