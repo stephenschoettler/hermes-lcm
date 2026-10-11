@@ -11794,18 +11794,27 @@ class TestEngineCompress:
             {"role": "user", "content": "fresh"},
             {"role": "assistant", "content": "answer"},
         ]
-        monotonic_calls = 0
+        # est-o44x: value-driven fake clock, not a call-counter. The previous
+        # fake advanced on every monotonic() *read*, so any incidental read on
+        # the sweep path (lock-retry clocks, extraction timeouts, worker
+        # threads sharing the patched time module) shifted when the "budget
+        # exhausted" value first landed and could stop the sweep before the
+        # first leaf pass ("assert 0 == 1" on leaf_passes). A value-based clock
+        # that only advances when the fake leaf completes a pass is invariant
+        # to the number of reads: the budget still expires strictly after one
+        # full pass, which is the behaviour this test actually pins.
+        import hermes_lcm.compaction as compaction_module
+
+        budget_exhausted_at = compaction_module._THRESHOLD_FULL_SWEEP_MAX_SECONDS + 1.0
+        fake_now = {"t": 0.0}
 
         def fake_monotonic():
-            nonlocal monotonic_calls
-            monotonic_calls += 1
-            return 0.0 if monotonic_calls <= 2 else 121.0
+            return fake_now["t"]
 
         def fake_leaf(chunk, focus_topic=None, deadline=None):
             del focus_topic, deadline
+            fake_now["t"] = budget_exhausted_at
             return chunk, count_messages_tokens(chunk), "timed summary", 1, 0
-
-        import hermes_lcm.compaction as compaction_module
 
         monkeypatch.setattr(compaction_module.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
