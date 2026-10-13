@@ -24,6 +24,7 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
+    defer_integrity_scans,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
     run_versioned_migrations,
@@ -210,13 +211,14 @@ class SummaryDAG:
                 value TEXT
             );
         """)
-        ensure_external_content_fts(
-            self._conn,
-            build_nodes_fts_spec(),
-        )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_window_columns()
-        self._conn.commit()
+        with defer_integrity_scans(self._conn):
+            ensure_external_content_fts(
+                self._conn,
+                build_nodes_fts_spec(),
+            )
+            run_versioned_migrations(self._conn)
+            self._ensure_source_window_columns()
+            self._conn.commit()
 
     def _ensure_source_window_columns(self) -> None:
         columns = {

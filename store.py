@@ -25,7 +25,9 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
+    defer_integrity_scans,
     ensure_external_content_fts,
+    mark_migration_step_complete,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
@@ -388,15 +390,16 @@ class MessageStore:
                 value TEXT
             );
         """)
-        ensure_external_content_fts(
-            self._conn,
-            build_message_fts_spec(),
-        )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_column()
-        self._ensure_conversation_id_column()
-        self._ensure_time_contract_columns()
-        self._conn.commit()
+        with defer_integrity_scans(self._conn):
+            ensure_external_content_fts(
+                self._conn,
+                build_message_fts_spec(),
+            )
+            run_versioned_migrations(self._conn)
+            self._ensure_source_column()
+            self._ensure_conversation_id_column()
+            self._ensure_time_contract_columns()
+            self._conn.commit()
 
     def _ensure_source_column(self) -> None:
         columns = {
@@ -421,6 +424,8 @@ class MessageStore:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
         )
+
+    _TIME_BACKFILL_STEP = "message_ingested_at_backfill_v1"
 
     def _ensure_time_contract_columns(self) -> None:
         """Add the backward-compatible V4.2 source-time sidecar columns.
@@ -450,9 +455,17 @@ class MessageStore:
             "observed_at_source",
             "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
         )
-        self._conn.execute(
-            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
-        )
+        # The backfill and completion marker share the caller's transaction.
+        # Reopening a current store must not rescan every historical message.
+        completed = self._conn.execute(
+            "SELECT 1 FROM lcm_migration_state WHERE step_name = ?",
+            (self._TIME_BACKFILL_STEP,),
+        ).fetchone()
+        if completed is None:
+            self._conn.execute(
+                "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            )
+            mark_migration_step_complete(self._conn, self._TIME_BACKFILL_STEP)
 
     # -- Write operations ---------------------------------------------------
 

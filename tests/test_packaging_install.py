@@ -732,6 +732,7 @@ def test_pre_llm_hook_routed_path_creates_one_answer_ready_baseline(tmp_path, mo
 
     ctx = _Ctx()
     module.register(ctx)
+    ctx.engine._ensure_storage()
     lead = "I was preparing the Atlas ownership handoff."
     lead_id = ctx.engine._store.append(
         "prior-session", {"role": "user", "content": lead}
@@ -796,6 +797,7 @@ def test_pre_llm_hook_selective_compiler_uses_existing_auxiliary_seam_and_fails_
 
     ctx = _Ctx()
     module.register(ctx)
+    ctx.engine._ensure_storage()
     first = "The first of the two purchases cost $20."
     second = "The second purchase cost $30."
     # Pin the observation time before the pinned question_date ("2026-07-20"):
@@ -902,6 +904,7 @@ def test_pre_llm_hook_requirements_mode_uses_compiler_without_selector(
 
     ctx = _Ctx()
     module.register(ctx)
+    ctx.engine._ensure_storage()
     prompt = "How long is your commute?"
     answer = "My commute is 35 minutes."
     observed_before_question = datetime(
@@ -976,6 +979,7 @@ def test_pre_llm_hook_renders_internally_recalled_answer_sufficient_fact(
     ctx = _Ctx()
     module.register(ctx)
     assert ctx.engine is not None
+    ctx.engine._ensure_storage()
     fact = "You need 15 points to redeem the reward."
     fact_id = ctx.engine._store.append(
         "prior-session", {"role": "user", "content": fact, "timestamp": 100.0}
@@ -1407,6 +1411,9 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1465,6 +1472,9 @@ def test_post_llm_hook_does_not_foreground_match_side_channel_clone(monkeypatch,
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1518,6 +1528,9 @@ def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, 
 
             def register_context_engine(self, engine):
                 self.engine = engine
+
+            def register_hook(self, name, callback):
+                manager._hooks.setdefault(name, []).append(callback)
 
         ctx = _CtxNoTool()
         module.register(ctx)
@@ -1588,6 +1601,9 @@ def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1650,6 +1666,9 @@ def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatc
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
 
     ctx = _CtxNoTool()
     module.register(ctx)

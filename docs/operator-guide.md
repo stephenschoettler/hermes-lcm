@@ -79,6 +79,41 @@ If you installed a symlink from a separate checkout:
 
 Restart Hermes after updating.
 
+### Startup deadlines and large databases
+
+LCM registers its context-engine prototype without opening SQLite. The first
+session (or explicit storage-backed tool) initializes the selected profile's
+storage; registration is not proof that ingestion has begun. Verify a bound
+`lcm_status`, the expected database path, and new persisted messages.
+
+Timestamp sidecar backfill is recorded as the named migration
+`message_ingested_at_backfill_v1`, committed atomically with its updates. The
+first open of an older database can still take time to complete that one-time
+backfill; subsequent opens and agent clones do not repeat it. Do not pre-seed
+the completion marker to bypass the migration. Existing source timestamps and
+non-null ingestion timestamps are preserved.
+
+Background FTS integrity scans are queued until the owning store bootstrap
+commits; cross-process claims occur on the worker with a bounded lock wait.
+The expensive write-form FTS integrity operation runs against a worker-owned
+consistent backup, not the active database, so it cannot monopolize the live
+SQLite writer lock. Temporary snapshots are private (0700 directory/0600 DB),
+cleaned after checking, and need free disk space roughly equal to the database
+plus a safety margin. Copy deadline or insufficient-space failures defer the
+optional scan rather than flag corruption. Foreground repair invalidates outstanding
+snapshot leases in its transaction; old snapshot results cannot reinstate a
+corruption flag or overwrite the newer repair timestamp.
+Transient claim contention defers the scan, not the engine registration, and
+does not mark the index corrupt. Explicit repair and in-memory SQLite retain
+synchronous checking. Disabling `LCM_FTS_INTEGRITY_BACKGROUND` restores costly
+synchronous checks and is not a startup-speed workaround.
+
+If Hermes reports a plugin load timeout followed by a late registration being
+ignored, the engine did not become active even if older plugin builds printed
+an `active` message. Keep the host's plugin deadline bounded; a longer
+`plugins.load_timeout_seconds` only masks expensive plugin registration and is
+not required by this lazy-registration fix. No Hermes core patch is needed.
+
 ## Upgrade from v0.20.0 or v0.21.0-rc2 to v1.0.0-rc.1
 
 1. While the old runtime is running, run `/lcm backup`. If Hermes or any other

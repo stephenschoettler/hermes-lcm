@@ -475,7 +475,8 @@ def _help_text(error: str | None = None) -> str:
 
 def _status_text(engine) -> str:
     status = engine.get_status()
-    db_path = Path(engine._store.db_path)
+    identity = status.get("runtime_identity") or {}
+    db_path = Path(identity.get("database_path") or engine._storage_path)
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
     session_bound = bool(engine.current_session_id)
@@ -520,6 +521,8 @@ def _status_text(engine) -> str:
         f"model: {model}",
         f"provider: {provider}",
         f"database_path: {db_path}",
+        f"storage_ready: {_fmt_bool(status.get('storage_ready', True))}",
+        f"storage_status: {'ready' if status.get('storage_ready', True) else 'pending_initialization'}",
         f"database_path_source: {runtime_identity.get('database_path_source', '(unknown)')}",
         f"database_exists: {_fmt_bool(db_exists)}",
         f"database_size: {_fmt_size(db_size) if db_exists else 'missing'}",

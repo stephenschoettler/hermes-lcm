@@ -393,10 +393,16 @@ def register(ctx):
         import os
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
-    engine = LCMEngine(config=config, hermes_home=hermes_home)
+    if getattr(ctx, "_load_abandoned", False):
+        logger.warning("LCM registration skipped: host abandoned plugin load")
+        return
+    engine = LCMEngine(config=config, hermes_home=hermes_home, defer_storage=True)
 
-    # Register as the context engine (replaces ContextCompressor)
+    # Register a cheap engine; the first session binds durable storage.
     ctx.register_context_engine(engine)
+    if getattr(ctx, "_load_abandoned", False):
+        logger.warning("LCM registration rejected: host abandoned plugin load")
+        return
 
     # Ship the same recall contract through both Hermes plugin skill
     # registration (explicit qualified loads) and the installer's ordinary
@@ -556,9 +562,6 @@ def register(ctx):
     # existing _ingest_messages cursor prevents duplicates if compress() runs
     # later the same turn.
     try:
-        from hermes_cli.plugins import get_plugin_manager as _get_pm
-        _mgr = _get_pm()
-
         def _on_post_llm_call(**kwargs):
             history = kwargs.get("conversation_history")
             if not history:
@@ -600,9 +603,13 @@ def register(ctx):
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
 
-        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
-        logger.debug("LCM registered post_llm_call hook for per-turn ingest")
+        if callable(register_hook):
+            register_hook("post_llm_call", _on_post_llm_call)
+            logger.debug("LCM registered post_llm_call hook for per-turn ingest")
+        else:
+            logger.debug("LCM host has no guarded post_llm_call registration")
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)
 
-    logger.info("LCM plugin loaded — lossless context management active")
+    if not getattr(ctx, "_load_abandoned", False):
+        logger.info("LCM plugin registered — durable storage initializes on first use")

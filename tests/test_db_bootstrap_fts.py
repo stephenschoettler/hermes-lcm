@@ -984,11 +984,11 @@ def test_background_scan_flags_corruption_without_rebuilding(tmp_path, monkeypat
     conn.close()
 
 
-def test_dispatch_stamps_scan_started_before_thread_runs(tmp_path, monkeypatch):
-    """The dispatcher durably stamps scan_started_at before the thread runs (F6).
+def test_dispatch_leaves_durable_claim_to_worker(tmp_path, monkeypatch):
+    """Scheduling never takes a caller-side write claim.
 
-    A second process racing dispatch in the window before the thread commits its
-    own stamp must see the claim and not launch a duplicate deep scan.
+    The worker claims transactionally before checking; cross-process dedup is
+    verified separately against two real processes in the scheduling suite.
     """
     monkeypatch.setenv(INTERVAL_ENV, "24")
     monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)
@@ -1007,14 +1007,13 @@ def test_dispatch_stamps_scan_started_before_thread_runs(tmp_path, monkeypatch):
     dispatched = db_bootstrap._dispatch_background_integrity_scan(conn, spec)
     assert dispatched is True
     try:
-        # A separate connection sees the stamp already committed by the dispatcher.
+        # A blocked worker cannot have acquired its durable lease yet.
         verify = sqlite3.connect(_db_file(tmp_path))
         try:
             started = db_bootstrap._load_scan_started_at(verify, spec)
         finally:
             verify.close()
-        # The dispatcher wrote it — the thread body is blocked and cannot have.
-        assert started is not None
+        assert started is None
     finally:
         release.set()
         db_bootstrap.join_background_integrity_scans(timeout=30)
