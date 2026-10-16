@@ -350,12 +350,19 @@ def test_unreconstructible_history_is_persisted_not_skipped(tmp_path):
 # --------------------------------------------------------------------------
 # ``tests/test_lcm_engine.py`` aborts early in this environment (exit 1, no test
 # report).  It is not caused by these changes: the same run aborts identically on
-# the unmodified tree, same exit code and same truncated output.
+# the unmodified tree, same exit code and same truncated output, and the last
+# line before the abort is the test named above at 24%.
 #
-# The cause is outside the plugin: the run is relaunched in a second interpreter
-# whose bootstrap re-imports the test runner with the Hermes agent directory
-# first on ``sys.path`` and without site processing, so the child cannot import
-# ``pytest`` and exits.  The parent's report never appears.  Reproduced both
-# under ``pytest`` and by calling one test directly from a plain script, which is
-# why this is an environment finding and not a defect in the code under test.
+# What is reproduced: the run is relaunched into a second interpreter whose
+# bootstrap re-imports the test runner with the agent directory first on
+# ``sys.path`` and without site processing, so the child cannot import the test
+# runner and exits; the parent's report never appears.  Seen both under the test
+# runner and when calling one test directly from a plain script.
+#
+# What is *not* established: where the trigger for that relaunch sits.  That it
+# reproduces without the patch shows only that the abort is independent of these
+# changes.  It does not show that the trigger lies in the surrounding runtime
+# rather than in the code path under test.  This note is not a clearance of the
+# plugin, and the abort should be investigated on its own.
+
 
