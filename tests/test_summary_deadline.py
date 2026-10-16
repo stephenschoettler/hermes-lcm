@@ -148,3 +148,19 @@ def test_pending_reservation_limits_concurrency_without_false_spend():
     spend.clear()  # A forced operation starts a new budget, including pending calls.
     spend.release_call(token, attempted=True)
     assert spend.allows()
+
+
+def test_expired_l1_uses_the_same_l3_cap_as_normal_exhaustion(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+
+    def summary(*args, **kwargs):
+        clock[0] += 2.0
+        return None
+
+    monkeypatch.setattr(escalation, "_call_llm_for_summary", summary)
+    request = dict(text="source facts " * 1000, source_tokens=3000,
+                   token_budget=100, l3_truncate_tokens=512)
+    expired = escalation.summarize_with_escalation(**request, timeout=1)
+    normal = escalation.summarize_with_escalation(**request, timeout=None)
+    assert expired == normal

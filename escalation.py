@@ -692,7 +692,7 @@ def summarize_with_escalation(
         return l1_result, 1
 
     if deadline is not None and time.monotonic() >= deadline:
-        return _deterministic_truncate(text, min(l3_truncate_tokens, token_budget)), 3
+        return _deterministic_truncate(text, l3_truncate_tokens), 3
 
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
