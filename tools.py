@@ -1679,6 +1679,17 @@ def _context_content_token_count(blocks: list[dict[str, Any]]) -> int:
     return total
 
 
+class _ExpansionSynthesisError(RuntimeError):
+    """Raised when the expansion aux-LLM call returns an unusable response.
+
+    ``call_llm`` can hand back an error-shaped or partial object whose
+    ``choices`` is missing, ``None``, or otherwise non-subscriptable. Surfacing
+    that as a typed error lets ``lcm_expand_query`` degrade the same way it
+    already degrades on a synthesis timeout, instead of leaking an opaque
+    ``TypeError``/``AttributeError`` out of the tool call.
+    """
+
+
 def _synthesize_expansion_answer(
     *,
     prompt: str,
@@ -1717,7 +1728,26 @@ def _synthesize_expansion_answer(
     }
     apply_lcm_model_route(call_kwargs, model)
     response = call_llm(**call_kwargs)
-    content = response.choices[0].message.content
+    # ``call_llm`` can return an error-shaped or partial object (e.g. when the
+    # auxiliary lane collides with the foreground model's own in-flight calls),
+    # in which case ``choices`` may be absent, ``None``, empty, or a
+    # non-subscriptable sentinel. Guard the access so an unusable response
+    # degrades cleanly at the call site instead of raising an opaque
+    # ``TypeError``/``AttributeError`` that kills the whole expand call.
+    choices = getattr(response, "choices", None)
+    first = None
+    if choices is not None:
+        try:
+            first = choices[0]
+        except (TypeError, IndexError, KeyError):
+            first = None
+    if first is None:
+        raise _ExpansionSynthesisError(
+            "expansion synthesis returned no usable choices "
+            f"(response type={type(response).__name__})"
+        )
+    message = getattr(first, "message", None)
+    content = getattr(message, "content", None)
     if not isinstance(content, str):
         content = str(content) if content else ""
     from .escalation import _strip_reasoning_blocks
@@ -5744,6 +5774,12 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
             f"lcm_expand_query synthesis timed out after {timeout:.3g}s",
             include_timeout=True,
         )
+    except _ExpansionSynthesisError as exc:
+        # Unusable aux-LLM response. Degrade the same way a timeout does: the
+        # caller still receives the node/raw matches it asked for, only the
+        # synthesized prose answer is unavailable.
+        logger.warning("LCM expand_query synthesis failed: %s", exc)
+        return _degraded_payload(f"lcm_expand_query synthesis unavailable: {exc}")
 
     answer = str(answer).strip() if answer is not None else ""
     if not answer:
