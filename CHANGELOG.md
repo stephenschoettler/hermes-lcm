@@ -4,7 +4,13 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+- Keeper connection pins the WAL sidecar for the store's process lifetime, so a
+  peer's clean close can no longer delete it out from under a live engine
+  (issue #628 class). The sidecar guard now fuses on database identity change
+  (dev/ino) or on sidecar disappearance/recreation while connections are open,
+  and treats sidecar absence with no open store connection as benign
+  (warn-once). Missing databases get their own health message; the pre/post
+  connect identity race is closed on all init paths, including the keeper.
 
 ## v1.0.0-rc.1 - 2026-09-03
 

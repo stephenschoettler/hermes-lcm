@@ -12,6 +12,8 @@ still depends on SQLite WAL recovery.
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -21,8 +23,10 @@ from hermes_lcm.db_bootstrap import (
     configure_connection,
     ensure_message_origin_columns,
 )
-from hermes_lcm.store import MessageStore
-from hermes_lcm.dag import SummaryDAG
+from hermes_lcm.config import LCMConfig
+from hermes_lcm.store import MessageStore, load_sidecar_health_failure
+from hermes_lcm.engine import LCMEngine
+from hermes_lcm.dag import SummaryDAG, SummaryNode
 from hermes_lcm.lifecycle_state import LifecycleStateStore
 
 
@@ -107,19 +111,303 @@ class TestGracefulClose:
         store.append("sess", {"role": "user", "content": "hello"})
         assert db.exists()
         store.close()
-        # After close the WAL should be small or non-existent (all frames
-        # checkpointed by the passive call).
-        wal_size = self._write_and_get_wal_size(db)
-        assert wal_size < 4096, (
-            f"WAL still {wal_size} bytes after MessageStore.close(); "
-            "checkpoint may not have run"
-        )
+        # The sentinel intentionally keeps WAL sidecars present after close();
+        # the invariant is that the database remains readable and healthy.
+        assert Path(str(db) + "-wal").is_file()
+        assert Path(str(db) + "-shm").is_file()
+        with sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True) as conn:
+            assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        store.shutdown()
 
     def test_message_store_close_is_idempotent(self, tmp_path: Path):
         db = tmp_path / "store.db"
         store = MessageStore(db)
         store.close()
         store.close()  # should not raise
+
+    def test_sentinel_holds_contour(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        wal = Path(str(db) + "-wal")
+        shm = Path(str(db) + "-shm")
+
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+        before = (
+            (wal.stat().st_dev, wal.stat().st_ino),
+            (shm.stat().st_dev, shm.stat().st_ino),
+        )
+
+        store.close()
+
+        assert wal.is_file()
+        assert shm.is_file()
+        assert (
+            (wal.stat().st_dev, wal.stat().st_ino),
+            (shm.stat().st_dev, shm.stat().st_ino),
+        ) == before
+
+        reopened = MessageStore(db)
+        try:
+            assert wal.is_file()
+            assert shm.is_file()
+            assert (
+                (wal.stat().st_dev, wal.stat().st_ino),
+                (shm.stat().st_dev, shm.stat().st_ino),
+            ) == before
+        finally:
+            reopened.shutdown()
+            store.shutdown()
+
+    def test_guard_tolerates_missing_sidecars_after_full_shutdown(self, tmp_path: Path, caplog):
+        db = tmp_path / "store.db"
+        wal = Path(str(db) + "-wal")
+        shm = Path(str(db) + "-shm")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+        store.shutdown()
+
+        wal.unlink(missing_ok=True)
+        shm.unlink(missing_ok=True)
+
+        with caplog.at_level("WARNING"):
+            assert store.check_sidecars_intact() is True
+
+        assert "SQLite WAL sidecar missing with no open store connection" in caplog.text
+        assert "sidecar vanished" not in caplog.text
+        assert not load_sidecar_health_failure(db)
+
+    def test_guard_fuses_when_keeper_open_and_sidecars_unlinked(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        wal = Path(str(db) + "-wal")
+        shm = Path(str(db) + "-shm")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+        store.close()
+
+        wal.unlink()
+        shm.unlink()
+
+        try:
+            with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+                store.check_sidecars_intact()
+            assert load_sidecar_health_failure(db)
+        finally:
+            store.shutdown()
+
+    def test_sidecar_alien_recreate_with_keeper_open_fuses(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        shm = Path(str(db) + "-shm")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+        store.close()
+
+        shm.unlink()
+        shm.write_bytes(b"alien contour")
+
+        try:
+            with pytest.raises(RuntimeError, match="sidecar identity changed.*issue #628"):
+                store.check_sidecars_intact()
+        finally:
+            store.shutdown()
+
+    def test_sidecar_check_is_noop_before_contour_materializes(self, tmp_path: Path):
+        db = tmp_path / "fresh.db"
+        store = MessageStore.__new__(MessageStore)
+        store.db_path = db
+        store._is_memory_database = False
+        store._conn = sqlite3.connect(str(db))
+        store._contour_lock = threading.RLock()
+        store._contour_ids = {}
+        store._db_identity = None
+        store._benign_missing_sidecars_warned = set()
+        try:
+            configure_connection(store._conn)
+            assert not Path(str(db) + "-wal").exists()
+            assert not Path(str(db) + "-shm").exists()
+            assert store.check_sidecars_intact() is True
+        finally:
+            store._conn.close()
+
+    def test_engine_guard_closes_helpers_and_refuses_dag_after_confirmed_sidecar_failure(
+        self,
+        tmp_path: Path,
+    ):
+        db = tmp_path / "engine.db"
+        replacement = tmp_path / "replacement.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        store = engine._store
+        dag = engine._dag
+        engine._store.append("sess", {"role": "user", "content": "hello"})
+
+        with sqlite3.connect(replacement) as conn:
+            configure_connection(conn)
+            conn.execute("CREATE TABLE replacement_marker(value TEXT)")
+            conn.commit()
+        replacement.replace(db)
+        engine._sidecar_guard_tick()
+
+        assert engine._storage_unavailable_reason
+        assert engine._storage_bound is False
+        assert store._conn is None
+        assert store._sentinel_conn is None
+        assert dag._conn is None
+        with pytest.raises(RuntimeError, match="database file identity changed.*issue #628"):
+            engine._ensure_storage()
+        with pytest.raises(RuntimeError, match="database file identity changed.*issue #628"):
+            engine._dag.add_node(SummaryNode(session_id="sess", summary="blocked"))
+
+    def test_inline_confirmed_failure_trips_engine_fuse_immediately(self, tmp_path: Path):
+        db = tmp_path / "engine.db"
+        replacement = tmp_path / "replacement.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        store = engine._store
+        dag = engine._dag
+        engine._store.append("sess", {"role": "user", "content": "hello"})
+
+        with sqlite3.connect(replacement) as conn:
+            configure_connection(conn)
+            conn.execute("CREATE TABLE replacement_marker(value TEXT)")
+            conn.commit()
+        replacement.replace(db)
+        store._last_inline_contour_check_at = 0.0
+
+        with pytest.raises(RuntimeError, match="database file identity changed.*issue #628"):
+            store.append("sess", {"role": "user", "content": "blocked"})
+
+        # The contour-failure listener tripped the engine fuse synchronously:
+        # the very next lazy-attribute access tears down ALL helpers (not just
+        # MessageStore) and refuses — no 30s window for DAG/lifecycle writes.
+        assert engine._storage_unavailable_reason
+        assert engine._storage_bound is False
+        with pytest.raises(RuntimeError, match="database file identity changed.*issue #628"):
+            engine._dag.add_node(SummaryNode(session_id="sess", summary="blocked"))
+        assert store._sentinel_conn is None
+        # dag was resolved BEFORE the fuse tripped: the teardown must have
+        # closed its connection (the same instance, now unusable).
+        assert dag._conn is None
+
+    def test_write_path_rate_limited_restat_detects_db_inode_change(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        replacement = tmp_path / "replacement.db"
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+
+        with sqlite3.connect(replacement) as conn:
+            configure_connection(conn)
+            conn.execute("CREATE TABLE replacement_marker(value TEXT)")
+            conn.commit()
+        replacement.replace(db)
+        store._last_inline_contour_check_at = 0.0
+
+        try:
+            with pytest.raises(RuntimeError, match="database file identity changed.*issue #628"):
+                store.append("sess", {"role": "user", "content": "blocked"})
+        finally:
+            store.shutdown()
+
+    def test_write_path_inline_fuses_on_missing_sidecar_with_open_keeper(self, tmp_path: Path):
+        db = tmp_path / "store.db"
+        shm = Path(str(db) + "-shm")
+        store = MessageStore(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+
+        shm.unlink()
+        store._last_inline_contour_check_at = 0.0
+
+        try:
+            with pytest.raises(RuntimeError, match="sidecar vanished.*issue #628"):
+                store.append("sess", {"role": "user", "content": "again"})
+        finally:
+            store.shutdown()
+
+    def test_keeper_connection_holds_wal(self, tmp_path: Path):
+        db = tmp_path / "engine.db"
+        wal = Path(str(db) + "-wal")
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        engine._session_id = "sess"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * engine._config.context_threshold)
+        try:
+            engine.ingest([{"role": "user", "content": "keeper initial"}])
+            assert wal.is_file()
+            script = (
+                "import sqlite3, sys\n"
+                "db = sys.argv[1]\n"
+                "for _ in range(5):\n"
+                "    conn = sqlite3.connect(db)\n"
+                "    conn.execute('PRAGMA journal_mode=WAL')\n"
+                "    conn.execute('SELECT COUNT(*) FROM messages').fetchone()\n"
+                "    conn.close()\n"
+            )
+            subprocess.run([sys.executable, "-c", script, str(db)], check=True)
+
+            assert wal.is_file()
+            engine.ingest([
+                {"role": "user", "content": "keeper initial"},
+                {"role": "user", "content": "keeper still ingesting"},
+            ])
+            assert engine._store.get_session_count("sess") == 2
+        finally:
+            engine.shutdown()
+
+    def test_guard_fuses_on_db_inode_change(self, tmp_path: Path):
+        db = tmp_path / "engine.db"
+        replacement = tmp_path / "replacement.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        engine._session_id = "sess"
+        engine.context_length = 200000
+        engine.threshold_tokens = int(200000 * engine._config.context_threshold)
+        try:
+            engine.ingest([{"role": "user", "content": "before replacement"}])
+            with sqlite3.connect(replacement) as conn:
+                configure_connection(conn)
+                conn.execute("CREATE TABLE replacement_marker(value TEXT)")
+                conn.commit()
+            replacement.replace(db)
+            engine._store._last_inline_contour_check_at = 0.0
+
+            engine.ingest([
+                {"role": "user", "content": "before replacement"},
+                {"role": "user", "content": "after replacement"},
+            ])
+            assert engine._storage_unavailable_reason
+            assert engine._storage_bound is False
+        finally:
+            engine.shutdown()
+
+    def test_reset_closes_sentinel(self, tmp_path: Path):
+        fd_dir = Path("/proc/self/fd")
+        if not fd_dir.exists():
+            pytest.skip("fd inspection is Linux-specific")
+
+        def open_fds_for(path: Path) -> list[str]:
+            result = []
+            resolved = str(path)
+            for fd in fd_dir.iterdir():
+                try:
+                    target = fd.resolve(strict=False)
+                except OSError:
+                    continue
+                if str(target).startswith(resolved):
+                    result.append(str(target))
+            return result
+
+        db = tmp_path / "store.db"
+        engine = LCMEngine(config=LCMConfig(database_path=str(db)))
+        engine._store.append("sess", {"role": "user", "content": "before reset"})
+        assert open_fds_for(db)
+
+        engine.shutdown()
+
+        assert open_fds_for(db) == []
+        for path in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm")):
+            path.unlink(missing_ok=True)
+
+        reopened = LCMEngine(config=LCMConfig(database_path=str(db)))
+        try:
+            assert reopened._store.get_session_count("sess") == 0
+        finally:
+            reopened.shutdown()
 
     # -- SummaryDAG ---------------------------------------------------------
 

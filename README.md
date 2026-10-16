@@ -631,6 +631,32 @@ dropping data.
 largest content/tool-call rows, suspicious inline payload rows, and aggregate
 externalized-payload stats. Doctor output is metadata-only for these scans.
 
+### Multi-process deployments
+
+Gateway, cron scheduler, and one-shot CLI processes often share the default
+`lcm.db`. In SQLite WAL mode, the last close of all connections to that database
+can unlink the shared `lcm.db-wal` and `lcm.db-shm` sidecars. If a long-lived
+process still has file descriptors to deleted sidecar inodes while another
+process creates fresh sidecar files at the same paths, the deployment is at
+split-brain risk and can corrupt pages (issue #628).
+
+LCM keeps one keeper SQLite connection open for the `MessageStore` lifetime so
+ordinary `Store.close()` calls do not create last-close windows inside a running
+process. It also checks that `lcm.db`, `lcm.db-wal`, and `lcm.db-shm` keep the
+same file identity while the store has open connections, including the keeper.
+If the database file is missing or replaced, LCM logs an error, marks the store
+unhealthy, closes storage helpers, refuses further reads/writes/binds in that
+process, and requires a restart. Missing or recreated WAL/SHM sidecars are also
+fatal while any store connection is open, because SQLite may keep writing
+through orphaned descriptors; when the store has no open connection on that
+database, absent sidecars are benign and will be recreated on demand. LCM does
+not attempt automatic repair.
+
+For read-only diagnostics on a live path, open SQLite with
+`file:/path/to/lcm.db?mode=ro&immutable=1` so inspection does not participate in
+the live WAL contour. After any manual repair, restore, or database swap, stop
+and restart all processes that may hold `lcm.db`, `lcm.db-wal`, or `lcm.db-shm`.
+
 This guard is scoped to LCM's own `lcm.db` write boundary. It does not prevent
 Hermes core, or any other host layer, from writing inline payloads to Hermes
 `state.db`, and it does not rewrite historical rows already present in `lcm.db`.

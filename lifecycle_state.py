@@ -11,6 +11,7 @@ This is the smallest viable substrate for cross-turn/session lifecycle state:
 from __future__ import annotations
 
 import functools
+import logging
 import sqlite3
 import threading
 import time
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+
+logger = logging.getLogger(__name__)
 
 
 def _synchronized(method):
@@ -270,6 +273,10 @@ class LifecycleStateStore:
         state = self.get_by_conversation(conversation_id)
         if state is None:
             return None
+        normalized_frontier = int(frontier_store_id or 0)
+        if normalized_frontier == 0 and not self._session_has_lcm_data(session_id):
+            logger.debug("skipped finalization for empty session %s", session_id)
+            return state
         now = time.time()
         current_session_id = state.current_session_id
         current_frontier = state.current_frontier_store_id
@@ -277,7 +284,7 @@ class LifecycleStateStore:
             current_session_id = None
             current_frontier = 0
         finalized_frontier = max(
-            int(frontier_store_id or 0),
+            normalized_frontier,
             state.last_finalized_frontier_store_id,
         )
         self._conn.execute(
@@ -305,6 +312,22 @@ class LifecycleStateStore:
         )
         self._conn.commit()
         return self.get_by_conversation(state.conversation_id)
+
+    def _session_has_lcm_data(self, session_id: str) -> bool:
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is not None:
+                return True
+            row = self._conn.execute(
+                "SELECT 1 FROM summary_nodes WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
 
     @_synchronized
     def record_rollover(
