@@ -194,78 +194,55 @@ def test_message_store_refuses_hardlinked_sidecar_before_chmod(tmp_path, suffix)
     assert _mode(target) == 0o644
 
 
-@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
-def test_message_store_refuses_sidecar_link_swap_before_chmod(
+@pytest.mark.parametrize("swap_kind", ["symlink", "hardlink", "replacement"])
+def test_message_store_detects_sidecar_swapped_during_chmod(
     tmp_path,
     monkeypatch,
-    link_kind,
+    swap_kind,
 ):
+    """Artifacts are tightened by path-relative chmod (never through a descriptor,
+    which would drop SQLite's POSIX locks). The entry is re-validated afterwards, so
+    a symlink, hardlink or replacement swapped in around the chmod is rejected.
+    """
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-wal")
     sidecar.write_text("replace me", encoding="utf-8")
+    sidecar.chmod(0o644)
     target = tmp_path / "unrelated.txt"
     target.write_text("shared", encoding="utf-8")
     target.chmod(0o644)
-    real_open = os.open
+    real_chmod = os.chmod
     swapped = False
 
-    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+    def swapping_chmod(path, mode, **kwargs):
         nonlocal swapped
-        if not swapped and dir_fd is not None and path == sidecar.name:
+        result = real_chmod(path, mode, **kwargs)
+        if not swapped and kwargs.get("dir_fd") is not None and path == sidecar.name:
             swapped = True
             sidecar.unlink()
-            if link_kind == "symlink":
+            if swap_kind == "symlink":
                 sidecar.symlink_to(target)
-            else:
+            elif swap_kind == "hardlink":
                 os.link(target, sidecar)
-        if dir_fd is None:
-            return real_open(path, flags, mode)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
+            else:
+                target.rename(sidecar)
+        return result
 
-    monkeypatch.setattr(sqlite_util_module.os, "open", swapping_open)
+    monkeypatch.setattr(sqlite_util_module.os, "chmod", swapping_chmod)
 
-    with pytest.raises(OSError):
+    # Message varies: a freed inode number can be reused by the swapped-in entry
+    # (then it is rejected as a non-regular/multi-link file instead).
+    with pytest.raises(OSError, match="refusing SQLite artifact"):
         MessageStore(db_path)
 
     assert swapped is True
-    assert _mode(target) == 0o644
+    if swap_kind != "replacement":
+        assert _mode(target) == 0o644
+    else:
+        assert _mode(sidecar) == 0o644
 
 
-def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
-    tmp_path,
-    monkeypatch,
-):
-    db_path = tmp_path / "lcm.db"
-    sidecar = db_path.with_name(db_path.name + "-journal")
-    replacement = tmp_path / "replacement-journal"
-    sidecar.write_bytes(b"replace me")
-    replacement.write_bytes(b"unrelated")
-    sidecar.chmod(0o644)
-    replacement.chmod(0o644)
-    real_open = os.open
-    swapped = False
-
-    def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
-        nonlocal swapped
-        if dir_fd is None:
-            return real_open(path, flags, mode)
-        fd = real_open(path, flags, mode, dir_fd=dir_fd)
-        if not swapped and dir_fd is not None and path == sidecar.name:
-            swapped = True
-            sidecar.unlink()
-            replacement.rename(sidecar)
-        return fd
-
-    monkeypatch.setattr(sqlite_util_module.os, "open", swapping_open)
-
-    with pytest.raises(OSError, match="directory entry changed while opening"):
-        MessageStore(db_path)
-
-    assert swapped is True
-    assert _mode(sidecar) == 0o644
-
-
-def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
+def test_message_store_tolerates_sidecar_disappearing_between_stat_and_chmod(
     tmp_path,
     monkeypatch,
 ):
@@ -273,19 +250,18 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
-    real_open = os.open
+    journal.chmod(0o644)
+    real_chmod = os.chmod
     disappeared = False
 
-    def disappearing_open(path, flags, mode=0o777, *, dir_fd=None):
+    def disappearing_chmod(path, mode, **kwargs):
         nonlocal disappeared
-        if not disappeared and dir_fd is not None and path == journal.name:
+        if not disappeared and kwargs.get("dir_fd") is not None and path == journal.name:
             disappeared = True
             journal.unlink()
-        if dir_fd is None:
-            return real_open(path, flags, mode)
-        return real_open(path, flags, mode, dir_fd=dir_fd)
+        return real_chmod(path, mode, **kwargs)
 
-    monkeypatch.setattr(sqlite_util_module.os, "open", disappearing_open)
+    monkeypatch.setattr(sqlite_util_module.os, "chmod", disappearing_chmod)
 
     store = MessageStore(db_path)
     try:
@@ -295,7 +271,7 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
         store.close()
 
 
-def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
+def test_message_store_tolerates_sidecar_unlinked_between_chmod_and_revalidation(
     tmp_path,
     monkeypatch,
 ):
@@ -303,20 +279,19 @@ def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
     _seed_searchable_store(db_path)
     journal = db_path.with_name(db_path.name + "-journal")
     journal.write_bytes(b"transient rollback journal")
-    real_open = os.open
+    journal.chmod(0o644)
+    real_chmod = os.chmod
     unlinked = False
 
-    def unlinking_open(path, flags, mode=0o777, *, dir_fd=None):
+    def unlinking_chmod(path, mode, **kwargs):
         nonlocal unlinked
-        if dir_fd is None:
-            return real_open(path, flags, mode)
-        fd = real_open(path, flags, mode, dir_fd=dir_fd)
-        if not unlinked and path == journal.name:
+        result = real_chmod(path, mode, **kwargs)
+        if not unlinked and kwargs.get("dir_fd") is not None and path == journal.name:
             unlinked = True
             journal.unlink()
-        return fd
+        return result
 
-    monkeypatch.setattr(sqlite_util_module.os, "open", unlinking_open)
+    monkeypatch.setattr(sqlite_util_module.os, "chmod", unlinking_chmod)
 
     store = MessageStore(db_path)
     try:

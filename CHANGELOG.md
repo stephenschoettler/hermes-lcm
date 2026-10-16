@@ -4,7 +4,17 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ## Unreleased
 
-No additional changes yet.
+### Fixed
+
+- SQLite artifact hardening no longer opens a descriptor on an existing
+  `lcm.db`, `-wal`, `-shm` or `-journal`. On POSIX, closing any descriptor for a
+  file releases every advisory lock the process holds on it, including its live
+  SQLite connections' locks, which let a sibling process checkpoint and unlink a
+  WAL generation that was still in use (see
+  <https://www.sqlite.org/howtocorrupt.html>, section 2.2). Existing artifacts
+  are now validated with `lstat` and tightened with a path-relative `chmod`;
+  only creation of a brand-new database file still uses a descriptor
+  (`O_CREAT|O_EXCL`). Symlink and hardlink rejection is unchanged.
 
 ## v1.0.0-rc.1 - 2026-09-03
 
