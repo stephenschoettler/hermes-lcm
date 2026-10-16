@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import stat
@@ -31,6 +32,7 @@ from hermes_lcm.externalize import (
     reassign_externalized_payloads,
 )
 from hermes_lcm.ingest_protection import (
+    assistant_output_quarantine_reason,
     extract_all_externalized_payload_refs,
     extract_ingest_externalized_refs,
     redact_sensitive_text,
@@ -4199,3 +4201,104 @@ def test_wrapped_base64_scan_preserves_short_terminal_line():
     payload = "\n".join([full_line] * 70 + [terminal])
 
     assert contains_long_base64_run(payload) is True
+
+
+SHORT_REPEAT_MARKER = "SHORT_REPEAT_LOOP_MARKER_196"
+SHORT_REPEAT_LINE = f"{SHORT_REPEAT_MARKER} " + "x" * (72 - len(SHORT_REPEAT_MARKER) - 1)
+SHORT_REPEAT_R1 = (SHORT_REPEAT_LINE + "\n") * 46
+SHORT_REPEAT_R2 = (_broken_assistant_output().splitlines(keepends=True)[0].split(". ")[0] + ".\n") * 6
+SHORT_REPEAT_R3 = ("z" * 40 + "\n") * 3
+# A multi-sentence paragraph looped 6x spreads repetition across 3 distinct
+# sentence segments (top ratio 6/18, dup ratio 12/18) -- below the 0.90 bar
+# by design; low-count coherent-prose loops may be intentional content.
+SHORT_REPEAT_PARAGRAPH_X6_BELOW_BAR = _broken_assistant_output()[: 232 * 6]
+
+
+@pytest.mark.parametrize("text", [SHORT_REPEAT_R1, SHORT_REPEAT_R2, SHORT_REPEAT_R3])
+def test_short_repetitive_assistant_output_is_quarantined(text):
+    assert assistant_output_quarantine_reason(text) == "high_repetition"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\n".join(_legitimate_long_report().splitlines()[:60]),
+        "\n".join(
+            [
+                "The weather station recorded a calm morning over the northern valley.",
+                "A small bakery opened early and sold fresh bread to commuters.",
+                "The museum added two restored paintings to its spring exhibition.",
+                "Engineers tested a quieter motor design in the downtown workshop.",
+                "A local choir rehearsed harmonies for Saturday's community concert.",
+                "The library extended its evening hours during the exam season.",
+                "Several hikers found a new trail marker beside the eastern ridge.",
+                "The science club built a water filter from simple household materials.",
+                "A gardener planted herbs and tomatoes beside the apartment entrance.",
+                "The ferry timetable changed slightly after maintenance was completed.",
+            ]
+        ),
+        "Hello world.",
+        "\n".join(
+            [
+                "import json",
+                "from pathlib import Path",
+                "DEFAULT_LIMIT = 15",
+                "def load_records(source_path):",
+                "    payload = Path(source_path).read_text()",
+                "    return json.loads(payload)",
+                "def select_record(records, record_id):",
+                "    for candidate in records:",
+                "        if candidate.get(\"id\") == record_id:",
+                "            return candidate",
+                "    return None",
+                "records = load_records(\"records.json\")",
+                "selected = select_record(records, \"alpha\")",
+                "print(selected)",
+            ]
+        ),
+        "\n".join(
+            [
+                "INFO: worker=alpha request=prepare status=ok",
+                "INFO: worker=bravo request=load status=ok",
+                "INFO: worker=charlie request=scan status=ok",
+                "INFO: worker=delta request=write status=ok",
+                "INFO: worker=echo request=close status=ok",
+                "INFO: worker=foxtrot request=sync status=ok",
+                "INFO: worker=golf request=flush status=ok",
+                "INFO: worker=hotel request=wait status=ok",
+            ]
+        ),
+        "\n".join(["A" * 40, "B" * 40, "A" * 40, "B" * 40] * 2),
+        SHORT_REPEAT_PARAGRAPH_X6_BELOW_BAR,
+    ],
+)
+def test_short_normal_output_is_not_quarantined(text):
+    assert assistant_output_quarantine_reason(text) is None
+
+
+def test_short_repetitive_assistant_output_is_quarantined_end_to_end(tmp_path, monkeypatch):
+    # Windows cannot open a directory handle via os.open() (upstream Issue #408,
+    # fixed in PR #522/#563); quarantine then degrades to inline preservation and
+    # this test would fail for an unrelated reason. Isolate the quarantine logic
+    # from the directory-fsync path so the test is portable.
+    if os.name == "nt":
+        monkeypatch.setattr(
+            "hermes_lcm.externalize._fsync_directory", lambda path: None
+        )
+    engine = _engine(tmp_path)
+
+    engine._ingest_messages([{"role": "assistant", "content": SHORT_REPEAT_R1}])
+
+    _store_id, content, _tool_calls = _single_message_row(engine, role="assistant")
+    assert "assistant output quarantined" in content
+    assert "high_repetition" in content
+    assert SHORT_REPEAT_MARKER not in content
+    assert engine._store.search(SHORT_REPEAT_MARKER, session_id=engine.current_session_id) == []
+
+    ref = _extract_ref(content)
+    expanded = _expand_ref(engine, ref)
+    assert expanded["kind"] == "quarantined_assistant_output"
+    assert expanded["content"] == SHORT_REPEAT_R1
+
+    doctor = handle_lcm_command("doctor", engine)
+    assert "quarantined_assistant_rows:" in doctor

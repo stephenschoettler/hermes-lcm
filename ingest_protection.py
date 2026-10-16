@@ -105,6 +105,9 @@ _QUARANTINED_ASSISTANT_KIND = "quarantined_assistant_output"
 _QUARANTINED_ASSISTANT_REASON = "high_repetition"
 _QUARANTINED_ASSISTANT_MIN_CHARS = 65_536
 _QUARANTINED_ASSISTANT_MIN_TOKENS = 1_000
+_SHORT_REPEAT_MIN_SEGMENTS = 3
+_SHORT_REPEAT_TOP_RATIO = 0.90
+_SHORT_REPEAT_DUP_RATIO = 0.90
 _WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _REPETITION_SEGMENT_SPLIT_RE = re.compile(r"(?:\n+|(?<=[.!?])\s+)")
 _HEARTBEAT_NOISE_RE = re.compile(
@@ -856,6 +859,27 @@ def heartbeat_noise_reason(role: str, text: str) -> str | None:
     return None
 
 
+def _short_repetition_reason(segments: list[str]) -> str | None:
+    """Size-independent repetition check for short outputs.
+
+    The 65,536-char gate cannot catch a model loop that repeats one sentence 46
+    times (a few thousand chars). This check fires only when normalized
+    segments are overwhelmingly identical, so it never quarantines varied
+    prose, code, or logs.
+    """
+    if len(segments) < _SHORT_REPEAT_MIN_SEGMENTS:
+        return None
+    segment_counts = Counter(segments)
+    top_segment_ratio = segment_counts.most_common(1)[0][1] / len(segments)
+    duplicate_segment_ratio = 1.0 - len(segment_counts) / len(segments)
+    if (
+        top_segment_ratio >= _SHORT_REPEAT_TOP_RATIO
+        or duplicate_segment_ratio >= _SHORT_REPEAT_DUP_RATIO
+    ):
+        return _QUARANTINED_ASSISTANT_REASON
+    return None
+
+
 def assistant_output_quarantine_reason(text: str) -> str | None:
     """Return a quarantine reason for obviously broken assistant output.
 
@@ -863,39 +887,42 @@ def assistant_output_quarantine_reason(text: str) -> str | None:
     both low token novelty and repeated sentence/line segments. Long diverse
     reports and code with varied identifiers should stay inline.
     """
-    if not isinstance(text, str) or len(text) < _QUARANTINED_ASSISTANT_MIN_CHARS:
+    if not isinstance(text, str):
         return None
 
     normalized = re.sub(r"\s+", " ", text.strip().lower())
-    tokens = _WORD_TOKEN_RE.findall(normalized)
-    if len(tokens) < _QUARANTINED_ASSISTANT_MIN_TOKENS:
-        if len(normalized) >= _QUARANTINED_ASSISTANT_MIN_CHARS and len(set(normalized)) <= 12:
-            return _QUARANTINED_ASSISTANT_REASON
-        return None
-
-    token_counts = Counter(tokens)
-    unique_token_ratio = len(token_counts) / max(1, len(tokens))
-    top_token_ratio = token_counts.most_common(1)[0][1] / max(1, len(tokens))
-
     segments = _normalized_repetition_segments(text)
-    top_segment_ratio = 0.0
-    duplicate_segment_ratio = 0.0
-    if len(segments) >= 20:
-        segment_counts = Counter(segments)
-        top_segment_ratio = segment_counts.most_common(1)[0][1] / len(segments)
-        duplicate_segment_ratio = 1.0 - (len(segment_counts) / len(segments))
+    if len(text) >= _QUARANTINED_ASSISTANT_MIN_CHARS:
+        tokens = _WORD_TOKEN_RE.findall(normalized)
+        if len(tokens) < _QUARANTINED_ASSISTANT_MIN_TOKENS:
+            if len(normalized) >= _QUARANTINED_ASSISTANT_MIN_CHARS and len(set(normalized)) <= 12:
+                return _QUARANTINED_ASSISTANT_REASON
+        else:
+            token_counts = Counter(tokens)
+            unique_token_ratio = len(token_counts) / max(1, len(tokens))
+            top_token_ratio = token_counts.most_common(1)[0][1] / max(1, len(tokens))
 
-    if unique_token_ratio <= 0.03 and (
-        top_segment_ratio >= 0.10
-        or duplicate_segment_ratio >= 0.50
-        or top_token_ratio >= 0.08
-    ):
-        return _QUARANTINED_ASSISTANT_REASON
+            top_segment_ratio = 0.0
+            duplicate_segment_ratio = 0.0
+            if len(segments) >= 20:
+                segment_counts = Counter(segments)
+                top_segment_ratio = segment_counts.most_common(1)[0][1] / len(segments)
+                duplicate_segment_ratio = 1.0 - (len(segment_counts) / len(segments))
 
-    # Covers degenerate long loops with little punctuation/newline structure.
-    if unique_token_ratio <= 0.015 and len(set(normalized)) <= 64:
-        return _QUARANTINED_ASSISTANT_REASON
+            if unique_token_ratio <= 0.03 and (
+                top_segment_ratio >= 0.10
+                or duplicate_segment_ratio >= 0.50
+                or top_token_ratio >= 0.08
+            ):
+                return _QUARANTINED_ASSISTANT_REASON
 
+            # Covers degenerate long loops with little punctuation/newline structure.
+            if unique_token_ratio <= 0.015 and len(set(normalized)) <= 64:
+                return _QUARANTINED_ASSISTANT_REASON
+
+    short_reason = _short_repetition_reason(segments)
+    if short_reason:
+        return short_reason
     return None
 
 
