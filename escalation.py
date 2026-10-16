@@ -333,6 +333,7 @@ def _invoke_summary_llm_chain(
     model: str = "",
     fallback_models: list[str] | tuple[str, ...] | None = None,
     timeout: float | None = None,
+    deadline: float | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
@@ -340,6 +341,10 @@ def _invoke_summary_llm_chain(
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
     for candidate_model in chain:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            logger.warning("LCM summary deadline exhausted; using deterministic fallback")
+            break
         if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
             skipped += 1
             logger.warning(
@@ -360,7 +365,7 @@ def _invoke_summary_llm_chain(
                 prompt,
                 max_tokens,
                 model=candidate_model,
-                timeout=timeout,
+                timeout=remaining if remaining is not None else timeout,
             )
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
@@ -617,6 +622,9 @@ def summarize_with_escalation(
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    # Model fallbacks and L2 are retries within one operation, not fresh
+    # timeout windows. The host may impose an even earlier pass deadline.
+    deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(
         text,
@@ -633,6 +641,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
@@ -659,6 +668,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
