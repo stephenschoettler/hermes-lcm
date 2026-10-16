@@ -12,8 +12,8 @@ state conditions.  The sites, by the path that reaches them:
 * ``compaction.py`` leaf compaction       -> status ``compacted``
 * ``compaction.py`` boundary-cooldown     -> status ``sanitized`` (early return)
 * ``compaction.py`` sanitized branch      -> status ``sanitized`` (no leaf node)
-* ``compaction.py`` dropped-scaffold      -> status ``noop`` — NOT reachable in
-  this suite; see the note at the end of the file.
+* ``compaction.py`` dropped-scaffold      -> status ``noop`` — see the note at the
+  end of the file: not reachable from this harness, and why.
 
 The contract asserted for every site:
 
@@ -324,3 +324,38 @@ def test_unreconstructible_history_is_persisted_not_skipped(tmp_path):
 # per-message identity.  The xfail for this case lives in
 # ``tests/test_ingest_cursor_reuse.py`` and stays there until the host provides
 # a history-replacement signal.  It is a known limitation, not an oversight.
+#
+#
+# --------------------------------------------------------------------------
+# The fourth site — why it has no test here
+# --------------------------------------------------------------------------
+# The dropped-scaffold assignment (status ``noop``) is reached only when the
+# active list loses replayed scaffold messages *and* the reassembly comes out
+# equal to the already-shortened list, so the ``sanitized`` branch is skipped
+# and the ``else`` arm runs with ``dropped_replayed_scaffold_messages`` set.
+# Reaching it needs two conditions in the same call: ``candidate_start >
+# leading_anchor_count`` after skipping scaffold messages at the leaf-chunk
+# start, and then ``fresh_tail_start <= leading_anchor_count``.
+#
+# A search over 81 input shapes (scaffold kind x insertion index x body length x
+# leaf chunk size) did not produce that combination against this harness; the
+# sanitizer ran before the scaffold-drop condition, so the ``sanitized`` branch
+# always won.  The assignment there is fixed identically, it is covered by the
+# same invariant as the three tested sites, and it was verified by reading — but
+# it is *not* verified by a test, and this note exists so nobody assumes it is.
+#
+#
+# --------------------------------------------------------------------------
+# Not related to this change — a pre-existing process relaunch
+# --------------------------------------------------------------------------
+# ``tests/test_lcm_engine.py`` aborts early in this environment (exit 1, no test
+# report).  It is not caused by these changes: the same run aborts identically on
+# the unmodified tree, same exit code and same truncated output.
+#
+# The cause is outside the plugin: the run is relaunched in a second interpreter
+# whose bootstrap re-imports the test runner with the Hermes agent directory
+# first on ``sys.path`` and without site processing, so the child cannot import
+# ``pytest`` and exits.  The parent's report never appears.  Reproduced both
+# under ``pytest`` and by calling one test directly from a plain script, which is
+# why this is an environment finding and not a defect in the code under test.
+
