@@ -41,6 +41,9 @@ class CompactionMixin:
             maybe_reclassify()
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
+        sync_policy = getattr(self, "_maybe_sync_hermes_compression_policy", None)
+        if callable(sync_policy):
+            sync_policy()
         if self._bypasses_lcm_context_management():
             if self._compression_boundary_cooldown_active():
                 return False
@@ -68,6 +71,9 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
+        sync_policy = getattr(self, "_maybe_sync_hermes_compression_policy", None)
+        if callable(sync_policy):
+            sync_policy()
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
