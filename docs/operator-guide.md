@@ -264,7 +264,7 @@ engine. Exposure is not activation. On a stock install:
 | `LCM_QUERY_VIEWS_ENABLED` | `false` | Create and bind demand-shaped evidence views without invoking a model or retrieval provider. |
 | `LCM_ADAPTIVE_RETRIEVAL_ENABLED` | `false` | Enable `lcm_retrieve` and bind query views for evidence reuse. Episodes are bounded to existing retrieval tools and store evidence/traces, never final prose. |
 | `LCM_PREANSWER_EVIDENCE_ENABLED` | `false` | Enable the automatic pre-answer evidence hook. Disabled preserves the ordinary hook context and performs no retrieval or computation. |
-| `LCM_PREANSWER_EVIDENCE_MODE` | empty | When the master flag is enabled, empty selects legacy selective behavior; explicit values are `off`, `legacy_selective`, or `requirements_v1`. |
+| `LCM_PREANSWER_EVIDENCE_MODE` | empty | When the master flag is enabled, empty selects legacy selective behavior; explicit values are `off`, `legacy_selective`, `requirements_v1`, or `sufficiency_v1` (requirements compiler plus a sufficiency verdict/disclosure on every result). |
 | `LCM_SELECTIVE_COMPILER_ENABLED` | `false` | Separately opt into the semantic selector for code-derived closed operations. Disabling the selective compiler does not prevent the pre-answer hook from retrieving a baseline. |
 | `LCM_SELECTIVE_COMPILER_MODEL` | empty | Optional model override for the selective compiler. |
 
