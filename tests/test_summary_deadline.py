@@ -32,7 +32,7 @@ def test_spent_l1_budget_never_starts_another_provider_call(monkeypatch):
     def summary(prompt, max_tokens, model="", timeout=None):
         calls.append(model)
         clock[0] += 10.0
-        return "x" * 10000  # An overlong L1 is rejected even on a successful HTTP call.
+        return "oversized summary " * 10000  # Larger than the source on either tokenizer.
 
     monkeypatch.setattr(escalation, "_call_llm_for_summary", summary)
     result, level = escalation.summarize_with_escalation(
