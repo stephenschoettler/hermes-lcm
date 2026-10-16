@@ -52,14 +52,14 @@ def test_route_guards_cannot_dispatch_with_stale_remaining_budget(monkeypatch):
     calls = []
     monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
     breaker = escalation.SummaryCircuitBreaker()
-    spend = escalation.SummarySpendGuard()
-    reserve = spend.try_record_call
+    spend = escalation.SummarySpendGuard(max_calls=1)
+    reserve = spend.reserve_call
 
     def contended_reservation():
         clock[0] += 10.0
         return reserve()
 
-    monkeypatch.setattr(spend, "try_record_call", contended_reservation)
+    monkeypatch.setattr(spend, "reserve_call", contended_reservation)
     monkeypatch.setattr(
         escalation, "_invoke_summary_llm",
         lambda *args, **kwargs: calls.append(kwargs),
@@ -70,6 +70,10 @@ def test_route_guards_cannot_dispatch_with_stale_remaining_budget(monkeypatch):
     ) is None
     assert calls == []
     assert breaker._failures == {}
+    assert spend._calls == []
+    assert spend._reservations == {}
+    assert spend._backoff_until == 0
+    assert spend.allows()
 
 
 def test_deadline_starved_fallback_remains_healthy_next_operation(monkeypatch):
@@ -102,3 +106,45 @@ def test_deadline_starved_fallback_remains_healthy_next_operation(monkeypatch):
     )
     assert second == ("healthy backup summary", 1)
     assert calls == [("primary", 10), ("backup", 1), ("backup", 10)]
+
+
+def test_first_route_timeout_still_opens_its_circuit(monkeypatch):
+    clock = [100.0]
+    calls = []
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+    breaker = escalation.SummaryCircuitBreaker(failure_threshold=1)
+
+    def summary(prompt, max_tokens, model="", timeout=None):
+        calls.append((model, timeout))
+        if model == "primary":
+            clock[0] += timeout
+            return None
+        return "healthy backup summary"
+
+    monkeypatch.setattr(escalation, "_call_llm_for_summary", summary)
+    for _ in range(2):
+        escalation.summarize_with_escalation(
+            "source facts " * 1000, source_tokens=3000, token_budget=100,
+            model="primary", fallback_models=["backup"], timeout=10, circuit_breaker=breaker,
+        )
+    assert not breaker.allows("primary")
+    assert calls == [("primary", 10), ("backup", 10)]
+
+
+def test_pending_reservation_limits_concurrency_without_false_spend():
+    spend = escalation.SummarySpendGuard(max_calls=1)
+    token = spend.reserve_call()
+    assert token is not None
+    assert not spend.allows()
+    assert spend.reserve_call() is None
+    spend.release_call(token, attempted=False)
+    assert spend.allows()
+    token = spend.reserve_call()
+    spend.release_call(token, attempted=True)
+    assert not spend.allows()
+    assert spend._reservations == {}
+    spend.clear()
+    token = spend.reserve_call()
+    spend.clear()  # A forced operation starts a new budget, including pending calls.
+    spend.release_call(token, attempted=True)
+    assert spend.allows()
