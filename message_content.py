@@ -8,10 +8,43 @@ use deliberate normalization.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
 _TEXT_PART_TYPES = {"text", "input_text", "output_text"}
+
+
+def repair_unicode(text: str) -> str:
+    """Return text that strict UTF-8 can encode.
+
+    Tool and Telegram payloads can carry a lone UTF-16 surrogate (a broken
+    emoji half such as ``\\ud83d``). ``str.encode("utf-8")`` raises on that
+    and aborts compaction before the model runs. Valid Unicode is unchanged.
+    Lone surrogates become U+FFFD.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # UTF-16 keeps a real emoji pair (high+low surrogate) and turns a
+        # lone half into one U+FFFD. UTF-8 surrogatepass does not.
+        return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return text
+
+
+def utf8_bytes(text: str) -> bytes:
+    """Strict UTF-8 bytes for hashing or sizing untrusted message text.
+
+    Well-formed text is unchanged. Lone surrogates are replaced first, so the
+    call cannot raise UnicodeEncodeError and the same broken string always
+    hashes the same.
+    """
+    return repair_unicode(text).encode("utf-8")
+
+
+def content_sha256(text: str, *, length: int | None = None) -> str:
+    digest = hashlib.sha256(utf8_bytes(text)).hexdigest()
+    return digest if length is None else digest[:length]
 
 
 def _extract_text_part_value(value: Any) -> str | None:
@@ -38,7 +71,7 @@ def normalize_content_value(content: Any) -> str | None:
     if content is None:
         return None
     if isinstance(content, str):
-        return content
+        return repair_unicode(content)
     try:
         return json.dumps(content, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):

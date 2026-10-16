@@ -111,7 +111,8 @@ def test_read_only_open_without_schema_fails_without_mutation(tmp_path):
     db_path = tmp_path / "legacy.db"
     messages = MessageStore(db_path)
     before = tuple(
-        messages._conn.execute(
+        tuple(row)
+        for row in messages._conn.execute(
             "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
         ).fetchall()
     )

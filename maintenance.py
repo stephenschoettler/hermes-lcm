@@ -61,9 +61,13 @@ def flush_engine_connections(engine) -> None:
     contract stays in one place.
     """
     engine._store.commit()
-    engine._dag._conn.commit()
+    dag_conn = getattr(getattr(engine, "_dag", None), "_conn", None)
+    if dag_conn is not None and dag_conn is not getattr(engine._store, "_conn", None):
+        dag_conn.commit()
     lifecycle_conn = getattr(getattr(engine, "_lifecycle", None), "_conn", None)
-    if lifecycle_conn is not None:
+    if lifecycle_conn is not None and lifecycle_conn is not getattr(
+        engine._store, "_conn", None
+    ):
         lifecycle_conn.commit()
     assertion_store = getattr(engine, "_assertions", None)
     if assertion_store is not None:

@@ -17,7 +17,9 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterable, Sequence
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -124,15 +126,300 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                              or cap growth while another
                                              connection holds an old WAL
                                              end mark.
-    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM.
+    - mmap_size=0                          : disable mmap. Concurrent mmap
+                                              writers plus a torn checkpoint
+                                              have produced btree page_count
+                                              mismatches on the live file.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute("PRAGMA mmap_size=0")
+
+
+def checkpoint_wal(conn: sqlite3.Connection) -> None:
+    """Flush committed WAL frames into the main file on graceful close.
+
+    TRUNCATE copies frames and resets the WAL. PASSIVE is the fallback when
+    another connection still holds a read lock. Unexpected process death still
+    depends on SQLite WAL recovery. Callers must not VACUUM a live database
+    that other processes still have open.
+    """
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error:
+            pass
+
+
+class _SnapshotCursor:
+    """Cursor whose rows were fetched while the hub lock was held."""
+
+    __slots__ = ("lastrowid", "rowcount", "description", "_rows", "_i")
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        self.lastrowid = cursor.lastrowid
+        self.rowcount = cursor.rowcount
+        self.description = cursor.description
+        self._rows = cursor.fetchall()
+        self._i = 0
+
+    def fetchone(self):
+        if self._i >= len(self._rows):
+            return None
+        row = self._rows[self._i]
+        self._i += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._i :]
+        self._i = len(self._rows)
+        return rows
+
+    def fetchmany(self, size: int | None = None):
+        if size is None:
+            size = len(self._rows) - self._i
+        rows = self._rows[self._i : self._i + size]
+        self._i += len(rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    def close(self) -> None:
+        return None
+
+
+class _HubConnection:
+    """Serialize every use of one ``sqlite3.Connection``.
+
+    Stores share one writer handle. SQLite serializes statements at the C
+    layer, but Python transaction state is per connection: a ``BEGIN`` from
+    AssertionStore and a ``commit()`` from MessageStore must not interleave.
+    The hub lock is re-entrant so an in-flight ``BEGIN IMMEDIATE`` can keep
+    calling ``execute`` on the same thread.
+    """
+
+    __slots__ = ("_conn", "_lock")
+
+    def __init__(self, conn: sqlite3.Connection, lock: threading.RLock) -> None:
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_lock", lock)
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return _SnapshotCursor(self._conn.execute(*args, **kwargs))
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return _SnapshotCursor(self._conn.executemany(*args, **kwargs))
+
+    def executescript(self, *args, **kwargs):
+        with self._lock:
+            return self._conn.executescript(*args, **kwargs)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def rollback(self) -> None:
+        with self._lock:
+            self._conn.rollback()
+
+    def backup(self, *args, **kwargs):
+        with self._lock:
+            return self._conn.backup(*args, **kwargs)
+
+    def cursor(self, *args, **kwargs):
+        with self._lock:
+            return _SnapshotCursor(self._conn.cursor(*args, **kwargs))
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def interrupt(self) -> None:
+        self._conn.interrupt()
+
+    def set_progress_handler(self, *args, **kwargs):
+        return self._conn.set_progress_handler(*args, **kwargs)
+
+    def __enter__(self):
+        self._lock.acquire()
+        try:
+            self._conn.__enter__()
+            return self
+        except BaseException:
+            self._lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return self._conn.__exit__(exc_type, exc, tb)
+        finally:
+            self._lock.release()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __setattr__(self, name, value):
+        if name in _HubConnection.__slots__:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._conn, name, value)
+
+
+class _WriterHubEntry:
+    __slots__ = ("conn", "refs")
+
+    def __init__(self, conn: _HubConnection) -> None:
+        self.conn = conn
+        self.refs = 1
+
+    @property
+    def lock(self) -> threading.RLock:
+        return self.conn._lock
+
+
+_WRITER_HUB_LOCK = threading.RLock()
+_WRITER_HUB: dict[str, _WriterHubEntry] = {}
+
+
+def _wrap_connection(conn: sqlite3.Connection) -> _HubConnection:
+    return _HubConnection(conn, threading.RLock())
+
+
+def _writer_hub_key(db_path: str | Path) -> str | None:
+    """Return the shared-writer key, or ``None`` when the handle must stay private.
+
+    In-memory databases and read-only URIs never join the writer hub: each
+    caller gets an unshared connection. Filesystem paths resolve so ``lcm.db``
+    and ``./lcm.db`` map to one entry.
+    """
+    raw = str(db_path)
+    if raw == ":memory:" or raw.startswith("file:") or "mode=ro" in raw:
+        return None
+    path = Path(raw)
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
+
+
+def acquire_lcm_connection(
+    db_path: str | Path,
+    *,
+    timeout: float | None = None,
+    read_only: bool = False,
+) -> sqlite3.Connection:
+    """Return a SQLite connection, sharing one writer per filesystem path.
+
+    Writer connections use ``isolation_level=None`` (autocommit) so a long-lived
+    reader does not pin a WAL snapshot. Callers that need a multi-statement
+    write must open ``BEGIN IMMEDIATE`` themselves (see
+    :func:`lcm_write_transaction`). ``configure_connection`` is left to the
+    caller so a too-new schema can be refused before PRAGMAs mutate the file.
+    Read-only and ``:memory:`` handles are never shared.
+    """
+    if timeout is None:
+        timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    if read_only:
+        uri = f"file:{quote(os.fspath(db_path), safe='/')}?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=timeout,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        return _wrap_connection(conn)
+    key = _writer_hub_key(db_path)
+    if key is None:
+        conn = sqlite3.connect(
+            str(db_path),
+            timeout=timeout,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        return _wrap_connection(conn)
+    with _WRITER_HUB_LOCK:
+        entry = _WRITER_HUB.get(key)
+        if entry is not None:
+            entry.refs += 1
+            return entry.conn
+        conn = sqlite3.connect(
+            key,
+            timeout=timeout,
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        wrapped = _wrap_connection(conn)
+        _WRITER_HUB[key] = _WriterHubEntry(wrapped)
+        return wrapped
+
+
+def lcm_connection_lock(conn: sqlite3.Connection) -> threading.RLock:
+    """Return the in-process lock that serializes use of ``conn``.
+
+    Shared writer connections share one re-entrant lock so MessageStore,
+    SummaryDAG, and LifecycleStateStore cannot interleave ``BEGIN IMMEDIATE``
+    on the same Python connection. Unshared handles get a private lock.
+    """
+    if isinstance(conn, _HubConnection):
+        return conn._lock
+    with _WRITER_HUB_LOCK:
+        for entry in _WRITER_HUB.values():
+            if entry.conn is conn:
+                return entry.lock
+        return threading.RLock()
+
+
+def release_lcm_connection(conn: sqlite3.Connection | None) -> None:
+    """Drop one acquire. The last writer-hub reference checkpoints and closes."""
+    if conn is None:
+        return
+    close_now = False
+    with _WRITER_HUB_LOCK:
+        for key, entry in list(_WRITER_HUB.items()):
+            if entry.conn is conn:
+                entry.refs -= 1
+                if entry.refs > 0:
+                    return
+                del _WRITER_HUB[key]
+                close_now = True
+                break
+        else:
+            close_now = True
+    if not close_now:
+        return
+    try:
+        conn.commit()
+    except sqlite3.Error:
+        pass
+    checkpoint_wal(conn)
+    conn.close()
+
+
+@contextmanager
+def lcm_write_transaction(conn: sqlite3.Connection):
+    """Autocommit-safe write transaction (``BEGIN IMMEDIATE`` / commit)."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        raise
 
 
 def _execute_wal_conversion_with_lock_retry(

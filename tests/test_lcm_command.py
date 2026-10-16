@@ -14,7 +14,11 @@ import hermes_lcm.command as command_mod
 from hermes_lcm.command import _fmt_size, handle_lcm_command
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
-from hermes_lcm.db_bootstrap import check_external_content_fts_integrity
+from hermes_lcm.db_bootstrap import (
+    acquire_lcm_connection,
+    check_external_content_fts_integrity,
+    lcm_connection_lock,
+)
 from hermes_lcm.diagnostics import doctor_guidance_for_check
 from hermes_lcm.engine import LCMEngine
 from hermes_lcm.store import build_message_fts_spec
@@ -46,15 +50,13 @@ def _replace_with_header_only_sqlite_db(e: LCMEngine) -> Path:
     with sqlite3.connect(str(db_path)) as conn:
         conn.execute("PRAGMA user_version = 2")
         conn.commit()
-    e._store._conn = sqlite3.connect(str(db_path), timeout=5.0, check_same_thread=False)
-    e._dag._conn = sqlite3.connect(str(db_path), timeout=5.0, check_same_thread=False)
-    e._lifecycle._conn = sqlite3.connect(
-        str(db_path),
-        timeout=30.0,
-        check_same_thread=False,
-        isolation_level=None,
-    )
-    e._lifecycle._conn.row_factory = sqlite3.Row
+    e._store._conn = acquire_lcm_connection(db_path)
+    e._dag._conn = acquire_lcm_connection(db_path)
+    e._lifecycle._conn = acquire_lcm_connection(db_path)
+    lock = lcm_connection_lock(e._store._conn)
+    e._store._write_lock = lock
+    e._dag._db_lock = lock
+    e._lifecycle._lock = lock
     return db_path
 
 

@@ -24,9 +24,13 @@ from typing import Any, Callable, Dict, List, Optional
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
+    acquire_lcm_connection,
     configure_connection,
     ensure_external_content_fts,
+    lcm_connection_lock,
+    lcm_write_transaction,
     refuse_schema_version_too_new,
+    release_lcm_connection,
     run_versioned_migrations,
 )
 from .config import LCMConfig
@@ -355,12 +359,14 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        if not self._is_memory_database:
-            _restrict_existing_sqlite_artifacts(self.db_path)
-        self._conn.executescript("""
+        self._conn = acquire_lcm_connection(self.db_path)
+        self._write_lock = lcm_connection_lock(self._conn)
+        try:
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            if not self._is_memory_database:
+                _restrict_existing_sqlite_artifacts(self.db_path)
+            self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -388,15 +394,19 @@ class MessageStore:
                 value TEXT
             );
         """)
-        ensure_external_content_fts(
-            self._conn,
-            build_message_fts_spec(),
-        )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_column()
-        self._ensure_conversation_id_column()
-        self._ensure_time_contract_columns()
-        self._conn.commit()
+            ensure_external_content_fts(
+                self._conn,
+                build_message_fts_spec(),
+            )
+            run_versioned_migrations(self._conn)
+            self._ensure_source_column()
+            self._ensure_conversation_id_column()
+            self._ensure_time_contract_columns()
+            self._conn.commit()
+        except Exception:
+            release_lcm_connection(self._conn)
+            self._conn = None
+            raise
 
     def _ensure_source_column(self) -> None:
         columns = {
@@ -534,7 +544,7 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
-        with self._write_lock, self._conn:
+        with self._write_lock, lcm_write_transaction(self._conn):
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
@@ -605,7 +615,7 @@ class MessageStore:
         later batch archive would slice the new (short) content at the old chunk
         offsets, returning a garbled fragment (F2).
         """
-        with self._write_lock:
+        with self._write_lock, lcm_write_transaction(self._conn):
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
@@ -628,7 +638,6 @@ class MessageStore:
             )
             if before_commit is not None:
                 before_commit(self._conn, store_id)
-            self._conn.commit()
             return True
 
     def pin(self, store_id: int) -> None:
@@ -1040,7 +1049,7 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._write_lock, self._conn:
+        with self._write_lock, lcm_write_transaction(self._conn):
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
@@ -1724,9 +1733,11 @@ class MessageStore:
 
         Used by the backup path's cross-connection flush so callers do not reach
         the private connection. Requires a live connection: a closed store
-        raises, matching direct ``_conn.commit()`` use.
+        raises, matching direct ``_conn.commit()`` use. Takes the hub lock so a
+        flush cannot commit another store's in-flight ``BEGIN IMMEDIATE``.
         """
-        self._conn.commit()
+        with self._write_lock:
+            self._conn.commit()
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
@@ -1742,14 +1753,7 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
-            conn.close()
+            release_lcm_connection(conn)
             self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup

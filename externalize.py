@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
 
+from .message_content import content_sha256, utf8_bytes
+
 DEFAULT_LARGE_OUTPUT_DIRNAME = "lcm-large-outputs"
 _EXTERNALIZED_REF_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
@@ -78,13 +80,13 @@ def _safe_stub(value: str, fallback: str) -> str:
 
 
 def _content_digest_prefix(content: str) -> str:
-    return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
+    return content_sha256(content or "", length=12)
 
 
 def _preview_sha256(preview_prefix: Any) -> str:
     if not preview_prefix:
         return ""
-    return hashlib.sha256(str(preview_prefix).encode("utf-8")).hexdigest()
+    return content_sha256(str(preview_prefix))
 
 
 def _fsync_directory(path: Path) -> None:
@@ -651,7 +653,7 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
         "session_id": payload.get("session_id", ""),
         "field_path": payload.get("field_path", ""),
         "content_chars": payload.get("content_chars", len(payload.get("content", ""))),
-        "content_bytes": payload.get("content_bytes", len((payload.get("content", "") or "").encode("utf-8"))),
+        "content_bytes": payload.get("content_bytes", len(utf8_bytes(payload.get("content", "") or ""))),
         "created_at": payload.get("created_at"),
     }
 
@@ -2049,7 +2051,7 @@ def externalize_ingest_payload(
         "field_path": field_path,
         "content": content,
         "content_chars": len(content),
-        "content_bytes": len(content.encode("utf-8")),
+        "content_bytes": len(utf8_bytes(content)),
         "created_at": time.time(),
     }
     try:
@@ -2174,7 +2176,7 @@ def maybe_externalize_payload(
         "session_id": session_id,
         "content": content,
         "content_chars": len(content),
-        "content_bytes": len(content.encode("utf-8")),
+        "content_bytes": len(utf8_bytes(content)),
         "created_at": time.time(),
     }
     if metadata:

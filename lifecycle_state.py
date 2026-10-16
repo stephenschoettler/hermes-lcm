@@ -18,7 +18,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .db_bootstrap import (
+    acquire_lcm_connection,
+    configure_connection,
+    lcm_connection_lock,
+    refuse_schema_version_too_new,
+    release_lcm_connection,
+    run_versioned_migrations,
+)
 
 
 def _synchronized(method):
@@ -66,26 +73,22 @@ class LifecycleStateStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30.0,
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        self._conn.commit()
+        self._conn = acquire_lcm_connection(self.db_path)
+        self._lock = lcm_connection_lock(self._conn)
+        try:
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            run_versioned_migrations(self._conn)
+            self._conn.commit()
+        except Exception:
+            release_lcm_connection(self._conn)
+            self._conn = None
+            raise
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
+            release_lcm_connection(conn)
             self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
@@ -664,6 +667,37 @@ class LifecycleStateStore:
             WHERE conversation_id = ?
             """,
             (now, now, conversation_id),
+        )
+        self._conn.commit()
+        return self.get_by_conversation(conversation_id)
+
+    @_synchronized
+    def drop_carry_for_explicit_new(self, conversation_id: str | None) -> LifecycleState | None:
+        """User /new: this conversation's finalized session must not be a carry source.
+
+        ``record_reset`` only stamps ``last_reset_at``. Compression then reassigns
+        ``last_finalized_session_id``'s summary nodes into the next segment.
+        """
+        if not conversation_id:
+            return None
+        state = self.get_by_conversation(conversation_id)
+        if state is None:
+            return None
+        now = time.time()
+        self._conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET last_finalized_session_id = NULL,
+                last_finalized_frontier_store_id = 0,
+                current_frontier_store_id = 0,
+                last_reset_at = ?,
+                debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = ?,
+                updated_at = ?
+            WHERE conversation_id = ?
+            """,
+            (now, now, now, conversation_id),
         )
         self._conn.commit()
         return self.get_by_conversation(conversation_id)

@@ -26,11 +26,14 @@ from typing import Any, Iterator, Optional, Sequence
 
 from .config import LCMConfig
 from .db_bootstrap import (
+    acquire_lcm_connection,
     configure_connection,
     ensure_chunk_tables,
     ensure_embedding_tables,
+    lcm_connection_lock,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
+    release_lcm_connection,
     run_versioned_migrations,
     verify_chunk_schema,
     verify_embedding_schema,
@@ -373,18 +376,18 @@ class VectorStore:
         # data_version), defeating the cross-process cache invalidation. Write
         # atomicity is preserved via the explicit BEGIN IMMEDIATE in
         # _write_transaction.
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=5.0,
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        self._ensure_embedding_schema()
-        self._conn.commit()
+        self._conn = acquire_lcm_connection(self.db_path)
+        self._write_lock = lcm_connection_lock(self._conn)
+        try:
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            run_versioned_migrations(self._conn)
+            self._ensure_embedding_schema()
+            self._conn.commit()
+        except Exception:
+            release_lcm_connection(self._conn)
+            self._conn = None
+            raise
 
     def _ensure_embedding_schema(self) -> None:
         """Materialize (and verify) the opt-in embedding tables on VectorStore use.
@@ -2944,11 +2947,7 @@ class VectorStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
+            release_lcm_connection(conn)
             self._conn = None
         with self._cache_lock:
             self._matrix_cache.clear()

@@ -16,10 +16,14 @@ from pathlib import Path
 from typing import Iterator, NamedTuple, Optional, Sequence
 
 from .db_bootstrap import (
+    acquire_lcm_connection,
     configure_connection,
     ensure_temporal_rollup_tables,
+    lcm_connection_lock,
+    lcm_write_transaction,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
+    release_lcm_connection,
     run_versioned_migrations,
     verify_temporal_rollup_schema,
 )
@@ -60,42 +64,43 @@ class RollupStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=5.0,
-            check_same_thread=False,
-        )
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        # The rollup tables are a lazy, opt-in feature: they are NOT part of the
-        # core numeric schema_version (see db_bootstrap.run_versioned_migrations).
-        # RollupStore is only constructed on the temporal_rollups_enabled path, so
-        # creating them here keeps a disabled install at the base schema with no
-        # rollup tables while still being idempotent under concurrent construction.
-        ensure_temporal_rollup_tables(self._conn)
-        # Do NOT trust the named marker alone: it can be present on a DB whose
-        # tables were dropped or left partial by a crash mid-create. Verify the
-        # required tables+indexes actually exist and re-ensure (idempotent
-        # CREATE IF NOT EXISTS makes this safe) before recording the step, so a
-        # stale marker can never mask a missing table (maintainer #387 A3).
-        missing = verify_temporal_rollup_schema(self._conn)
-        if missing:
+        self._conn = acquire_lcm_connection(self.db_path)
+        self._write_lock = lcm_connection_lock(self._conn)
+        try:
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            run_versioned_migrations(self._conn)
+            # The rollup tables are a lazy, opt-in feature: they are NOT part of the
+            # core numeric schema_version (see db_bootstrap.run_versioned_migrations).
+            # RollupStore is only constructed on the temporal_rollups_enabled path, so
+            # creating them here keeps a disabled install at the base schema with no
+            # rollup tables while still being idempotent under concurrent construction.
             ensure_temporal_rollup_tables(self._conn)
+            # Do NOT trust the named marker alone: it can be present on a DB whose
+            # tables were dropped or left partial by a crash mid-create. Verify the
+            # required tables+indexes actually exist and re-ensure (idempotent
+            # CREATE IF NOT EXISTS makes this safe) before recording the step, so a
+            # stale marker can never mask a missing table (maintainer #387 A3).
             missing = verify_temporal_rollup_schema(self._conn)
             if missing:
-                raise RuntimeError(
-                    "temporal rollup schema incomplete after ensure: "
-                    + ", ".join(missing)
-                )
-        mark_migration_step_complete(self._conn, "temporal_rollups_v1")
-        self._conn.commit()
+                ensure_temporal_rollup_tables(self._conn)
+                missing = verify_temporal_rollup_schema(self._conn)
+                if missing:
+                    raise RuntimeError(
+                        "temporal rollup schema incomplete after ensure: "
+                        + ", ".join(missing)
+                    )
+            mark_migration_step_complete(self._conn, "temporal_rollups_v1")
+            self._conn.commit()
+        except Exception:
+            release_lcm_connection(self._conn)
+            self._conn = None
+            raise
 
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         try:
-            with self._write_lock, self._conn:
+            with self._write_lock, lcm_write_transaction(self._conn):
                 yield
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):
@@ -834,11 +839,7 @@ class RollupStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
+            release_lcm_connection(conn)
             self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup

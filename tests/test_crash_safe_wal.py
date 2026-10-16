@@ -1,12 +1,12 @@
 """Tests for WAL durability configuration and graceful-close hygiene.
 
 These tests verify the PRAGMAs applied by ``configure_connection()`` and
-the best-effort passive WAL checkpoint performed by ``close()`` on all three
+the TRUNCATE-then-PASSIVE WAL checkpoint performed by ``close()`` on the
 SQLite helpers.
 
-This covers the PR #237 hardening path without overclaiming it: graceful close
-can checkpoint committed WAL frames best-effort, while unexpected process death
-still depends on SQLite WAL recovery.
+Graceful close checkpoints committed WAL frames best-effort. Unexpected
+process death still depends on SQLite WAL recovery. mmap stays off so
+concurrent writers cannot tear page_count against btree pointers.
 """
 
 from __future__ import annotations
@@ -14,16 +14,25 @@ from __future__ import annotations
 import sqlite3
 import threading
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from hermes_lcm.assertion_store import AssertionStore
 from hermes_lcm.db_bootstrap import (
+    SchemaVersionTooNewError,
+    _WRITER_HUB,
+    _writer_hub_key,
+    acquire_lcm_connection,
+    checkpoint_wal,
     configure_connection,
     ensure_message_origin_columns,
+    release_lcm_connection,
 )
 from hermes_lcm.store import MessageStore
 from hermes_lcm.dag import SummaryDAG
 from hermes_lcm.lifecycle_state import LifecycleStateStore
+from hermes_lcm.trajectory_store import CorpusIdentity, TrajectoryStore
 
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +91,34 @@ class TestConfigureConnectionPragmas:
         configure_connection(conn)
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
-        assert val == 268_435_456, f"expected mmap_size=268435456, got {val}"
+        assert val == 0, f"expected mmap_size=0, got {val}"
+
+
+class TestCheckpointWal:
+    def test_truncate_then_passive_on_lock(self):
+        seen: list[str] = []
+
+        class _Conn:
+            def execute(self, sql: str):
+                seen.append(sql)
+                if "TRUNCATE" in sql:
+                    raise sqlite3.OperationalError("database is locked")
+
+        checkpoint_wal(_Conn())  # type: ignore[arg-type]
+        assert seen == [
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA wal_checkpoint(PASSIVE)",
+        ]
+
+    def test_truncate_success_skips_passive(self):
+        seen: list[str] = []
+
+        class _Conn:
+            def execute(self, sql: str):
+                seen.append(sql)
+
+        checkpoint_wal(_Conn())  # type: ignore[arg-type]
+        assert seen == ["PRAGMA wal_checkpoint(TRUNCATE)"]
 
 
 # --------------------------------------------------------------------------- #
@@ -91,8 +127,7 @@ class TestConfigureConnectionPragmas:
 
 
 class TestGracefulClose:
-    """Verify that close() performs a best-effort passive WAL checkpoint
-    without raising."""
+    """Verify that close() performs a best-effort WAL checkpoint without raising."""
 
     def _write_and_get_wal_size(self, db_path: Path) -> int:
         """Return WAL file size in bytes (0 if no WAL)."""
@@ -163,21 +198,27 @@ class TestGracefulClose:
         underlying close."""
         db = tmp_path / "store.db"
         store = MessageStore(db)
+        conn = store._conn
         # Manually invalidate the connection so close() has nothing to do
         store._conn = None
         store.close()  # should not raise
+        release_lcm_connection(conn)
 
     def test_summary_dag_close_does_not_mask_sqlite_error(self, tmp_path: Path):
         db = tmp_path / "dag.db"
         dag = SummaryDAG(db)
+        conn = dag._conn
         dag._conn = None
         dag.close()  # should not raise
+        release_lcm_connection(conn)
 
     def test_lifecycle_state_close_does_not_mask_sqlite_error(self, tmp_path: Path):
         db = tmp_path / "lifecycle.db"
         lc = LifecycleStateStore(db)
+        conn = lc._conn
         lc._conn = None
         lc.close()  # should not raise
+        release_lcm_connection(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -265,3 +306,124 @@ class TestConcurrentStartupMigration:
         ]
         conn.close()
         assert columns.count("conversation_id") == 1
+
+
+class TestSharedWriterHub:
+    """One filesystem path -> one writer connection in this process."""
+
+    def test_message_dag_lifecycle_share_one_connection(self, tmp_path: Path):
+        db = tmp_path / "shared.db"
+        store = MessageStore(db)
+        dag = SummaryDAG(db)
+        lifecycle = LifecycleStateStore(db)
+        try:
+            assert store._conn is dag._conn
+            assert dag._conn is lifecycle._conn
+            store.append("sess", {"role": "user", "content": "hello"})
+            lifecycle.bind_session("sess")
+            assert store.get_session_messages("sess")
+        finally:
+            store.close()
+            dag.close()
+            lifecycle.close()
+
+    def test_last_release_closes_connection(self, tmp_path: Path):
+        db = tmp_path / "last-close.db"
+        store = MessageStore(db)
+        dag = SummaryDAG(db)
+        conn = store._conn
+        assert conn is dag._conn
+        store.close()
+        conn.execute("SELECT 1").fetchone()
+        dag.close()
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+    def test_second_acquire_same_identity(self, tmp_path: Path):
+        db = tmp_path / "second.db"
+        a = acquire_lcm_connection(db)
+        b = acquire_lcm_connection(db)
+        try:
+            assert a is b
+        finally:
+            release_lcm_connection(a)
+            release_lcm_connection(b)
+
+    def test_memory_databases_are_unshared(self):
+        a = MessageStore(":memory:")
+        b = SummaryDAG(":memory:")
+        try:
+            assert a._conn is not b._conn
+        finally:
+            a.close()
+            b.close()
+
+    def test_read_only_does_not_join_writer_hub(self, tmp_path: Path):
+        db = tmp_path / "ro.db"
+        writer = acquire_lcm_connection(db)
+        configure_connection(writer)
+        writer.execute("CREATE TABLE t(x INTEGER)")
+        writer.commit()
+        reader = acquire_lcm_connection(db, read_only=True)
+        try:
+            assert reader is not writer
+        finally:
+            release_lcm_connection(reader)
+            release_lcm_connection(writer)
+
+    def test_shared_store_close_still_truncates_wal(self, tmp_path: Path):
+        db = tmp_path / "wal-share.db"
+        store = MessageStore(db)
+        dag = SummaryDAG(db)
+        store.append("sess", {"role": "user", "content": "hello"})
+        store.close()
+        dag.close()
+        wal = Path(str(db) + "-wal")
+        wal_size = wal.stat().st_size if wal.exists() else 0
+        assert wal_size < 4096, f"WAL still {wal_size} bytes after last close"
+
+    def test_failed_assertion_open_drops_hub_ref(self, tmp_path: Path):
+        db = tmp_path / "assert-fail-open.db"
+        MessageStore(db).close()
+        with patch(
+            "hermes_lcm.assertion_store.refuse_schema_version_too_new",
+            side_effect=SchemaVersionTooNewError("too new"),
+        ):
+            with pytest.raises(SchemaVersionTooNewError):
+                AssertionStore(db)
+        assert _writer_hub_key(db) not in _WRITER_HUB
+        store = MessageStore(db)
+        try:
+            store.append("sess", {"role": "user", "content": "hello"})
+        finally:
+            store.close()
+        wal = Path(str(db) + "-wal")
+        wal_size = wal.stat().st_size if wal.exists() else 0
+        assert wal_size < 4096, f"WAL still {wal_size} bytes after failed open + close"
+
+    def test_failed_trajectory_open_drops_hub_ref(self, tmp_path: Path):
+        db = tmp_path / "traj-fail-open.db"
+        MessageStore(db).close()
+        identity = CorpusIdentity(
+            dataset_name="example/trajectory-benchmark",
+            dataset_revision="dataset-rev-1",
+            harness_commit="harness-commit-1",
+            tier="small",
+            domain="enterprise",
+            ingest_config_digest="ingest-v1",
+        )
+        with patch(
+            "hermes_lcm.trajectory_store.refuse_schema_version_too_new",
+            side_effect=SchemaVersionTooNewError("too new"),
+        ):
+            with pytest.raises(SchemaVersionTooNewError):
+                TrajectoryStore(db, identity, asset_root=tmp_path / "assets")
+        assert _writer_hub_key(db) not in _WRITER_HUB
+        store = MessageStore(db)
+        try:
+            store.append("sess", {"role": "user", "content": "hello"})
+        finally:
+            store.close()
+        wal = Path(str(db) + "-wal")
+        wal_size = wal.stat().st_size if wal.exists() else 0
+        assert wal_size < 4096, f"WAL still {wal_size} bytes after failed open + close"

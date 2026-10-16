@@ -23,10 +23,13 @@ from typing import Any, Callable, Iterable, Protocol, Sequence
 from urllib.parse import quote, unquote
 
 from .db_bootstrap import (
+    acquire_lcm_connection,
     configure_connection,
     get_fts_shadow_table_names,
+    lcm_connection_lock,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
+    release_lcm_connection,
     run_versioned_migrations,
 )
 from .ingest_protection import redact_sensitive_value
@@ -590,41 +593,39 @@ class TrajectoryStore:
             tuple[str, tuple[int, float], list[int], Any] | None
         ) = None
         self._lock = threading.RLock()
-        self._conn = self._open_connection()
+        self._conn = None  # type: ignore[assignment]
         try:
+            self._conn = self._open_connection()
             self._validate_existing_schema_version()
             self._init_schema()
             self._bind_identity()
         except Exception:
-            self._conn.close()
+            release_lcm_connection(self._conn)
             self._conn = None  # type: ignore[assignment]
             raise
 
     def _open_connection(self) -> sqlite3.Connection:
         if self.read_only:
-            uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
-            conn = sqlite3.connect(
-                uri,
-                uri=True,
-                timeout=5.0,
-                check_same_thread=False,
-                isolation_level=None,
-            )
-            conn.execute("PRAGMA query_only=ON")
-            conn.execute("PRAGMA busy_timeout=30000")
+            conn = acquire_lcm_connection(self.db_path, read_only=True)
         else:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(
-                str(self.db_path),
-                timeout=5.0,
-                check_same_thread=False,
-                isolation_level=None,
-            )
-            refuse_schema_version_too_new(conn)
-            configure_connection(conn)
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.row_factory = sqlite3.Row
-        return conn
+            conn = acquire_lcm_connection(self.db_path)
+        # Assign before setup so __init__'s except can release if we re-raise.
+        self._conn = conn
+        try:
+            if self.read_only:
+                conn.execute("PRAGMA query_only=ON")
+                conn.execute("PRAGMA busy_timeout=30000")
+            else:
+                refuse_schema_version_too_new(conn)
+                configure_connection(conn)
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._lock = lcm_connection_lock(conn)
+            return conn
+        except Exception:
+            release_lcm_connection(conn)
+            self._conn = None  # type: ignore[assignment]
+            raise
 
     def _validate_existing_schema_version(self) -> None:
         try:
@@ -3826,9 +3827,5 @@ class TrajectoryStore:
             conn = self._conn
             if conn is None:
                 return
-            try:
-                if not self.read_only:
-                    conn.commit()
-            finally:
-                conn.close()
-                self._conn = None  # type: ignore[assignment]
+            release_lcm_connection(conn)
+            self._conn = None  # type: ignore[assignment]

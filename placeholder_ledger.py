@@ -23,7 +23,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from .message_content import text_content_for_pattern_matching
+from .message_content import content_sha256, text_content_for_pattern_matching, utf8_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +52,13 @@ class PlaceholderLedgerMixin:
 
     @staticmethod
     def _ignored_active_replay_placeholder(content: str) -> str:
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        raw = utf8_bytes(content)
+        digest = hashlib.sha256(raw).hexdigest()[:16]
         return (
             "[LCM active replay placeholder: message ignored; "
             "kind=ignored_message; "
             "scope=ignored_message_pattern; field=content; "
-            f"chars={len(content)}; bytes={len(content.encode('utf-8'))}; "
+            f"chars={len(content)}; bytes={len(raw)}; "
             f"sha256={digest}]"
         )
 
@@ -153,7 +154,7 @@ class PlaceholderLedgerMixin:
                 if store_id is None:
                     continue
                 identity = f"{source_session_id}\0{int(store_id)}"
-                active_dependent_store_digests.add(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16])
+                active_dependent_store_digests.add(content_sha256(identity, length=16))
         except Exception:
             logger.debug("LCM active dependent marker scan failed", exc_info=True)
 
@@ -429,7 +430,7 @@ class PlaceholderLedgerMixin:
         if store_id is None:
             return None
         identity = f"{self._session_id}\0{store_id}"
-        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return content_sha256(identity, length=16)
 
     def _ignored_dependent_reply_content_fingerprint(self, msg: Dict[str, Any], text: str) -> Optional[str]:
         role = str(msg.get("role") or "")
@@ -443,7 +444,7 @@ class PlaceholderLedgerMixin:
                 text,
             )
         )
-        return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+        return content_sha256(identity, length=16)
 
     def _load_generated_ignored_dependent_reply_records(
         self,
@@ -680,7 +681,7 @@ class PlaceholderLedgerMixin:
                 active_message = {"role": "system", "content": placeholder}
             else:
                 active_message = {"role": "user", "content": placeholder}
-            digest = hashlib.sha256(original_text.encode("utf-8")).hexdigest()[:16]
+            digest = content_sha256(original_text, length=16)
             self._remember_generated_ignored_placeholder_hash(digest)
             self._generated_ignored_active_replay_placeholder_message_ids.add(id(active_message))
             active_replay_messages[idx] = active_message

@@ -23,9 +23,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
+    acquire_lcm_connection,
     configure_connection,
     ensure_external_content_fts,
+    lcm_connection_lock,
     refuse_schema_version_too_new,
+    release_lcm_connection,
     run_versioned_migrations,
 )
 
@@ -180,10 +183,12 @@ class SummaryDAG:
         return self._conn
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        refuse_schema_version_too_new(self._conn)
-        configure_connection(self._conn)
-        self._conn.executescript("""
+        self._conn = acquire_lcm_connection(self.db_path)
+        self._db_lock = lcm_connection_lock(self._conn)
+        try:
+            refuse_schema_version_too_new(self._conn)
+            configure_connection(self._conn)
+            self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS summary_nodes (
                 node_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -210,13 +215,17 @@ class SummaryDAG:
                 value TEXT
             );
         """)
-        ensure_external_content_fts(
-            self._conn,
-            build_nodes_fts_spec(),
-        )
-        run_versioned_migrations(self._conn)
-        self._ensure_source_window_columns()
-        self._conn.commit()
+            ensure_external_content_fts(
+                self._conn,
+                build_nodes_fts_spec(),
+            )
+            run_versioned_migrations(self._conn)
+            self._ensure_source_window_columns()
+            self._conn.commit()
+        except Exception:
+            release_lcm_connection(self._conn)
+            self._conn = None
+            raise
 
     def _ensure_source_window_columns(self) -> None:
         columns = {
@@ -877,11 +886,7 @@ class SummaryDAG:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
+            release_lcm_connection(conn)
             self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup

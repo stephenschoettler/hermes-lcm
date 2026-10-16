@@ -360,6 +360,30 @@ def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine)
     return _handler
 
 
+def _on_explicit_session_reset(**payload):
+    """Gateway/CLI /new. Drop this conversation's summary nodes and carry pointer.
+
+    Ordinary compression reset is a different hook path and still uses retain
+    depth. This runs only for an explicit new-session reason.
+    """
+    reason = str(payload.get("reason") or "")
+    if reason not in {"new_session", "session_reset"}:
+        return None
+    try:
+        from .session_forget import forget_explicit_new
+
+        return forget_explicit_new(
+            str(payload.get("conversation_id") or payload.get("session_key") or ""),
+            extra_session_ids=[
+                str(payload.get("old_session_id") or ""),
+                str(payload.get("session_id") or ""),
+            ],
+        )
+    except Exception:
+        logger.warning("LCM explicit /new forget failed", exc_info=True)
+        return None
+
+
 def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
@@ -432,6 +456,7 @@ def register(ctx):
         try:
             register_hook("subagent_start", lambda **payload: record_subagent_start(payload))
             register_hook("subagent_stop", lambda **payload: record_subagent_stop(payload))
+            register_hook("on_session_reset", _on_explicit_session_reset)
         except Exception as exc:
             logger.info(
                 "LCM explicit subagent-lineage hooks unavailable on this Hermes "
