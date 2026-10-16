@@ -164,3 +164,36 @@ def test_expired_l1_uses_the_same_l3_cap_as_normal_exhaustion(monkeypatch):
     expired = escalation.summarize_with_escalation(**request, timeout=1)
     normal = escalation.summarize_with_escalation(**request, timeout=None)
     assert expired == normal
+
+
+def test_out_of_order_completion_does_not_count_expired_reservations(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+    spend = escalation.SummarySpendGuard(max_calls=2, window_seconds=10)
+    old = spend.reserve_call()
+    clock[0] = 20.0
+    fresh = spend.reserve_call()
+    spend.release_call(fresh, attempted=True)
+    clock[0] = 30.0
+    spend.release_call(old, attempted=True)
+    assert spend._calls == [20.0]
+    assert spend._backoff_until == 0
+    assert spend.allows()
+
+
+def test_near_full_budget_fallback_timeout_counts_as_route_failure(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+    breaker = escalation.SummaryCircuitBreaker(failure_threshold=1)
+
+    def summary(prompt, max_tokens, model="", timeout=None):
+        clock[0] += 0.1 if model == "primary" else timeout
+        return None
+
+    monkeypatch.setattr(escalation, "_call_llm_for_summary", summary)
+    escalation.summarize_with_escalation(
+        "source facts " * 1000, source_tokens=3000, token_budget=100,
+        model="primary", fallback_models=["backup"], timeout=10, circuit_breaker=breaker,
+    )
+    assert not breaker.allows("primary")
+    assert not breaker.allows("backup")

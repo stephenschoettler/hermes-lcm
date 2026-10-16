@@ -57,6 +57,7 @@ _REASONING_START_RE = re.compile(
 )
 
 _DEFAULT_ROUTE_KEY = "<task-default>"
+_MIN_ROUTE_HEALTH_BUDGET_FRACTION = 0.5
 
 
 @dataclass
@@ -145,6 +146,10 @@ class SummarySpendGuard:
         if self._calls and self._calls[0] < cutoff:
             self._calls = [t for t in self._calls if t >= cutoff]
 
+    def _pending_count(self, current_time: float) -> int:
+        cutoff = current_time - self.window_seconds
+        return sum(started >= cutoff for started in self._reservations.values())
+
     def allows(self, *, now: float | None = None) -> bool:
         if self.max_calls <= 0:
             return True
@@ -153,7 +158,7 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            return len(self._calls) + len(self._reservations) < self.max_calls
+            return len(self._calls) + self._pending_count(current_time) < self.max_calls
 
     def reserve_call(self) -> object | None:
         """Reserve capacity without charging spend until dispatch is confirmed."""
@@ -163,7 +168,7 @@ class SummarySpendGuard:
         with self._lock:
             now = time.monotonic()
             self._prune(now)
-            if now < self._backoff_until or len(self._calls) + len(self._reservations) >= self.max_calls:
+            if now < self._backoff_until or len(self._calls) + self._pending_count(now) >= self.max_calls:
                 return None
             self._reservations[token] = now
         return token
@@ -172,8 +177,10 @@ class SummarySpendGuard:
         with self._lock:
             reserved_at = self._reservations.pop(token, None)
             if attempted and reserved_at is not None and self.max_calls > 0:
-                self._prune(time.monotonic())
-                self._record_call_locked(reserved_at)
+                now = time.monotonic()
+                self._prune(now)
+                if reserved_at >= now - self.window_seconds:
+                    self._record_call_locked(reserved_at)
 
     def try_record_call(self, *, now: float | None = None) -> bool:
         """Atomically reserve one provider call if the budget allows it."""
@@ -184,7 +191,7 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            if len(self._calls) + len(self._reservations) >= self.max_calls:
+            if len(self._calls) + self._pending_count(current_time) >= self.max_calls:
                 return False
             self._record_call_locked(current_time)
             return True
@@ -360,7 +367,6 @@ def _invoke_summary_llm_chain(
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
-    is_retry: bool = False,
 ) -> Optional[str]:
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
@@ -388,13 +394,17 @@ def _invoke_summary_llm_chain(
         # Profile-local guard locks can consume the remaining operation budget.
         # Recompute immediately before dispatch instead of forwarding a stale timeout.
         attempted = False
-        was_retry = is_retry
         try:
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 break
+            # A timeout needs at least half the configured window to be a
+            # route-health verdict. Near-full retries still count as failures.
+            budget_starved = (
+                remaining is not None and timeout is not None
+                and remaining < float(timeout) * _MIN_ROUTE_HEALTH_BUDGET_FRACTION
+            )
             attempted = True
-            is_retry = True
             try:
                 result = _invoke_summary_llm(
                     prompt, max_tokens, model=candidate_model,
@@ -412,7 +422,7 @@ def _invoke_summary_llm_chain(
             return result
         # An empty result at the operation deadline is not evidence that this
         # route is unhealthy: a previous route may have spent almost all its time.
-        if not result and was_retry and deadline is not None and time.monotonic() >= deadline:
+        if not result and budget_starved and deadline is not None and time.monotonic() >= deadline:
             break
         if circuit_breaker is not None:
             circuit_breaker.record_failure(candidate_model)
@@ -712,7 +722,6 @@ def summarize_with_escalation(
         fallback_models=fallback_models,
         timeout=timeout,
         deadline=deadline,
-        is_retry=True,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
