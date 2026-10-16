@@ -197,3 +197,20 @@ def test_near_full_budget_fallback_timeout_counts_as_route_failure(monkeypatch):
     )
     assert not breaker.allows("primary")
     assert not breaker.allows("backup")
+
+
+def test_out_of_order_backoff_starts_at_latest_counted_dispatch(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+    spend = escalation.SummarySpendGuard(max_calls=2, window_seconds=10, backoff_seconds=5)
+    old = spend.reserve_call()
+    clock[0] = 4.0
+    fresh = spend.reserve_call()
+    clock[0] = 5.0
+    spend.release_call(fresh, attempted=True)
+    clock[0] = 6.0
+    spend.release_call(old, attempted=True)
+    assert spend._backoff_until == 9.0
+    assert not spend.allows()
+    clock[0] = 9.0
+    assert spend.allows()

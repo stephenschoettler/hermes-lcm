@@ -199,8 +199,9 @@ class SummarySpendGuard:
     def _record_call_locked(self, current_time: float) -> None:
         self._calls.append(current_time)
         self._calls.sort()  # Concurrent reservations may finish out of order.
-        if len(self._calls) >= self.max_calls and self._backoff_until <= current_time:
-            self._backoff_until = current_time + max(0.0, self.backoff_seconds)
+        latest_dispatch = self._calls[-1]
+        if len(self._calls) >= self.max_calls and self._backoff_until <= latest_dispatch:
+            self._backoff_until = latest_dispatch + max(0.0, self.backoff_seconds)
             # Backoff is the penalty; start the window fresh so the guard allows
             # again once it elapses rather than double-blocking on the old count.
             self._calls.clear()
