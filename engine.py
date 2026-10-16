@@ -969,6 +969,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.threshold_tokens = self._effective_threshold_tokens(
             context_threshold_tokens
         )
+        # Absolute override: pin the compaction trigger to a fixed token budget
+        # so model-window switches do not move the operator's context-health
+        # setpoint (e.g. ~130K for high-quality coding recall). Ratio-based
+        # LCM_CONTEXT_THRESHOLD alone drifts with context_length.
+        try:
+            absolute_threshold_tokens = int(
+                os.environ.get("LCM_ABSOLUTE_THRESHOLD_TOKENS", "0") or 0
+            )
+        except (TypeError, ValueError):
+            absolute_threshold_tokens = 0
+        if absolute_threshold_tokens > 0:
+            self.threshold_tokens = absolute_threshold_tokens
+            # Keep route-specific ratio auto-raise from re-climbing the
+            # intermediate ratio on later recomputes; absolute still wins
+            # above, but disabling auto-raise keeps status/percent honest.
+            self._config.codex_gpt55_autoraise_enabled = False
         return True
 
     def _session_metadata_matches_active_runtime(
