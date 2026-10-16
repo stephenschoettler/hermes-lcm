@@ -118,6 +118,7 @@ from .session_patterns import (
 from .message_analysis import (
     _is_synthetic_assistant_noise,
     _matched_tool_call_ids,
+    _merge_adjacent_assistant_messages,
     _tool_call_id,
 )
 from .fresh_tail import FreshTailBoundary, resolve_fresh_tail_boundary
@@ -5232,12 +5233,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages: List[Dict[str, Any]],
         *,
         insert_missing_tool_stubs: bool = True,
+        merge_adjacent_assistants: bool = True,
     ) -> List[Dict[str, Any]]:
         """Drop unsafe assistant-only noise, then repair tool sequencing.
 
         This is intentionally active-context-only: callers pass the selected
         provider replay context, and this helper never mutates stored rows,
         source mappings, or DAG nodes.
+
+        ``merge_adjacent_assistants`` collapses assistant rows left adjacent
+        after tool rows are dropped (the final emitted/persisted shape). It is
+        turned OFF for the intermediate token-budget selection pass in
+        ``_assemble_context``, where each turn must be weighed and kept/dropped
+        on its own — merging there would force an all-or-nothing decision on a
+        combined row and could drop a small tail turn glued to an oversized one.
         """
         cleaned: list[Dict[str, Any]] = []
         dropped_assistant_messages = 0
@@ -5266,10 +5275,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 stripped_assistant_messages,
             )
 
-        return self._sanitize_tool_pairs(
+        paired = self._sanitize_tool_pairs(
             cleaned,
             insert_missing_tool_stubs=insert_missing_tool_stubs,
         )
+        if not merge_adjacent_assistants:
+            return paired
+        # Merge any assistant rows left adjacent once tool rows were dropped —
+        # emit an alternation-clean active context so downstream loads don't
+        # have to repair it and the persisted message count matches replay.
+        return _merge_adjacent_assistant_messages(paired)
 
     @staticmethod
     def _active_tool_stub_content(original_content: Any, placeholder: str) -> Any:
@@ -6061,6 +6076,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_for_selection = self._sanitize_active_context_messages(
                 assembly_tail_messages,
                 insert_missing_tool_stubs=False,
+                # Intermediate pass for per-turn token-budget selection: weigh
+                # each turn on its own; do NOT merge adjacent assistants here or
+                # a small tail turn glued to an oversized one gets dropped with
+                # it. The final assembled result is merged downstream.
+                merge_adjacent_assistants=False,
             )
             skipped_tail_gap = False
             for msg in reversed(tail_for_selection):
