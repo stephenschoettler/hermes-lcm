@@ -442,7 +442,14 @@ class CompactionMixin:
                 sanitized_messages,
                 observed_tokens=observed_prompt_tokens,
             )
-            self._ingest_cursor = len(sanitized_messages)
+            # ``sanitized_messages`` is the list this call hands back, not the
+            # list that is ingested next.  A cursor is a position inside one
+            # specific list, so its length must never become the ingest
+            # position: the host continues from its own history and would get
+            # every already-stored message between the two lengths re-appended.
+            # Keep the previous cursor and re-derive it from the store by
+            # identity instead.
+            self._ingest_cursor_needs_reconcile = True
             self._last_compression_status = "sanitized"
             self._last_compression_noop_reason = ""
             self._write_generated_ignored_placeholder_hash_counts(
@@ -888,20 +895,22 @@ class CompactionMixin:
                     insert_missing_tool_stubs=False,
                 )
             if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
-                # _ingest_messages() already advanced the cursor to the original
-                # active-context length. If the host continues from a sanitized
-                # or reassembled context, keeping the old cursor could make the
-                # next appended messages look already ingested. This applies to
-                # content-only cleanup as well as dropped-message cleanup.
-                self._ingest_cursor = len(sanitized_messages)
+                # The host may continue from a sanitized or reassembled
+                # context, so the cursor cannot simply stay where it was — but
+                # it must not be read off ``sanitized_messages`` either, because
+                # the list ingested next is the host's own history, not this
+                # one.  Arm the reconciliation: it re-derives the position from
+                # the store by identity, which is correct for both cases and
+                # cannot skip a message the store does not hold.
+                self._ingest_cursor_needs_reconcile = True
                 self._last_compression_status = "sanitized"
                 self._last_compression_noop_reason = ""
             else:
                 if dropped_replayed_scaffold_messages:
                     # The active context changed even though no new leaf node was
-                    # written. Keep the cursor aligned with the returned context
-                    # so the next appended turn is ingested instead of skipped.
-                    self._ingest_cursor = len(sanitized_messages)
+                    # written.  Same rule as above: re-derive the position from
+                    # the store rather than reading it off the returned list.
+                    self._ingest_cursor_needs_reconcile = True
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)
@@ -982,10 +991,13 @@ class CompactionMixin:
                     recovery_assembly_cap,
                     count_messages_tokens(compressed),
                 )
-        # Reset cursor to the length of the compressed context so that
-        # only messages appended *after* this point get ingested next time.
-        self._ingest_cursor = len(compressed)
-        self._ingest_cursor_needs_reconcile = False
+        # ``compressed`` is the context this call returns, not the list that is
+        # ingested next: a cursor is a position inside one specific list, and a
+        # length read off the replacement list re-appends every already-stored
+        # message between the two lengths on the next ingest.  Keep the previous
+        # cursor and let the reconciliation re-derive it from the store by
+        # identity.
+        self._ingest_cursor_needs_reconcile = True
 
         logger.info(
             "LCM compaction #%d: %d messages → %d (%d leaf pass%s, %d→%d tokens, %d DAG nodes%s)",
