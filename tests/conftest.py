@@ -5,7 +5,15 @@ Patches the plugin modules so they can be imported both as a package
 """
 import sys
 import importlib
+import os
 from pathlib import Path
+
+# Tests must never run Hermes' lazy source-update completion: importing
+# ``hermes_bootstrap`` from a non-Hermes launcher (e.g. a venv pytest) would
+# otherwise ``os.execv`` the test process into the PM runtime, where this
+# checkout's packages (pytest included) are not importable, killing the run.
+# The core suite's conftest sets the same bridge var.
+os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
 
 # Make the repo root importable (for agent.context_engine etc.)
 repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
