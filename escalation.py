@@ -360,6 +360,11 @@ def _invoke_summary_llm_chain(
                 "deferring to deterministic fallback"
             )
             break
+        # Profile-local guard locks can consume the remaining operation budget.
+        # Recompute immediately before dispatch instead of forwarding a stale timeout.
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            break
         try:
             result = _invoke_summary_llm(
                 prompt,
@@ -374,6 +379,10 @@ def _invoke_summary_llm_chain(
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
             return result
+        # An empty result at the operation deadline is not evidence that this
+        # route is unhealthy: a previous route may have spent almost all its time.
+        if not result and deadline is not None and time.monotonic() >= deadline:
+            break
         if circuit_breaker is not None:
             circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
@@ -650,6 +659,9 @@ def summarize_with_escalation(
     if l1_result:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
         return l1_result, 1
+
+    if deadline is not None and time.monotonic() >= deadline:
+        return _deterministic_truncate(text, min(l3_truncate_tokens, token_budget)), 3
 
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
