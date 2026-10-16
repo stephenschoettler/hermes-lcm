@@ -146,10 +146,6 @@ class SummarySpendGuard:
         if self._calls and self._calls[0] < cutoff:
             self._calls = [t for t in self._calls if t >= cutoff]
 
-    def _pending_count(self, current_time: float) -> int:
-        cutoff = current_time - self.window_seconds
-        return sum(started >= cutoff for started in self._reservations.values())
-
     def allows(self, *, now: float | None = None) -> bool:
         if self.max_calls <= 0:
             return True
@@ -158,7 +154,7 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            return len(self._calls) + self._pending_count(current_time) < self.max_calls
+            return len(self._calls) + len(self._reservations) < self.max_calls
 
     def reserve_call(self) -> object | None:
         """Reserve capacity without charging spend until dispatch is confirmed."""
@@ -168,19 +164,37 @@ class SummarySpendGuard:
         with self._lock:
             now = time.monotonic()
             self._prune(now)
-            if now < self._backoff_until or len(self._calls) + self._pending_count(now) >= self.max_calls:
+            if now < self._backoff_until or len(self._calls) + len(self._reservations) >= self.max_calls:
                 return None
             self._reservations[token] = now
         return token
 
-    def release_call(self, token: object, *, attempted: bool) -> None:
+    def release_call(self, token: object) -> None:
+        """Cancel an undispatched reservation without charging spend."""
         with self._lock:
-            reserved_at = self._reservations.pop(token, None)
-            if attempted and reserved_at is not None and self.max_calls > 0:
-                now = time.monotonic()
-                self._prune(now)
-                if reserved_at >= now - self.window_seconds:
-                    self._record_call_locked(reserved_at)
+            self._reservations.pop(token, None)
+
+    def commit_call(self, token: object, *, deadline: float | None = None) -> float | None:
+        """Charge a reserved call at dispatch, before a slow request can age it out.
+
+        The final deadline check happens under the same lock that consumes the
+        reservation. If contention reaches the deadline, the token is cancelled
+        and no provider call or spend/backoff is recorded. Return the dispatch
+        timestamp so the caller forwards the budget after the last guard lock.
+        """
+        with self._lock:
+            reserved = self._reservations.pop(token, None)
+            if self.max_calls > 0 and reserved is None:
+                return None
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                return None
+            self._prune(now)
+            if self.max_calls > 0:
+                if now < self._backoff_until or len(self._calls) + len(self._reservations) >= self.max_calls:
+                    return None
+                self._record_call_locked(now)
+            return now
 
     def try_record_call(self, *, now: float | None = None) -> bool:
         """Atomically reserve one provider call if the budget allows it."""
@@ -191,27 +205,22 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            if len(self._calls) + self._pending_count(current_time) >= self.max_calls:
+            if len(self._calls) + len(self._reservations) >= self.max_calls:
                 return False
             self._record_call_locked(current_time)
             return True
 
     def _record_call_locked(self, current_time: float) -> None:
         self._calls.append(current_time)
-        self._calls.sort()  # Concurrent reservations may finish out of order.
+        self._calls.sort()
         latest_dispatch = self._calls[-1]
         if len(self._calls) >= self.max_calls and self._backoff_until <= latest_dispatch:
             self._backoff_until = latest_dispatch + max(0.0, self.backoff_seconds)
             # Backoff is the penalty; start the window fresh so the guard allows
             # again once it elapses rather than double-blocking on the old count.
             self._calls.clear()
-            logger.warning(
-                "LCM summary spend guard tripped: %d calls within %ss; "
-                "backing off summarizer for %ss (deterministic fallback active)",
-                self.max_calls,
-                self.window_seconds,
-                self.backoff_seconds,
-            )
+            # Do not log under this lock: blocking handlers can consume the
+            # remaining deadline after admission but before provider dispatch.
 
     def record_call(self, *, now: float | None = None) -> None:
         if self.max_calls <= 0:
@@ -394,18 +403,23 @@ def _invoke_summary_llm_chain(
             break
         # Profile-local guard locks can consume the remaining operation budget.
         # Recompute immediately before dispatch instead of forwarding a stale timeout.
-        attempted = False
+        reservation_pending = reservation is not None
         try:
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 break
+            if reservation_pending:
+                dispatch_at = spend_guard.commit_call(reservation, deadline=deadline)
+                reservation_pending = False
+                if dispatch_at is None:
+                    break
+                remaining = None if deadline is None else deadline - dispatch_at
             # A timeout needs at least half the configured window to be a
             # route-health verdict. Near-full retries still count as failures.
             budget_starved = (
                 remaining is not None and timeout is not None
                 and remaining < float(timeout) * _MIN_ROUTE_HEALTH_BUDGET_FRACTION
             )
-            attempted = True
             try:
                 result = _invoke_summary_llm(
                     prompt, max_tokens, model=candidate_model,
@@ -415,8 +429,8 @@ def _invoke_summary_llm_chain(
                 logger.warning("LLM summarization failed: %s", exc)
                 result = None
         finally:
-            if spend_guard is not None and reservation is not None:
-                spend_guard.release_call(reservation, attempted=attempted)
+            if spend_guard is not None and reservation_pending:
+                spend_guard.release_call(reservation)
         if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)

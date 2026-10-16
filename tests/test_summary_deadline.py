@@ -137,16 +137,16 @@ def test_pending_reservation_limits_concurrency_without_false_spend():
     assert token is not None
     assert not spend.allows()
     assert spend.reserve_call() is None
-    spend.release_call(token, attempted=False)
+    spend.release_call(token)
     assert spend.allows()
     token = spend.reserve_call()
-    spend.release_call(token, attempted=True)
+    assert spend.commit_call(token) is not None
     assert not spend.allows()
     assert spend._reservations == {}
     spend.clear()
     token = spend.reserve_call()
     spend.clear()  # A forced operation starts a new budget, including pending calls.
-    spend.release_call(token, attempted=True)
+    assert spend.commit_call(token) is None
     assert spend.allows()
 
 
@@ -166,19 +166,14 @@ def test_expired_l1_uses_the_same_l3_cap_as_normal_exhaustion(monkeypatch):
     assert expired == normal
 
 
-def test_out_of_order_completion_does_not_count_expired_reservations(monkeypatch):
+def test_slow_dispatched_call_still_enters_backoff(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
-    spend = escalation.SummarySpendGuard(max_calls=2, window_seconds=10)
+    spend = escalation.SummarySpendGuard(max_calls=1, window_seconds=10, backoff_seconds=100)
     old = spend.reserve_call()
-    clock[0] = 20.0
-    fresh = spend.reserve_call()
-    spend.release_call(fresh, attempted=True)
-    clock[0] = 30.0
-    spend.release_call(old, attempted=True)
-    assert spend._calls == [20.0]
-    assert spend._backoff_until == 0
-    assert spend.allows()
+    assert spend.commit_call(old) is not None
+    clock[0] = 11.0  # The provider response is slower than the spend window.
+    assert not spend.allows()
 
 
 def test_near_full_budget_fallback_timeout_counts_as_route_failure(monkeypatch):
@@ -204,13 +199,51 @@ def test_out_of_order_backoff_starts_at_latest_counted_dispatch(monkeypatch):
     monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
     spend = escalation.SummarySpendGuard(max_calls=2, window_seconds=10, backoff_seconds=5)
     old = spend.reserve_call()
+    assert spend.commit_call(old) is not None
     clock[0] = 4.0
     fresh = spend.reserve_call()
-    clock[0] = 5.0
-    spend.release_call(fresh, attempted=True)
+    assert spend.commit_call(fresh) is not None
     clock[0] = 6.0
-    spend.release_call(old, attempted=True)
+    # Completion order is irrelevant after dispatch has been charged.
     assert spend._backoff_until == 9.0
     assert not spend.allows()
     clock[0] = 9.0
     assert spend.allows()
+
+
+def test_commit_lock_cannot_charge_an_expired_dispatch(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+    spend = escalation.SummarySpendGuard(max_calls=1)
+    token = spend.reserve_call()
+    real_lock = spend._lock
+
+    class ContendedLock:
+        def __enter__(self):
+            real_lock.acquire()
+            clock[0] = 10.0
+
+        def __exit__(self, *_args):
+            real_lock.release()
+
+    monkeypatch.setattr(spend, "_lock", ContendedLock())
+    assert spend.commit_call(token, deadline=10.0) is None
+    assert spend._calls == []
+    assert spend._reservations == {}
+    assert spend._backoff_until == 0
+
+
+def test_chain_accounts_for_slow_call_before_it_returns(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(escalation.time, "monotonic", lambda: clock[0])
+    spend = escalation.SummarySpendGuard(max_calls=1, window_seconds=10, backoff_seconds=100)
+
+    def slow_summary(*args, **kwargs):
+        assert spend._reservations == {}
+        assert spend._backoff_until == 100.0
+        clock[0] = 11.0
+        return "slow summary"
+
+    monkeypatch.setattr(escalation, "_call_llm_for_summary", slow_summary)
+    assert escalation._invoke_summary_llm_chain("source", 100, spend_guard=spend) == "slow summary"
+    assert not spend.allows()
