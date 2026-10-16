@@ -2070,6 +2070,247 @@ def test_externalized_payload_integrity_scan_reports_missing_and_unreferenced_re
     assert "not-counted.json" not in encoded
 
 
+def test_externalized_payload_integrity_scan_ignores_incidental_source_excerpts(tmp_path):
+    engine = _engine(tmp_path)
+    storage_dir = tmp_path / "externalized"
+    storage_dir.mkdir()
+    present_ref = "20260719_present_payload_0123456789ab_abcdef.json"
+    missing_ref = "20260719_missing_payload_0123456789ab_abcdef.json"
+    braced_ref = "20260719_call-{index}_payload_0123456789ab_abcdef.json"
+    orphan_ref = "20260719_orphan_payload_0123456789ab_abcdef.json"
+    incidental_existing_refs = (
+        "docs-placeholder.json",
+        "foreign_payload_ref.json",
+        "tool-result.json",
+        "inc-tool-colon.json",
+    )
+    for ref in (present_ref, braced_ref, orphan_ref, *incidental_existing_refs):
+        (storage_dir / ref).write_text(json.dumps({"content": "fixture payload"}))
+
+    template_source_excerpt = "\n".join(
+        [
+            "509:     refs = [",
+            '510:         "[Externalized tool output: tool_call_id=call_"',
+            '511:         f"{index}; chars=120000; bytes=120321; '
+            'ref=20260708T120000Z-tool-call-{index}.json]"',
+            "512:         for index in range(3)",
+        ]
+    )
+    read_file_excerpt = "\n".join(
+        [
+            "8210|        placeholder = (",
+            '8211|            "[GC\'d externalized tool output: tool_call_id=call_abc; "',
+            '8212|            "chars=1234; ref=foreign_payload_ref.json]"',
+            "8213|        )",
+        ]
+    )
+    retrieved_diff = "\n".join(
+        [
+            "diff --git a/tests/test_example.py b/tests/test_example.py",
+            "@@ -10,0 +11,2 @@",
+            "+    tool_result = (",
+            '+        "[Externalized payload: kind=tool_result; role=tool; chars=1; bytes=1; ref=tool-result.json]"',
+            "+    )",
+        ]
+    )
+    docs_excerpt = (
+        "The test fixture uses `[Externalized payload: kind=raw_payload; role=assistant; "
+        "chars=1; bytes=1; ref=docs-placeholder.json]` as an example."
+    )
+    content = "\n".join(
+        [
+            f"[Externalized payload: kind=raw_payload; role=assistant; chars=1; bytes=1; ref={present_ref}]",
+            (
+                '<img src="[Externalized payload: kind=raw_payload; role=assistant; '
+                f'chars=1; bytes=1; ref={missing_ref}]">'
+            ),
+            (
+                'recovery ticket: "[Externalized tool output: '
+                f'tool_call_id=call-braced; chars=1; ref={braced_ref}]"'
+            ),
+        ]
+    )
+    for role, row_content in (
+        ("assistant", content),
+        ("tool", json.dumps({"content": template_source_excerpt})),
+        ("tool", json.dumps({"content": read_file_excerpt})),
+        ("tool", json.dumps({"content": retrieved_diff})),
+        ("tool", json.dumps({"content": docs_excerpt})),
+    ):
+        engine._store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                engine.current_session_id,
+                "test",
+                role,
+                row_content,
+                None,
+                None,
+                None,
+                1.0,
+                1,
+                0,
+            ),
+        )
+    colon_source_excerpt = (
+        '100: value = "[Externalized payload: kind=raw_payload; role=assistant; '
+        'chars=1; bytes=1; ref=inc-tool-colon.json]"'
+    )
+    pipe_source_excerpt = (
+        '200| value = "[Externalized payload: kind=raw_payload; role=assistant; '
+        'chars=1; bytes=1; ref=inc-tool-pipe.json]"'
+    )
+    for stored_tool_calls in (
+        json.dumps([{"function": {"name": "inspect", "arguments": colon_source_excerpt}}]),
+        json.dumps(
+            [
+                {
+                    "function": {
+                        "name": "inspect",
+                        "arguments": json.dumps({"source": pipe_source_excerpt}),
+                    }
+                }
+            ]
+        ),
+    ):
+        engine._store._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                engine.current_session_id,
+                "test",
+                "assistant",
+                "calling source inspection tool",
+                None,
+                stored_tool_calls,
+                None,
+                1.0,
+                1,
+                0,
+            ),
+        )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+    doctor_result = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+    doctor_detail = next(
+        check["detail"] for check in doctor_result["checks"] if check["check"] == "payload_storage"
+    )
+
+    assert detail["externalized_payload_refs_total"] == 3
+    assert detail["externalized_payload_refs_existing"] == 2
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "test",
+            "role": "assistant",
+            "field": "content",
+            "externalized_ref": missing_ref,
+        }
+    ]
+    assert detail["externalized_payload_files_unreferenced"] == 5
+    assert detail["unreferenced_externalized_payload_files"] == [
+        {"externalized_ref": ref}
+        for ref in sorted((orphan_ref, *incidental_existing_refs))
+    ]
+    for key in (
+        "externalized_payload_refs_total",
+        "externalized_payload_refs_existing",
+        "externalized_payload_refs_missing",
+        "externalized_payload_files_unreferenced",
+        "missing_externalized_payload_refs",
+        "unreferenced_externalized_payload_files",
+    ):
+        assert doctor_detail[key] == detail[key]
+    encoded = json.dumps(detail)
+    for incidental_ref in incidental_existing_refs:
+        assert {"externalized_ref": incidental_ref} in detail["unreferenced_externalized_payload_files"]
+    for incidental_ref in (
+        "20260708T120000Z-tool-call-{index}.json",
+        "inc-tool-pipe.json",
+    ):
+        assert incidental_ref not in encoded
+
+
+def test_externalized_payload_integrity_scan_ignores_nested_serialized_diff_literals(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    review_diff = "\n".join(
+        [
+            "diff --git a/tests/test_example.py b/tests/test_example.py",
+            "@@ -10,2 +10,3 @@",
+            (
+                "-        'fixture_source = \\\"[Externalized tool output: "
+                "tool_call_id=call_1; chars=1; ref=20260708T120000Z-tool-call-{index}.json]\\\"'"
+            ),
+            (
+                "+        '100: value = \\\"[Externalized payload: kind=raw_payload; "
+                "role=assistant; chars=1; ref=inc-tool-colon.json]\\\"'"
+            ),
+            (
+                "+        '200| value = \\\"[Externalized payload: kind=raw_payload; "
+                "role=assistant; chars=1; ref=inc-tool-pipe.json]\\\"'"
+            ),
+        ]
+    )
+    genuine_placeholder = (
+        "[Externalized LCM ingest payload: kind=ingest_payload; field=content; "
+        "chars=1; bytes=1; ref=missing-genuine.json]"
+    )
+    nested_tool_output = json.dumps(
+        {
+            "output": review_diff.replace("\n", "\\n"),
+            "recoverable_payload": genuine_placeholder,
+        }
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "discord",
+            "tool",
+            nested_tool_output,
+            None,
+            None,
+            None,
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"] == [
+        {
+            "store_id": 1,
+            "session_id": engine.current_session_id,
+            "source": "discord",
+            "role": "tool",
+            "field": "content",
+            "externalized_ref": "missing-genuine.json",
+        }
+    ]
+
+
 def test_externalized_payload_integrity_scan_detects_embedded_content_placeholder_with_trailing_text(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()
