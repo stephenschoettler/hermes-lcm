@@ -2610,6 +2610,90 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         requested_conversation_id = str(kwargs.get("conversation_id") or session_id)
         self._lcm_current_start_allows_bypass_lineage = False
         requested_platform = str(kwargs.get("platform") or self._session_platform or "")
+        same_binding_in_place_boundary = bool(
+            boundary_reason == "compression"
+            and old_session_id
+            and old_session_id == session_id
+            and previous_session_id == session_id
+            and kwargs.get("in_place") is not False
+            and (
+                not requested_platform
+                or not self._session_platform
+                or requested_platform == self._session_platform
+            )
+            and (
+                not kwargs.get("conversation_id")
+                or not self._conversation_id
+                or requested_conversation_id == self._conversation_id
+            )
+        )
+        if same_binding_in_place_boundary:
+            # Older hosts send an end before the successful same-ID start.
+            # Keep the existing cursor while validating/restoring only that
+            # exact durable owner; ordinary bind_session can switch owners.
+            self._lifecycle.resume_compression_session(
+                self._conversation_id, session_id, self._last_compacted_store_id,
+            )
+            # Hermes performs in-place compression by calling compress() and
+            # then emitting a compression boundary with the same session id.
+            # compress() has already rebased the cursor to its returned active
+            # context. Treating this callback as a fresh session start clears
+            # that cursor, schedules a full durable replay reconciliation, and
+            # can append the entire active history again.
+            active_message_count = kwargs.get("active_message_count")
+            if (
+                isinstance(active_message_count, int)
+                and not isinstance(active_message_count, bool)
+                and active_message_count >= 0
+            ):
+                self._ingest_cursor = active_message_count
+            elif active_message_count is not None:
+                logger.warning(
+                    "LCM ignored invalid in-place compression active_message_count=%r for session=%s",
+                    active_message_count,
+                    session_id,
+                )
+            metadata_kwargs = dict(kwargs)
+            metadata_kwargs.setdefault("platform", self._session_platform)
+            self._apply_session_start_metadata(session_id, metadata_kwargs)
+            self._ingest_cursor_needs_reconcile = False
+            self._clear_pending_reset_boundary()
+            self._compression_boundary_ingest_pending = False
+            self._compression_boundary_active_placeholder_digest_budget = {}
+            self._compression_boundary_active_placeholder_digest_ordinals = {}
+            self._compression_boundary_stored_placeholder_digest_counts = {}
+            # These cache entries describe the pre-boundary list. Reusing them
+            # against the compressed list would force another expensive replay
+            # identity pass and can return stale active-message copies.
+            self._last_active_replay_source_identities = []
+            self._last_active_replay_messages = []
+            self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            self._register_active_engine_binding()
+            try:
+                session_count = self._store.get_session_count(session_id)
+            except Exception:
+                session_count = -1
+                logger.debug(
+                    "LCM in-place compression boundary count probe failed: session=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            self._last_ingest_reconciliation = {
+                "action": "preserved cursor",
+                "reason": "same-session in-place compression boundary",
+                "cursor": self._ingest_cursor,
+                "incoming": self._ingest_cursor,
+                "session_count": session_count,
+                "stored_tail_count": 0,
+            }
+            logger.info(
+                "LCM preserved in-place compression boundary: session=%s cursor=%d frontier=%d",
+                session_id,
+                self._ingest_cursor,
+                self._last_compacted_store_id,
+            )
+            self._log_session_filter_diagnostics()
+            return
         pre_reset_preserve_ambiguous_no_frame_old_session = False
         if boundary_reason == "compression" and old_session_id and old_session_id != session_id:
             old_session_auxiliary_generation = self._in_process_auxiliary_caller_generation(

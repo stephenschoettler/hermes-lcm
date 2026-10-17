@@ -261,6 +261,47 @@ class LifecycleStateStore:
         return state
 
     @_synchronized
+    def resume_compression_session(
+        self,
+        conversation_id: str,
+        session_id: str,
+        frontier_store_id: int = 0,
+    ) -> LifecycleState:
+        """Restore only the same owner finalized before an in-place callback.
+
+        Ordinary binding can switch sessions. This narrower boundary must not
+        claim a replacement owner's conversation or reset its current state.
+        """
+        conn = self._conn
+        if conn is None or conn.in_transaction:
+            raise RuntimeError("compression resume requires an idle lifecycle writer")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            state = self.get_by_conversation(conversation_id)
+            if state is None:
+                raise RuntimeError("compression boundary lost conversation ownership")
+            if state.current_session_id == session_id:
+                conn.commit()
+                return state
+            if state.current_session_id is not None or state.last_finalized_session_id != session_id:
+                raise RuntimeError("compression boundary lost conversation ownership")
+            # The finalized maximum can belong to an earlier session. Resume
+            # with this continuing compressor's exact frontier instead.
+            conn.execute(
+                "UPDATE lcm_lifecycle_state "
+                "SET current_session_id = ?, current_frontier_store_id = ?, updated_at = ? "
+                "WHERE conversation_id = ?",
+                (session_id, max(0, int(frontier_store_id)), time.time(), conversation_id),
+            )
+            resumed = self.get_by_conversation(conversation_id)
+            assert resumed is not None
+            conn.commit()
+            return resumed
+        except BaseException:
+            conn.rollback()
+            raise
+
+    @_synchronized
     def finalize_session(
         self,
         conversation_id: str | None,
