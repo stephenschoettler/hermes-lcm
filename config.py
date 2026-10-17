@@ -150,7 +150,17 @@ def _config_bool_disabled(value) -> bool:
 
 
 def _hermes_config_path() -> Path:
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = Path(get_hermes_home())
+    except Exception:
+        try:
+            from hermes_cli.config import get_hermes_home
+
+            home = Path(get_hermes_home())
+        except Exception:
+            home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     return home / "config.yaml"
 
 
@@ -199,14 +209,25 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+def _lcm_config_yaml_section(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return merged legacy ``lcm`` and canonical ``context.lcm`` settings."""
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    if not isinstance(cfg, dict):
+        return {}
+    merged: dict[str, Any] = {}
+    legacy = cfg.get("lcm")
+    if isinstance(legacy, dict):
+        merged.update(legacy)
+    context = cfg.get("context")
+    canonical = context.get("lcm") if isinstance(context, dict) else None
+    if isinstance(canonical, dict):
+        merged.update(canonical)
+    return merged
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
     cfg = cfg if cfg is not None else _load_hermes_config_yaml()
-    lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
-    if not isinstance(lcm_section, dict):
-        return []
+    lcm_section = _lcm_config_yaml_section(cfg)
     return sorted(
         str(key)
         for key in lcm_section
@@ -215,14 +236,15 @@ def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str
 
 
 def _hermes_compression_threshold(default: float) -> float:
-    """Read lcm.context_threshold or Hermes compression.threshold from config.yaml.
+    """Read context.lcm threshold or Hermes compression threshold from config.yaml.
 
     Priority when no ``LCM_CONTEXT_THRESHOLD`` env var is set:
-      1. ``lcm.context_threshold`` (LCM-specific override in config.yaml)
-      2. ``compression.threshold`` (Hermes global setting, unless compression disabled)
+      1. ``context.lcm.context_threshold`` (LCM-specific profile setting)
+      2. Legacy ``lcm.context_threshold``
+      3. ``compression.threshold`` (Hermes global setting, unless compression disabled)
 
     Hermes gateways may load ``~/.hermes/config.yaml`` without exporting every
-    setting into the process environment. The ``lcm.context_threshold`` key lets
+    setting into the process environment. The ``context.lcm.context_threshold`` key lets
     operators tune LCM compaction independently of the Hermes compression setting.
     Disabled Hermes compression should not leak its threshold into LCM.
     """
@@ -232,23 +254,45 @@ def _hermes_compression_threshold(default: float) -> float:
 
 def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
     cfg = _load_hermes_config_yaml()
+    value, source, _warnings = _resolve_context_threshold(default, cfg)
+    return value, source
+
+
+def _resolve_context_threshold(
+    default: float, cfg: dict[str, Any]
+) -> tuple[float, str, list[str]]:
+    """Resolve canonical, legacy, then Hermes compression threshold."""
+    warnings: list[str] = []
+    context = cfg.get("context") if isinstance(cfg, dict) else None
+    canonical = context.get("lcm") if isinstance(context, dict) else None
+    legacy = cfg.get("lcm") if isinstance(cfg, dict) else None
+    for section, source in (
+        (canonical, "config_yaml:context.lcm.context_threshold"),
+        (legacy, "config_yaml:lcm.context_threshold"),
+    ):
+        if not isinstance(section, dict) or "context_threshold" not in section:
+            continue
+        try:
+            return float(section["context_threshold"]), source, warnings
+        except (TypeError, ValueError):
+            warnings.append(f"invalid {source} ignored")
+
+    compression = cfg.get("compression") if isinstance(cfg, dict) else None
+    if not isinstance(compression, dict) or _config_bool_disabled(
+        compression.get("enabled")
+    ):
+        return default, "default", warnings
+    if "threshold" not in compression:
+        return default, "default", warnings
     try:
-        lcm_section = cfg.get("lcm") or {}
-        if isinstance(lcm_section, dict):
-            lcm_val = lcm_section.get("context_threshold")
-            if lcm_val is not None:
-                return float(lcm_val), "config_yaml:lcm.context_threshold"
-        compression = cfg.get("compression") or {}
-        if not isinstance(compression, dict):
-            return default, "default"
-        if _config_bool_disabled(compression.get("enabled")):
-            return default, "default"
-        comp_val = compression.get("threshold")
-        if comp_val is not None:
-            return float(comp_val), "config_yaml:compression.threshold"
-    except Exception:
-        return default, "default"
-    return default, "default"
+        return (
+            float(compression["threshold"]),
+            "config_yaml:compression.threshold",
+            warnings,
+        )
+    except (TypeError, ValueError):
+        warnings.append("invalid config_yaml:compression.threshold ignored")
+        return default, "default", warnings
 
 
 def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
@@ -317,6 +361,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("condensation_fanin", "LCM_CONDENSATION_FANIN", int),
     _EnvFieldSpec("dynamic_leaf_chunk_enabled", "LCM_DYNAMIC_LEAF_CHUNK_ENABLED", bool),
     _EnvFieldSpec("dynamic_leaf_chunk_max", "LCM_DYNAMIC_LEAF_CHUNK_MAX", int),
+    _EnvFieldSpec("manual_compaction_max_passes", "LCM_MANUAL_COMPACTION_MAX_PASSES", int),
     _EnvFieldSpec("cache_friendly_condensation_enabled", "LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", bool),
     _EnvFieldSpec("cache_friendly_min_debt_groups", "LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", int),
     _EnvFieldSpec("deferred_maintenance_enabled", "LCM_DEFERRED_MAINTENANCE_ENABLED", bool),
@@ -418,6 +463,87 @@ _PARSER_BY_TYPE = {
     str: _parse_str_env,
 }
 
+_PATTERN_CONFIG_FIELDS = frozenset({
+    "sensitive_patterns",
+    "summary_fallback_models",
+    "ignore_session_patterns",
+    "stateless_session_patterns",
+    "ignore_message_patterns",
+    "empty_lifecycle_gc_max_age_hours",
+})
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = frozenset(
+    spec.name for spec in ENV_FIELD_SPECS
+) | _PATTERN_CONFIG_FIELDS
+
+
+def _coerce_yaml_scalar(value: Any, py_type: type) -> tuple[bool, Any]:
+    """Coerce one profile-local YAML scalar without touching process env."""
+    try:
+        if py_type is bool:
+            if isinstance(value, bool):
+                return True, value
+            normalized = str(value).strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True, True
+            if normalized in {"0", "false", "no", "off"}:
+                return True, False
+            return False, None
+        return True, py_type(value)
+    except (TypeError, ValueError):
+        return False, None
+
+
+def _apply_profile_yaml_defaults(
+    config: "LCMConfig", cfg: dict[str, Any]
+) -> tuple[dict[str, str], list[str]]:
+    """Apply valid legacy then canonical defaults without touching process env."""
+    sources: dict[str, str] = {}
+    warnings: list[str] = []
+    context = cfg.get("context") if isinstance(cfg, dict) else None
+    sections = (
+        (cfg.get("lcm") if isinstance(cfg, dict) else None, "config_yaml:lcm"),
+        (
+            context.get("lcm") if isinstance(context, dict) else None,
+            "config_yaml:context.lcm",
+        ),
+    )
+    for section, source in sections:
+        if not isinstance(section, dict):
+            continue
+        for spec in ENV_FIELD_SPECS:
+            if spec.name == "context_threshold" or spec.name not in section:
+                continue
+            valid, value = _coerce_yaml_scalar(section[spec.name], spec.py_type)
+            if valid:
+                setattr(config, spec.name, value)
+                sources[spec.name] = f"{source}.{spec.name}"
+            else:
+                warnings.append(f"invalid {source}.{spec.name} ignored")
+
+        for name in _PATTERN_CONFIG_FIELDS - {"empty_lifecycle_gc_max_age_hours"}:
+            if name not in section:
+                continue
+            raw = section[name]
+            if isinstance(raw, str):
+                value = _parse_pattern_list(raw)
+            elif isinstance(raw, (list, tuple)):
+                value = [str(item).strip() for item in raw if str(item).strip()]
+            else:
+                warnings.append(f"invalid {source}.{name} ignored")
+                continue
+            setattr(config, name, value)
+            sources[name] = f"{source}.{name}"
+
+        name = "empty_lifecycle_gc_max_age_hours"
+        if name in section:
+            raw_age = section[name]
+            try:
+                setattr(config, name, None if raw_age is None else float(raw_age))
+                sources[name] = f"{source}.{name}"
+            except (TypeError, ValueError):
+                warnings.append(f"invalid {source}.{name} ignored")
+    return sources, warnings
+
 # Fields whose env reading needs provenance tracking or a computed default;
 # ``from_env`` handles these explicitly, so the uniform loop skips them.
 _SOURCE_TRACKED_ENV_FIELDS = frozenset({
@@ -467,6 +593,10 @@ class LCMConfig:
     dynamic_leaf_chunk_enabled: bool = False
     # Upper bound for the working dynamic leaf chunk threshold
     dynamic_leaf_chunk_max: int = 40_000
+    # Maximum bounded leaf-summary passes for an explicit manual compaction.
+    # Manual requests intentionally ignore the automatic pressure threshold but
+    # remain capped so one command cannot spend without bound.
+    manual_compaction_max_passes: int = 8
     # When enabled, suppress follow-on condensation after a leaf pass unless
     # debt/pressure says the extra churn is worth it
     cache_friendly_condensation_enabled: bool = False
@@ -778,34 +908,49 @@ class LCMConfig:
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
-        """Build config from environment variables (LCM_ prefix)."""
+        """Build profile-local config, then apply explicit ``LCM_*`` overrides."""
         c = cls()
         config_sources: dict[str, str] = {}
-        config_source_warnings: list[str] = []
+        cfg = _load_hermes_config_yaml()
+        yaml_sources, config_source_warnings = _apply_profile_yaml_defaults(c, cfg)
+        for name in (
+            "sensitive_patterns",
+            "ignore_session_patterns",
+            "stateless_session_patterns",
+            "ignore_message_patterns",
+        ):
+            if name in yaml_sources:
+                setattr(c, f"{name}_source", yaml_sources[name].rsplit(".", 1)[0])
 
         def _record(field: str, source: str, warning: str | None = None) -> None:
             config_sources[field] = source
             if warning:
                 config_source_warnings.append(warning)
 
-        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys(cfg)
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
         c.fresh_tail_count, source, warning = _parse_int_env_with_source(
-            "LCM_FRESH_TAIL_COUNT", c.fresh_tail_count
+            "LCM_FRESH_TAIL_COUNT", c.fresh_tail_count,
+            default_source=yaml_sources.get("fresh_tail_count", "default"),
         )
         _record("fresh_tail_count", source, warning)
         c.fresh_tail_max_tokens, source, warning = _parse_int_env_with_source(
-            "LCM_FRESH_TAIL_MAX_TOKENS", c.fresh_tail_max_tokens
+            "LCM_FRESH_TAIL_MAX_TOKENS", c.fresh_tail_max_tokens,
+            default_source=yaml_sources.get("fresh_tail_max_tokens", "default"),
         )
         c.fresh_tail_max_tokens = max(0, c.fresh_tail_max_tokens)
         _record("fresh_tail_max_tokens", source, warning)
         c.leaf_chunk_tokens, source, warning = _parse_int_env_with_source(
-            "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens
+            "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens,
+            default_source=yaml_sources.get("leaf_chunk_tokens", "default"),
         )
         _record("leaf_chunk_tokens", source, warning)
-        context_default, context_source = _hermes_compression_threshold_with_source(c.context_threshold)
+        context_default, context_source, threshold_warnings = _resolve_context_threshold(
+            c.context_threshold, cfg
+        )
+        config_source_warnings.extend(threshold_warnings)
         c.context_threshold, source, warning = _parse_float_env_with_source(
             "LCM_CONTEXT_THRESHOLD",
             context_default,
@@ -819,21 +964,28 @@ class LCMConfig:
         c.summary_spend_max_calls, source, warning = _parse_int_env_with_source(
             "LCM_SUMMARY_SPEND_MAX_CALLS",
             c.summary_spend_max_calls,
+            default_source=yaml_sources.get("summary_spend_max_calls", "default"),
         )
         _record("summary_spend_max_calls", source, warning)
         c.summary_spend_window_seconds, source, warning = _parse_float_env_with_source(
             "LCM_SUMMARY_SPEND_WINDOW_SECONDS",
             c.summary_spend_window_seconds,
+            default_source=yaml_sources.get("summary_spend_window_seconds", "default"),
         )
         _record("summary_spend_window_seconds", source, warning)
         c.summary_spend_backoff_seconds, source, warning = _parse_float_env_with_source(
             "LCM_SUMMARY_SPEND_BACKOFF_SECONDS",
             c.summary_spend_backoff_seconds,
+            default_source=yaml_sources.get("summary_spend_backoff_seconds", "default"),
         )
         _record("summary_spend_backoff_seconds", source, warning)
-        summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
-            c.summary_timeout_ms
-        )
+        if "summary_timeout_ms" in yaml_sources:
+            summary_timeout_default = c.summary_timeout_ms
+            summary_timeout_source = yaml_sources["summary_timeout_ms"]
+        else:
+            summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
+                c.summary_timeout_ms
+            )
         c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
             "LCM_SUMMARY_TIMEOUT_MS",
             summary_timeout_default,

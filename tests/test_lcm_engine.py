@@ -467,12 +467,21 @@ def test_codex_oauth_context_cap_keeps_explicit_lcm_threshold(tmp_path):
         engine.shutdown()
 
 
-def test_codex_oauth_context_cap_keeps_lcm_config_yaml_threshold_override(tmp_path):
+@pytest.mark.parametrize(
+    "source",
+    (
+        "config_yaml:context.lcm.context_threshold",
+        "config_yaml:lcm.context_threshold",
+    ),
+)
+def test_codex_oauth_context_cap_keeps_lcm_config_yaml_threshold_override(
+    tmp_path, source
+):
     config = LCMConfig(
         context_threshold=0.62,
         database_path=str(tmp_path / "codex-lcm-yaml-threshold.db"),
     )
-    config.config_sources["context_threshold"] = "config_yaml:lcm.context_threshold"
+    config.config_sources["context_threshold"] = source
     engine = LCMEngine(config=config)
     try:
         engine.update_model(
@@ -485,7 +494,7 @@ def test_codex_oauth_context_cap_keeps_lcm_config_yaml_threshold_override(tmp_pa
         assert engine.context_length == 272_000
         assert engine.context_threshold == 0.62
         assert engine.threshold_tokens == int(272_000 * 0.62)
-        assert engine._context_threshold_source == "config_yaml:lcm.context_threshold"
+        assert engine._context_threshold_source == source
         assert engine._context_threshold_autoraised is None
     finally:
         engine.shutdown()
@@ -11484,6 +11493,173 @@ class TestEngineCompress:
         assert count_messages_tokens(compressed) < count_messages_tokens(messages)
         compressed_contents = [msg.get("content") for msg in compressed]
         assert messages[-1]["content"] in compressed_contents
+
+    def test_manual_force_compacts_all_eligible_backlog_below_auto_threshold(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=20,
+            database_path=str(tmp_path / "lcm_manual_force.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "manual-force-session"
+        engine.context_length = 200_000
+        engine.threshold_tokens = 170_000
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(13):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Message {i}: compact me"})
+
+        summary_calls: list[int] = []
+
+        def summarize_two(chunk, focus_topic=None):
+            summary_calls.append(len(chunk))
+            return (
+                chunk,
+                count_messages_tokens(chunk),
+                "Manual summary.\nExpand for details about: forced backlog",
+                1,
+                0,
+            )
+
+        monkeypatch.setattr(engine, "_select_oldest_leaf_chunk", lambda candidate, _limit: candidate[:2])
+        monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", summarize_two)
+        monkeypatch.setattr(engine, "_maybe_condense", lambda **_kwargs: None)
+
+        compressed = engine.compress(messages, current_tokens=100, force=True)
+
+        # Eleven messages are outside the protected two-message fresh tail.
+        # Manual compaction must drain five full chunks plus the undersized
+        # remainder even though the request began below the auto threshold.
+        assert summary_calls == [2, 2, 2, 2, 2, 1]
+        compressed_contents = [message.get("content") for message in compressed]
+        assert not any(message["content"] in compressed_contents for message in messages[1:-2])
+        assert compressed[-2:] == messages[-2:]
+
+    def test_manual_force_static_mode_continues_after_adaptive_rescue(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=100,
+            dynamic_leaf_chunk_enabled=False,
+            manual_compaction_max_passes=8,
+            database_path=str(tmp_path / "lcm_manual_force_static_rescue.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "manual-force-static-rescue"
+        engine.context_length = 200_000
+        engine.threshold_tokens = 170_000
+
+        messages = [{"role": "system", "content": "You are a helpful assistant."}]
+        for i in range(10):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Message {i}: compact me"})
+
+        summary_calls: list[int] = []
+
+        def rescue_one(chunk, focus_topic=None):
+            summary_calls.append(len(chunk))
+            rescued = chunk[:1]
+            return (
+                rescued,
+                count_messages_tokens(rescued),
+                "Rescued summary.\nExpand for details about: one rescued message",
+                1,
+                1,
+            )
+
+        monkeypatch.setattr(engine, "_summarize_leaf_chunk_with_rescue", rescue_one)
+        monkeypatch.setattr(engine, "_maybe_condense", lambda **_kwargs: None)
+
+        compressed = engine.compress(messages, current_tokens=100, force=True)
+
+        assert len(summary_calls) == 8
+        compressed_contents = [message.get("content") for message in compressed]
+        assert not any(message["content"] in compressed_contents for message in messages[1:-2])
+        assert compressed[-2:] == messages[-2:]
+
+    def test_leaf_chunk_extends_through_complete_tool_result_group(self, tmp_path, monkeypatch):
+        assistant = {
+            "role": "assistant",
+            "content": "running tool",
+            "tool_calls": [{
+                "id": "call_boundary",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        }
+        old_user = {"role": "user", "content": "old request"}
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_boundary",
+            "name": "terminal",
+            "content": "important durable result",
+        }
+        fresh_user = {"role": "user", "content": "fresh request"}
+        chunk_limit = count_messages_tokens([old_user, assistant])
+        config = LCMConfig(
+            fresh_tail_count=1,
+            leaf_chunk_tokens=chunk_limit,
+            dynamic_leaf_chunk_enabled=True,
+            dynamic_leaf_chunk_max=chunk_limit,
+            manual_compaction_max_passes=1,
+            database_path=str(tmp_path / "lcm_tool_group_boundary.db"),
+        )
+        engine = LCMEngine(config=config)
+        engine._session_id = "tool-group-boundary"
+
+        monkeypatch.setattr(
+            engine,
+            "_summarize_leaf_chunk_with_rescue",
+            lambda chunk, focus_topic=None: (
+                chunk,
+                count_messages_tokens(chunk),
+                "Tool group summary.\nExpand for details about: complete tool group",
+                1,
+                0,
+            ),
+        )
+        monkeypatch.setattr(engine, "_maybe_condense", lambda **_kwargs: None)
+
+        engine.compress(
+            [{"role": "system", "content": "system"}, old_user, assistant, tool_result, fresh_user],
+            current_tokens=100,
+            force=True,
+        )
+
+        nodes = engine._dag.get_session_nodes("tool-group-boundary")
+        assert len(nodes) == 1
+        source_contents = [engine._store.get(store_id)["content"] for store_id in nodes[0].source_ids]
+        assert source_contents == [old_user["content"], assistant["content"], tool_result["content"]]
+
+    def test_adaptive_rescue_never_bisects_tool_result_group(self, tmp_path):
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm_rescue_tool_group.db")))
+        assistant = {
+            "role": "assistant",
+            "content": "running tool",
+            "tool_calls": [{
+                "id": "call_rescue",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        }
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": "call_rescue",
+            "name": "terminal",
+            "content": "durable rescue result",
+        }
+        old_user = {"role": "user", "content": "safe earlier boundary"}
+
+        group = [assistant, tool_result]
+        assert engine._next_leaf_rescue_chunk(group, count_messages_tokens(group)) == []
+
+        with_safe_prefix = [old_user, assistant, tool_result]
+        assert engine._next_leaf_rescue_chunk(
+            with_safe_prefix,
+            count_messages_tokens(with_safe_prefix),
+        ) == [old_user]
 
     def test_dynamic_leaf_chunk_pressure_uses_current_working_window_after_each_pass(self, tmp_path, monkeypatch):
         config = LCMConfig(

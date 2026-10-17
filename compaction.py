@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .message_analysis import _tool_call_id
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -345,6 +346,38 @@ class CompactionMixin:
                 break
             selected.append(msg)
             used += msg_tokens
+
+        # A token boundary must not bisect an assistant/tool-result group. The
+        # fresh-tail resolver protects the other side of the compaction window;
+        # this protects boundaries between successive leaf passes.
+        pending_tool_call_ids: set[str] = set()
+        for msg in selected:
+            role = str(msg.get("role") or "")
+            if role == "assistant":
+                pending_tool_call_ids = {
+                    call_id
+                    for call_id in (
+                        _tool_call_id(tool_call)
+                        for tool_call in (msg.get("tool_calls") or [])
+                    )
+                    if call_id
+                }
+            elif role == "tool" and pending_tool_call_ids:
+                pending_tool_call_ids.discard(str(msg.get("tool_call_id") or ""))
+            elif role in {"user", "system"}:
+                pending_tool_call_ids.clear()
+
+        if pending_tool_call_ids:
+            for msg in candidate_raw[len(selected):]:
+                if str(msg.get("role") or "") != "tool":
+                    break
+                result_id = str(msg.get("tool_call_id") or "")
+                if result_id not in pending_tool_call_ids:
+                    break
+                selected.append(msg)
+                pending_tool_call_ids.discard(result_id)
+                if not pending_tool_call_ids:
+                    break
         return selected
 
     def compress(self, messages: List[Dict[str, Any]],
@@ -431,6 +464,7 @@ class CompactionMixin:
         cleanup_only_due_to_boundary_cooldown = bool(
             self._preflight_cleanup_only_due_to_boundary_cooldown
             and not force_overflow
+            and not force
         )
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
         if cleanup_only_due_to_boundary_cooldown:
@@ -516,7 +550,10 @@ class CompactionMixin:
         max_leaf_passes = base_max_leaf_passes
         if threshold_full_sweep_active:
             max_leaf_passes = _THRESHOLD_FULL_SWEEP_MAX_PASSES
-        if deferred_maintenance_active:
+        if force and not force_overflow:
+            # Explicit manual /compress wins over the automatic sweep cap.
+            max_leaf_passes = max(1, self._config.manual_compaction_max_passes)
+        elif deferred_maintenance_active:
             max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
 
         explicit_focus_topic = focus_topic is not None
@@ -673,7 +710,7 @@ class CompactionMixin:
                 )
             elif self._config.dynamic_leaf_chunk_enabled:
                 working_leaf_chunk_tokens = self._working_leaf_chunk_tokens(raw_tokens_outside_tail)
-                if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow:
+                if raw_tokens_outside_tail < working_leaf_chunk_tokens and not force_overflow and not force:
                     if not (deferred_maintenance_active and critical_budget_pressure):
                         noop_reason = (
                             "raw backlog outside fresh tail is below leaf chunk threshold"
@@ -684,7 +721,7 @@ class CompactionMixin:
                 else:
                     to_compact = self._select_oldest_leaf_chunk(candidate_raw, working_leaf_chunk_tokens)
             else:
-                if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow:
+                if raw_tokens_outside_tail < self._config.leaf_chunk_tokens and not force_overflow and not force:
                     if not (deferred_maintenance_active and critical_budget_pressure):
                         noop_reason = (
                             "raw backlog outside fresh tail is below leaf chunk threshold"
@@ -818,10 +855,10 @@ class CompactionMixin:
                     break
                 continue
 
-            if not self._config.dynamic_leaf_chunk_enabled:
+            if not self._config.dynamic_leaf_chunk_enabled and not force:
                 break
 
-            if not force_overflow:
+            if not force_overflow and not force:
                 if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
