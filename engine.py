@@ -6007,6 +6007,72 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         body = "\n".join([header, *lines])
         return f"<relevant-memories>\n{body}\n</relevant-memories>"
 
+    def _select_atomic_tail_groups(
+        self, messages: List[Dict[str, Any]], budget: int,
+    ) -> List[Dict[str, Any]]:
+        """Select whole tool occurrences and preserve the latest real user."""
+        units: list[list[Dict[str, Any]]] = []
+        i = 0
+        while i < len(messages):
+            unit = [messages[i]]
+            if messages[i].get("role") == "assistant" and messages[i].get("tool_calls"):
+                # Group only this occurrence's contiguous results. Reused IDs
+                # in another turn can never supply a missing result here.
+                while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
+                    i += 1
+                    unit.append(messages[i])
+            units.append(unit)
+            i += 1
+        live_user = None
+        for message in reversed(messages):
+            if self._is_preserved_todo_context_message(message):
+                continue
+            if self._is_replayed_context_scaffold_message(message):
+                break
+            if message.get("role") == "user":
+                live_user = message
+                break
+        live_user_index = next(
+            (index for index, unit in enumerate(units) if unit[0] is live_user), -1
+        )
+        newest_tool_index = next(
+            (
+                index for index in range(len(units) - 1, -1, -1)
+                if index > live_user_index
+                and units[index][0].get("role") == "assistant"
+                and units[index][0].get("tool_calls")
+            ),
+            -1,
+        )
+        # A sole irreducible request remains visible and reports overflow. In
+        # other cases the established objective scaffold owns omitted users:
+        # replaying a non-contiguous raw user would duplicate it after restart.
+        if len(units) == 1 and units[0][0] is live_user:
+            self._assembly_protected_group_dropped = False
+            return units[0]
+        selected = []
+        used = 0
+        skipped = False
+        self._assembly_protected_group_dropped = False
+        for index in range(len(units) - 1, -1, -1):
+            unit = units[index]
+            cost = sum(count_message_tokens(message) for message in unit)
+            if used + cost > budget:
+                if unit[0].get("role") == "assistant" and unit[0].get("tool_calls"):
+                    if index == newest_tool_index:
+                        self._assembly_protected_group_dropped = True
+                if all(self._is_budget_droppable_tail_message(message) for message in unit):
+                    skipped = True
+                    continue
+                break
+            if skipped:
+                # Let the existing objective scaffold preserve omitted intent;
+                # never replay raw rows across a deleted exchange.
+                break
+            selected.append((index, unit))
+            used += cost
+        return [message for _, unit in sorted(selected) for message in unit]
+
     def _assemble_context(
         self,
         system_msg: Optional[Dict[str, Any]],
@@ -6022,6 +6088,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           [fresh tail messages]
         """
         result = []
+        self._assembly_protected_group_dropped = False
 
         # Leading anchor with optional LCM annotation. Only a true system prompt
         # is a safe permanent anchor; gateway sessions can start directly with
@@ -6056,25 +6123,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         summary_budget = None
         if assembly_cap is not None:
             used = count_message_tokens(leading_msg) if leading_msg is not None else 0
-            kept_tail_reversed: list[Dict[str, Any]] = []
-            tail_token_total = 0
             tail_for_selection = self._sanitize_active_context_messages(
                 assembly_tail_messages,
                 insert_missing_tool_stubs=False,
             )
-            skipped_tail_gap = False
-            for msg in reversed(tail_for_selection):
-                msg_tokens = count_message_tokens(msg)
-                if used + tail_token_total + msg_tokens > assembly_cap:
-                    if self._is_budget_droppable_tail_message(msg):
-                        skipped_tail_gap = True
-                        continue
-                    break
-                if skipped_tail_gap:
-                    break
-                kept_tail_reversed.append(msg)
-                tail_token_total += msg_tokens
-            tail_selected = list(reversed(kept_tail_reversed))
+            tail_selected = self._select_atomic_tail_groups(
+                tail_for_selection, max(0, assembly_cap - used)
+            )
+            tail_token_total = count_messages_tokens(tail_selected)
             summary_budget = max(0, assembly_cap - used - tail_token_total)
         if anchor_source is not None:
             anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)
@@ -6230,7 +6286,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if effective_cap is None:
             self._last_overflow_recovery_failed = False
         else:
-            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > effective_cap
+            self._last_overflow_recovery_failed = (
+                count_messages_tokens(compressed) > effective_cap
+                or getattr(self, "_assembly_protected_group_dropped", False)
+            )
             if self._last_overflow_recovery_failed:
                 logger.warning(
                     "LCM overflow recovery could not get under cap=%d; returning best-effort context (%d tokens)",

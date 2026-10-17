@@ -975,7 +975,10 @@ class CompactionMixin:
         if recovery_assembly_cap is None:
             self._last_overflow_recovery_failed = False
         else:
-            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > recovery_assembly_cap
+            self._last_overflow_recovery_failed = (
+                count_messages_tokens(compressed) > recovery_assembly_cap
+                or getattr(self, "_assembly_protected_group_dropped", False)
+            )
             if self._last_overflow_recovery_failed:
                 logger.warning(
                     "LCM overflow recovery could not get under cap=%d after compaction; returning best-effort context (%d tokens)",
