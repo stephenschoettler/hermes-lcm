@@ -229,6 +229,43 @@ def test_voyage_over_cap_document_is_skipped_and_reported(monkeypatch, caplog):
     assert "index=1" in caplog.text
 
 
+def test_ollama_over_context_document_is_skipped_and_reported(monkeypatch, caplog):
+    # /api/embed runs with truncate:false, so one over-context document fails
+    # the WHOLE batch with a 400 (observed live: a ~48K-token summary poisoned
+    # every 32-item backfill batch containing it). Pre-screen like Voyage:
+    # skip the over-budget document, dispatch the rest, record the skip.
+    monkeypatch.setattr(
+        provider_mod,
+        "count_tokens",
+        lambda text: 3000 if text == "too large" else 2,
+    )
+    transport = FakeTransport(
+        _response(200, {"embeddings": [[1, 2, 3]]})
+    )
+    provider = OllamaProvider("nomic-embed-text", transport=transport)
+
+    with caplog.at_level(logging.WARNING):
+        vectors = provider.embed_documents(["keep", "too large"])
+
+    assert len(vectors) == 1
+    assert provider.last_skipped_documents == [1]
+    assert transport.calls[0]["payload"]["input"] == ["keep"]
+    assert transport.calls[0]["payload"]["truncate"] is False
+    assert "index=1" in caplog.text
+
+
+def test_ollama_document_token_budget_env_override(monkeypatch):
+    monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 3000)
+    transport = FakeTransport(_response(200, {"embeddings": [[1, 2, 3]]}))
+    provider = OllamaProvider("bge-m3", transport=transport)
+
+    monkeypatch.setenv("LCM_OLLAMA_DOCUMENT_TOKEN_BUDGET", "8192")
+    vectors = provider.embed_documents(["fits a big-window model"])
+
+    assert len(vectors) == 1
+    assert provider.last_skipped_documents == []
+
+
 def test_voyage_uses_asymmetric_input_types(monkeypatch):
     monkeypatch.setattr(provider_mod, "count_tokens", lambda _text: 1)
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
