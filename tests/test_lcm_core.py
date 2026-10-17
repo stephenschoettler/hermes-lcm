@@ -688,6 +688,21 @@ class TestProviderPrefixedAuxiliaryCalls:
 
 
 class TestConfig:
+    @pytest.fixture(autouse=True)
+    def _scrub_scalar_lcm_env(self, monkeypatch):
+        """Scrub ambient scalar LCM_* overrides for every test in this class.
+
+        Env intentionally overrides YAML (the feature under test), so live
+        environment values (e.g. a running gateway's LCM_FRESH_TAIL_COUNT)
+        would otherwise shadow the config.yaml assertions below. Only the
+        scalar specs are cleared; pattern/model vars keep their ambient
+        values, matching the previous per-test delenv behavior.
+        """
+        import hermes_lcm.config as config_mod
+
+        for spec in config_mod.ENV_FIELD_SPECS:
+            monkeypatch.delenv(spec.env_key, raising=False)
+
     def test_defaults(self):
         c = LCMConfig()
         assert c.fresh_tail_count == 32
@@ -1116,6 +1131,152 @@ class TestConfig:
         c = LCMConfig.from_env()
 
         assert c.context_threshold == 0.55
+
+    def test_from_env_reads_lcm_yaml_scalar_settings(self, monkeypatch, tmp_path):
+        """Arbitrary scalar LCM_* fields, not just context_threshold, can be set
+        under the lcm: section in config.yaml."""
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("""lcm:
+  fresh_tail_count: 24
+  fresh_tail_max_tokens: 9000
+  leaf_chunk_tokens: 8000
+  dynamic_leaf_chunk_enabled: true
+  dynamic_leaf_chunk_max: 24000
+  cache_friendly_condensation_enabled: true
+  cache_friendly_min_debt_groups: 3
+  deferred_maintenance_enabled: true
+  deferred_maintenance_max_passes: 5
+  critical_budget_pressure_ratio: 0.9
+  summary_timeout_ms: 90000
+  expansion_context_tokens: 64000
+  summary_spend_max_calls: 10
+  summary_spend_window_seconds: 300.0
+  summary_spend_backoff_seconds: 900.0
+  custom_instructions: Prefer concise summaries.
+""")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 24
+        assert c.fresh_tail_max_tokens == 9000
+        assert c.leaf_chunk_tokens == 8000
+        assert c.dynamic_leaf_chunk_enabled is True
+        assert c.dynamic_leaf_chunk_max == 24000
+        assert c.cache_friendly_condensation_enabled is True
+        assert c.cache_friendly_min_debt_groups == 3
+        assert c.deferred_maintenance_enabled is True
+        assert c.deferred_maintenance_max_passes == 5
+        assert c.critical_budget_pressure_ratio == 0.9
+        assert c.summary_timeout_ms == 90_000
+        assert c.expansion_context_tokens == 64_000
+        assert c.summary_spend_max_calls == 10
+        assert c.summary_spend_window_seconds == 300.0
+        assert c.summary_spend_backoff_seconds == 900.0
+        assert c.custom_instructions == "Prefer concise summaries."
+        assert c.config_sources["fresh_tail_count"] == "config_yaml:lcm.fresh_tail_count"
+        assert c.config_sources["leaf_chunk_tokens"] == "config_yaml:lcm.leaf_chunk_tokens"
+        assert c.config_sources["dynamic_leaf_chunk_enabled"] == "config_yaml:lcm.dynamic_leaf_chunk_enabled"
+        assert c.config_sources["summary_timeout_ms"] == "config_yaml:lcm.summary_timeout_ms"
+        assert c.config_sources["summary_spend_max_calls"] == "config_yaml:lcm.summary_spend_max_calls"
+        assert c.ignored_config_yaml_lcm_keys == []
+
+    def test_from_env_env_overrides_lcm_yaml_scalar_settings(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("""lcm:
+  fresh_tail_count: 24
+  dynamic_leaf_chunk_enabled: false
+  expansion_context_tokens: 64000
+""")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "48")
+        monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_ENABLED", "true")
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 48
+        assert c.dynamic_leaf_chunk_enabled is True
+        assert c.expansion_context_tokens == 64_000
+        assert c.config_sources["fresh_tail_count"] == "env:LCM_FRESH_TAIL_COUNT"
+        assert c.config_sources["dynamic_leaf_chunk_enabled"] == "env:LCM_DYNAMIC_LEAF_CHUNK_ENABLED"
+        assert c.config_sources["expansion_context_tokens"] == "config_yaml:lcm.expansion_context_tokens"
+
+    def test_from_env_invalid_env_falls_back_to_lcm_yaml_scalar(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  fresh_tail_count: 24\n  dynamic_leaf_chunk_enabled: true\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("LCM_FRESH_TAIL_COUNT", "nope")
+        monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_ENABLED", "maybe")
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 24
+        assert c.dynamic_leaf_chunk_enabled is True
+        assert c.config_sources["fresh_tail_count"] == "config_yaml:lcm.fresh_tail_count"
+        assert c.config_sources["dynamic_leaf_chunk_enabled"] == "config_yaml:lcm.dynamic_leaf_chunk_enabled"
+        assert "invalid env LCM_FRESH_TAIL_COUNT='nope' ignored" in c.config_source_warnings
+        assert "invalid env LCM_DYNAMIC_LEAF_CHUNK_ENABLED='maybe' ignored" in c.config_source_warnings
+
+    def test_from_env_invalid_lcm_yaml_scalar_falls_back_with_warning(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("""lcm:
+  fresh_tail_count: nope
+  dynamic_leaf_chunk_enabled: maybe
+""")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 32
+        assert c.dynamic_leaf_chunk_enabled is False
+        assert c.config_sources["fresh_tail_count"] == "default"
+        assert c.config_sources["dynamic_leaf_chunk_enabled"] == "default"
+        assert "invalid config_yaml:lcm.fresh_tail_count='nope' ignored" in c.config_source_warnings
+        assert "invalid config_yaml:lcm.dynamic_leaf_chunk_enabled='maybe' ignored" in c.config_source_warnings
+
+    def test_from_env_reads_lcm_yaml_scalar_settings_without_pyyaml(self, monkeypatch, tmp_path):
+        import hermes_lcm.config as config_mod
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n"
+            "  fresh_tail_count: '24'\n"
+            "  dynamic_leaf_chunk_enabled: true\n"
+            "  critical_budget_pressure_ratio: '0.9'\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(config_mod, "yaml", None)
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 24
+        assert c.dynamic_leaf_chunk_enabled is True
+        assert c.critical_budget_pressure_ratio == 0.9
+        assert c.config_sources["fresh_tail_count"] == "config_yaml:lcm.fresh_tail_count"
+
+    def test_from_env_lcm_yaml_unsupported_scalar_key_reported_ignored(self, monkeypatch, tmp_path):
+        """A typo'd or unknown lcm: key has no LCM_* field mapping and is
+        surfaced via ignored_config_yaml_lcm_keys rather than silently applied."""
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n  context_threshold: 0.52\n  leaf_chunk_tokenz: 12345\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.52
+        assert c.leaf_chunk_tokens == 20_000
+        assert c.ignored_config_yaml_lcm_keys == ["leaf_chunk_tokenz"]
 
 
 class TestSessionPatterns:

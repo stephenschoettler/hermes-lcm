@@ -67,72 +67,6 @@ def _parse_arm_weights(raw: str, defaults: dict[str, float]) -> dict[str, float]
     return weights
 
 
-def _parse_int_env(key: str, default: int) -> int:
-    raw = os.environ.get(key)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _parse_float_env(key: str, default: float) -> float:
-    raw = os.environ.get(key)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _parse_bool_env(key: str, default: bool) -> bool:
-    raw = os.environ.get(key)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _parse_str_env(key: str, default):
-    return os.environ.get(key, default)
-
-
-def _parse_int_env_with_source(
-    key: str,
-    default: int,
-    *,
-    default_source: str = "default",
-) -> tuple[int, str, str | None]:
-    raw = os.environ.get(key)
-    if raw is None:
-        return default, default_source, None
-    try:
-        return int(raw), f"env:{key}", None
-    except (TypeError, ValueError):
-        return default, default_source, f"invalid env {key}={raw!r} ignored"
-
-
-def _parse_float_env_with_source(
-    key: str,
-    default: float,
-    *,
-    default_source: str = "default",
-) -> tuple[float, str, str | None]:
-    raw = os.environ.get(key)
-    if raw is None:
-        return default, default_source, None
-    try:
-        return float(raw), f"env:{key}", None
-    except (TypeError, ValueError):
-        return default, default_source, f"invalid env {key}={raw!r} ignored"
-
-
 def _config_bool_disabled(value) -> bool:
     if isinstance(value, bool):
         return value is False
@@ -199,7 +133,13 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+def _supported_lcm_config_yaml_keys() -> frozenset[str]:
+    """Scalar ``lcm:`` YAML keys ``from_env`` will actually apply.
+
+    Every field with a scalar ``LCM_*`` env override (``ENV_FIELD_SPECS``) is
+    supported generically -- see ``_lcm_yaml_value_with_source``.
+    """
+    return frozenset(spec.name for spec in ENV_FIELD_SPECS)
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -207,10 +147,11 @@ def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str
     lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
     if not isinstance(lcm_section, dict):
         return []
+    supported_keys = _supported_lcm_config_yaml_keys()
     return sorted(
         str(key)
         for key in lcm_section
-        if str(key) not in _SUPPORTED_LCM_CONFIG_YAML_KEYS
+        if str(key) not in supported_keys
     )
 
 
@@ -230,8 +171,11 @@ def _hermes_compression_threshold(default: float) -> float:
     return value
 
 
-def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_compression_threshold_with_source(
+    default: float,
+    cfg: dict[str, Any] | None = None,
+) -> tuple[float, str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     try:
         lcm_section = cfg.get("lcm") or {}
         if isinstance(lcm_section, dict):
@@ -263,8 +207,11 @@ def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
     return value
 
 
-def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[int, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_auxiliary_compression_timeout_ms_with_source(
+    default: int,
+    cfg: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     try:
         auxiliary = cfg.get("auxiliary") or {}
         if not isinstance(auxiliary, dict):
@@ -280,8 +227,11 @@ def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[
         return default, "default"
 
 
-def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_codex_gpt55_autoraise_with_source(
+    default: bool,
+    cfg: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
     try:
         compression = cfg.get("compression") or {}
         if not isinstance(compression, dict):
@@ -292,6 +242,86 @@ def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]
         return (not _config_bool_disabled(value)), "config_yaml:compression.codex_gpt55_autoraise"
     except Exception:
         return default, "default"
+
+
+def _coerce_lcm_scalar_value(field: str, raw: Any, py_type: type) -> tuple[Any, str | None]:
+    """Coerce one scalar LCM_* field's raw value to ``py_type``.
+
+    ``raw`` is either a YAML-native value (bool/int/float/str, as produced by
+    ``_load_hermes_config_yaml``) or an env-var string -- both callers below
+    share this coercion so a YAML ``lcm:`` scalar and its ``LCM_*`` env
+    equivalent parse identically. Returns ``(value, warning)``; on failure
+    ``value`` is ``None`` and ``warning`` describes the rejected
+    ``lcm.<field>`` YAML value (env callers rewrite the warning to reference
+    the env var instead).
+    """
+    try:
+        if py_type is bool:
+            if isinstance(raw, bool):
+                return raw, None
+            if isinstance(raw, (int, float)):
+                if raw == 1:
+                    return True, None
+                if raw == 0:
+                    return False, None
+            if isinstance(raw, str):
+                normalized = raw.strip().lower()
+                if normalized in {"1", "true", "yes", "on"}:
+                    return True, None
+                if normalized in {"0", "false", "no", "off"}:
+                    return False, None
+            return None, f"invalid config_yaml:lcm.{field}={raw!r} ignored"
+        if py_type is int:
+            if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                return None, f"invalid config_yaml:lcm.{field}={raw!r} ignored"
+            return int(raw), None
+        if py_type is float:
+            if isinstance(raw, bool):
+                return None, f"invalid config_yaml:lcm.{field}={raw!r} ignored"
+            return float(raw), None
+        if py_type is str:
+            if not isinstance(raw, str):
+                return None, f"invalid config_yaml:lcm.{field}={raw!r} ignored"
+            return raw, None
+    except (TypeError, ValueError):
+        return None, f"invalid config_yaml:lcm.{field}={raw!r} ignored"
+    return None, f"unsupported config_yaml:lcm.{field} type {py_type!r} ignored"
+
+
+def _lcm_yaml_value_with_source(
+    field: str,
+    py_type: type,
+    default: Any,
+    *,
+    default_source: str = "default",
+    cfg: dict[str, Any] | None = None,
+) -> tuple[Any, str, str | None]:
+    """Read ``lcm.<field>`` from config.yaml, falling back to ``default``."""
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+    lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
+    if not isinstance(lcm_section, dict) or field not in lcm_section:
+        return default, default_source, None
+    value, warning = _coerce_lcm_scalar_value(field, lcm_section.get(field), py_type)
+    if warning:
+        return default, default_source, warning
+    return value, f"config_yaml:lcm.{field}", None
+
+
+def _parse_env_spec_with_source(
+    key: str,
+    py_type: type,
+    default: Any,
+    *,
+    default_source: str = "default",
+) -> tuple[Any, str, str | None]:
+    """Read the ``LCM_*`` env var ``key``, falling back to ``default``."""
+    raw = os.environ.get(key)
+    if raw is None:
+        return default, default_source, None
+    value, warning = _coerce_lcm_scalar_value(key, raw, py_type)
+    if warning:
+        return default, default_source, f"invalid env {key}={raw!r} ignored"
+    return value, f"env:{key}", None
 
 
 @dataclass(frozen=True)
@@ -411,23 +441,15 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rollup_maintenance_budget_ms", "LCM_ROLLUP_MAINTENANCE_BUDGET_MS", int),
 )
 
-_PARSER_BY_TYPE = {
-    int: _parse_int_env,
-    float: _parse_float_env,
-    bool: _parse_bool_env,
-    str: _parse_str_env,
-}
-
-# Fields whose env reading needs provenance tracking or a computed default;
-# ``from_env`` handles these explicitly, so the uniform loop skips them.
+# Fields whose default needs a Hermes-config fallback computed outside the
+# lcm: YAML section (context_threshold also inherits compression.threshold;
+# summary_timeout_ms also inherits auxiliary.compression.timeout); ``from_env``
+# handles these explicitly, so the uniform loop below skips them. Every other
+# scalar field takes its default from ``lcm.<field>`` in config.yaml (if
+# present) before falling back to the dataclass default -- see
+# ``_lcm_yaml_value_with_source``.
 _SOURCE_TRACKED_ENV_FIELDS = frozenset({
-    "fresh_tail_count",
-    "fresh_tail_max_tokens",
-    "leaf_chunk_tokens",
     "context_threshold",
-    "summary_spend_max_calls",
-    "summary_spend_window_seconds",
-    "summary_spend_backoff_seconds",
     "summary_timeout_ms",
 })
 
@@ -780,73 +802,74 @@ class LCMConfig:
     def from_env(cls) -> "LCMConfig":
         """Build config from environment variables (LCM_ prefix)."""
         c = cls()
+        hermes_config = _load_hermes_config_yaml()
         config_sources: dict[str, str] = {}
         config_source_warnings: list[str] = []
 
-        def _record(field: str, source: str, warning: str | None = None) -> None:
+        def _record(field: str, source: str, *warnings: str | None) -> None:
             config_sources[field] = source
-            if warning:
-                config_source_warnings.append(warning)
+            config_source_warnings.extend(warning for warning in warnings if warning)
 
-        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys(hermes_config)
 
-        # Source-tracked fields (provenance recording and/or a computed default)
-        # stay explicit; the uniform loop below skips them.
-        c.fresh_tail_count, source, warning = _parse_int_env_with_source(
-            "LCM_FRESH_TAIL_COUNT", c.fresh_tail_count
+        # Fields with a Hermes-config fallback default (beyond the ordinary
+        # lcm.<field> YAML key) stay explicit; the uniform scalar loop below
+        # handles every other env > lcm.<field> YAML > dataclass-default field.
+        context_default, context_source = _hermes_compression_threshold_with_source(
+            c.context_threshold, hermes_config
         )
-        _record("fresh_tail_count", source, warning)
-        c.fresh_tail_max_tokens, source, warning = _parse_int_env_with_source(
-            "LCM_FRESH_TAIL_MAX_TOKENS", c.fresh_tail_max_tokens
-        )
-        c.fresh_tail_max_tokens = max(0, c.fresh_tail_max_tokens)
-        _record("fresh_tail_max_tokens", source, warning)
-        c.leaf_chunk_tokens, source, warning = _parse_int_env_with_source(
-            "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens
-        )
-        _record("leaf_chunk_tokens", source, warning)
-        context_default, context_source = _hermes_compression_threshold_with_source(c.context_threshold)
-        c.context_threshold, source, warning = _parse_float_env_with_source(
+        c.context_threshold, source, warning = _parse_env_spec_with_source(
             "LCM_CONTEXT_THRESHOLD",
+            float,
             context_default,
             default_source=context_source,
         )
         _record("context_threshold", source, warning)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
-            c.codex_gpt55_autoraise_enabled
+            c.codex_gpt55_autoraise_enabled, hermes_config
         )
         _record("codex_gpt55_autoraise_enabled", source)
-        c.summary_spend_max_calls, source, warning = _parse_int_env_with_source(
-            "LCM_SUMMARY_SPEND_MAX_CALLS",
-            c.summary_spend_max_calls,
-        )
-        _record("summary_spend_max_calls", source, warning)
-        c.summary_spend_window_seconds, source, warning = _parse_float_env_with_source(
-            "LCM_SUMMARY_SPEND_WINDOW_SECONDS",
-            c.summary_spend_window_seconds,
-        )
-        _record("summary_spend_window_seconds", source, warning)
-        c.summary_spend_backoff_seconds, source, warning = _parse_float_env_with_source(
-            "LCM_SUMMARY_SPEND_BACKOFF_SECONDS",
-            c.summary_spend_backoff_seconds,
-        )
-        _record("summary_spend_backoff_seconds", source, warning)
         summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
-            c.summary_timeout_ms
+            c.summary_timeout_ms, hermes_config
         )
-        c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
-            "LCM_SUMMARY_TIMEOUT_MS",
+        yaml_default, yaml_source, yaml_warning = _lcm_yaml_value_with_source(
+            "summary_timeout_ms",
+            int,
             summary_timeout_default,
             default_source=summary_timeout_source,
+            cfg=hermes_config,
         )
-        _record("summary_timeout_ms", source, warning)
+        c.summary_timeout_ms, source, warning = _parse_env_spec_with_source(
+            "LCM_SUMMARY_TIMEOUT_MS",
+            int,
+            yaml_default,
+            default_source=yaml_source,
+        )
+        _record("summary_timeout_ms", source, yaml_warning, warning)
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
+        # Precedence is env > lcm.<field> in config.yaml > dataclass default.
         for spec in ENV_FIELD_SPECS:
             if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
                 continue
-            parser = _PARSER_BY_TYPE[spec.py_type]
-            setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+            yaml_default, yaml_source, yaml_warning = _lcm_yaml_value_with_source(
+                spec.name,
+                spec.py_type,
+                getattr(c, spec.name),
+                cfg=hermes_config,
+            )
+            value, source, warning = _parse_env_spec_with_source(
+                spec.env_key,
+                spec.py_type,
+                yaml_default,
+                default_source=yaml_source,
+            )
+            setattr(c, spec.name, value)
+            _record(spec.name, source, yaml_warning, warning)
+
+        # fresh_tail_max_tokens is a plain scalar override (handled by the
+        # uniform loop above); clamp to a non-negative token cap afterward.
+        c.fresh_tail_max_tokens = max(0, c.fresh_tail_max_tokens)
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")
