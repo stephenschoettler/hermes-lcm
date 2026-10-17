@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 class ModelRoute:
     provider: str | None
     model: str
+    api_mode: str | None = None
 
 
 ProviderResolver = Callable[[str], bool]
@@ -26,7 +27,37 @@ ProviderResolver = Callable[[str], bool]
 # custom providers because Hermes auxiliary routing normalizes ``provider`` the
 # same way, but canonical built-ins such as ``custom:openai-codex/...`` remain
 # model-only to avoid accidentally selecting the built-in provider.
-_PROVIDER_PREFIXES = frozenset({"cerebras"})
+_PROVIDER_PREFIXES = frozenset({"cerebras", "minimax-cn"})
+_ANTHROPIC_MESSAGES_PROVIDER_PREFIXES = frozenset({"minimax-cn"})
+
+
+def _named_custom_provider_api_mode(provider: str) -> str | None:
+    provider = (provider or "").strip().lower()
+    if provider.startswith("custom:"):
+        provider = provider.split(":", 1)[1].strip()
+    if not provider:
+        return None
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        entry = _get_named_custom_provider(provider)
+    except Exception:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    api_mode = entry.get("api_mode")
+    if isinstance(api_mode, str) and api_mode.strip():
+        return api_mode.strip()
+    return None
+
+
+def _route_api_mode(provider: str) -> str | None:
+    provider = (provider or "").strip().lower()
+    if provider.startswith("custom:"):
+        provider = provider.split(":", 1)[1].strip()
+    if provider in _ANTHROPIC_MESSAGES_PROVIDER_PREFIXES:
+        return "anthropic_messages"
+    return _named_custom_provider_api_mode(provider)
 
 
 def _provider_route_is_resolvable(provider: str) -> bool:
@@ -83,7 +114,11 @@ def parse_lcm_model_override(
         route_provider = provider.split(":", 1)[1].strip()
     can_resolve_provider = provider_resolver or _provider_route_is_resolvable
     if sep and rest and route_provider and can_resolve_provider(route_provider):
-        return ModelRoute(provider=route_provider, model=rest)
+        return ModelRoute(
+            provider=route_provider,
+            model=rest,
+            api_mode=_route_api_mode(route_provider),
+        )
 
     return ModelRoute(provider=None, model=model)
 
@@ -95,6 +130,8 @@ def apply_lcm_model_route(call_kwargs: dict, model: str | None) -> None:
         call_kwargs["provider"] = route.provider
     if route.model:
         call_kwargs["model"] = route.model
+    if route.api_mode:
+        call_kwargs["api_mode"] = route.api_mode
     if model and route.model:
         logger.debug(
             "LCM auxiliary model override routed: raw=%r provider=%s model=%s",
