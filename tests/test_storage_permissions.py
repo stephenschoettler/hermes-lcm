@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,17 @@ from hermes_lcm.store import MessageStore, build_message_fts_spec
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="requires POSIX mode semantics")
+
+
+@pytest.fixture(autouse=True)
+def _exercise_worker_syscalls_in_process(monkeypatch):
+    # These tests inject filesystem races through monkeypatched syscalls. Run
+    # the worker's exact code path in-process (worker flag set) so those
+    # injections reach the syscalls the Darwin worker really uses. Separate
+    # process-lock tests exercise the real subprocess isolation path.
+    monkeypatch.setattr(sqlite_util_module, "_permission_worker_required", lambda: False)
+    if sys.platform == "darwin":
+        monkeypatch.setattr(sqlite_util_module, "_IN_PERMISSION_WORKER", True)
 
 
 @contextmanager
