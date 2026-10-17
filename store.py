@@ -522,19 +522,27 @@ class MessageStore:
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                before_commit: Callable[[sqlite3.Connection, List[int]], None] | None = None) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
         before storage, for example to update active replay with raw-payload
         stubs. Direct callers should use ``append_batch`` so storage-boundary
         payload protection cannot be bypassed accidentally.
+
+        ``before_commit`` runs after insertion on this connection, under the
+        same write lock and transaction. A failure rolls back the entire batch.
         """
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
         ids = []
         with self._write_lock, self._conn:
+            if not messages and before_commit is not None and not self._conn.in_transaction:
+                # A proof-only batch still needs a writer reservation before
+                # its callback reads sources and updates metadata.
+                self._conn.execute("BEGIN IMMEDIATE")
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
@@ -564,6 +572,8 @@ class MessageStore:
                     ),
                 )
                 ids.append(cur.lastrowid)
+            if before_commit is not None:
+                before_commit(self._conn, ids)
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:

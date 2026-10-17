@@ -4182,7 +4182,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _is_cached_active_replay_message_at_index(self, idx: int, msg: Dict[str, Any]) -> bool:
         if idx < 0 or idx >= len(self._last_active_replay_messages):
             return False
-        return self._message_replay_identity(msg) == self._message_replay_identity(
+        return self._message_replay_cache_identity(msg) == self._message_replay_cache_identity(
             self._last_active_replay_messages[idx]
         )
 
@@ -4275,7 +4275,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         active_replay_messages: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         self._last_active_replay_source_identities = [
-            self._message_replay_identity(message) for message in original_messages
+            self._message_replay_cache_identity(message) for message in original_messages
         ]
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
             active_replay_messages
@@ -4292,7 +4292,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         original_messages: List[Dict[str, Any]],
     ) -> Optional[List[Dict[str, Any]]]:
-        identities = [self._message_replay_identity(message) for message in original_messages]
+        identities = [self._message_replay_cache_identity(message) for message in original_messages]
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
@@ -4514,8 +4514,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return self._redact_active_replay_messages(messages)
 
         n = len(messages)
-        cursor = min(max(self._ingest_cursor, 0), n)
-        scan_start = 0 if self._ingest_cursor_needs_reconcile else cursor
+        prior_cursor = min(max(self._ingest_cursor, 0), n)
+        uid_replay = any(self._has_core_identity(message) for message in messages)
+        proven_origins = self._validated_core_origins(messages) if uid_replay else {}
+        expected_origins = dict(proven_origins)
+        cached_identities = getattr(self, "_last_active_replay_source_identities", [])
+        cached_messages = getattr(self, "_last_active_replay_messages", [])
+        legacy_prefix_proven = (
+            uid_replay and not self._ingest_cursor_needs_reconcile and prior_cursor > 0
+            and len(cached_identities) >= prior_cursor and len(cached_messages) >= prior_cursor
+            and [self._message_replay_cache_identity(message) for message in messages[:prior_cursor]]
+            == cached_identities[:prior_cursor]
+        )
+        cursor = 0 if uid_replay else prior_cursor
+        scan_start = 0 if uid_replay or self._ingest_cursor_needs_reconcile else cursor
         ignored_original_messages = [False] * n
         if self._compiled_ignore_message_patterns:
             previous_store_id_map = self._current_compress_store_ids_by_message_id
@@ -4550,7 +4562,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
-        if self._ingest_cursor_needs_reconcile:
+        if legacy_prefix_proven:
+            # Keep the established warm-cursor proof only for identity-free
+            # rows in an unchanged complete prefix. Invalid UID fields never
+            # receive this exemption, and cold/reordered inputs remain unknown.
+            cached_prefix = self._copy_active_replay_messages_preserving_generated_ids(
+                cached_messages[:prior_cursor],
+            )
+            replay_messages = list(replay_messages)
+            for index in range(prior_cursor):
+                if not self._has_core_identity(messages[index]):
+                    replay_messages[index] = cached_prefix[index]
+        if self._ingest_cursor_needs_reconcile and not uid_replay:
             reconcile_messages = [
                 original_msg
                 if (
@@ -4571,7 +4594,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
-        cursor = min(max(self._ingest_cursor, 0), n)
+        cursor = 0 if uid_replay else min(max(self._ingest_cursor, 0), n)
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4582,7 +4605,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 and len(cached_active_replay_messages) >= cursor
             ):
                 current_prefix_identities = [
-                    self._message_replay_identity(message) for message in messages[:cursor]
+                    self._message_replay_cache_identity(message) for message in messages[:cursor]
                 ]
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
@@ -4681,6 +4704,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
                 absolute_idx = cursor + offset
+                if proven_origins.pop(id(original_msg), None) is not None:
+                    continue
+                if legacy_prefix_proven and absolute_idx < prior_cursor and not self._has_core_identity(original_msg):
+                    continue
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
@@ -4831,7 +4858,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             messages_to_store_with_index = kept
 
         if not messages_to_store_with_index:
+            if uid_replay:
+                self._store._append_protected_batch(
+                    self._session_id, [],
+                    before_commit=lambda conn, ids: self._publish_core_origins(
+                        conn, messages, active_replay_messages, [], ids, expected_origins,
+                    ),
+                )
             self._ingest_cursor = n
+            if uid_replay:
+                self._ingest_cursor_needs_reconcile = False
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
@@ -4881,6 +4917,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
+            before_commit=lambda conn, ids: self._publish_core_origins(
+                conn, messages, active_replay_messages, messages_to_store_with_index, ids, expected_origins,
+            ),
         )
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
@@ -4888,6 +4927,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # would let a rebuild publish 'ready' from old sources and omit the leaf
         # (maintainer #388 P1).
         self._ingest_cursor = n
+        if uid_replay:
+            self._ingest_cursor_needs_reconcile = False
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}

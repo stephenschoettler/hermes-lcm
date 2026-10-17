@@ -19,6 +19,7 @@ avoid an import cycle (staticmethod resolution is identical).
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -50,9 +51,154 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_CORE_IDENTITY_FIELDS = ("message_uid", "_absorbed_message_uids", "_tool_call_uids", "_tool_call_uid")
 
 
 class ReconcileMixin:
+    @staticmethod
+    def _has_core_identity(message: Dict[str, Any]) -> bool:
+        return any(key in message for key in _CORE_IDENTITY_FIELDS)
+
+    @staticmethod
+    def _core_message_uid(message: Dict[str, Any]) -> str | None:
+        uid = message.get("message_uid")
+        if not isinstance(uid, str) or not uid:
+            return None
+        if "_absorbed_message_uids" in message:
+            witness = message["_absorbed_message_uids"]
+            if not isinstance(witness, list) or any(not isinstance(v, str) or not v for v in witness):
+                return None
+            if len(witness) != len(set(witness)) or uid in witness:
+                return None
+        if "_tool_call_uids" in message:
+            calls = message["_tool_call_uids"]
+            if not isinstance(calls, dict):
+                return None
+            for call_id, value in calls.items():
+                if not isinstance(call_id, str) or not call_id:
+                    return None
+                values = value if isinstance(value, list) else [value]
+                if not values or any(not isinstance(v, str) or not v for v in values):
+                    return None
+        if "_tool_call_uid" in message:
+            value = message["_tool_call_uid"]
+            if not isinstance(value, str) or not value:
+                return None
+        return uid
+
+    @staticmethod
+    def _core_identity(message: Dict[str, Any]) -> dict:
+        # Keep the actual witness and per-occurrence maps in the fingerprint.
+        # Malformed identity is never coerced into a usable message UID.
+        return {key: message[key] for key in _CORE_IDENTITY_FIELDS if key in message}
+
+    @staticmethod
+    def _core_origin_digest(value: Any) -> str:
+        return hashlib.sha256(json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def _core_output_digest(self, message: Dict[str, Any]) -> str:
+        # Presence and JSON shape matter here; null, empty text and media are
+        # distinct projections. Decoration/cache fields never locate a row.
+        fields = (
+            "role", "content", "name", "tool_name", "tool_call_id", "tool_calls",
+            "reasoning", "reasoning_content", "reasoning_details", "finish_reason",
+            "codex_reasoning_items", "codex_message_items", *_CORE_IDENTITY_FIELDS,
+        )
+        return self._core_origin_digest({key: message[key] for key in fields if key in message})
+
+    def _core_source_digest(self, row: Dict[str, Any]) -> str:
+        return self._core_origin_digest([
+            self._message_replay_identity(row, stored_row=True),
+            {key: row.get(key) for key in ("role", "content", "tool_call_id", "tool_calls", "tool_name")},
+        ])
+
+    def _core_origins_scope(self) -> tuple[str, dict]:
+        core_db = self._state_db_path().resolve()
+        scope = {
+            "version": 1,
+            "profile": str(Path(self._hermes_home).expanduser().resolve() if self._hermes_home else core_db.parent),
+            "session_id": self._session_id,
+            "core_db": str(core_db),
+        }
+        return "core_message_origins:" + self._core_origin_digest(scope), scope
+
+    def _validated_core_origins(self, messages: List[Dict[str, Any]]) -> dict[int, int]:
+        """Join only by scoped host UID, then validate both stored and live views."""
+        key, scope = self._core_origins_scope()
+        state = self._store.read_metadata_json(key)
+        if not isinstance(state, dict) or any(state.get(k) != v for k, v in scope.items()):
+            return {}
+        entries = state.get("origins")
+        if not isinstance(entries, dict):
+            return {}
+        proven = {}
+        consumed = set()
+        for message in messages:
+            uid = self._core_message_uid(message)
+            if uid is None or uid in consumed:
+                continue
+            entry = entries.get(uid)
+            if not isinstance(entry, dict):
+                continue
+            source_id = entry.get("source_id")
+            if type(source_id) is not int or source_id <= 0:
+                continue
+            row = self._store.get(source_id)
+            if (
+                not row or row.get("session_id") != self._session_id
+                or self._core_source_digest(row) != entry.get("source_digest")
+                or self._core_output_digest(message) not in entry.get("output_digests", [])
+            ):
+                continue
+            consumed.add(uid)
+            proven[id(message)] = source_id
+        return proven
+
+    def _publish_core_origins(self, conn, messages, active_messages, indexed_messages, store_ids, expected_origins) -> None:
+        """Publish the active UID bridge in the same transaction as raw append."""
+        if not any(self._has_core_identity(message) for message in messages):
+            return
+        key, scope = self._core_origins_scope()
+        raw = conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+        state = json.loads(raw[0]) if raw and raw[0] else {**scope, "origins": {}}
+        if not isinstance(state, dict) or any(state.get(k) != v for k, v in scope.items()):
+            raise ValueError("Core message origin scope mismatch")
+        if not isinstance(state.get("origins"), dict):
+            raise ValueError("Core message origin map is invalid")
+        mapped = self._validated_core_origins(messages)
+        if any(mapped.get(message_id) != source_id for message_id, source_id in expected_origins.items()):
+            raise ValueError("Core message origins changed during ingest")
+        for (index, _message), source_id in zip(indexed_messages, store_ids):
+            mapped[id(messages[index])] = source_id
+        # A candidate context can be rejected by the host. Its old durable
+        # history may return next turn, so ingestion proof cannot be erased
+        # merely because a speculative active list stopped carrying a UID.
+        origins = dict(state["origins"])
+        for index, message in enumerate(messages):
+            uid = self._core_message_uid(message)
+            source_id = mapped.get(id(message))
+            if uid is None or source_id is None:
+                continue
+            row = self._store.get(source_id)
+            if not row or row.get("session_id") != self._session_id:
+                continue
+            origins[uid] = {
+                "source_id": source_id,
+                "source_digest": self._core_source_digest(row),
+                "output_digests": sorted({
+                    self._core_output_digest(message), self._core_output_digest(active_messages[index]),
+                }),
+            }
+        conn.execute(
+            "INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps({**scope, "origins": origins}, sort_keys=True)),
+        )
+
+    def _message_replay_cache_identity(self, message: Dict[str, Any]) -> tuple:
+        return self._message_replay_identity(message), self._core_origin_digest(self._core_identity(message))
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -963,6 +1109,10 @@ class ReconcileMixin:
         synthetic/carry-over and left unmapped so they cannot steal later stored
         literal copies with the same content.
         """
+        if any(self._has_core_identity(message) for message in messages):
+            # A UID miss must not borrow a content-identical occurrence. Mixed
+            # legacy rows remain unmapped rather than weakening that proof.
+            return self._validated_core_origins(messages)
         candidates: list[Dict[str, Any]] = []
         next_candidate_after = self._last_compacted_store_id
         while True:
