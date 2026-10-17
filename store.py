@@ -327,7 +327,14 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        ingest_protection_config=None,
+        hermes_home: str = "",
+        db_lock: object | None = None,
+    ):
         self.db_path = Path(db_path)
         self._is_memory_database = str(self.db_path) == ":memory:"
         if not self._is_memory_database:
@@ -335,23 +342,8 @@ class MessageStore:
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
-        # ``self._conn`` is shared across threads (the connection is opened with
-        # ``check_same_thread=False``). SQLite's own C-level mutex serializes
-        # statements at the engine layer, but the Python ``sqlite3`` module
-        # releases the GIL while the C call runs. Under heavy thread contention
-        # with concurrent HTTPS clients in the same process, downstream
-        # operators have observed on-disk corruption that is consistent with
-        # external bytes landing inside SQLite's write path (e.g. the first
-        # 28 bytes of the database file replaced with a TLS record header +
-        # ciphertext while the "SQLit" magic remains intact).
-        #
-        # This re-entrant lock is defense-in-depth: it forces all write call
-        # sites that use ``self._conn`` to be serialized at the Python layer,
-        # eliminating any window where Python-side buffer reuse or memory
-        # aliasing could intersect SQLite's flush of a write. It does not
-        # change semantics for single-threaded callers and adds only a single
-        # uncontended ``RLock.acquire``/``release`` pair per operation.
-        self._write_lock = threading.RLock()
+        # One canonical database path uses one lock across all helper bundles.
+        self._write_lock = db_lock or threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -1757,3 +1749,50 @@ class MessageStore:
             self.close()
         except Exception:
             pass
+
+
+def _synchronized(method):
+    """Serialize every operation on the shared SQLite connection."""
+    def locked(self, *args, **kwargs):
+        with self._write_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
+for _method_name in (
+    "append",
+    "append_batch",
+    "_append_protected_batch",
+    "reassign_session_messages",
+    "delete_session_messages",
+    "gc_externalized_tool_result",
+    "pin",
+    "unpin",
+    "get",
+    "get_batch",
+    "scan_evidence_rows",
+    "get_range",
+    "count_session_load_messages",
+    "load_session_page",
+    "load_session_window",
+    "get_session_messages",
+    "get_session_messages_after",
+    "get_session_tail",
+    "get_session_count",
+    "get_session_token_total",
+    "get_source_stats",
+    "scan_session_cleanup_stats",
+    "scan_session_retention_stats",
+    "get_source_normalization_plan",
+    "normalize_legacy_blank_sources",
+    "get_time_bounds",
+    "read_metadata_json",
+    "write_metadata_json",
+    "commit",
+    "backup",
+    "search",
+    "_search_like",
+    "close",
+):
+    setattr(MessageStore, _method_name, _synchronized(getattr(MessageStore, _method_name)))
