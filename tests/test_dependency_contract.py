@@ -35,7 +35,7 @@ def test_dependency_contract_validator_accepts_repository():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "dependency contract valid: version 1.0.4" in result.stdout
+    assert "dependency contract valid: version 1.0.5" in result.stdout
     assert "9 external imports declared" in result.stdout
 
 
@@ -940,7 +940,7 @@ def test_contract_records_host_ownership_versions_and_update_owner():
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
     assert contract["schema_version"] == 1
-    assert contract["contract_version"] == "1.0.4"
+    assert contract["contract_version"] == "1.0.5"
     assert contract["boundary"] == "host-owned"
     assert contract["imported_api_validation"] == "observed-coverage-only"
     assert contract["ownership"]["dependency_resolver"] == "Hermes Agent host environment"

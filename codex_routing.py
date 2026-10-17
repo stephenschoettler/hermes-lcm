@@ -2,12 +2,16 @@
 
 Isolated from ``engine.py`` (WS5 seam) so the Codex-specific routing policy —
 which model slugs are on the ChatGPT Codex OAuth route and what effective
-context window that route enforces — lives in one cohesive place. These are
-pure helpers with no engine state; ``engine.py`` imports them and keeps its own
+context window to budget against — lives in one cohesive place. These helpers
+have no engine state; ``engine.py`` imports them and keeps its own
 policy constants (for example the gpt-5.5 compaction threshold).
 """
 
 from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Only these exact normalized bare slugs have a proven 900k Codex OAuth route.
 # Keep them separate from the family fallbacks below so suffixes and synthetic
@@ -21,10 +25,9 @@ _CODEX_OAUTH_EXACT_CONTEXT_CAPS: dict[str, int] = {
 # ChatGPT Codex OAuth exposes provider-enforced context windows that can be
 # materially lower than the same model slug on direct OpenAI/OpenRouter routes.
 # Hermes Agent resolves these from chatgpt.com/backend-api/codex/models, with
-# this table as its fallback. LCM sees only the host-advertised context_length;
-# when that value was explicitly overridden above the real Codex OAuth window,
-# we still have to budget against the effective provider window or compaction
-# fires too late and provider requests can overflow.
+# the tables here retained as compatibility fallbacks when the host resolver is
+# missing, incompatible, or fails. A successful host resolution takes precedence
+# over these tables, including the host's explicit model_overrides policy.
 _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
@@ -48,19 +51,40 @@ def _is_openai_codex_route(provider: str | None) -> bool:
     return (provider or "").strip().lower() == "openai-codex"
 
 
-def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | None:
-    """Return LCM's best-known Codex OAuth effective context cap.
+def _codex_oauth_context_cap(
+    model: str | None,
+    provider: str | None,
+    *,
+    api_key: str = "",
+) -> int | None:
+    """Resolve the Codex window using Hermes policy, then local fallbacks.
 
-    This intentionally mirrors Hermes Agent's hardcoded fallback policy, not the
-    direct OpenAI model catalog. A host-provided context_length may be a user
-    override or stale cache entry; Codex OAuth still enforces these lower route
-    windows.
+    Hermes' supported resolver honors explicit model_overrides before provider
+    metadata. Its result is not necessarily a live provider-enforced maximum.
+    The engine still preserves any lower raw host context length.
     """
     if not _is_openai_codex_route(provider):
         return None
     bare_model = _bare_model_slug(model)
-    if not bare_model:
+    if not model or not bare_model:
         return None
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        # Preserve the model identifier for exact host model_overrides. Only the
+        # local fallback uses the normalized bare slug. Omit base_url so a
+        # custom endpoint cannot divert resolution away from the Codex provider.
+        resolved = get_model_context_length(
+            model,
+            api_key=api_key or "",
+            provider=(provider or "").strip().lower(),
+        )
+        if isinstance(resolved, int) and not isinstance(resolved, bool) and resolved > 0:
+            return resolved
+    except Exception:
+        # Exceptions from a credential-aware resolver may contain secrets.
+        logger.debug("Hermes Codex context resolver unavailable; using LCM fallback")
+
     exact_cap = _CODEX_OAUTH_EXACT_CONTEXT_CAPS.get(bare_model)
     if exact_cap is not None:
         return exact_cap

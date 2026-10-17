@@ -891,10 +891,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         model: str | None = None,
         provider: str | None = None,
+        api_key: str | None = None,
     ) -> tuple[int, int | None, str]:
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
-        cap = _codex_oauth_context_cap(route_model, route_provider)
+        cap = _codex_oauth_context_cap(
+            route_model,
+            route_provider,
+            api_key=self.api_key if api_key is None else api_key,
+        )
         if cap is not None and raw_context_length > cap:
             return (
                 cap,
@@ -926,6 +931,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source: str,
         model: str | None = None,
         provider: str | None = None,
+        api_key: str | None = None,
     ) -> bool:
         try:
             parsed_context_length = int(context_length)
@@ -954,6 +960,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             parsed_context_length,
             model=model,
             provider=provider,
+            api_key=api_key,
         )
         self.context_length = effective_context_length
         self.effective_context_length_cap = cap
@@ -2278,8 +2285,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     self._set_context_length(
                         parsed_context_length,
                         source="session_start",
-                        model=str(kwargs.get("model") or self.model),
-                        provider=str(kwargs.get("provider") or self.provider),
+                        model=str(kwargs.get("model", self.model) or ""),
+                        provider=str(kwargs.get("provider", self.provider) or ""),
+                        api_key=str(kwargs.get("api_key", self.api_key) or ""),
                     )
                     update_model_is_authoritative = False
         if (
@@ -2295,7 +2303,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return
         if "model" in kwargs:
             self.model = str(kwargs.get("model") or "")
-        route_affects_context = "model" in kwargs or "provider" in kwargs
+        route_affects_context = any(key in kwargs for key in ("model", "provider", "api_key"))
         for key in ("base_url", "api_key", "provider", "api_mode"):
             if key in kwargs:
                 setattr(self, key, str(kwargs.get(key) or ""))
