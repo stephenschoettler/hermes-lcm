@@ -68,7 +68,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        self._preflight_cleanup_only = False
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -129,11 +129,27 @@ class CompactionMixin:
                 messages=replay_messages,
             )
             if cleanup_requested:
+                # Deterministic replay cleanup, including ignored-message
+                # sanitization, may publish below threshold but must not
+                # piggyback summary work. Configured critical pressure still
+                # owes a maintenance pass, so cleanup must not swallow it.
+                critical_maintenance_due = self._critical_budget_pressure_reached(
+                    observed_tokens=replay_rough,
+                    messages=replay_messages,
+                ) and self._should_run_deferred_maintenance(
+                    replay_messages,
+                    observed_tokens=replay_rough,
+                )
                 if (
                     not force_overflow_requested
-                    and self._compression_boundary_cooldown_active()
+                    and not critical_maintenance_due
+                    and (
+                        self._compression_boundary_cooldown_active()
+                        or self.threshold_tokens <= 0
+                        or max(rough, replay_rough) < self.threshold_tokens
+                    )
                 ):
-                    self._preflight_cleanup_only_due_to_boundary_cooldown = True
+                    self._preflight_cleanup_only = True
                 return self._mark_preflight_compression_requested()
             if force_overflow_requested:
                 return self._mark_preflight_compression_requested()
@@ -158,7 +174,18 @@ class CompactionMixin:
                 ),
             )
             if eligible:
-                return self._mark_preflight_compression_requested()
+                if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+                    return self._mark_preflight_compression_requested()
+                self._refresh_raw_backlog_debt(
+                    replay_messages,
+                    observed_tokens=replay_rough,
+                )
+                if self._critical_budget_pressure_reached(
+                    observed_tokens=replay_rough,
+                    messages=replay_messages,
+                ):
+                    return self._mark_preflight_compression_requested()
+                return False
             if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
                 return self._mark_preflight_compression_requested()
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
@@ -169,7 +196,13 @@ class CompactionMixin:
                 logger.info("LCM preflight compression no-op: %s", reason)
                 return False
             self._refresh_raw_backlog_debt(replay_messages, observed_tokens=replay_rough)
-            if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
+            if self._critical_budget_pressure_reached(
+                observed_tokens=replay_rough,
+                messages=replay_messages,
+            ) and self._should_run_deferred_maintenance(
+                replay_messages,
+                observed_tokens=replay_rough,
+            ):
                 return self._mark_preflight_compression_requested()
             return False
         if self._compression_boundary_cooldown_active():
@@ -197,7 +230,13 @@ class CompactionMixin:
             logger.info("LCM preflight compression no-op: %s", reason)
             return False
         self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
-        if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
+        if self._critical_budget_pressure_reached(
+            observed_tokens=rough,
+            messages=messages,
+        ) and self._should_run_deferred_maintenance(
+            messages,
+            observed_tokens=rough,
+        ):
             return self._mark_preflight_compression_requested()
         return False
 
@@ -426,14 +465,13 @@ class CompactionMixin:
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
+        preflight_cleanup_only = bool(
+            self._preflight_cleanup_only and not force_overflow and not force
+        )
+        self._preflight_cleanup_only = False
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
-        cleanup_only_due_to_boundary_cooldown = bool(
-            self._preflight_cleanup_only_due_to_boundary_cooldown
-            and not force_overflow
-        )
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
-        if cleanup_only_due_to_boundary_cooldown:
+        if preflight_cleanup_only:
             sanitized_messages = self._sanitize_active_context_messages(
                 working_messages,
                 insert_missing_tool_stubs=False,
