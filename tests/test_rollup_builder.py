@@ -128,6 +128,24 @@ def test_build_day_uses_newest_source_day_and_mocked_summarizer(rollup_parts):
     assert calls[0][1]["l3_truncate_tokens"] == config.rollup_daily_max_tokens
 
 
+def test_build_day_routes_configured_summary_reasoning_effort(rollup_parts):
+    store, dag, config = rollup_parts
+    scope = "session-reasoning"
+    target_day = date(2026, 7, 15)
+    config.summary_reasoning_effort = "high"
+    _add_node(dag, scope, target_day, "leaf fixture summary")
+    calls = []
+
+    def summarize(text, **kwargs):
+        calls.append((text, kwargs))
+        return "reasoned daily rollup", 1
+
+    result = build_day(store, dag, config, scope, target_day, summarizer=summarize)
+
+    assert result is not None
+    assert calls[0][1]["reasoning_effort"] == "high"
+
+
 def test_build_day_honors_target_and_hard_cap_after_oversize_result(rollup_parts):
     store, dag, config = rollup_parts
     scope = "session-budget"

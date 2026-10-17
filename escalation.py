@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
 
 from . import tokens as _token_module
-from .model_routing import apply_lcm_model_route
+from .model_routing import apply_lcm_model_route, apply_lcm_reasoning_effort
 from .prompt_boundary import build_untrusted_data_messages
 from .tokens import count_tokens
 
@@ -228,7 +228,8 @@ def _sanitize_reasoning_summary(text: str) -> str:
 
 
 def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
-                           model: str = "", timeout: float | None = None) -> Optional[str]:
+                           model: str = "", timeout: float | None = None,
+                           reasoning_effort: str = "") -> Optional[str]:
     """Call the Hermes auxiliary LLM for summarization."""
     try:
         from agent.auxiliary_client import call_llm
@@ -255,6 +256,7 @@ def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
             "max_tokens": max_tokens,
         }
         apply_lcm_model_route(call_kwargs, model)
+        apply_lcm_reasoning_effort(call_kwargs, reasoning_effort)
         if timeout is not None:
             call_kwargs["timeout"] = timeout
         response = call_llm(**call_kwargs)
@@ -274,8 +276,11 @@ def _call_llm_for_summary(prompt: str | list[dict[str, str]], max_tokens: int,
 
 
 def _invoke_summary_llm(prompt: str | list[dict[str, str]], max_tokens: int,
-                        model: str = "", timeout: float | None = None) -> Optional[str]:
+                        model: str = "", timeout: float | None = None,
+                        reasoning_effort: str = "") -> Optional[str]:
     kwargs = {"model": model} if model else {}
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
     if timeout is not None:
         try:
             sig = inspect.signature(_call_llm_for_summary)
@@ -333,6 +338,7 @@ def _invoke_summary_llm_chain(
     model: str = "",
     fallback_models: list[str] | tuple[str, ...] | None = None,
     timeout: float | None = None,
+    reasoning_effort: str = "",
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
@@ -361,6 +367,7 @@ def _invoke_summary_llm_chain(
                 max_tokens,
                 model=candidate_model,
                 timeout=timeout,
+                reasoning_effort=reasoning_effort,
             )
         except Exception as exc:
             logger.warning("LLM summarization failed: %s", exc)
@@ -603,6 +610,7 @@ def summarize_with_escalation(
     depth: int = 0,
     model: str = "",
     timeout: float | None = None,
+    reasoning_effort: str = "",
     l2_budget_ratio: float = 0.50,
     l3_truncate_tokens: int = 512,
     focus_topic: str = "",
@@ -633,6 +641,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        reasoning_effort=reasoning_effort,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
@@ -659,6 +668,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        reasoning_effort=reasoning_effort,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,

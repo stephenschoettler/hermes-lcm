@@ -246,6 +246,7 @@ def _daily_sources(dag: SummaryDAG, scope: str, day: date) -> list[dict[str, obj
 def _summary_controls(config: LCMConfig) -> dict[str, object]:
     return {
         "model": config.summary_model,
+        "reasoning_effort": config.summary_reasoning_effort,
         "timeout": config.summary_timeout_ms / 1000.0,
         "l2_budget_ratio": config.l2_budget_ratio,
         "custom_instructions": config.custom_instructions,
