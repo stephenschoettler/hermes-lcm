@@ -919,6 +919,28 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return assembly_cap
         return context_threshold_tokens
 
+    @staticmethod
+    def _coerce_threshold_tokens_cap(value: Any) -> Optional[int]:
+        """Normalize a ``threshold_tokens`` cap to a positive int, or None for "no cap".
+
+        Mirrors the Hermes core ContextCompressor contract
+        (``agent/context_compressor.py``: ``_coerce_max_tokens`` aliased to
+        ``_coerce_threshold_tokens_cap``). The core live-compression sync
+        (``tui_gateway/session_compression.py``) calls
+        ``cc.threshold_tokens_cap = cc._coerce_threshold_tokens_cap(...)`` on the
+        active compression controller every turn; when LCM is the controller that
+        controller is an LCMEngine, so this method must exist here to avoid the
+        per-turn AttributeError that breaks live compression-config sync.
+
+        Accepts None / str / int (as delivered from config). Non-numeric or
+        non-positive values yield None (no cap).
+        """
+        try:
+            ivalue = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
     def _set_context_length(
         self,
         context_length: Any,
