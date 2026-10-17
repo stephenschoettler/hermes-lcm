@@ -361,6 +361,36 @@ _AUTO_FOCUS_MAX_CHARS = 700
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
+# Canonical provider-visible message keys. Overflow recovery rebuilds the
+# active context from these only; every other key on an incoming message is
+# transport-replayed provider metadata (``reasoning``, ``codex_reasoning_items``,
+# ``codex_message_items``, ...) that count_message_tokens deliberately does
+# not model — keeping it would break the recovery cap in the provider-visible
+# payload (PR #533 review).
+_RECOVERY_CANONICAL_MESSAGE_KEYS = (
+    "role",
+    "name",
+    "content",
+    "tool_calls",
+    "tool_call_id",
+)
+
+
+def _strip_replay_metadata_for_recovery_message(
+    message: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of *message* keeping only canonical provider keys.
+
+    Non-dict input passes through untouched (defensive, matches the
+    tolerance of the message estimator). Messages that already carry only
+    canonical keys are returned as-is — no copy, no mutation.
+    """
+    if not isinstance(message, dict):
+        return message
+    if not (set(message) - set(_RECOVERY_CANONICAL_MESSAGE_KEYS)):
+        return message
+    return {key: message[key] for key in _RECOVERY_CANONICAL_MESSAGE_KEYS if key in message}
+
 
 def _normalize_total_compactions(value: Any) -> int:
     """Return a persisted compaction total only when it is a valid counter."""
@@ -6023,6 +6053,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         result = []
 
+        # An assembly_cap_override is the forced-overflow-recovery signature:
+        # every caller that passes one is rebuilding the context under
+        # recovery pressure. Project the inputs onto canonical message keys
+        # here so the recovery guarantee holds no matter which entry point
+        # (_assemble_overflow_recovery_context, the post-leaf-compaction
+        # assembly in compaction.py) reached this method — replay metadata
+        # that count_message_tokens does not model must not survive into a
+        # payload assembled against the cap. Normal (override-less) assembly
+        # never strips: replay fields are the host's business there.
+        if assembly_cap_override is not None:
+            system_msg = _strip_replay_metadata_for_recovery_message(system_msg)
+            tail_messages = [
+                _strip_replay_metadata_for_recovery_message(msg)
+                for msg in tail_messages
+            ]
+
         # Leading anchor with optional LCM annotation. Only a true system prompt
         # is a safe permanent anchor; gateway sessions can start directly with
         # user messages, and those user turns must remain compactable.
@@ -6275,15 +6321,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         observed_tokens: Optional[int] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[int]:
-        assembly_cap = self._effective_assembly_token_cap()
-        if assembly_cap is None:
-            return None
-        if messages is None or observed_tokens is None or observed_tokens <= 0:
-            return assembly_cap
+        """Return the cap used while rebuilding the provider-visible context.
 
-        message_tokens = count_messages_tokens(messages)
-        overhead_tokens = max(0, observed_tokens - message_tokens)
-        return max(1, assembly_cap - overhead_tokens)
+        ``observed_tokens`` is a pressure signal from the host.  It is not a
+        message-only count: Hermes may include system prompts, tool schemas,
+        and provider replay metadata that LCM's message estimator deliberately
+        does not model.  Subtracting ``observed_tokens - message_tokens``
+        therefore treats estimator skew as fixed assembly overhead and can
+        collapse a normal cap to one token.  Headroom for non-message payloads
+        belongs in ``reserve_tokens_floor`` (or an explicit cap), so recovery
+        must use the configured message-assembly cap unchanged.
+        """
+        assembly_cap = self._effective_assembly_token_cap()
+        return assembly_cap
 
     def _effective_assembly_token_cap(self) -> Optional[int]:
         """Return the active assembly cap, if any.
@@ -6321,6 +6371,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        # Recovery rebuilds the provider-visible payload from canonical
+        # message parts only. Transports replay provider metadata such as
+        # ``reasoning`` / ``codex_reasoning_items`` / ``codex_message_items``
+        # alongside each message; count_message_tokens does not count them,
+        # so retaining them would let a recovered context that measured at
+        # the cap ship a payload far past it and re-overflow on the next
+        # request. Copies, never mutates the caller's dicts.
+        system_msg = _strip_replay_metadata_for_recovery_message(system_msg)
+        tail_messages = [
+            _strip_replay_metadata_for_recovery_message(msg) for msg in tail_messages
+        ]
         if tail_messages:
             first = tail_messages[0]
             content = first.get("content") or ""
