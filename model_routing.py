@@ -26,7 +26,7 @@ ProviderResolver = Callable[[str], bool]
 # custom providers because Hermes auxiliary routing normalizes ``provider`` the
 # same way, but canonical built-ins such as ``custom:openai-codex/...`` remain
 # model-only to avoid accidentally selecting the built-in provider.
-_PROVIDER_PREFIXES = frozenset({"cerebras"})
+_PROVIDER_PREFIXES = frozenset({"cerebras", "minimax"})
 
 
 def _provider_route_is_resolvable(provider: str) -> bool:
