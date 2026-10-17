@@ -31,6 +31,16 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def _record_committed_leaf_failure(self, stage: str, started: float) -> None:
+        """Count durable leaf progress while preserving the later failure."""
+        self.compression_count += 1
+        self._last_compaction_duration_ms = (time.perf_counter() - started) * 1000.0
+        self._last_compression_status = "partial"
+        self._last_compression_noop_reason = f"{stage}_failed_after_leaf_commit"
+        logger.warning(
+            "LCM leaf committed before %s failed; partial progress retained", stage
+        )
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -352,6 +362,7 @@ class CompactionMixin:
                  focus_topic: Optional[str] = None,
                  force: bool = False) -> List[Dict[str, Any]]:
         """Run compaction and leave a terminal public status on every failure."""
+        count_before = self.compression_count
         try:
             return self._compress_impl(
                 messages,
@@ -360,8 +371,12 @@ class CompactionMixin:
                 force=force,
             )
         except BaseException:
-            self._last_compression_status = "error"
-            self._last_compression_noop_reason = ""
+            if not (
+                self._last_compression_status == "partial"
+                and self.compression_count > count_before
+            ):
+                self._last_compression_status = "error"
+                self._last_compression_noop_reason = ""
             raise
 
     def _compress_impl(self, messages: List[Dict[str, Any]],
@@ -942,12 +957,16 @@ class CompactionMixin:
                     )
                 )
         else:
-            self._maybe_condense(
-                focus_topic=focus_topic,
-                leaf_compacted_this_turn=True,
-                force_overflow=force_overflow,
-                critical_budget_pressure=critical_budget_pressure,
-            )
+            try:
+                self._maybe_condense(
+                    focus_topic=focus_topic,
+                    leaf_compacted_this_turn=True,
+                    force_overflow=force_overflow,
+                    critical_budget_pressure=critical_budget_pressure,
+                )
+            except Exception:
+                self._record_committed_leaf_failure("condensation", _compress_started)
+                raise
 
         # Step 7: Assemble new active context
         self._refresh_raw_backlog_debt(
@@ -963,6 +982,9 @@ class CompactionMixin:
                 working_messages[leading_anchor_count:],
                 assembly_cap_override=recovery_assembly_cap,
             )
+        except Exception:
+            self._record_committed_leaf_failure("assembly", _compress_started)
+            raise
         finally:
             self._pending_context_anchor_messages = None
         self.compression_count += 1
