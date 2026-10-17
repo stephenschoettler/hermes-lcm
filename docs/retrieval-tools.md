@@ -229,7 +229,10 @@ even when the sources still belong to the previous session.
 `lcm_recent` accepts `today`, `yesterday`, `Nd`, `week`, `month`,
 `date:YYYY-MM-DD`, and `last Nh`. All periods are normalized to UTC `[start,
 end)` windows. Results are newest-first, limited to 200 sections, and bounded to
-the same 20,000-character response ceiling used by the retrieval tools.
+the same 20,000-character response ceiling used by the retrieval tools. The
+current schema supports only the active conversation: omit `scope` to use the
+default, or pass `scope: "conversation"` explicitly. Cross-session/global
+rollups remain future work.
 
 ```json
 {"period": "today"}
@@ -240,7 +243,7 @@ the same 20,000-character response ceiling used by the retrieval tools.
 ```
 
 ```json
-{"period": "date:2026-07-15", "scope": "global"}
+{"period": "date:2026-07-15", "scope": "conversation"}
 ```
 
 When temporal rollups are enabled and `ready` rollups cover the **entire**
