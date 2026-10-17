@@ -366,7 +366,9 @@ def test_live_stub_adoption_outranks_compression_boundary_cooldown(make_engine):
     assert engine.last_compression_status == "sanitized"
 
 
-def test_flag_off_plain_preflight_cooldown_blocks_threshold_and_overflow(make_engine):
+def test_flag_off_plain_preflight_cooldown_blocks_threshold_but_preserves_overflow(
+    make_engine,
+):
     engine = make_engine(
         large_output_active_replay_stubbing_enabled=False,
         max_assembly_tokens=10,
@@ -376,7 +378,7 @@ def test_flag_off_plain_preflight_cooldown_blocks_threshold_and_overflow(make_en
     messages = [{"role": "user", "content": "plain branch pressure " * 100}]
 
     assert engine._should_force_overflow_recovery(messages=messages) is True
-    assert engine.should_compress_preflight(messages) is False
+    assert engine.should_compress_preflight(messages) is True
 
 
 def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
@@ -390,7 +392,7 @@ def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
     monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
 
     assert engine.should_compress_preflight(messages) is True
-    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
+    assert engine._preflight_cleanup_only is True
 
 
 def test_flag_off_replay_cleanup_cooldown_publishes_without_summary_llm(
@@ -458,6 +460,95 @@ def test_live_stub_cooldown_adoption_skips_eligible_leaf_work(make_engine, monke
     assert any(message.get("content") == "old request with eligible raw backlog" for message in result)
     assert engine._dag.get_session_node_count(engine._session_id) == 0
     assert engine.last_compression_status == "sanitized"
+
+
+def test_live_stub_below_threshold_adoption_skips_eligible_leaf_work(
+    make_engine,
+    monkeypatch,
+):
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    payload = "fresh durable payload with old eligible backlog " * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("subthreshold-eligible-call", payload),
+    ]
+    summary_spy = Mock(return_value=("summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(messages) is True
+    result = engine.compress(messages, current_tokens=1_000)
+
+    assert assembled_tool(result, "subthreshold-eligible-call")["content"].startswith(
+        "[Externalized tool output:"
+    )
+    assert any(message.get("content") == "old request with eligible raw backlog" for message in result)
+    assert engine._dag.get_session_node_count(engine._session_id) == 0
+    assert engine.last_compression_status == "sanitized"
+    summary_spy.assert_not_called()
+
+
+def test_below_threshold_cleanup_handoff_honors_explicit_force(make_engine, monkeypatch):
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    payload = "fresh durable payload with old eligible backlog " * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("forced-eligible-call", payload),
+    ]
+    summary_spy = Mock(
+        return_value=("forced summary\nExpand for details about: old work", 1)
+    )
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(messages) is True
+    assert engine._preflight_cleanup_only is True
+    result = engine.compress(messages, current_tokens=1_000, force=True)
+
+    assert assembled_tool(result, "forced-eligible-call")["content"].startswith(
+        "[Externalized tool output:"
+    )
+    assert engine._dag.get_session_node_count(engine._session_id) == 1
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
+def test_failed_cleanup_only_ingest_does_not_poison_later_threshold_compaction(
+    make_engine,
+    monkeypatch,
+):
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("failed-cleanup-call", "fresh durable payload " * 100),
+    ]
+    real_ingest = engine._ingest_messages
+
+    assert engine.should_compress_preflight(messages) is True
+
+    def fail_second_ingest(_messages):
+        raise RuntimeError("second ingest failed")
+
+    monkeypatch.setattr(engine, "_ingest_messages", fail_second_ingest)
+    with pytest.raises(RuntimeError, match="second ingest failed"):
+        engine.compress(messages, current_tokens=1_000)
+
+    summary_spy = Mock(return_value=("threshold summary", 1))
+    monkeypatch.setattr(engine, "_ingest_messages", real_ingest)
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+    engine.threshold_tokens = 1
+
+    engine.compress(messages, current_tokens=1_000)
+
+    assert engine._dag.get_session_node_count(engine._session_id) == 1
+    summary_spy.assert_called()
 
 
 def test_live_interceptor_converges_when_no_leaf_is_eligible(make_engine):
