@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+import copy
 
 
 def _synchronized(method):
@@ -78,6 +79,58 @@ class LifecycleStateStore:
         run_versioned_migrations(self._conn)
         self._conn.commit()
 
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if closed.
+
+        close() nulls self._conn, and a shallow-copied sibling or GC path can
+        close the same underlying handle underneath this store. Before this
+        guard any later query raised AttributeError: 'NoneType' object has no
+        attribute 'execute' permanently. Lazy reconnection here keeps the
+        store usable; the connection property stays honest (it does not
+        reconnect).
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            # A closed sqlite3 connection is still a truthy object, so probe it
+            # and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        self._init_db()
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy state but never the DB handle or locks.
+
+        Default deepcopy would pickle the sqlite3.Connection (TypeError) or a
+        shallow copy would share it so the copy's GC could close the original's
+        live handle. The copy gets _conn=None and fresh locks; it lazily
+        reconnects on first use via _ensure_connection.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                new_store.__dict__[name] = None
+            elif callable(getattr(value, "acquire", None)) and callable(
+                getattr(value, "release", None)
+            ):
+                # Re-allocate any lock object (RLock/Lock) so the copy does not
+                # share the original's lock. Use the same class rather than a
+                # hard-coded threading reference (the runtime may patch it).
+                new_store.__dict__[name] = type(value)()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        return new_store
+
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
@@ -106,7 +159,7 @@ class LifecycleStateStore:
         return getattr(self, "_conn", None)
 
     def row_count(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()
+        row = self._ensure_connection().execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()
         return int(row["count"] if row else 0)
 
     def _row_to_state(self, row: sqlite3.Row | None) -> LifecycleState | None:
@@ -132,7 +185,7 @@ class LifecycleStateStore:
     def get_by_conversation(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT * FROM lcm_lifecycle_state WHERE conversation_id = ?",
             (conversation_id,),
         ).fetchone()
@@ -141,7 +194,7 @@ class LifecycleStateStore:
     def get_by_session(self, session_id: str | None) -> LifecycleState | None:
         if not session_id:
             return None
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             """
             SELECT *
             FROM lcm_lifecycle_state
@@ -205,7 +258,7 @@ class LifecycleStateStore:
             )
             last_reset_at = existing.last_reset_at
 
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             INSERT INTO lcm_lifecycle_state(
                 conversation_id,
@@ -255,7 +308,7 @@ class LifecycleStateStore:
                 now,
             ),
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
         state = self.get_by_conversation(conversation_id)
         assert state is not None
         return state
@@ -280,7 +333,7 @@ class LifecycleStateStore:
             int(frontier_store_id or 0),
             state.last_finalized_frontier_store_id,
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             UPDATE lcm_lifecycle_state
             SET current_session_id = ?,
@@ -303,7 +356,7 @@ class LifecycleStateStore:
                 state.conversation_id,
             ),
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
         return self.get_by_conversation(state.conversation_id)
 
     @_synchronized
@@ -328,7 +381,7 @@ class LifecycleStateStore:
             int(finalized_frontier_store_id or 0),
             state.last_finalized_frontier_store_id if state else 0,
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             INSERT INTO lcm_lifecycle_state(
                 conversation_id,
@@ -365,7 +418,7 @@ class LifecycleStateStore:
                 now,
             ),
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
         updated = self.get_by_conversation(conversation_id)
         assert updated is not None
         return updated
@@ -377,7 +430,7 @@ class LifecycleStateStore:
         mismatch is corrupt, and it never rewrites lifecycle, message, DAG, or
         Hermes host state. Repair/cleanup flows must stay explicit and separate.
         """
-        conn = self._conn
+        conn = self._ensure_connection()
         assert conn is not None
 
         def _count(query: str, params: tuple[Any, ...] = ()) -> int:
@@ -613,7 +666,7 @@ class LifecycleStateStore:
         if state is None:
             return None
         now = time.time()
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             UPDATE lcm_lifecycle_state
             SET debt_kind = ?,
@@ -624,7 +677,7 @@ class LifecycleStateStore:
             """,
             (kind, max(0, int(size_estimate or 0)), now, now, conversation_id),
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
         return self.get_by_conversation(conversation_id)
 
     def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
@@ -634,7 +687,7 @@ class LifecycleStateStore:
         if state is None:
             return None
         now = time.time()
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             UPDATE lcm_lifecycle_state
             SET debt_kind = NULL,
@@ -645,7 +698,7 @@ class LifecycleStateStore:
             """,
             (now, now, conversation_id),
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
@@ -656,7 +709,7 @@ class LifecycleStateStore:
         if state is None:
             return None
         now = time.time()
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             UPDATE lcm_lifecycle_state
             SET last_maintenance_attempt_at = ?,
@@ -665,7 +718,7 @@ class LifecycleStateStore:
             """,
             (now, now, conversation_id),
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
@@ -676,7 +729,7 @@ class LifecycleStateStore:
         if state is None:
             return None
         now = time.time()
-        self._conn.execute(
+        self._ensure_connection().execute(
             """
             UPDATE lcm_lifecycle_state
             SET last_reset_at = ?,
@@ -688,7 +741,7 @@ class LifecycleStateStore:
             """,
             (now, now, now, conversation_id),
         )
-        self._conn.commit()
+        self._ensure_connection().commit()
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
@@ -716,7 +769,7 @@ class LifecycleStateStore:
         Returns:
             Number of rows deleted.
         """
-        conn = self._conn
+        conn = self._ensure_connection()
         assert conn is not None
         protected = {str(s) for s in (protected_session_ids or ()) if s}
 
@@ -821,7 +874,7 @@ class LifecycleStateStore:
         protected = {str(s) for s in (protected_session_ids or ()) if s}
         deleted = 0
         skipped = 0
-        rows = self._conn.execute("SELECT * FROM lcm_lifecycle_state").fetchall()
+        rows = self._ensure_connection().execute("SELECT * FROM lcm_lifecycle_state").fetchall()
         for row in rows:
             refs = {
                 str(value)
@@ -834,7 +887,7 @@ class LifecycleStateStore:
                 skipped += 1
                 continue
             if refs <= candidates:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "DELETE FROM lcm_lifecycle_state WHERE conversation_id = ?",
                     (row["conversation_id"],),
                 )
@@ -842,7 +895,7 @@ class LifecycleStateStore:
                 continue
             skipped += 1
         if deleted:
-            self._conn.commit()
+            self._ensure_connection().commit()
         return deleted, skipped
 
     def advance_frontier(
@@ -858,7 +911,7 @@ class LifecycleStateStore:
             if state is None or state.current_session_id != session_id:
                 return state
             now = time.time()
-            conn = self._conn
+            conn = self._ensure_connection()
             assert conn is not None
             # MAX() in SQL keeps the advance monotonic even if a concurrent
             # writer bumped the frontier between the read above and this write.
