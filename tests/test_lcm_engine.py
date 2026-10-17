@@ -25496,6 +25496,51 @@ class TestEngineTools:
                 {"query": "docker", "prompt": "What was the plan?"},
             )
 
+    def test_handle_expand_query_malformed_synthesis_response_is_degraded(self, engine, monkeypatch):
+        """An error-shaped auxiliary response (no usable ``choices``) must degrade
+        like a timeout, not fail the whole call with an opaque TypeError."""
+        engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
+        node_id = engine._dag.add_node(
+            SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary="Docker rollout summary",
+                token_count=10,
+                source_token_count=20,
+                source_ids=[1],
+                source_type="messages",
+                created_at=0,
+            )
+        )
+
+        class _ErrorShaped:
+            choices = None
+            error = "upstream busy"
+
+        import types
+
+        # Minimal agent.auxiliary_client for CI, where hermes-agent is only stubbed.
+        agent_mod = sys.modules.get("agent") or types.ModuleType("agent")
+        aux_mod = types.ModuleType("agent.auxiliary_client")
+        aux_mod.call_llm = lambda **kwargs: _ErrorShaped()
+        agent_mod.auxiliary_client = aux_mod
+        monkeypatch.setitem(sys.modules, "agent", agent_mod)
+        monkeypatch.setitem(sys.modules, "agent.auxiliary_client", aux_mod)
+
+        result = json.loads(
+            engine.handle_tool_call(
+                "lcm_expand_query",
+                {"query": "docker", "prompt": "What was the plan?"},
+            )
+        )
+
+        assert result["degraded"] is True
+        assert "synthesis unavailable" in result["error"]
+        assert "no choices" in result["error"]
+        assert result["node_ids"] == [node_id]
+        assert result["matches"]
+        assert "answer" not in result
+
     def test_handle_expand_query_blank_synthesis_is_not_false_success(self, engine, monkeypatch):
         engine._store.append("test-session", {"role": "user", "content": "Discussed docker rollout plan"})
         node_id = engine._dag.add_node(
