@@ -408,6 +408,7 @@ moved back to that assistant even when doing so exceeds a configured bound.
 | `LCM_IGNORE_MESSAGE_PATTERNS` | empty | Comma-separated regex patterns; matching message content is excluded from LCM storage |
 | `LCM_SENSITIVE_PATTERNS_ENABLED` | `false` | Opt in to deterministic redaction before LCM storage, FTS indexing, summarization, active replay, and externalized ingest payloads |
 | `LCM_SENSITIVE_PATTERNS` | `api_key,bearer_token,password_assignment,private_key` | Comma-separated named sensitive pattern catalog entries to apply when redaction is enabled |
+| `LCM_SENSITIVE_RETAIN_RAW_CONTENT` | `false` | Retain the pre-redaction message text in a separate non-indexed `messages.content_raw` column so a pattern false positive is recoverable |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Store oversized ingest payloads, including tool results, media blocks, and generic raw content, in plugin-managed JSON files |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Externalization threshold for normalized payload text |
 | `LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED` | `false` | Replace token-heavy textual tool results with recoverable externalized refs in active replay; current-turn ingest is immediate and historical assembly respects the protected fresh tail; requires large-output externalization |
@@ -452,11 +453,46 @@ Supported named catalog entries are:
   assignments or JSON keys, including quoted values with spaces.
 - `private_key`: PEM private-key blocks.
 
+The three keyword patterns anchor on a credential-ish name plus a separator, so
+the matched value is additionally checked for credential shape before it is
+replaced. A value is left alone when it is environment-variable indirection
+(`os.environ.get(...)`, `process.env.X`, `$VAR`, `${VAR}`), a config or docs
+template (`${{ secrets.X }}`, `{{ vault_x }}`, `<your-key-here>`, `!secret x`,
+`YOUR_*`, `CHANGEME`), or a plain code reference (`settings.openai_api_key`,
+`user_password`, `apiKeyFromContext`). Values that clear the check need real
+entropy: mixed letters and digits, a multi-word passphrase, or credential
+punctuation an identifier cannot carry. `private_key` is PEM-anchored and
+self-validating, so it is not shape-checked.
+
 Redaction is forward-only. Enabling it does not rewrite existing SQLite rows,
 FTS shadow tables, DAG summaries, or externalized payload JSON that were written
 before the setting was enabled. Non-password placeholders include a short
 truncated SHA-256 digest for correlation. `password_assignment` placeholders omit
 the digest to avoid making password-like values easier to dictionary-check.
+
+#### Retaining pre-redaction content
+
+No pattern set is perfect, and redaction runs on the ingest write path, so a
+false positive would otherwise destroy ordinary text permanently. Setting
+`LCM_SENSITIVE_RETAIN_RAW_CONTENT=true` alongside
+`LCM_SENSITIVE_PATTERNS_ENABLED=true` keeps the original text in a separate
+`messages.content_raw` column:
+
+- `messages.content` is unchanged and still holds only the redacted form, so
+  FTS, search, summarization, active replay and externalization behave exactly
+  as they do today. Raw text is never indexed and never searchable.
+- `content_raw` is written only for rows a sensitive pattern actually rewrote.
+  Unmatched messages cost nothing.
+- The column is added lazily on first use and recorded with the named
+  `sensitive_raw_content_v1` migration marker, so `SCHEMA_VERSION` is unchanged
+  and an install with the setting off stays readable by a base build.
+- Read it back with `MessageStore.get_raw_content(store_id)`, which returns
+  `None` when nothing was retained.
+
+This is off by default. It is the right choice when transcript fidelity matters
+more than the store never holding a matched secret, and the wrong one when the
+store must not contain credential text at all.
+
 `lcm_status`, `lcm_inspect`, and `lcm_doctor` expose the enabled state, configured pattern names,
 unknown names, source, and placeholder format without exposing raw secret values.
 

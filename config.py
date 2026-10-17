@@ -352,6 +352,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
         float,
     ),
     _EnvFieldSpec("sensitive_patterns_enabled", "LCM_SENSITIVE_PATTERNS_ENABLED", bool),
+    _EnvFieldSpec("sensitive_retain_raw_content", "LCM_SENSITIVE_RETAIN_RAW_CONTENT", bool),
     _EnvFieldSpec("large_output_externalization_enabled", "LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED", bool),
     _EnvFieldSpec("large_output_externalization_threshold_chars", "LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS", int),
     _EnvFieldSpec("large_output_externalization_path", "LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH", str),
@@ -555,6 +556,15 @@ class LCMConfig:
     )
     # Diagnostics: where the sensitive pattern list came from.
     sensitive_patterns_source: str = "default"
+    # When enabled together with sensitive_patterns_enabled, the unredacted
+    # message content is retained in a separate, non-indexed `content_raw`
+    # column so a pattern false positive is a rendering annoyance rather than
+    # permanent data loss. `messages.content` still holds only the redacted
+    # form, so FTS, search, summarization, active replay and externalization
+    # are unchanged. Off by default: retaining raw text is a deliberate choice
+    # for operators who care more about transcript fidelity than about the
+    # store never holding a matched secret.
+    sensitive_retain_raw_content: bool = False
 
     # -- Large tool-output externalization ---
     # When enabled, oversized tool results are written to plugin-managed storage

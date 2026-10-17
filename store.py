@@ -26,11 +26,17 @@ from .db_bootstrap import (
     add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
+    mark_migration_step_complete,
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
 from .config import LCMConfig
-from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
+from .ingest_protection import (
+    SENSITIVE_RAW_CONTENT_KEY,
+    protect_message_for_ingest,
+    protect_messages_for_ingest,
+    sensitive_raw_content_retention_enabled,
+)
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -454,6 +460,73 @@ class MessageStore:
             "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
         )
 
+    def _ensure_content_raw_column(self) -> None:
+        """Add the non-indexed ``content_raw`` retention column.
+
+        Materialized lazily on the enabled path and recorded with the named
+        ``sensitive_raw_content_v1`` migration marker, the same shape the
+        temporal-rollup and embedding features use. It deliberately does not
+        advance ``SCHEMA_VERSION``: an install with retention off stays at the
+        v5 shape and stays readable by a base build.
+
+        The column is NOT indexed by ``messages_fts`` (the FTS spec indexes
+        ``content`` only) and has no index of its own, so retained raw text is
+        never searchable and never reaches a query path that only knows about
+        ``content``.
+        """
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "content_raw" in columns:
+            return
+        add_column_if_missing(
+            self._conn, columns, "content_raw",
+            "ALTER TABLE messages ADD COLUMN content_raw TEXT",
+        )
+        mark_migration_step_complete(self._conn, "sensitive_raw_content_v1")
+        self._conn.commit()
+
+    def _content_raw_column_present(self) -> bool:
+        return any(
+            row[1] == "content_raw"
+            for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        )
+
+    def _retained_raw_content(self, msg: Dict[str, Any]) -> str | None:
+        """Pop the raw-content sidecar, provisioning the column on first use.
+
+        Must be called OUTSIDE an open write transaction: provisioning the
+        column commits, which would end a caller's transaction early.
+        """
+        raw = msg.pop(SENSITIVE_RAW_CONTENT_KEY, None)
+        if raw is None:
+            return None
+        if not sensitive_raw_content_retention_enabled(self._ingest_protection_config):
+            return None
+        self._ensure_content_raw_column()
+        return raw
+
+    def _retained_raw_contents(self, messages: List[Dict[str, Any]]) -> List[str | None]:
+        """Pop the raw-content sidecar from a batch before the write opens."""
+        return [self._retained_raw_content(msg) for msg in messages]
+
+    def get_raw_content(self, store_id: int) -> str | None:
+        """Return the pre-redaction content for ``store_id``, if retained.
+
+        ``None`` means no raw text is available: retention was off when the row
+        was written, no sensitive pattern matched it (in which case ``content``
+        is already the original text), or the column does not exist. Callers
+        that want "the best available text" should fall back to ``content``.
+        """
+        if not self._content_raw_column_present():
+            return None
+        row = self._conn.execute(
+            "SELECT content_raw FROM messages WHERE store_id = ?", (store_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0]
+
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
@@ -470,6 +543,7 @@ class MessageStore:
         tc_json = json.dumps(tool_calls) if tool_calls else None
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
+        raw_content = self._retained_raw_content(msg)
 
         with self._write_lock:
             cur = self._conn.execute(
@@ -495,8 +569,18 @@ class MessageStore:
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
+            store_id = cur.lastrowid
+            if raw_content is not None:
+                # Written as a separate UPDATE so the INSERT column list, and
+                # therefore the msg_fts_insert trigger, is untouched. The
+                # msg_fts_update trigger fires only on UPDATE OF content, so
+                # this does not disturb the FTS index either.
+                self._conn.execute(
+                    "UPDATE messages SET content_raw = ? WHERE store_id = ?",
+                    (raw_content, store_id),
+                )
             self._conn.commit()
-            return cur.lastrowid
+            return store_id
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -534,8 +618,11 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
+        # Pop the sidecars (and provision the column) before the transaction
+        # opens: `_ensure_content_raw_column` commits.
+        raw_contents = self._retained_raw_contents(messages)
         with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
+            for msg, est, raw_content in zip(messages, token_estimates, raw_contents):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
@@ -563,6 +650,11 @@ class MessageStore:
                         "host_message_timestamp" if observed_at is not None else None,
                     ),
                 )
+                if raw_content is not None:
+                    self._conn.execute(
+                        "UPDATE messages SET content_raw = ? WHERE store_id = ?",
+                        (raw_content, cur.lastrowid),
+                    )
                 ids.append(cur.lastrowid)
         return ids
 
