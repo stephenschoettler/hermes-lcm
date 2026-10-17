@@ -3,9 +3,12 @@
 Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
+import os
 import sys
 import importlib
 from pathlib import Path
+
+import pytest
 
 # Make the repo root importable (for agent.context_engine etc.)
 repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
@@ -47,3 +50,25 @@ if pkg_name not in sys.modules:
                 sub_spec.loader.exec_module(sub_mod)
             except Exception:
                 pass  # some modules may fail (e.g. engine needs agent)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_lcm_env(monkeypatch):
+    """Run every test against LCMConfig defaults, not the developer's shell.
+
+    Production code reads ambient configuration through ``LCMConfig.from_env()``
+    (engine, vector store, and the import/backfill scripts). Hermes exports its
+    own ``LCM_*`` settings into any shell that sources ``~/.hermes/.env``, so
+    without this fixture the suite silently tests whatever the current machine
+    happens to be configured for: the same commit passes or fails depending on
+    the environment it runs in, and CI cannot reproduce a local failure.
+
+    Concretely, ``LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED=1`` in the ambient
+    env flips whole-message externalization on, so the lossless-import tests
+    saw a ``media_payload`` covering the entire message instead of the expected
+    payload-only ``ingest_payload``, and failed on content they never set.
+
+    Tests that want a specific value set it explicitly with monkeypatch.setenv.
+    """
+    for name in [key for key in os.environ if key.startswith("LCM_")]:
+        monkeypatch.delenv(name, raising=False)
