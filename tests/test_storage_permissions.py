@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -74,6 +76,123 @@ def _assert_searchable_store_integrity(store: MessageStore) -> None:
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
+@pytest.fixture(params=["path-descriptor", "regular-descriptor"])
+def chmod_descriptor(request, monkeypatch):
+    """Run a permission test through both artifact chmod strategies."""
+    if request.param == "path-descriptor":
+        if not sqlite_util_module._CHMOD_THROUGH_PATH_DESCRIPTOR:
+            pytest.skip("requires O_PATH and /proc/self/fd")
+    else:
+        monkeypatch.setattr(sqlite_util_module, "_CHMOD_THROUGH_PATH_DESCRIPTOR", False)
+    return request.param
+
+
+def _hold_wal_connection(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE held (value TEXT)")
+    conn.execute("INSERT INTO held VALUES ('held')")
+    conn.commit()
+    assert conn.execute("SELECT count(*) FROM held").fetchone()[0] == 1
+    return conn
+
+
+def _run_permission_helper(helper: str, db_path: Path) -> MessageStore | None:
+    if helper == "prepare":
+        sqlite_util_module._prepare_private_sqlite_file(db_path)
+    elif helper == "restrict":
+        sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+    else:
+        return MessageStore(db_path)
+    return None
+
+
+def _assert_wal_survives_other_process_close(db_path: Path, held: sqlite3.Connection) -> None:
+    """Another process closing its last connection must not delete the live WAL.
+
+    If this process's POSIX locks were released, the other process believes it
+    holds the last connection, checkpoints, and unlinks -wal/-shm while
+    ``held`` still uses them; a fresh connection then pairs the orphaned index
+    with a new WAL and fails with ``disk I/O error``.
+    """
+    sidecars = [db_path.with_name(db_path.name + suffix) for suffix in ("-wal", "-shm")]
+    before = [os.stat(sidecar).st_ino for sidecar in sidecars]
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sqlite3, sys\n"
+            "conn = sqlite3.connect(sys.argv[1])\n"
+            "conn.execute(\"INSERT INTO held VALUES ('other process')\")\n"
+            "conn.commit()\n"
+            "conn.close()\n",
+            str(db_path),
+        ],
+        check=True,
+        timeout=60,
+    )
+
+    assert [sidecar.exists() for sidecar in sidecars] == [True, True]
+    assert [os.stat(sidecar).st_ino for sidecar in sidecars] == before
+    held.execute("INSERT INTO held VALUES ('held again')")
+    held.commit()
+    fresh = sqlite3.connect(db_path)
+    try:
+        assert fresh.execute("SELECT count(*) FROM held").fetchone()[0] == 3
+        assert fresh.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    finally:
+        fresh.close()
+
+
+@pytest.mark.parametrize("helper", ["prepare", "restrict", "message_store"])
+def test_permission_helpers_keep_sqlite_locks_on_private_database(
+    tmp_path,
+    helper,
+    chmod_descriptor,
+):
+    db_path = tmp_path / "lcm.db"
+    with _process_umask(0o077):
+        held = _hold_wal_connection(db_path)
+    store = None
+    try:
+        store = _run_permission_helper(helper, db_path)
+
+        _assert_private_sqlite_artifacts(db_path)
+        _assert_wal_survives_other_process_close(db_path, held)
+    finally:
+        if store is not None:
+            store.close()
+        held.close()
+
+
+@pytest.mark.skipif(
+    not sqlite_util_module._CHMOD_THROUGH_PATH_DESCRIPTOR,
+    reason="tightening without a lock-releasing close requires O_PATH and /proc/self/fd",
+)
+@pytest.mark.parametrize("helper", ["prepare", "restrict", "message_store"])
+def test_permission_helpers_tighten_loose_database_without_releasing_sqlite_locks(
+    tmp_path,
+    helper,
+):
+    db_path = tmp_path / "lcm.db"
+    with _process_umask(0o022):
+        held = _hold_wal_connection(db_path)
+    store = None
+    try:
+        for artifact in _sqlite_artifacts(db_path):
+            if artifact.exists():
+                artifact.chmod(0o644)
+
+        store = _run_permission_helper(helper, db_path)
+
+        _assert_private_sqlite_artifacts(db_path)
+        _assert_wal_survives_other_process_close(db_path, held)
+    finally:
+        if store is not None:
+            store.close()
+        held.close()
+
+
 def test_message_store_creates_private_database_and_sidecars_under_umask_022(tmp_path):
     db_path = tmp_path / "database" / "lcm.db"
 
@@ -135,7 +254,7 @@ def test_message_store_refuses_created_directory_swap_before_chmod(tmp_path, mon
     assert _mode(unrelated_target) == 0o755
 
 
-def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path):
+def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path, chmod_descriptor):
     db_dir = tmp_path / "existing"
     db_dir.mkdir(mode=0o755)
     db_dir.chmod(0o755)
@@ -167,7 +286,7 @@ def test_message_store_tightens_compatible_existing_database_artifacts(tmp_path)
 
 
 @pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
-def test_message_store_refuses_symlinked_sidecar_before_chmod(tmp_path, suffix):
+def test_message_store_refuses_symlinked_sidecar_before_chmod(tmp_path, suffix, chmod_descriptor):
     db_path = tmp_path / "lcm.db"
     target = tmp_path / "unrelated.txt"
     target.write_text("shared", encoding="utf-8")
@@ -181,7 +300,7 @@ def test_message_store_refuses_symlinked_sidecar_before_chmod(tmp_path, suffix):
 
 
 @pytest.mark.parametrize("suffix", _SQLITE_SIDECAR_SUFFIXES)
-def test_message_store_refuses_hardlinked_sidecar_before_chmod(tmp_path, suffix):
+def test_message_store_refuses_hardlinked_sidecar_before_chmod(tmp_path, suffix, chmod_descriptor):
     db_path = tmp_path / "lcm.db"
     target = tmp_path / "unrelated.txt"
     target.write_text("shared", encoding="utf-8")
@@ -199,6 +318,7 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
     tmp_path,
     monkeypatch,
     link_kind,
+    chmod_descriptor,
 ):
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-wal")
@@ -234,6 +354,7 @@ def test_message_store_refuses_sidecar_link_swap_before_chmod(
 def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
     tmp_path,
     monkeypatch,
+    chmod_descriptor,
 ):
     db_path = tmp_path / "lcm.db"
     sidecar = db_path.with_name(db_path.name + "-journal")
@@ -268,6 +389,7 @@ def test_message_store_refuses_sidecar_replacement_after_open_before_fstat(
 def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
     tmp_path,
     monkeypatch,
+    chmod_descriptor,
 ):
     db_path = tmp_path / "lcm.db"
     _seed_searchable_store(db_path)
@@ -298,6 +420,7 @@ def test_message_store_tolerates_sidecar_disappearing_between_stat_and_open(
 def test_message_store_tolerates_sidecar_unlinked_between_open_and_fstat(
     tmp_path,
     monkeypatch,
+    chmod_descriptor,
 ):
     db_path = tmp_path / "lcm.db"
     _seed_searchable_store(db_path)
