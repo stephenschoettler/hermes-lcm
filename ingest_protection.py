@@ -117,6 +117,19 @@ _INGEST_PLACEHOLDER_RE = re.compile(r"\[Externalized LCM ingest payload:.*?;\s*r
 _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE = re.compile(
     r"\[(?:Externalized|GC'd externalized) (?:tool output|payload):.*?;\s*ref=([^;\]\s]+)\]"
 )
+_SOURCE_LITERAL_ASSIGNMENT_RE = re.compile(
+    r"^\s*(?:(?:\d+[|:])|(?:[+-](?![+-])))?\s*"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\r\n]+\])?\s*=\s*(?:[rubf]{0,2})?[\"']\s*$",
+    re.IGNORECASE,
+)
+_SOURCE_LITERAL_LINE_RE = re.compile(
+    r"^\s*(?:(?:\d+[|:])|(?:[+-](?![+-])))\s*(?:[rubf]{0,2})?[\"']\s*$",
+    re.IGNORECASE,
+)
+_SOURCE_DIFF_LITERAL_RE = re.compile(
+    r"^\s*[+-](?![+-])\s*(?:[rubf]{0,2})?[\"'][^\r\n]*$",
+    re.IGNORECASE,
+)
 _PERSISTED_OUTPUT_TAG = "<persisted-output>"
 _PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 _PERSISTED_OUTPUT_SAVED_TO_RE = re.compile(r"^Full output saved to:\s*(?P<path>.+?)\s*$", re.MULTILINE)
@@ -1595,9 +1608,10 @@ def _append_unique_refs(target: list[str], refs: list[str]) -> None:
 
 def _walk_string_values(value: Any):
     if isinstance(value, str):
-        yield value
         parsed = _maybe_parse_json_string(value)
-        if parsed is not None and not (isinstance(parsed, str) and parsed == value):
+        if parsed is None:
+            yield value
+        else:
             yield from _walk_string_values(parsed)
     elif isinstance(value, dict):
         for key, nested in value.items():
@@ -1675,12 +1689,39 @@ def _looks_like_example_payload_ref(ref: str) -> bool:
     return name.startswith(("example-", "example_", "fake-", "fake_", "dummy-", "dummy_", "placeholder-", "placeholder_"))
 
 
+def _placeholder_line_prefix(text: str, start: int) -> str:
+    separators = (("\n", 1), ("\r", 1), ("\\n", 2), ("\\r", 2))
+    separator_start, separator_length = max(
+        ((text.rfind(token, 0, start), length) for token, length in separators),
+        key=lambda item: item[0],
+    )
+    prefix = text[separator_start + separator_length:start]
+    return re.sub(r"\\+([\"'])", r"\1", prefix)
+
+
+def _is_incidental_source_placeholder(text: str, start: int) -> bool:
+    """Return true when a placeholder match is quoted source/docs, not a recovery ref."""
+    prefix = _placeholder_line_prefix(text, start)
+    if (
+        _SOURCE_LITERAL_ASSIGNMENT_RE.search(prefix)
+        or _SOURCE_LITERAL_LINE_RE.fullmatch(prefix)
+        or _SOURCE_DIFF_LITERAL_RE.fullmatch(prefix)
+    ):
+        return True
+    before = text[:start]
+    if before.count("```") % 2:
+        return True
+    return prefix.count("`") % 2 == 1
+
+
 def _extract_unescaped_externalized_payload_refs(text: str, *, ignore_quoted_spans: bool = False) -> list[str]:
     refs: list[str] = []
     for pattern in (_INGEST_PLACEHOLDER_RE, _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE):
         for match in pattern.finditer(text):
             ref = match.group(1).strip()
             if not _is_basename_ref(ref):
+                continue
+            if _is_incidental_source_placeholder(text, match.start()):
                 continue
             if _looks_like_example_payload_ref(ref) and _is_escaped_placeholder_example(text, match.start()):
                 continue
@@ -1712,15 +1753,22 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
     if is_externalized_ingest_placeholder(stripped) or is_externalized_placeholder(stripped):
         return extract_all_externalized_payload_refs(stripped)
     if field == "tool_calls":
-        refs = _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
         parsed = _maybe_parse_json_string(value)
         if parsed is None:
-            return refs
+            return _extract_unescaped_externalized_payload_refs(value, ignore_quoted_spans=True)
+        # Raw JSON text erases whether a match came from quoted source. Once the
+        # envelope parses, scan decoded values only and keep raw scanning as the
+        # malformed-envelope fallback above.
+        refs: list[str] = []
         for argument in _walk_tool_call_argument_values(parsed):
             if isinstance(argument, str):
-                _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True))
                 parsed_argument = _maybe_parse_json_string(argument)
-                if parsed_argument is not None:
+                if parsed_argument is None:
+                    _append_unique_refs(
+                        refs,
+                        _extract_unescaped_externalized_payload_refs(argument, ignore_quoted_spans=True),
+                    )
+                else:
                     for nested in _walk_string_values(parsed_argument):
                         nested_stripped = nested.strip()
                         if is_externalized_ingest_placeholder(nested_stripped) or is_externalized_placeholder(nested_stripped):
@@ -1755,7 +1803,7 @@ def _refs_for_externalized_integrity_scan(value: str, *, role: str, field: str) 
                 else:
                     _append_unique_refs(refs, _extract_unescaped_externalized_payload_refs(nested, ignore_quoted_spans=True))
         return refs
-    return extract_all_externalized_payload_refs(value)
+    return _extract_unescaped_externalized_payload_refs(value)
 
 
 def scan_externalized_payload_integrity(conn, config, *, hermes_home: str = "", limit: int = 5) -> dict[str, Any]:
