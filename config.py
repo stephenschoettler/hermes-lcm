@@ -371,6 +371,8 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
+    _EnvFieldSpec("rerank_model", "LCM_RERANK_MODEL", str),
+    _EnvFieldSpec("rerank_base_url", "LCM_RERANK_BASE_URL", str),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
     _EnvFieldSpec("recall_scan_max_rows", "LCM_RECALL_SCAN_MAX_ROWS", int),
     _EnvFieldSpec("recall_scan_budget_s", "LCM_RECALL_SCAN_BUDGET_S", float),
@@ -392,6 +394,12 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("embedding_model", "LCM_EMBEDDING_MODEL", str),
     _EnvFieldSpec("embedding_content_policy", "LCM_EMBED_CONTENT_POLICY", str),
     _EnvFieldSpec("ollama_base_url", "LCM_OLLAMA_BASE_URL", str),
+    _EnvFieldSpec(
+        "embedding_base_url", "LCM_EMBEDDING_BASE_URL", str
+    ),
+    _EnvFieldSpec(
+        "embedding_api_key_env", "LCM_EMBEDDING_API_KEY_ENV", str
+    ),
     _EnvFieldSpec("embedding_query_timeout_s", "LCM_EMBEDDING_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("recall_query_timeout_s", "LCM_RECALL_QUERY_TIMEOUT_S", float),
     _EnvFieldSpec("embedding_backfill_timeout_s", "LCM_EMBEDDING_BACKFILL_TIMEOUT_S", float),
@@ -605,10 +613,17 @@ class LCMConfig:
 
     # -- Embeddings (default-off until a provider/model are configured) ---
     embeddings_enabled: bool = False
-    # lcm_recall cross-encoder rerank stage (voyage rerank-2.5-lite over the top
-    # fused candidates). Default-off: recall ships value on RRF order alone, and
-    # rerank is one extra billable API call the operator opts into.
+    # lcm_recall cross-encoder rerank stage for capable providers (Voyage
+    # rerank-2.5-lite, or a Cohere-compatible local endpoint through the
+    # openai-compatible provider). Default-off: recall ships value on RRF order
+    # alone, and rerank is one extra call the operator opts into.
     rerank_enabled: bool = False
+    # Empty preserves the selected provider's rerank default.
+    rerank_model: str = ""
+    # Empty keeps rerank co-located with the embedding endpoint (same
+    # base_url). Set to point rerank at a dedicated endpoint (e.g. a
+    # separate reranker container alongside an embedding server).
+    rerank_base_url: str = ""
     embedding_bounded_scan_rows: int = 2_000
     # Vector storage dtype for NEWLY-registered embedding profiles: float32
     # (default; a stock install keeps summary vectors byte-identical) or int8
@@ -676,12 +691,9 @@ class LCMConfig:
     # otherwise have to lcm_recall by hand. Default-off => byte-identical
     # assembly; when disabled the whole path is skipped before any work.
     proactive_recall_enabled: bool = False
-    # Relevance floor on the lcm_recall composite score. Two regimes:
-    #  - rerank OFF (default): the score is RRF-scale (~0.014-0.05); a single
-    #    top-ranked arm hit is ~0.016, so this floor mainly drops ancient or
-    #    low-ranked hits. The default keeps fresh top-of-arm hits.
-    #  - rerank ON: a cross-encoder relevance in [0,1] dominates the score;
-    #    raise this floor (e.g. ~0.3) for a true semantic gate.
+    # Relevance floor on the lcm_recall composite RRF-scale score (~0.014-0.05).
+    # Reranking only permutes the selected window; it never replaces or splices
+    # cross-encoder relevance scores onto this scale.
     proactive_recall_min_score: float = 0.01
     # Hard token budget for the single injected "relevant memories" block.
     proactive_recall_budget_tokens: int = 500
@@ -710,6 +722,8 @@ class LCMConfig:
     # default in the chunker's normalize_content_policy.
     embedding_content_policy: str = "conversational"
     ollama_base_url: str = "http://localhost:11434"
+    embedding_base_url: str = ""
+    embedding_api_key_env: str = "LCM_EMBEDDING_API_KEY"
     embedding_query_timeout_s: float = 3.0
     # Dedicated deadline for lcm_recall. It fans out three sequential arms (FTS +
     # summary KNN + chunk KNN) plus fusion, hydration, and an optional rerank, so
