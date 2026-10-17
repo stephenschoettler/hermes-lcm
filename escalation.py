@@ -57,6 +57,7 @@ _REASONING_START_RE = re.compile(
 )
 
 _DEFAULT_ROUTE_KEY = "<task-default>"
+_MIN_ROUTE_HEALTH_BUDGET_FRACTION = 0.5
 
 
 @dataclass
@@ -132,6 +133,7 @@ class SummarySpendGuard:
     window_seconds: float = 600.0
     backoff_seconds: float = 1800.0
     _calls: list[float] = field(default_factory=list)
+    _reservations: dict[object, float] = field(default_factory=dict)
     _backoff_until: float = 0.0
     _lock: threading.Lock = field(
         default_factory=threading.Lock,
@@ -152,7 +154,47 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            return len(self._calls) < self.max_calls
+            return len(self._calls) + len(self._reservations) < self.max_calls
+
+    def reserve_call(self) -> object | None:
+        """Reserve capacity without charging spend until dispatch is confirmed."""
+        token = object()
+        if self.max_calls <= 0:
+            return token
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            if now < self._backoff_until or len(self._calls) + len(self._reservations) >= self.max_calls:
+                return None
+            self._reservations[token] = now
+        return token
+
+    def release_call(self, token: object) -> None:
+        """Cancel an undispatched reservation without charging spend."""
+        with self._lock:
+            self._reservations.pop(token, None)
+
+    def commit_call(self, token: object, *, deadline: float | None = None) -> float | None:
+        """Charge a reserved call at dispatch, before a slow request can age it out.
+
+        The final deadline check happens under the same lock that consumes the
+        reservation. If contention reaches the deadline, the token is cancelled
+        and no provider call or spend/backoff is recorded. Return the dispatch
+        timestamp so the caller forwards the budget after the last guard lock.
+        """
+        with self._lock:
+            reserved = self._reservations.pop(token, None)
+            if self.max_calls > 0 and reserved is None:
+                return None
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                return None
+            self._prune(now)
+            if self.max_calls > 0:
+                if now < self._backoff_until or len(self._calls) + len(self._reservations) >= self.max_calls:
+                    return None
+                self._record_call_locked(now)
+            return now
 
     def try_record_call(self, *, now: float | None = None) -> bool:
         """Atomically reserve one provider call if the budget allows it."""
@@ -163,25 +205,22 @@ class SummarySpendGuard:
             if current_time < self._backoff_until:
                 return False
             self._prune(current_time)
-            if len(self._calls) >= self.max_calls:
+            if len(self._calls) + len(self._reservations) >= self.max_calls:
                 return False
             self._record_call_locked(current_time)
             return True
 
     def _record_call_locked(self, current_time: float) -> None:
         self._calls.append(current_time)
-        if len(self._calls) >= self.max_calls and self._backoff_until <= current_time:
-            self._backoff_until = current_time + max(0.0, self.backoff_seconds)
+        self._calls.sort()
+        latest_dispatch = self._calls[-1]
+        if len(self._calls) >= self.max_calls and self._backoff_until <= latest_dispatch:
+            self._backoff_until = latest_dispatch + max(0.0, self.backoff_seconds)
             # Backoff is the penalty; start the window fresh so the guard allows
             # again once it elapses rather than double-blocking on the old count.
             self._calls.clear()
-            logger.warning(
-                "LCM summary spend guard tripped: %d calls within %ss; "
-                "backing off summarizer for %ss (deterministic fallback active)",
-                self.max_calls,
-                self.window_seconds,
-                self.backoff_seconds,
-            )
+            # Do not log under this lock: blocking handlers can consume the
+            # remaining deadline after admission but before provider dispatch.
 
     def record_call(self, *, now: float | None = None) -> None:
         if self.max_calls <= 0:
@@ -194,6 +233,7 @@ class SummarySpendGuard:
     def clear(self) -> None:
         with self._lock:
             self._calls.clear()
+            self._reservations.clear()
             self._backoff_until = 0.0
 
 
@@ -333,6 +373,7 @@ def _invoke_summary_llm_chain(
     model: str = "",
     fallback_models: list[str] | tuple[str, ...] | None = None,
     timeout: float | None = None,
+    deadline: float | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
     accepts_result: Callable[[str], bool] | None = None,
@@ -340,6 +381,10 @@ def _invoke_summary_llm_chain(
     chain = _summary_model_chain(model, fallback_models)
     skipped = 0
     for candidate_model in chain:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            logger.warning("LCM summary deadline exhausted; using deterministic fallback")
+            break
         if circuit_breaker is not None and not circuit_breaker.allows(candidate_model):
             skipped += 1
             logger.warning(
@@ -349,26 +394,51 @@ def _invoke_summary_llm_chain(
             continue
         # Check the spend guard per-route so a mid-chain trip stops the
         # remaining fallbacks instead of over-spending by up to len(chain)-1.
-        if spend_guard is not None and not spend_guard.try_record_call():
+        reservation = spend_guard.reserve_call() if spend_guard is not None else None
+        if spend_guard is not None and reservation is None:
             logger.warning(
                 "LCM summary spend guard active; skipping LLM summarization and "
                 "deferring to deterministic fallback"
             )
             break
+        # Profile-local guard locks can consume the remaining operation budget.
+        # Recompute immediately before dispatch instead of forwarding a stale timeout.
+        reservation_pending = reservation is not None
         try:
-            result = _invoke_summary_llm(
-                prompt,
-                max_tokens,
-                model=candidate_model,
-                timeout=timeout,
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                break
+            if reservation_pending:
+                dispatch_at = spend_guard.commit_call(reservation, deadline=deadline)
+                reservation_pending = False
+                if dispatch_at is None:
+                    break
+                remaining = None if deadline is None else deadline - dispatch_at
+            # A timeout needs at least half the configured window to be a
+            # route-health verdict. Near-full retries still count as failures.
+            budget_starved = (
+                remaining is not None and timeout is not None
+                and remaining < float(timeout) * _MIN_ROUTE_HEALTH_BUDGET_FRACTION
             )
-        except Exception as exc:
-            logger.warning("LLM summarization failed: %s", exc)
-            result = None
+            try:
+                result = _invoke_summary_llm(
+                    prompt, max_tokens, model=candidate_model,
+                    timeout=remaining if remaining is not None else timeout,
+                )
+            except Exception as exc:
+                logger.warning("LLM summarization failed: %s", exc)
+                result = None
+        finally:
+            if spend_guard is not None and reservation_pending:
+                spend_guard.release_call(reservation)
         if result and (accepts_result is None or accepts_result(result)):
             if circuit_breaker is not None:
                 circuit_breaker.record_success(candidate_model)
             return result
+        # An empty result at the operation deadline is not evidence that this
+        # route is unhealthy: a previous route may have spent almost all its time.
+        if not result and budget_starved and deadline is not None and time.monotonic() >= deadline:
+            break
         if circuit_breaker is not None:
             circuit_breaker.record_failure(candidate_model)
     if skipped == len(chain):
@@ -617,6 +687,9 @@ def summarize_with_escalation(
     Guarantees convergence: level 3 is deterministic and always produces
     output shorter than the source.
     """
+    # Model fallbacks and L2 are retries within one operation, not fresh
+    # timeout windows. The host may impose an even earlier pass deadline.
+    deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
     # Level 1: detailed summary
     l1_prompt = _build_l1_prompt(
         text,
@@ -633,6 +706,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
@@ -641,6 +715,9 @@ def summarize_with_escalation(
     if l1_result:
         logger.debug("L1 summarization succeeded (%d tokens)", count_tokens(l1_result))
         return l1_result, 1
+
+    if deadline is not None and time.monotonic() >= deadline:
+        return _deterministic_truncate(text, l3_truncate_tokens), 3
 
     # Level 2: aggressive bullets at reduced budget
     l2_budget = int(token_budget * l2_budget_ratio)
@@ -659,6 +736,7 @@ def summarize_with_escalation(
         model=model,
         fallback_models=fallback_models,
         timeout=timeout,
+        deadline=deadline,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
         accepts_result=lambda result: count_tokens(result) < source_tokens,
