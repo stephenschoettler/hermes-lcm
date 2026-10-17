@@ -11722,6 +11722,79 @@ class TestEngineCompress:
         finally:
             instance.shutdown()
 
+    def _automatic_budget_messages(self):
+        messages = [{"role": "system", "content": "system"}]
+        for index in range(20):
+            messages.append({
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"budget-{index} " + ("token " * 20),
+            })
+        return messages
+
+    def test_automatic_foreground_budget_defaults_match_manual_sweep_ceiling(self):
+        config = LCMConfig()
+
+        assert config.automatic_foreground_max_passes == 12
+        assert config.automatic_foreground_max_seconds == 120.0
+
+    def test_automatic_foreground_pass_ceiling_bounds_automatic_compaction(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            automatic_foreground_max_passes=2,
+            database_path=str(tmp_path / "lcm_automatic_pass_ceiling.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = self._automatic_budget_messages()
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "bounded", 1, 0
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            instance.compress(messages, current_tokens=count_messages_tokens(messages))
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["leaf_passes"] == 2
+            assert telemetry["stop_reason"] == "pass_budget_exhausted"
+            assert telemetry["budget_exhausted"] is True
+        finally:
+            instance.shutdown()
+
+    def test_forced_compaction_ignores_automatic_foreground_pass_ceiling(self, tmp_path, monkeypatch):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=1,
+            threshold_full_sweep_enabled=True,
+            automatic_foreground_max_passes=2,
+            database_path=str(tmp_path / "lcm_forced_ignores_ceiling.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.threshold_tokens = 1
+        messages = self._automatic_budget_messages()
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            return chunk, count_messages_tokens(chunk), "bounded", 1, 0
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            instance.compress(
+                messages,
+                current_tokens=count_messages_tokens(messages),
+                force=True,
+            )
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert telemetry["leaf_passes"] == 12
+        finally:
+            instance.shutdown()
+
     def test_threshold_full_sweep_condenses_frontier_to_target_and_beyond_preferred_depth(self, tmp_path, monkeypatch):
         config = LCMConfig(
             fresh_tail_count=2,

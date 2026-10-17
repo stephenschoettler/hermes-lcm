@@ -388,6 +388,8 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
 | `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
+| `LCM_AUTOMATIC_FOREGROUND_MAX_PASSES` | `12` | Pass ceiling for automatic (non-forced) foreground compaction. Lower it to keep automatic compaction off the critical path; forced compaction is unaffected |
+| `LCM_AUTOMATIC_FOREGROUND_MAX_SECONDS` | `120` | Wall-clock ceiling for automatic (non-forced) foreground compaction. Forced compaction is unaffected |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |

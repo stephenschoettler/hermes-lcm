@@ -6503,6 +6503,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_prefix_target_tokens": engine._config.summary_prefix_target_tokens,
             "threshold_full_sweep_max_passes": 12,
             "threshold_full_sweep_max_seconds": 120,
+            "automatic_foreground_max_passes": engine._config.automatic_foreground_max_passes,
+            "automatic_foreground_max_seconds": engine._config.automatic_foreground_max_seconds,
             "context_threshold": engine._config.context_threshold,
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
