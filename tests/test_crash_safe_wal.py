@@ -82,7 +82,10 @@ class TestConfigureConnectionPragmas:
         configure_connection(conn)
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
-        assert val == 268_435_456, f"expected mmap_size=268435456, got {val}"
+        # 2026-09-29 corruption-#4 fix: mmap reads were the suspect in the
+        # corruption class (4 processes mmap'ing the same file while a
+        # compaction write ran), so configure_connection now pins mmap_size=0.
+        assert val == 0, f"expected mmap_size=0 (2026-09-29 fix), got {val}"
 
 
 # --------------------------------------------------------------------------- #

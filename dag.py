@@ -24,6 +24,7 @@ from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
+    cross_process_gate_lock,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
     run_versioned_migrations,
@@ -164,7 +165,9 @@ class SummaryDAG:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
-        self._db_lock = threading.RLock()
+        # See ``CrossProcessWriteGate``: serializes writers in-process AND
+        # against the other OS processes sharing this database.
+        self._db_lock = cross_process_gate_lock(self.db_path, "_db_lock")
         self._init_db()
 
     @property
@@ -878,7 +881,8 @@ class SummaryDAG:
         conn = getattr(self, "_conn", None)
         if conn:
             try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                with self._db_lock:  # fence the checkpoint cross-process
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error:
                 pass
             conn.close()

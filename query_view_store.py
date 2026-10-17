@@ -23,6 +23,7 @@ import uuid
 
 from .db_bootstrap import (
     configure_connection,
+    cross_process_gate_lock,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
     run_versioned_migrations,
@@ -538,7 +539,7 @@ class QueryViewStore:
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
-        self._write_lock = threading.RLock()
+        self._write_lock = cross_process_gate_lock(self.db_path, "_write_lock")
         try:
             refuse_schema_version_too_new(self._conn)
             configure_connection(self._conn)
