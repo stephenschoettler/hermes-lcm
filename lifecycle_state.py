@@ -669,6 +669,37 @@ class LifecycleStateStore:
         return self.get_by_conversation(conversation_id)
 
     @_synchronized
+    def drop_carry_for_explicit_new(self, conversation_id: str | None) -> LifecycleState | None:
+        """User /new: this conversation's finalized session must not be a carry source.
+
+        ``record_reset`` only stamps ``last_reset_at``. Compression then reassigns
+        ``last_finalized_session_id``'s summary nodes into the next segment.
+        """
+        if not conversation_id:
+            return None
+        state = self.get_by_conversation(conversation_id)
+        if state is None:
+            return None
+        now = time.time()
+        self._conn.execute(
+            """
+            UPDATE lcm_lifecycle_state
+            SET last_finalized_session_id = NULL,
+                last_finalized_frontier_store_id = 0,
+                current_frontier_store_id = 0,
+                last_reset_at = ?,
+                debt_kind = NULL,
+                debt_size_estimate = 0,
+                debt_updated_at = ?,
+                updated_at = ?
+            WHERE conversation_id = ?
+            """,
+            (now, now, now, conversation_id),
+        )
+        self._conn.commit()
+        return self.get_by_conversation(conversation_id)
+
+    @_synchronized
     def record_reset(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
