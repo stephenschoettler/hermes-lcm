@@ -201,6 +201,53 @@ class CompactionMixin:
             return self._mark_preflight_compression_requested()
         return False
 
+    def should_compress_request_pressure(self, messages, prompt_tokens: int) -> bool:
+        """Message-aware mid-turn pressure check for protected fresh tails.
+
+        Hermes core calls this after it has estimated the full provider request
+        (system prompt, tool schemas, and messages). That pressure can be over
+        threshold even when LCM has no raw backlog outside the protected latest
+        user/fresh tail, so a normal leaf compaction would be a no-op. Decline in
+        that case and let the host proceed to tool-tail spill or terminal
+        handoff instead of burning repeated compression attempts.
+        """
+        self._maybe_reclassify_late_auxiliary_before_compaction_write()
+        if self._bypasses_lcm_context_management():
+            self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+            if self._compression_boundary_cooldown_active():
+                return False
+            if self._should_force_overflow_recovery(
+                observed_tokens=prompt_tokens,
+                messages=messages,
+            ):
+                return True
+            return self.threshold_tokens > 0 and prompt_tokens >= self.threshold_tokens
+
+        if self._compression_boundary_cooldown_active():
+            return False
+        if self._should_force_overflow_recovery(
+            observed_tokens=prompt_tokens,
+            messages=messages,
+        ):
+            return True
+        if self.threshold_tokens > 0 and prompt_tokens >= self.threshold_tokens:
+            eligible, reason = self._leaf_compaction_candidate_status(
+                messages,
+                allow_partial_leaf=self._config.threshold_full_sweep_enabled,
+            )
+            if eligible:
+                return True
+            if self._has_ignored_backlog_outside_fresh_tail(messages):
+                return True
+            if self._should_run_deferred_maintenance(messages, observed_tokens=prompt_tokens):
+                return True
+            self._last_compression_status = "noop"
+            self._last_compression_noop_reason = reason
+            logger.info("LCM request-pressure compression no-op: %s", reason)
+            return False
+        self._refresh_raw_backlog_debt(messages, observed_tokens=prompt_tokens)
+        return self._should_run_deferred_maintenance(messages, observed_tokens=prompt_tokens)
+
     def _replay_diff_requests_ingest_cleanup(
         self,
         original_messages: List[Dict[str, Any]],

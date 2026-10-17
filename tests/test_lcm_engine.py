@@ -458,7 +458,7 @@ def test_codex_oauth_context_cap_keeps_explicit_lcm_threshold(tmp_path):
         assert engine.context_length == 272_000
         assert engine.context_threshold == 0.68
         assert engine.threshold_tokens == int(272_000 * 0.68)
-        assert engine._effective_assembly_token_cap() is None
+        assert engine._effective_assembly_token_cap() == 248_000
 
         status = engine.get_status()
         assert status["context_threshold_source"] == "env:LCM_CONTEXT_THRESHOLD"
@@ -20744,6 +20744,60 @@ class TestConfigCleanup:
 
 
 class TestAssemblyGuardrails:
+    def test_default_reserve_tokens_floor_auto_caps_large_context(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "auto-reserve.db"))
+        instance = LCMEngine(config=config)
+        instance.context_length = 272_000
+
+        assert config.reserve_tokens_floor == -1
+        assert instance._effective_assembly_token_cap() == 248_000
+
+    def test_explicit_zero_reserve_tokens_floor_disables_auto_cap(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "zero-reserve.db"),
+            reserve_tokens_floor=0,
+        )
+        instance = LCMEngine(config=config)
+        instance.context_length = 272_000
+
+        assert instance._effective_assembly_token_cap() is None
+
+    def test_auto_reserve_tokens_floor_does_not_cap_small_contexts(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "small-auto-reserve.db"))
+        instance = LCMEngine(config=config)
+        instance.context_length = 32_000
+
+        assert instance._effective_assembly_token_cap() is None
+
+    def test_request_pressure_declines_when_only_protected_tail_is_large(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "request-pressure-tail-only.db"),
+            reserve_tokens_floor=0,
+        )
+        instance = LCMEngine(config=config)
+        instance.threshold_tokens = 50
+        messages = [
+            {"role": "user", "content": "latest question"},
+            {"role": "tool", "content": "x" * 1000},
+        ]
+
+        assert instance.should_compress_request_pressure(messages, 1_000) is False
+        assert instance.last_compression_was_noop
+        assert "fresh tail" in instance.last_compression_noop_reason
+
+    def test_request_pressure_forces_recovery_when_auto_cap_is_exceeded(self, tmp_path):
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "request-pressure-auto-cap.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.context_length = 272_000
+        instance.threshold_tokens = 204_000
+        messages = [{"role": "user", "content": "latest question"}]
+
+        assert instance.should_compress_request_pressure(messages, 260_000) is True
+
     def test_max_assembly_tokens_caps_recent_tail(self, tmp_path, monkeypatch):
         import importlib
 
