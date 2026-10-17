@@ -5839,8 +5839,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         emitted inside the summary block so restart reconciliation ignores it
         instead of ingesting a duplicate non-contiguous user message.
 
-        Previous preserved-objective scaffolds are derived context, not real
-        user turns, so they are not eligible as the next anchor source. Once a
+        Previous objective anchors and DAG summaries are derived context, not
+        real user turns, so they are not eligible as the next anchor source. Once a
         reverse scan reaches one, older user turns are stale relative to that
         synthetic continuity marker and must not be promoted as current intent.
         """
@@ -5859,7 +5859,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 or self._is_ignored_active_replay_placeholder(message, content_text)
             ):
                 continue
-            if self._preserved_objective_context_content(message):
+            # A provider-compatible user role does not make generated
+            # summary context direct user guidance.
+            if self._is_replayed_context_scaffold_message(message):
                 return None
             if message.get("role") != "user":
                 continue
