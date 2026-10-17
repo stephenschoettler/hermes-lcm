@@ -79,6 +79,22 @@ def _chmod_sqlite_artifact_at(
         expected = None
     if expected is not None:
         _validate_sqlite_artifact(path, expected)
+        # MITIGATION (lock retention): an artifact that is already private is
+        # never opened at all, and a wrong-mode artifact is tightened without
+        # ever creating a read/write descriptor for it.  Opening the live
+        # SQLite file (or one of its sidecars) with O_RDWR and closing that
+        # descriptor again releases THIS process's POSIX record locks on the
+        # inode — including the ones SQLite is holding for an open
+        # transaction — which lets a second process write concurrently.
+        if stat.S_IMODE(expected.st_mode) == 0o600:
+            return True
+        if os.name == "posix":
+            return _tighten_sqlite_artifact_without_data_descriptor(
+                path,
+                directory_fd=directory_fd,
+                expected=expected,
+                allow_sidecar_disappearance=allow_sidecar_disappearance,
+            )
 
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
@@ -110,6 +126,90 @@ def _chmod_sqlite_artifact_at(
             return False
         _validate_sqlite_artifact(path, opened)
         os.fchmod(fd, 0o600)
+        restricted = os.fstat(fd)
+        if restricted.st_nlink == 0 and allow_sidecar_disappearance:
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        if restricted.st_nlink != 1:
+            raise _sqlite_artifact_error(path, "link count changed while restricting permissions")
+    finally:
+        os.close(fd)
+    return True
+
+
+def _chmod_sqlite_artifact_inode(fd: int, path: Path) -> None:
+    """Restrict the exact inode behind an already validated descriptor.
+
+    ``/proc/self/fd/<n>`` is resolved by procfs with a direct jump to the
+    descriptor's own dentry, so a directory-entry replacement between
+    validation and this call cannot redirect the mode change to a different
+    file, and no additional descriptor for the artifact is ever created or
+    closed (closing one would drop this process's record locks).
+    """
+    try:
+        os.chmod(f"/proc/self/fd/{fd}", 0o600)
+    except OSError as exc:
+        raise _sqlite_artifact_error(
+            path, f"cannot restrict through descriptor path ({exc.strerror})"
+        ) from exc
+
+
+def _tighten_sqlite_artifact_without_data_descriptor(
+    path: Path,
+    *,
+    directory_fd: int,
+    expected: os.stat_result,
+    allow_sidecar_disappearance: bool,
+) -> bool:
+    """Tighten an existing artifact lock-safely (POSIX).
+
+    Validation happens on an ``O_PATH`` descriptor: closing an ``O_PATH``
+    descriptor does not release POSIX record locks, unlike the legacy
+    ``O_RDWR`` + ``fchmod`` + ``close`` sequence, and the mode is applied
+    through ``/proc/self/fd/<n>``, which procfs resolves by a direct dentry
+    jump, so a directory-entry swap cannot redirect the change.
+
+    When the platform offers no ``O_PATH`` there is no primitive that both
+    pins the validated inode and avoids a descriptor whose close would release
+    this process's record locks: a name-resolved ``chmod`` (dirfd-relative,
+    ``fchmodat2`` path form) is lock-safe but can mutate a file that was
+    swapped into the directory entry after validation, while every
+    inode-pinned form (``fchmod`` on a real descriptor, ``fchmodat2`` with
+    ``AT_EMPTY_PATH``) needs a descriptor referring to the artifact, and
+    closing any such descriptor releases record locks.  Fail closed instead:
+    report the standard refusal and leave the mode untouched.
+    """
+    opath_flag = getattr(os, "O_PATH", None)
+    if opath_flag is None:
+        raise _sqlite_artifact_error(
+            path,
+            "lock-safe tightening is unsupported on this platform without O_PATH",
+        )
+
+    flags = int(opath_flag) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path.name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if not allow_sidecar_disappearance:
+            raise
+        _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+        return False
+    try:
+        opened = os.fstat(fd)
+        if stat.S_ISLNK(opened.st_mode):
+            # O_PATH|O_NOFOLLOW yields the symbolic link itself on Linux;
+            # never change modes through it.
+            raise _sqlite_artifact_error(path, "entry is a symbolic link")
+        if not stat.S_ISREG(opened.st_mode):
+            raise _sqlite_artifact_error(path, "not a regular file")
+        if not _same_file_identity(expected, opened):
+            raise _sqlite_artifact_error(path, "directory entry changed while opening")
+        if opened.st_nlink == 0 and allow_sidecar_disappearance:
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        _validate_sqlite_artifact(path, opened)
+        _chmod_sqlite_artifact_inode(fd, path)
         restricted = os.fstat(fd)
         if restricted.st_nlink == 0 and allow_sidecar_disappearance:
             _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
