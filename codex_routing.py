@@ -35,7 +35,7 @@ _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
-    "gpt-5.6": 372_000,
+    "gpt-5.6": 272_000,
     "gpt-5": 272_000,
 }
 
@@ -46,6 +46,22 @@ def _bare_model_slug(model: str | None) -> str:
 
 def _is_openai_codex_route(provider: str | None) -> bool:
     return (provider or "").strip().lower() == "openai-codex"
+
+
+def _is_host_codex_context_variant(bare_model: str) -> bool:
+    """Return True when the host marks ``bare_model`` as a context-window variant.
+
+    Best-effort: hosts that predate the helper (and the CI stub) raise on
+    import, in which case the exact/family tables below apply unchanged.
+    """
+    try:
+        from agent.model_metadata import is_codex_context_variant
+    except Exception:
+        return False
+    try:
+        return bool(is_codex_context_variant(bare_model))
+    except Exception:
+        return False
 
 
 def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | None:
@@ -60,6 +76,15 @@ def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | N
         return None
     bare_model = _bare_model_slug(model)
     if not bare_model:
+        return None
+    if _is_host_codex_context_variant(bare_model):
+        # The host resolves explicit context-window variants (for example
+        # ``gpt-5.6-sol-900k``) from its own live-verified table and strips
+        # the alias before the model id reaches the wire. Re-capping such a
+        # slug here would silently discard the user's opt-in, so defer to the
+        # host-supplied context_length. The exact table below remains the
+        # fallback when the host does not expose the helper (older hosts,
+        # the CI stub).
         return None
     exact_cap = _CODEX_OAUTH_EXACT_CONTEXT_CAPS.get(bare_model)
     if exact_cap is not None:
