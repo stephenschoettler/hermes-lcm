@@ -6,6 +6,7 @@ import importlib.util
 import sqlite3
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -58,9 +59,79 @@ def _replace_with_header_only_sqlite_db(e: LCMEngine) -> Path:
     return db_path
 
 
-def test_lcm_engine_declares_automatic_compaction_silent(engine):
-    assert engine.emit_automatic_compaction_status is False
+def test_lcm_engine_preserves_host_compaction_lifecycle(engine):
+    # Pytest prepends this plugin repository to sys.path, where its tools.py
+    # would shadow the Hermes host's tools package during host imports.
+    plugin_root = str(Path(__file__).resolve().parents[1])
+    shadowing_paths = [
+        entry for entry in sys.path
+        if Path(entry or ".").resolve() == Path(plugin_root)
+    ]
+    for entry in shadowing_paths:
+        sys.path.remove(entry)
+    shadowed_tools = sys.modules.pop("tools", None)
+    try:
+        from agent.context_compressor import SUMMARY_PREFIX, _DB_PERSISTED_MARKER
+        from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+        from agent.context_engine import automatic_compaction_status_message
+        from run_agent import AIAgent
+    finally:
+        if shadowed_tools is not None:
+            sys.modules["tools"] = shadowed_tools
+        sys.path[:0] = shadowing_paths
+
+    assert engine.emit_automatic_compaction_status is True
     assert engine.quiet_mode is True
+    assert automatic_compaction_status_message(
+        engine,
+        phase="compress",
+        default_message=COMPACTION_STATUS,
+    ) == COMPACTION_STATUS
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent.context_compressor = engine
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent.compression_enabled = False
+    events = []
+    agent.status_callback = lambda event, message: events.append((event, message))
+
+    def _fake_compress(messages, **_kwargs):
+        events.append(("compress", "started"))
+        return [{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"}]
+
+    with (
+        patch.object(engine, "compress", side_effect=_fake_compress),
+        patch.object(agent, "_build_system_prompt", return_value="new system prompt"),
+        patch("run_agent.estimate_request_tokens_rough", return_value=42),
+    ):
+        compressed, _ = agent._compress_context(
+            [{"role": "user", "content": "hello"}],
+            "system prompt",
+            approx_tokens=1234,
+        )
+
+    assert compressed == [
+        {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"},
+        {"role": "user", "content": "hello", _DB_PERSISTED_MARKER: True},
+    ]
+    assert events == [
+        ("lifecycle", COMPACTION_STATUS),
+        ("compress", "started"),
+        ("compacted", COMPACTION_DONE_STATUS),
+    ]
 
 
 def test_lcm_status_default_reports_current_session(engine):
