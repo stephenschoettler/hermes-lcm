@@ -9,6 +9,8 @@ recoverable through the LCM inspection and expansion tools.
 from __future__ import annotations
 
 import codecs
+from collections import OrderedDict
+from dataclasses import dataclass, field
 import errno
 import hashlib
 import json
@@ -17,6 +19,7 @@ import math
 import os
 import re
 import stat
+import threading
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
@@ -41,6 +44,205 @@ def _placeholder_metadata(value: Any) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+
+_MAX_EXTERNALIZED_TOOL_RESULT_INDEXES = 8
+_EXTERNALIZED_TOOL_RESULT_INDEX_LOCK = threading.RLock()
+
+
+@dataclass
+class _ExternalizedToolResultPathIndex:
+    """Process-local path index for persisted tool-result replay lookups.
+
+    Payload content deliberately stays on disk. The index keeps only the
+    session/tool-call routing metadata needed to reduce one lookup from a full
+    directory JSON scan to a handful of candidate files.
+    """
+
+    directory_signature: tuple[int, int, int, int] | None = None
+    file_signatures: dict[str, tuple | None] = field(default_factory=dict)
+    path_keys: dict[str, tuple[str, str]] = field(default_factory=dict)
+    by_tool_call: dict[str, set[str]] = field(default_factory=dict)
+    by_session_tool_call: dict[tuple[str, str], set[str]] = field(default_factory=dict)
+    parse_errors: set[str] = field(default_factory=set)
+    generation: int = 0
+
+
+_EXTERNALIZED_TOOL_RESULT_INDEXES: "OrderedDict[str, _ExternalizedToolResultPathIndex]" = (
+    OrderedDict()
+)
+
+
+def _externalized_directory_signature(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _externalized_payload_signature(path: Path) -> tuple | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _remove_externalized_tool_result_index_path(
+    index: _ExternalizedToolResultPathIndex,
+    path_key: str,
+) -> None:
+    previous = index.path_keys.pop(path_key, None)
+    index.parse_errors.discard(path_key)
+    if previous is None:
+        return
+    session_id, tool_call_id = previous
+    call_paths = index.by_tool_call.get(tool_call_id)
+    if call_paths is not None:
+        call_paths.discard(path_key)
+        if not call_paths:
+            index.by_tool_call.pop(tool_call_id, None)
+    session_paths = index.by_session_tool_call.get((session_id, tool_call_id))
+    if session_paths is not None:
+        session_paths.discard(path_key)
+        if not session_paths:
+            index.by_session_tool_call.pop((session_id, tool_call_id), None)
+
+
+def _index_externalized_tool_result_payload(
+    index: _ExternalizedToolResultPathIndex,
+    path: Path,
+    payload: Dict[str, Any],
+) -> None:
+    path_key = str(path)
+    _remove_externalized_tool_result_index_path(index, path_key)
+    if payload.get("kind", "tool_result") != "tool_result":
+        return
+    role = str(payload.get("role") or "")
+    if role and role != "tool":
+        return
+    tool_call_id = str(payload.get("tool_call_id") or "")
+    if not tool_call_id:
+        return
+    session_id = str(payload.get("session_id") or "")
+    index.path_keys[path_key] = (session_id, tool_call_id)
+    index.by_tool_call.setdefault(tool_call_id, set()).add(path_key)
+    index.by_session_tool_call.setdefault((session_id, tool_call_id), set()).add(path_key)
+
+
+def _read_externalized_index_payload(path: Path) -> Dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _build_externalized_tool_result_index(
+    storage_dir: Path,
+) -> _ExternalizedToolResultPathIndex:
+    # A concurrent writer can add an entry while the cold scan runs. Retry the
+    # snapshot when directory metadata changed; partially-written entries
+    # remain in parse_errors and are retried cheaply on the next lookup.
+    latest_index = _ExternalizedToolResultPathIndex()
+    for _attempt in range(3):
+        before_signature = _externalized_directory_signature(storage_dir)
+        index = _ExternalizedToolResultPathIndex()
+        unstable_payload = False
+        for path in sorted(storage_dir.glob("*.json")):
+            before_payload = _externalized_payload_signature(path)
+            payload = _read_externalized_index_payload(path)
+            after_payload = _externalized_payload_signature(path)
+            index.file_signatures[str(path)] = after_payload
+            unstable_payload |= before_payload != after_payload
+            if payload is None:
+                index.parse_errors.add(str(path))
+                continue
+            _index_externalized_tool_result_payload(index, path, payload)
+        after_signature = _externalized_directory_signature(storage_dir)
+        index.directory_signature = after_signature
+        latest_index = index
+        if before_signature == after_signature and not unstable_payload:
+            return index
+    # Never publish an unstable scan as current. A later lookup must rebuild
+    # instead of permanently hiding a file created during the final scan.
+    latest_index.directory_signature = None
+    return latest_index
+
+
+def _retry_externalized_tool_result_index_errors(
+    index: _ExternalizedToolResultPathIndex,
+) -> None:
+    for path_key in list(index.parse_errors):
+        path = Path(path_key)
+        if not path.exists():
+            _remove_externalized_tool_result_index_path(index, path_key)
+            continue
+        payload = _read_externalized_index_payload(path)
+        if payload is None:
+            continue
+        index.parse_errors.discard(path_key)
+        _index_externalized_tool_result_payload(index, path, payload)
+
+
+def _externalized_tool_result_candidate_paths(
+    storage_dir: Path,
+    *,
+    tool_call_id: str,
+    session_id: str,
+) -> tuple[Path, ...]:
+    storage_key = str(storage_dir.resolve())
+    with _EXTERNALIZED_TOOL_RESULT_INDEX_LOCK:
+        current_signature = _externalized_directory_signature(storage_dir)
+        index = _EXTERNALIZED_TOOL_RESULT_INDEXES.get(storage_key)
+        payload_changed = index is not None and any(
+            _externalized_payload_signature(Path(path_key)) != signature
+            for path_key, signature in index.file_signatures.items()
+        )
+        if index is None or index.directory_signature != current_signature or payload_changed:
+            index = _build_externalized_tool_result_index(storage_dir)
+            _EXTERNALIZED_TOOL_RESULT_INDEXES[storage_key] = index
+        else:
+            _retry_externalized_tool_result_index_errors(index)
+        _EXTERNALIZED_TOOL_RESULT_INDEXES.move_to_end(storage_key)
+        while len(_EXTERNALIZED_TOOL_RESULT_INDEXES) > _MAX_EXTERNALIZED_TOOL_RESULT_INDEXES:
+            _EXTERNALIZED_TOOL_RESULT_INDEXES.popitem(last=False)
+        if index.directory_signature is None:
+            # The directory kept changing through every cold-scan attempt.
+            # Preserve legacy correctness for this lookup instead of trusting
+            # a partial candidate map; the next lookup will retry the index.
+            return tuple(sorted(storage_dir.glob("*.json")))
+        if session_id:
+            path_keys = index.by_session_tool_call.get((session_id, tool_call_id), set())
+        else:
+            path_keys = index.by_tool_call.get(tool_call_id, set())
+        return tuple(Path(path_key) for path_key in sorted(path_keys))
+
+
+def _refresh_externalized_tool_result_index_path(
+    path: Path,
+    payload: Dict[str, Any],
+) -> None:
+    storage_dir = path.parent
+    storage_key = str(storage_dir.resolve())
+    with _EXTERNALIZED_TOOL_RESULT_INDEX_LOCK:
+        index = _EXTERNALIZED_TOOL_RESULT_INDEXES.get(storage_key)
+        if index is None:
+            return
+        _index_externalized_tool_result_payload(index, path, payload)
+        # Updating one known path does not prove that no other writer changed
+        # the directory concurrently. Keep the incremental entry useful for
+        # this process, but force the next lookup to rebuild a complete stable
+        # snapshot before treating the index as authoritative.
+        index.directory_signature = None
+        index.generation += 1
+
+
+def _invalidate_externalized_tool_result_index(storage_dir: Path) -> None:
+    storage_key = str(storage_dir.resolve())
+    with _EXTERNALIZED_TOOL_RESULT_INDEX_LOCK:
+        _EXTERNALIZED_TOOL_RESULT_INDEXES.pop(storage_key, None)
 
 
 _UNSUPPORTED_FILESYSTEM_ERRNOS = {
@@ -1878,6 +2080,8 @@ def reassign_externalized_payloads(
         finally:
             if dir_fd is not None:
                 os.close(dir_fd)
+    if moved:
+        _invalidate_externalized_tool_result_index(storage_dir)
     return moved
 
 
@@ -1956,7 +2160,11 @@ def find_externalized_tool_result_content_for_call(
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
         return None
-    for path in sorted(storage_dir.glob("*.json")):
+    for path in _externalized_tool_result_candidate_paths(
+        storage_dir,
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+    ):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2057,6 +2265,7 @@ def externalize_ingest_payload(
     except OSError as exc:
         logger.warning("LCM ingest payload externalization skipped (non-blocking): %s", exc)
         return None
+    _refresh_externalized_tool_result_index_path(path, payload)
 
     summary = _externalized_summary(path, payload)
     placeholder = (
@@ -2144,6 +2353,7 @@ def maybe_externalize_payload(
             if existing_payload is not None and _merge_persisted_output_marker_metadata(existing_payload, metadata):
                 try:
                     _replace_externalized_payload(existing_path, existing_payload)
+                    _refresh_externalized_tool_result_index_path(existing_path, existing_payload)
                     existing = _externalized_summary(existing_path, existing_payload)
                 except OSError as exc:
                     logger.warning("Large payload metadata update skipped (non-blocking): %s", exc)
@@ -2185,6 +2395,7 @@ def maybe_externalize_payload(
     except OSError as exc:
         logger.warning("Large payload externalization skipped (non-blocking): %s", exc)
         return None
+    _refresh_externalized_tool_result_index_path(path, payload)
 
     placeholder = _build_externalized_placeholder(
         {
