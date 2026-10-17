@@ -364,6 +364,8 @@ def register(ctx):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
+    from .retrieval_core import _open_vector_store_pool
+    from .tools import _open_deadline_worker_registry
     from .schemas import (
         LCM_GREP,
         LCM_RECALL,
@@ -382,6 +384,8 @@ def register(ctx):
         LCM_DOCTOR,
     )
 
+    _open_deadline_worker_registry()
+    _open_vector_store_pool()
     config = LCMConfig.from_env()
 
     # Resolve hermes_home for profile-scoped storage
@@ -397,6 +401,9 @@ def register(ctx):
 
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
+    on_unload = getattr(ctx, "on_unload", None)
+    if callable(on_unload):
+        on_unload(engine.shutdown_all_instances)
 
     # Ship the same recall contract through both Hermes plugin skill
     # registration (explicit qualified loads) and the installer's ordinary
