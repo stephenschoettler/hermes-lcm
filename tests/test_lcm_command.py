@@ -570,7 +570,7 @@ def test_lcm_doctor_text_reports_missing_externalized_payload_refs(engine):
     assert "missing.json" in result
     assert "inspect missing externalized payload refs and restore from backups if needed" in result
     assert "stored" not in result
-    assert "orphaned" not in result
+    # Note: "orphaned" appears in the new "doctor externalize" help text, not in the main doctor output
 
 
 def test_lcm_doctor_finds_heartbeat_noise_after_many_short_nonmatches(engine):
@@ -1036,7 +1036,7 @@ def test_lcm_help_on_unknown_subcommand(engine):
 def test_lcm_doctor_clean_rejects_unknown_extra_args(engine):
     result = handle_lcm_command("doctor clean foo", engine)
 
-    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention`" in result
+    assert "currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `externalize`, `externalize apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention`" in result
     assert "/lcm doctor clean apply" in result
     assert "/lcm doctor clean lifecycle" in result
     assert "/lcm doctor clean lifecycle apply" in result
@@ -1846,3 +1846,89 @@ def test_register_allows_lcm_slash_command_when_explicitly_enabled(tmp_path, mon
 
     assert ctx.engine is not None
     assert "lcm" in ctx.commands
+
+
+def test_lcm_doctor_externalize_reports_orphaned_refs(engine):
+    """Test that `/lcm doctor externalize` detects orphaned payload references."""
+    storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
+    storage_dir.mkdir(parents=True)
+    # Create a reference in the DB but don't create the file
+    engine._store.append(
+        "externalize-test-session",
+        {
+            "role": "user",
+            "content": "[Externalized payload: kind=raw_payload; role=user; chars=100; bytes=100; ref=missing_file.json]",
+        },
+        token_estimate=2,
+    )
+
+    result = handle_lcm_command("doctor externalize", engine)
+
+    assert "status: repair-needed" in result
+    assert "orphaned_refs_found: 1" in result
+    assert "rows_affected: 1" in result
+    assert "missing_file.json" in result
+    assert "use `/lcm doctor externalize apply`" in result
+
+
+def test_lcm_doctor_externalize_no_orphans(engine):
+    """Test that `/lcm doctor externalize` reports ok when no orphans exist."""
+    storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
+    storage_dir.mkdir(parents=True)
+    # Create both the file and the reference
+    (storage_dir / "valid_file.json").write_text(json.dumps({"content": "test", "content_chars": 4}))
+    engine._store.append(
+        "externalize-valid-session",
+        {
+            "role": "user",
+            "content": "[Externalized payload: kind=raw_payload; role=user; chars=4; bytes=4; ref=valid_file.json]",
+        },
+        token_estimate=2,
+    )
+
+    result = handle_lcm_command("doctor externalize", engine)
+
+    assert "status: ok" in result
+    assert "orphaned_refs_found: 0" in result
+    assert "no orphaned externalized payload references found" in result
+
+
+def test_lcm_doctor_externalize_apply_denied_without_flag(engine):
+    """Test that `/lcm doctor externalize apply` is denied by default."""
+    result = handle_lcm_command("doctor externalize apply", engine)
+
+    assert "status: denied" in result
+    assert "destructive cleanup is disabled" in result
+    assert "no rows were deleted" in result
+
+
+def test_lcm_doctor_externalize_apply_with_flag(engine, monkeypatch):
+    """Test that `/lcm doctor externalize apply` cleans up orphaned refs when enabled."""
+    monkeypatch.setattr(
+        engine._config, "doctor_clean_apply_enabled", True
+    )
+
+    storage_dir = Path(engine._hermes_home) / "lcm-large-outputs"
+    storage_dir.mkdir(parents=True)
+    # Create a reference but no file
+    engine._store.append(
+        "externalize-apply-test",
+        {
+            "role": "user",
+            "content": "[Externalized payload: kind=raw_payload; role=user; chars=100; bytes=100; ref=orphan_test.json]",
+        },
+        token_estimate=2,
+    )
+
+    result = handle_lcm_command("doctor externalize apply", engine)
+
+    assert "status: ok" in result
+    assert "orphaned_refs_cleaned: 1" in result
+    assert "rows_deleted: 1" in result
+    assert "orphan_test.json" in result
+
+    # Verify the row was actually deleted
+    remaining = engine._store.connection.execute(
+        "SELECT COUNT(*) FROM messages WHERE content LIKE '%orphan_test.json%'"
+    ).fetchone()[0]
+    assert remaining == 0

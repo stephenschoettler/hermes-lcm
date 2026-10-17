@@ -31,6 +31,7 @@ from .diagnostics import (
     doctor_guidance_for_checks,
 )
 from .ingest_protection import (
+    clean_orphaned_externalized_payload_refs,
     externalized_payload_stats,
     scan_externalized_payload_integrity,
     scan_sqlite_payload_risks,
@@ -2143,6 +2144,81 @@ def _doctor_clean_lifecycle_apply_text(engine) -> str:
         f"backup_size_bytes: {backup['backup_size']}",
         "note: only empty lifecycle rows were deleted — messages and nodes untouched",
     ])
+
+
+def _doctor_externalize_text(engine) -> str:
+    """Scan for orphaned externalized payload references and report."""
+    conn = engine._store.connection
+    hermes_home = getattr(engine, "_hermes_home", "")
+    try:
+        result = clean_orphaned_externalized_payload_refs(conn, dry_run=True, hermes_home=hermes_home)
+    except Exception as exc:
+        return "\n".join([
+            "LCM doctor externalize",
+            "status: error",
+            f"error: scan failed: {exc}",
+            "note: read-only scan only — no rows were deleted",
+        ])
+
+    lines = [
+        "LCM doctor externalize",
+        f"status: {'repair-needed' if result['rows_scanned'] > 0 else 'ok'}",
+        f"orphaned_refs_found: {len(result['refs_cleaned'])}",
+        f"rows_affected: {result['rows_scanned']}",
+    ]
+    if result["refs_cleaned"]:
+        lines.append("missing_refs:")
+        for ref in result["refs_cleaned"][:20]:
+            lines.append(f"  - {ref}")
+        if len(result["refs_cleaned"]) > 20:
+            lines.append(f"  ... and {len(result['refs_cleaned']) - 20} more")
+        lines.append("note: use `/lcm doctor externalize apply` to remove orphaned references")
+    else:
+        lines.append("result: no orphaned externalized payload references found")
+    lines.append("note: read-only scan only — no rows were deleted")
+    return "\n".join(lines)
+
+
+def _doctor_externalize_apply_text(engine) -> str:
+    """Apply cleanup of orphaned externalized payload references."""
+    if not getattr(getattr(engine, "_config", None), "doctor_clean_apply_enabled", False):
+        return "\n".join([
+            "LCM doctor externalize apply",
+            "status: denied",
+            "error: destructive cleanup is disabled by default",
+            "note: set LCM_DOCTOR_CLEAN_APPLY_ENABLED=true only in trusted operator environments",
+            "note: no rows were deleted",
+        ])
+
+    conn = engine._store.connection
+    hermes_home = getattr(engine, "_hermes_home", "")
+    try:
+        result = clean_orphaned_externalized_payload_refs(conn, dry_run=False, hermes_home=hermes_home)
+    except sqlite3.Error as exc:
+        return "\n".join([
+            "LCM doctor externalize apply",
+            "status: error",
+            f"database_path: {engine._store.db_path}",
+            f"error: cleanup failed: {exc}",
+            "note: cleanup aborted before any rows were deleted",
+        ])
+
+    lines = [
+        "LCM doctor externalize apply",
+        "status: ok",
+        f"database_path: {engine._store.db_path}",
+        f"orphaned_refs_cleaned: {len(result['refs_cleaned'])}",
+        f"rows_deleted: {result['rows_deleted']}",
+    ]
+    if result["refs_cleaned"]:
+        lines.append("cleaned_refs:")
+        for ref in result["refs_cleaned"][:20]:
+            lines.append(f"  - {ref}")
+        if len(result["refs_cleaned"]) > 20:
+            lines.append(f"  ... and {len(result['refs_cleaned']) - 20} more")
+    else:
+        lines.append("result: no orphaned references found, nothing to clean")
+    return "\n".join(lines)
 
 
 def _backup_text(engine) -> str:
@@ -5034,7 +5110,11 @@ def handle_lcm_command(raw_args: str | None, engine) -> str:
             return _doctor_repair_schema_stamp_apply_text(engine)
         if len(rest) == 2 and rest[0].lower() == "source" and rest[1].lower() == "apply":
             return _doctor_source_apply_text(engine)
-        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention` as extra subcommands.")
+        if len(rest) == 1 and rest[0].lower() == "externalize":
+            return _doctor_externalize_text(engine)
+        if len(rest) == 2 and rest[0].lower() == "externalize" and rest[1].lower() == "apply":
+            return _doctor_externalize_apply_text(engine)
+        return _help_text("`/lcm doctor` currently supports `clean`, `clean apply`, `clean lifecycle`, `clean lifecycle apply`, `externalize`, `externalize apply`, `repair`, `repair apply`, `repair schema-stamp`, `repair schema-stamp apply`, `source`, `source apply`, and `retention` as extra subcommands.")
 
     if head == "backup":
         if rest:
