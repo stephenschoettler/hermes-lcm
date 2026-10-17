@@ -149,13 +149,38 @@ def _config_bool_disabled(value) -> bool:
     return False
 
 
-def _hermes_config_path() -> Path:
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "config.yaml"
+def _resolve_hermes_home(hermes_home: str | Path | None = None) -> Path:
+    """Resolve the active Hermes home without changing process-global state.
+
+    Routed Hermes gateways keep the active profile in a context-local core
+    override rather than mutating ``os.environ``.  The explicit argument is
+    used by engine lifecycle hooks; the core helper is the standalone fallback
+    for callers that do not have a home argument.
+    """
+    if hermes_home:
+        return Path(hermes_home).expanduser()
+
+    for module_name in ("hermes_constants", "hermes_cli.config"):
+        try:
+            module = __import__(module_name, fromlist=["get_hermes_home"])
+            resolver = getattr(module, "get_hermes_home", None)
+            if callable(resolver):
+                resolved_home = resolver()
+                return Path(str(resolved_home)).expanduser()
+        except Exception:
+            continue
+
+    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
 
 
-def _load_hermes_config_yaml() -> dict[str, Any]:
-    cfg_path = _hermes_config_path()
+def _hermes_config_path(hermes_home: str | Path | None = None) -> Path:
+    return _resolve_hermes_home(hermes_home) / "config.yaml"
+
+
+def _load_hermes_config_yaml(
+    hermes_home: str | Path | None = None,
+) -> dict[str, Any]:
+    cfg_path = _hermes_config_path(hermes_home)
     try:
         text = cfg_path.read_text()
     except Exception:
@@ -202,8 +227,12 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
 _SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
 
 
-def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
-    cfg = cfg if cfg is not None else _load_hermes_config_yaml()
+def _ignored_lcm_config_yaml_keys(
+    cfg: dict[str, Any] | None = None,
+    *,
+    hermes_home: str | Path | None = None,
+) -> list[str]:
+    cfg = cfg if cfg is not None else _load_hermes_config_yaml(hermes_home)
     lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
     if not isinstance(lcm_section, dict):
         return []
@@ -214,7 +243,11 @@ def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str
     )
 
 
-def _hermes_compression_threshold(default: float) -> float:
+def _hermes_compression_threshold(
+    default: float,
+    *,
+    hermes_home: str | Path | None = None,
+) -> float:
     """Read lcm.context_threshold or Hermes compression.threshold from config.yaml.
 
     Priority when no ``LCM_CONTEXT_THRESHOLD`` env var is set:
@@ -226,12 +259,19 @@ def _hermes_compression_threshold(default: float) -> float:
     operators tune LCM compaction independently of the Hermes compression setting.
     Disabled Hermes compression should not leak its threshold into LCM.
     """
-    value, _source = _hermes_compression_threshold_with_source(default)
+    value, _source = _hermes_compression_threshold_with_source(
+        default,
+        hermes_home=hermes_home,
+    )
     return value
 
 
-def _hermes_compression_threshold_with_source(default: float) -> tuple[float, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_compression_threshold_with_source(
+    default: float,
+    *,
+    hermes_home: str | Path | None = None,
+) -> tuple[float, str]:
+    cfg = _load_hermes_config_yaml(hermes_home)
     try:
         lcm_section = cfg.get("lcm") or {}
         if isinstance(lcm_section, dict):
@@ -251,7 +291,11 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
     return default, "default"
 
 
-def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
+def _hermes_auxiliary_compression_timeout_ms(
+    default: int,
+    *,
+    hermes_home: str | Path | None = None,
+) -> int:
     """Read Hermes auxiliary.compression.timeout when no LCM override is present.
 
     Hermes uses seconds for the auxiliary compression timeout, while LCM stores
@@ -259,12 +303,19 @@ def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
     calls from timing out earlier than the host compression route unless
     ``LCM_SUMMARY_TIMEOUT_MS`` is explicitly configured.
     """
-    value, _source = _hermes_auxiliary_compression_timeout_ms_with_source(default)
+    value, _source = _hermes_auxiliary_compression_timeout_ms_with_source(
+        default,
+        hermes_home=hermes_home,
+    )
     return value
 
 
-def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[int, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_auxiliary_compression_timeout_ms_with_source(
+    default: int,
+    *,
+    hermes_home: str | Path | None = None,
+) -> tuple[int, str]:
+    cfg = _load_hermes_config_yaml(hermes_home)
     try:
         auxiliary = cfg.get("auxiliary") or {}
         if not isinstance(auxiliary, dict):
@@ -280,8 +331,12 @@ def _hermes_auxiliary_compression_timeout_ms_with_source(default: int) -> tuple[
         return default, "default"
 
 
-def _hermes_codex_gpt55_autoraise_with_source(default: bool) -> tuple[bool, str]:
-    cfg = _load_hermes_config_yaml()
+def _hermes_codex_gpt55_autoraise_with_source(
+    default: bool,
+    *,
+    hermes_home: str | Path | None = None,
+) -> tuple[bool, str]:
+    cfg = _load_hermes_config_yaml(hermes_home)
     try:
         compression = cfg.get("compression") or {}
         if not isinstance(compression, dict):
@@ -775,11 +830,22 @@ class LCMConfig:
     config_sources: dict[str, str] = field(default_factory=dict)
     config_source_warnings: list[str] = field(default_factory=list)
     ignored_config_yaml_lcm_keys: list[str] = field(default_factory=list)
+    config_hermes_home: str = ""
 
     @classmethod
-    def from_env(cls) -> "LCMConfig":
-        """Build config from environment variables (LCM_ prefix)."""
+    def from_env(
+        cls,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> "LCMConfig":
+        """Build config from environment variables and one Hermes profile.
+
+        ``hermes_home`` is intentionally an argument instead of a temporary
+        ``HERMES_HOME`` environment mutation so concurrent routed profiles
+        cannot observe each other's configuration.
+        """
         c = cls()
+        c.config_hermes_home = str(_resolve_hermes_home(hermes_home))
         config_sources: dict[str, str] = {}
         config_source_warnings: list[str] = []
 
@@ -788,7 +854,9 @@ class LCMConfig:
             if warning:
                 config_source_warnings.append(warning)
 
-        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys(
+            hermes_home=hermes_home
+        )
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.
@@ -805,7 +873,10 @@ class LCMConfig:
             "LCM_LEAF_CHUNK_TOKENS", c.leaf_chunk_tokens
         )
         _record("leaf_chunk_tokens", source, warning)
-        context_default, context_source = _hermes_compression_threshold_with_source(c.context_threshold)
+        context_default, context_source = _hermes_compression_threshold_with_source(
+            c.context_threshold,
+            hermes_home=hermes_home,
+        )
         c.context_threshold, source, warning = _parse_float_env_with_source(
             "LCM_CONTEXT_THRESHOLD",
             context_default,
@@ -813,7 +884,8 @@ class LCMConfig:
         )
         _record("context_threshold", source, warning)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
-            c.codex_gpt55_autoraise_enabled
+            c.codex_gpt55_autoraise_enabled,
+            hermes_home=hermes_home,
         )
         _record("codex_gpt55_autoraise_enabled", source)
         c.summary_spend_max_calls, source, warning = _parse_int_env_with_source(
@@ -832,7 +904,8 @@ class LCMConfig:
         )
         _record("summary_spend_backoff_seconds", source, warning)
         summary_timeout_default, summary_timeout_source = _hermes_auxiliary_compression_timeout_ms_with_source(
-            c.summary_timeout_ms
+            c.summary_timeout_ms,
+            hermes_home=hermes_home,
         )
         c.summary_timeout_ms, source, warning = _parse_int_env_with_source(
             "LCM_SUMMARY_TIMEOUT_MS",
