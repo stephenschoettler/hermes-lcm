@@ -347,7 +347,7 @@ class _RollupMaintenanceScheduler:
 
 _ROLLUP_MAINTENANCE_SCHEDULER = _RollupMaintenanceScheduler()
 
-_SESSION_END_BUSY_TIMEOUT_MS = 50
+_SESSION_END_BUSY_TIMEOUT_MS = 500
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "current_conversation"
 

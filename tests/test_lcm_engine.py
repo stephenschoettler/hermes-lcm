@@ -12534,7 +12534,8 @@ class TestSessionRollover:
             locker.execute("ROLLBACK")
             locker.close()
 
-        assert elapsed < 0.3
+        # VPS deliberately permits a 500ms wait; retain a bounded 250ms scheduling margin.
+        assert elapsed < 0.75
         assert engine._store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
         assert engine._lifecycle._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 750
         assert "LCM session-end raw-message ingest skipped due to SQLite lock" in caplog.text
