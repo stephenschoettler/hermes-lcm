@@ -199,7 +199,23 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {
+    "context_threshold",
+    "fresh_tail_count",
+    "fresh_tail_max_tokens",
+    "leaf_chunk_tokens",
+    "dynamic_leaf_chunk_enabled",
+    "dynamic_leaf_chunk_max",
+    "critical_budget_pressure_ratio",
+    "threshold_full_sweep_enabled",
+    "summary_prefix_target_tokens",
+    "max_assembly_tokens",
+    "reserve_tokens_floor",
+    "large_output_externalization_enabled",
+    "large_output_externalization_threshold_chars",
+    "large_output_active_replay_stubbing_enabled",
+    "large_output_active_replay_stub_threshold_tokens",
+}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -847,6 +863,58 @@ class LCMConfig:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+
+        # Behavioral settings belong in config.yaml. Environment variables
+        # remain the explicit highest-precedence operator override.
+        yaml_cfg = _load_hermes_config_yaml()
+        yaml_lcm = yaml_cfg.get("lcm") if isinstance(yaml_cfg, dict) else None
+        if isinstance(yaml_lcm, dict):
+            for spec in ENV_FIELD_SPECS:
+                if spec.name == "context_threshold":
+                    continue
+                if spec.name not in _SUPPORTED_LCM_CONFIG_YAML_KEYS:
+                    continue
+                if spec.name not in yaml_lcm:
+                    continue
+                # Only let env mask yaml if env is parseable; invalid env shouldn't block valid yaml
+                env_value = os.environ.get(spec.env_key)
+                if env_value is not None:
+                    try:
+                        # Test parse the env value using same strict logic as YAML
+                        if spec.py_type is bool:
+                            if isinstance(env_value, str):
+                                normalized = env_value.strip().lower()
+                                if normalized not in {"true", "1", "yes", "on", "false", "0", "no", "off"}:
+                                    raise ValueError(f"Invalid boolean env value")
+                        else:
+                            _ = spec.py_type(env_value)
+                        continue  # valid env value masks yaml
+                    except (TypeError, ValueError):
+                        pass  # invalid env, fall through to yaml
+                raw_value = yaml_lcm[spec.name]
+                try:
+                    if spec.py_type is bool:
+                        if isinstance(raw_value, str):
+                            normalized = raw_value.strip().lower()
+                            if normalized in {"true", "1", "yes", "on"}:
+                                value = True
+                            elif normalized in {"false", "0", "no", "off"}:
+                                value = False
+                            else:
+                                raise ValueError(f"Invalid boolean YAML value: {raw_value!r}")
+                        elif isinstance(raw_value, bool):
+                            value = raw_value
+                        else:
+                            raise TypeError(f"YAML boolean must be bool or string, got {type(raw_value).__name__}")
+                    else:
+                        value = spec.py_type(raw_value)
+                except (TypeError, ValueError) as e:
+                    # Surface parse failures in config warnings so doctor/status can diagnose
+                    _record(spec.name, f"config_yaml:lcm.{spec.name}", f"Invalid value: {e}")
+                    continue
+                setattr(c, spec.name, value)
+                if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
+                    _record(spec.name, f"config_yaml:lcm.{spec.name}")
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")

@@ -21147,6 +21147,88 @@ class TestAssemblyGuardrails:
         assert joined.count("[Expand for details:") == 1
         assert not instance.get_status()["overflow_recovery_failed"]
 
+    def test_forced_overflow_recovery_never_returns_empty_after_active_cleanup(self, tmp_path):
+        """Forced recovery must leave a resumable context after cleanup drops the tail."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_nonempty_fallback.db"),
+            max_assembly_tokens=1,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+        instance.context_length = 200000
+
+        tail_messages = [
+            {"role": "user", "content": "latest actionable request"},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "internal only"}]},
+            {"role": "tool", "tool_call_id": "orphan", "content": "orphan result"},
+        ]
+
+        result = instance.compress(tail_messages)
+
+        assert result, "forced overflow recovery returned an empty active transcript"
+        assert instance.get_status()["last_compression_status"] == "overflow_recovery"
+        assert instance._ingest_cursor == len(result)
+        assert any(msg.get("role") == "user" for msg in result)
+        assert all(
+            not (msg.get("role") == "tool" and msg.get("tool_call_id") == "orphan")
+            for msg in result
+        )
+
+    def test_forced_overflow_recovery_uses_scaffold_when_no_user_survives(self, tmp_path):
+        """A systemless cleanup must still return a provider-starting user turn."""
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_guardrail_scaffold_fallback.db"),
+            max_assembly_tokens=1,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("guardrail-scaffold-session", context_length=200000)
+        instance.compression_count = 1
+
+        messages = [
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "internal only"}]},
+            {"role": "tool", "tool_call_id": "orphan", "content": "orphan result"},
+        ]
+
+        result = instance.compress(messages)
+
+        assert result
+        assert result[0]["role"] == "user"
+        assert result[0]["content"].startswith("[LCM overflow recovery:")
+        assert instance.get_status()["last_compression_status"] == "overflow_recovery"
+        assert all(row["content"] != result[0]["content"] for row in instance._store.get_session_messages(
+            "guardrail-scaffold-session",
+        ))
+
+    def test_forced_overflow_recovery_scaffold_is_not_reingested_after_restart(self, tmp_path):
+        """The synthetic fallback must remain provider-only across a rebind."""
+        db_path = tmp_path / "lcm_guardrail_scaffold_restart.db"
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(db_path),
+            max_assembly_tokens=1,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("guardrail-scaffold-restart-session", context_length=200000)
+        instance.compression_count = 1
+        result = instance.compress([
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "internal only"}]},
+            {"role": "tool", "tool_call_id": "orphan", "content": "orphan result"},
+        ])
+        fallback_content = result[0]["content"]
+        instance.shutdown()
+
+        rebound = LCMEngine(config=LCMConfig(database_path=str(db_path), max_assembly_tokens=1))
+        rebound.on_session_start("guardrail-scaffold-restart-session", context_length=200000)
+        rebound._ingest_messages(result + [{"role": "user", "content": "follow-up after recovery"}])
+
+        rows = rebound._store.get_session_messages("guardrail-scaffold-restart-session")
+        assert fallback_content not in [row["content"] for row in rows]
+        assert rows[-1]["content"] == "follow-up after recovery"
+        rebound.shutdown()
+
     def test_forced_overflow_recovery_flags_irreducible_single_tail_overflow(self, tmp_path, monkeypatch):
         import importlib
 
