@@ -549,6 +549,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         self._last_compression_status = "idle"
         self._last_compression_noop_reason = ""
+        self._verify_compaction_cleared_threshold = False
+        self.awaiting_real_usage_after_compression = False
         # Ingest-failure tracking. The core promise is that nothing is ever
         # lost, but a swallowed persistence error (disk full, DB locked,
         # corruption) silently breaks it: the turn continues while messages
@@ -1158,6 +1160,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     if generation_matches:
                         self._auxiliary_last_prompt_tokens[auxiliary_session_id] = prompt_tokens
             return
+        # Auxiliary responses return above; only the foreground response
+        # satisfies the host's post-compression usage gate, even without counts.
+        self._verify_compaction_cleared_threshold = False
+        self.awaiting_real_usage_after_compression = False
         self.last_prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         self.last_completion_tokens = int(usage.get("completion_tokens", 0) or 0)
         self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
