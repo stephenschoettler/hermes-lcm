@@ -554,6 +554,10 @@ LCM_COMPILE_EVIDENCE = {
             },
             "proposal": {
                 "type": "object",
+                "description": (
+                    "Required when mode is proposal (the default); ignored when "
+                    "mode is auto."
+                ),
                 "additionalProperties": False,
                 "required": [
                     "version",
@@ -686,14 +690,12 @@ LCM_COMPILE_EVIDENCE = {
             },
         },
         "required": ["question", "baseline_refs"],
-        "allOf": [
-            {
-                "if": {
-                    "properties": {"mode": {"const": "proposal"}},
-                },
-                "then": {"required": ["proposal"]},
-            }
-        ],
+        # No top-level allOf/oneOf/anyOf: the Anthropic Messages API rejects a
+        # tool input_schema that uses one ("input_schema does not support oneOf,
+        # allOf, or anyOf at the top level"), which 400s the whole request and
+        # takes every other tool down with it. The mode=proposal -> proposal
+        # requirement this used to declare is enforced in lcm_compile_evidence
+        # and stated in the "proposal" description above.
     },
 }
 
