@@ -30,7 +30,14 @@ from .db_bootstrap import (
     run_versioned_migrations,
 )
 from .config import LCMConfig
-from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
+from .ingest_protection import (
+    _is_hermes_persisted_output_marker,
+    _json_has_duplicate_object_keys,
+    _restore_ingest_payload_placeholder_refs,
+    protect_message_for_ingest,
+    protect_messages_for_ingest,
+)
+from .externalize import extract_externalized_ref
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -69,6 +76,117 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+
+# Replay-duplicate window (seconds): a message whose (session_id, role,
+# byte-identical content) row exists within this window of the candidate's
+# SOURCE time is treated as a replayed/compacted re-ingest of the same turn
+# (the whole-transcript re-ingest defect: whole-transcript re-ingest on every preflight/compress double-
+# ingested ~16x). The window is measured against the stored SOURCE time —
+# ``COALESCE(observed_at, timestamp)`` per row, NOT the write-time
+# ``timestamp`` column: the stored timestamp is write time and would read as
+# "now" for every ingest, collapsing legitimately-old messages replayed
+# later into the window. A candidate whose source timestamp was not
+# trustworthy falls back to ingest time (write time), which only affects
+# fresh live messages — the incident's replay traffic re-uses the original
+# source timestamps, so the source-time window still catches them. Bound the
+# window so a legitimate user re-sending the same text later ingests again;
+# role stays in the match so distinct turns in the same session are never
+# merged.
+_DEDUPE_REPLAY_WINDOW_SECONDS = 600.0
+
+# ``observed_at`` is the trustworthy SOURCE timestamp column added by the
+# V4.2 time-contract migration; ``timestamp`` is write time. Older rows have
+# only the write-time copy, so coalesce per row.
+_DEDUPE_REPLAY_SOURCE_TIME_EXPR = "COALESCE(observed_at, timestamp)"
+
+
+def _dedupe_replay_identity_text(
+    value: Any,
+    *,
+    config=None,
+    hermes_home: str = "",
+    session_id: str = "",
+) -> str:
+    """Normalization-stable identity text for dedupe-replay comparison.
+
+    Normalizes the value the same way the stored column was built
+    (``_normalize_content_value``), then restores
+    ``[Externalized LCM ingest payload: …]`` placeholders to their
+    regeneration-stable identity through
+    ``_restore_ingest_payload_placeholder_refs`` (payload-aware mode): a ref
+    whose payload exists for this session contributes the payload content;
+    anything else contributes a session-agnostic ``ref=<filename>`` token.
+    The per-pass ``time_ns`` filename inside a regenerated placeholder
+    therefore never changes the identity.
+    """
+    return _restore_ingest_payload_placeholder_refs(
+        _normalize_content_value(value),
+        config=config,
+        hermes_home=hermes_home,
+        session_id=session_id,
+    )
+
+
+def _canonical_tool_calls_identity(tool_calls: Any) -> str:
+    """Serialize tool_calls into a replay-stable identity string.
+
+    Mirrors reconcile's ``_stable_tool_calls_identity``: JSON text inside
+    string values (e.g. ``arguments``) is parsed and re-dumped with sorted
+    keys, so semantically identical calls serialize identically regardless
+    of host reserialization (object-key order, spacing). Duplicate-key JSON
+    is deliberately left verbatim — it is not losslessly canonicalizable,
+    and byte-equality is the safe comparison for it. Returns ``""`` for
+    empty/absent tool_calls, which is also what the ``tool_calls`` column
+    stores (NULL) — the dedupe probe compares this identity against the
+    column, so both sides must canonicalize the same way.
+    """
+    if not tool_calls:
+        return ""
+    if isinstance(tool_calls, str):
+        stripped = tool_calls.strip()
+        if stripped and stripped[0] in "[{" and not _json_has_duplicate_object_keys(stripped):
+            try:
+                tool_calls = json.loads(stripped)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return tool_calls
+
+    def _canon(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: _canon(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [_canon(item) for item in value]
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped[0] in "[{" and not _json_has_duplicate_object_keys(stripped):
+                try:
+                    parsed = json.loads(stripped)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return value
+                if isinstance(parsed, (dict, list)):
+                    return json.dumps(
+                        _canon(parsed), sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+            return value
+        return value
+
+    try:
+        return json.dumps(
+            _canon(tool_calls), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    except (TypeError, ValueError):
+        return str(tool_calls)
+
+# Expression index for the dedupe probe's source-time range: a plain index
+# on (session_id, timestamp) cannot serve a range over
+# COALESCE(observed_at, timestamp), so the probe would degrade to a
+# session-prefix scan (quadratic over a replayed transcript). The stored
+# expression must match the probe predicate byte-for-byte for SQLite to
+# use it.
+_DEDUPE_REPLAY_SOURCE_TIME_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_msg_session_source_time "
+    "ON messages(session_id, COALESCE(observed_at, timestamp))"
+)
 
 
 def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -333,6 +451,7 @@ class MessageStore:
         if not self._is_memory_database:
             _prepare_private_sqlite_storage(self.db_path)
         self._ingest_protection_config = ingest_protection_config or LCMConfig(database_path=str(self.db_path))
+        self._deduped_replay_count = 0
         self._hermes_home = hermes_home or str(self.db_path.parent)
         self._conn: Optional[sqlite3.Connection] = None
         # ``self._conn`` is shared across threads (the connection is opened with
@@ -396,6 +515,9 @@ class MessageStore:
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
+        # The dedupe probe's source-time range needs this expression index;
+        # a plain (session_id, timestamp) index cannot serve a COALESCE range.
+        self._conn.execute(_DEDUPE_REPLAY_SOURCE_TIME_INDEX_SQL)
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -456,10 +578,154 @@ class MessageStore:
 
     # -- Write operations ---------------------------------------------------
 
+    def _dedupe_replay_applies(self, role: str, content: Any) -> bool:
+        """Return False for message classes with their own replay semantics.
+
+        Tool-role Hermes persisted-output markers AND tool-role messages
+        already externalized to the ``[Externalized tool output: ...; ref=…]``
+        form are re-appended deliberately: the reconcile/retry logic above
+        the store decides whether a replayed result recovers from the
+        durable file, gets re-externalized, or is re-stored verbatim, so
+        collapsing byte-identical tool results here would break retry
+        recovery (regression class in TestIngestExternalization). Only the
+        plain non-marker messages that ride the whole-transcript replay
+        path are guarded.
+        """
+        if role == "tool" and isinstance(content, str) and content:
+            if _is_hermes_persisted_output_marker(content):
+                return False
+            if extract_externalized_ref(content) is not None:
+                return False
+        return True
+
+    def _is_duplicate_replay(self, session_id: str, role: str,
+                             content: Any, observed_at: float | None,
+                             tool_call_id: str | None = None,
+                             tool_name: str | None = None,
+                             msg_tool_calls: Any = None,
+                             *, _probe_only: bool = False) -> bool:
+        """True when this message is a replayed re-ingest of a stored turn.
+
+        A candidate is a duplicate when the same session already holds a row
+        with the same replay identity — role, content, the same tool_call_id,
+        the same tool_name, and semantically-identical (canonically
+        serialized) tool_calls — whose SOURCE time —
+        ``COALESCE(observed_at, timestamp)`` per row, not the write-time
+        ``timestamp`` column — falls inside a bounded window of the
+        candidate's observed SOURCE time, AND whose payload-bearing content
+        matches under a regeneration-stable identity comparison. The
+        transcript replay traffic this guard exists for (the whole-transcript re-ingest defect) re-carries
+        the original source timestamps AND the full original identity, so
+        the source-time window catches it; a legitimate user re-sending the
+        same text later falls outside it, and structurally different turns
+        (different tool_call_id, tool_name, or tool_calls, e.g. two tool
+        results both reading "ok" for different calls, or two assistant
+        tool-call turns with content=None calling different tools) never
+        collapse even inside the window.
+
+        Content comparison: ingest protection rewrites inline media / long
+        base64 payloads into ``[Externalized LCM ingest payload: …]``
+        placeholders whose filename embeds a per-pass ``time_ns`` suffix, so
+        byte-exact equality would miss a replayed turn whose placeholder was
+        regenerated. The SQL range narrows on raw stored content (indexed on
+        ``idx_msg_session_source_time``), then each surviving row's content
+        and the candidate's content are compared in Python through
+        ``_restore_ingest_payload_placeholder_refs``: both sides resolve to
+        the same stable identity (payload content when the ref's payload
+        exists for this session, else a session-agnostic ``ref=<filename>``
+        token — same eligibility rule as
+        ``restore_ingest_payload_placeholders``). tool_calls are compared
+        through ``_canonical_tool_calls_identity`` (sorted-key serialization
+        with embedded-JSON canonicalization), so hosts that reserialize
+        messages with different object-key order or argument spacing still
+        match the durable row; the canonical identity is compared in Python
+        because the column holds the raw per-host serialization.
+
+        Conversation_id is deliberately excluded: distinct turns in the same
+        session (even with identical text) must never collapse.
+
+        A candidate with no trustworthy source timestamp is skipped: there is
+        no observed_at to compare against stored source time (fresh live
+        messages never carry one; the replay traffic this guard exists for
+        re-carries the original source timestamps), and anchoring the window
+        at ingest time would invent a write-time comparison that collapses
+        legitimate fresh repeats ingested in the same batch.
+        """
+        if observed_at is None:
+            return False
+        anchor = observed_at
+        window = _DEDUPE_REPLAY_WINDOW_SECONDS
+        source_time = _DEDUPE_REPLAY_SOURCE_TIME_EXPR
+        if not self._dedupe_replay_applies(role, content):
+            return False
+        candidate_tool_calls_identity = _canonical_tool_calls_identity(
+            msg_tool_calls
+        )
+        candidate_identity_content = _dedupe_replay_identity_text(
+            content,
+            config=self._ingest_protection_config,
+            hermes_home=self._hermes_home,
+            session_id=session_id,
+        )
+        try:
+            rows = self._conn.execute(
+                f"""SELECT content, tool_calls FROM messages
+                   WHERE session_id = ?
+                     AND role = ?
+                     AND content IS ?
+                     AND tool_call_id IS ?
+                     AND tool_name IS ?
+                     AND {source_time} >= ? AND {source_time} <= ?""",
+                (
+                    session_id,
+                    role,
+                    content,
+                    tool_call_id,
+                    tool_name,
+                    anchor - window,
+                    anchor + window,
+                ),
+            ).fetchall()
+        except sqlite3.Error:
+            logger.debug("Replay-duplicate probe failed; storing the message", exc_info=True)
+            return False
+        # Identity comparisons happen in Python: the payload-placeholder and
+        # canonical tool-calls transformations are not expressible as indexed
+        # SQL predicates, and the columns hold raw per-host serializations.
+        for stored_content, stored_tool_calls in rows:
+            if _dedupe_replay_identity_text(
+                stored_content,
+                config=self._ingest_protection_config,
+                hermes_home=self._hermes_home,
+                session_id=session_id,
+            ) != candidate_identity_content:
+                continue
+            if _canonical_tool_calls_identity(
+                stored_tool_calls
+            ) != candidate_tool_calls_identity:
+                continue
+            if not _probe_only:
+                self._deduped_replay_count += 1
+                logger.debug(
+                    "Deduped replay ingest: session=%s role=%s (total deduped=%d)",
+                    session_id, role, self._deduped_replay_count,
+                )
+            return True
+        return False
+
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",
                conversation_id: str = "") -> int:
-        """Persist a message and return its store_id."""
+        """Persist a message and return its store_id.
+
+        Deliberately NOT guarded by the whole-transcript replay dedupe
+        (see ``append_batch``): this single-message path is only used by
+        direct store callers and tests, where byte-identical consecutive
+        appends are indistinguishable from legitimate live repeats — the
+        message-level source-time window cannot separate them. All
+        production ingest funnels through ``_ingest_messages`` →
+        ``_append_protected_batch``, where the guard is active.
+        """
         msg = protect_message_for_ingest(
             msg,
             config=self._ingest_protection_config,
@@ -502,8 +768,13 @@ class MessageStore:
                      messages: List[Dict[str, Any]],
                      token_estimates: List[int] | None = None,
                      source: str = "",
-                     conversation_id: str = "") -> List[int]:
-        """Persist multiple messages in one transaction. Returns store_ids."""
+                     conversation_id: str = "",
+                     *, dedupe_replay: bool = True) -> List[int]:
+        """Persist multiple messages in one transaction. Returns store_ids.
+
+        ``dedupe_replay=False`` skips the whole-transcript replay guard;
+        see ``append``.
+        """
         protected_messages = protect_messages_for_ingest(
             messages,
             config=self._ingest_protection_config,
@@ -516,19 +787,27 @@ class MessageStore:
             token_estimates,
             source=source,
             conversation_id=conversation_id,
+            dedupe_replay=dedupe_replay,
         )
 
     def _append_protected_batch(self, session_id: str,
                                 messages: List[Dict[str, Any]],
                                 token_estimates: List[int] | None = None,
                                 source: str = "",
-                                conversation_id: str = "") -> List[int]:
+                                conversation_id: str = "",
+                                *, dedupe_replay: bool = True) -> List[int]:
         """Persist messages that already passed ingest protection.
 
         This is an internal fast path for callers that need the protected form
         before storage, for example to update active replay with raw-payload
         stubs. Direct callers should use ``append_batch`` so storage-boundary
         payload protection cannot be bypassed accidentally.
+
+        ``dedupe_replay=False`` skips the whole-transcript replay guard for
+        this batch: callers that have ALREADY decided to append (the engine's
+        reconcile path records the decision and then persists, and retry /
+        recovery paths re-store deliberately) must not be second-guessed by a
+        store-level duplicate check.
         """
         if token_estimates is None:
             token_estimates = [0] * len(messages)
@@ -540,6 +819,17 @@ class MessageStore:
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
                 observed_at = _normalize_observed_at(msg.get("timestamp"))
+                if dedupe_replay and self._is_duplicate_replay(
+                    session_id,
+                    msg.get("role", "unknown"),
+                    _normalize_content_value(msg.get("content")),
+                    observed_at,
+                    tool_call_id=msg.get("tool_call_id"),
+                    tool_name=msg.get("tool_name"),
+                    msg_tool_calls=tc,
+                ):
+                    ids.append(-1)
+                    continue
                 cur = self._conn.execute(
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,

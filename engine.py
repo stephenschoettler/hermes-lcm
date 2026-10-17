@@ -138,7 +138,7 @@ from .sqlite_util import (
     _is_sqlite_locked_error,
     _temporary_sqlite_busy_timeout,
 )
-from .store import MessageStore
+from .store import MessageStore, _normalize_observed_at
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 from . import tools as lcm_tools
 
@@ -387,6 +387,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
+    def load_externalized_payload_sidecar(self, ref: str) -> Dict[str, Any] | None:
+        """Load one externalized payload through LCM's public safe reader."""
+        return load_externalized_payload(
+            ref,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
@@ -570,9 +578,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
-        # One-shot handoff from preflight: adopt an already-durable replay
-        # cleanup during boundary cooldown without running summary work.
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        # One-shot handoff from preflight: publish deterministic replay cleanup
+        # without letting below-threshold work invoke the summarizer.
+        self._preflight_cleanup_only = False
+        self._sanitation_claim_lock = threading.RLock()
+        self._pending_sanitation_claim = None
+        self._foreground_ingest_revision = 0
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -773,6 +784,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        self._invalidate_sanitation_operation()
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
@@ -834,11 +846,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
-            self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
-            if store is not None:
-                store._hermes_home = hermes_home
-            self._reset_profile_runtime_state()
+            # Serialize the configured-database swap too (round-3 finding
+            # 4041846904): the mutation below is the same half-swap hazard — a
+            # claimed sanitation running concurrently must not read the NEW
+            # profile home under the OLD session id mid-swap.
+            with self._sanitation_claim_lock:
+                self._hermes_home = hermes_home
+                store = getattr(self, "_store", None)
+                if store is not None:
+                    store._hermes_home = hermes_home
+                self._reset_profile_runtime_state()
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
@@ -847,10 +864,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
-        self._close_storage()
-        self._hermes_home = hermes_home
-        self._bind_storage(db_path, hermes_home)
-        self._reset_profile_runtime_state()
+        # Serialize the ENTIRE swap with claimed sanitation (round-8 finding):
+        # closing the old store before the claim lock was acquired let a claimed
+        # sanitation resume against a half-swapped engine (closed helpers) or the
+        # NEW profile's store (foreground messages written into the wrong
+        # profile). Claimed compressions and ingests take this same lock.
+        with self._sanitation_claim_lock:
+            self._close_storage()
+            self._hermes_home = hermes_home
+            self._bind_storage(db_path, hermes_home)
+            self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 
@@ -1013,10 +1036,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
 
-    def _mark_preflight_compression_requested(self) -> bool:
-        """Record that preflight found work and clear any stale no-op reason."""
+    def _mark_preflight_compression_requested(
+        self,
+        *,
+        operation: str,
+        reason: str,
+        trigger: str = "",
+    ) -> bool:
+        """Record and explain a positive preflight decision without content."""
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
+        if trigger:
+            logger.info(
+                "LCM preflight decision operation=%s reason=%s trigger=%s",
+                operation,
+                reason,
+                trigger,
+            )
+        else:
+            logger.info(
+                "LCM preflight decision operation=%s reason=%s",
+                operation,
+                reason,
+            )
         return True
 
     @property
@@ -1615,21 +1657,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
-            try:
-                self._remember_lcm_normal_message_prefix(
-                    self._session_id,
-                    messages,
-                    conversation_id=self._conversation_id,
-                )
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                logger.debug(
-                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
-                )
-            except Exception as e:
-                self._record_ingest_failure("per-turn ingest()", e)
+            with self._sanitation_claim_lock:
+                try:
+                    self._remember_lcm_normal_message_prefix(
+                        self._session_id,
+                        messages,
+                        conversation_id=self._conversation_id,
+                    )
+                    self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    logger.debug(
+                        "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                        self._session_id, len(messages), self._ingest_cursor,
+                    )
+                except Exception as e:
+                    self._record_ingest_failure("per-turn ingest()", e)
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -2786,6 +2829,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return
             if self._compression_boundary_from_lcm_bypassed_session(old_session_id):
+                self._invalidate_sanitation_operation()
                 self._handoff_lcm_bypass_lineage(
                     old_session_id,
                     session_id,
@@ -2816,6 +2860,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return
             self._clear_thread_context_stateless()
+            self._invalidate_sanitation_operation()
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
@@ -2844,6 +2889,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 previous_session_id,
             )
             return
+        self._invalidate_sanitation_operation()
         start_platform = str(kwargs.get("platform") or "")
         side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
             session_id,
@@ -3222,8 +3268,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        # Classify the callback BEFORE invalidating sanitation state. A stale
+        # auxiliary end for an id the foreground has since reused satisfies the
+        # string equality above, but nonzero ended_generation / lineage-suppressed
+        # reuse proves the callback is not the bound foreground ending - and must
+        # not destroy a fresh foreground sanitation claim.
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
         active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
+        if session_id == self._session_id and not (
+            ended_generation
+            or (
+                session_id != self._thread_context_session_id()
+                and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            )
+        ):
+            self._invalidate_sanitation_operation()
         if (
             self._has_auxiliary_lineage_session(session_id)
             and session_id != self._session_id
@@ -3551,6 +3610,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
 
     def on_session_reset(self) -> None:
+        self._invalidate_sanitation_operation()
         if self._host_fallback_compressor is not None:
             compressor = self._host_fallback_compressor
             on_session_reset = getattr(compressor, "on_session_reset", None)
@@ -3774,17 +3834,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages = kwargs.get("messages")
 
         if name != "lcm_inspect" and messages and self._session_id:
-            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            elif not (
-                self._session_ignored or self._session_stateless or self._thread_context_stateless()
-            ):
-                try:
-                    self._ingest_messages(messages)
-                    self._record_ingest_success()
-                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                except Exception as e:
-                    self._record_ingest_failure("tool-call ingest", e)
+            # Serialize with claimed compression exactly like ingest(): a
+            # tool-call ingest must not advance _ingest_cursor /
+            # _foreground_ingest_revision underneath a validated sanitation
+            # claim, or a stale claim could be echoed for a message set that
+            # no longer matches active replay.
+            with self._sanitation_claim_lock:
+                if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
+                    self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+                elif not (
+                    self._session_ignored or self._session_stateless or self._thread_context_stateless()
+                ):
+                    try:
+                        self._ingest_messages(messages)
+                        self._record_ingest_success()
+                        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    except Exception as e:
+                        self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
@@ -4488,6 +4554,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
+    def _store_guard_can_dedupe(self, msg: Dict[str, Any], session_id: str) -> bool:
+        """True when the store-level dedupe-replay guard can arbitrate this
+        row by itself (usable source timestamp, non-exempt class, and its
+        guard probe finds a dedupe twin within the source-time window).
+        Probe-only: no counter side effects. Rows the guard cannot dedupe -
+        no observed_at, exempt classes, or a stored copy whose source time
+        is outside the window (legacy pre-migration rows, mutated copies) -
+        must be mask-dropped by the alignment instead.
+        """
+        observed_at = _normalize_observed_at(msg.get("timestamp"))
+        content = normalize_content_value(msg.get("content"))
+        if observed_at is None:
+            return False
+        if not self._store._dedupe_replay_applies(
+            str(msg.get("role") or "unknown"), content
+        ):
+            return False
+        return self._store._is_duplicate_replay(
+            session_id,
+            str(msg.get("role") or "unknown"),
+            content,
+            observed_at,
+            tool_call_id=msg.get("tool_call_id"),
+            tool_name=msg.get("tool_name"),
+            msg_tool_calls=msg.get("tool_calls"),
+            _probe_only=True,
+        )
+
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
@@ -4550,7 +4644,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
+        reconcile_ran = False
         if self._ingest_cursor_needs_reconcile:
+            reconcile_ran = True
             reconcile_messages = [
                 original_msg
                 if (
@@ -4571,7 +4667,133 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             ]
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
+            reconcile_deferred = self._ingest_cursor is None
+            # The reconcile-stashed mask (computed over the SANITIZED
+            # reconcile_messages) governs the defer and durable-tail
+            # advance paths. The SCAFFOLD-prefix advance recomputes over
+            # the RAW post-cursor region in the unified block below: the
+            # sanitized form's rewrites diverge from the store's copies
+            # and starve the alignment (live 21:56 burst).
+            deferred_replay_alignment_mask = list(
+                getattr(self, "_deferred_replay_alignment_mask", []) or []
+            )
+            if reconcile_deferred:
+                # The reconcile-duplication defect: the reconcile pass could not decide (zero match
+                # against a mutated, non-empty stored tail). Leave the cursor
+                # at 0 for THIS pass so the store-level dedupe-replay guard
+                # can arbitrate the whole batch instead of reconcile
+                # second-guessing itself; the tail re-scan repeats next pass.
+                self._ingest_cursor = 0
+        else:
+            reconcile_deferred = False
+            deferred_replay_alignment_mask: list[bool] = []
+        # Unified replay-alignment mask computation (the reconcile-duplication defect live
+        # follow-up): computed over the RAW host messages on every pass
+        # that could face a whole-transcript replay - reconcile ran (any
+        # verdict; the scaffold-prefix advance's post-cursor region is the
+        # live burst shape), or a no-reconcile cursor=0 pass over a
+        # non-empty store (compaction resets land here). The gate decides;
+        # the mask-drop rules in the kept loop handle the two paths'
+        # different guard semantics (cursor-advance: guard off, drop all
+        # masked; defer: guard on, drop only guard-powerless rows).
+        _scaffold_cursor = self._last_ingest_reconciliation.get("cursor") or 0
+        _alignment_session_count = 0
+        if self._session_id and not self._session_ignored and not self._session_stateless:
+            try:
+                _alignment_session_count = self._store.get_session_count(self._session_id)
+            except Exception:
+                _alignment_session_count = 0
+        _scaffold_advance = (
+            reconcile_ran
+            and not reconcile_deferred
+            and self._last_ingest_reconciliation.get("reason")
+            == "skipped scaffold-only prefix"
+        )
+        _alignment_warranted = (
+            n >= 3
+            and _alignment_session_count > 0
+            and (
+                _scaffold_advance
+                or (
+                    not reconcile_ran
+                    and self._ingest_cursor == 0
+                )
+            )
+        )
+        if _alignment_warranted:
+            # Form per path: the scaffold advance evaluates the RAW
+            # POST-CURSOR region (the scaffold rows are not stored, so the
+            # transcript part is what the store holds; the sanitized form's
+            # rewrites starve the alignment). The no-reconcile path uses
+            # the SANITIZED replay (redaction placeholders in the store
+            # can never match raw sensitive rows).
+            _align_form = (
+                messages[_scaffold_cursor:]
+                if _scaffold_advance
+                else replay_messages
+            )
+            _cov, _span_turns, _align_mask, _order_ok = (
+                self._align_replayed_batch_against_stored_tail(
+                    _align_form,
+                    [
+                        row
+                        for row in self._store.get_session_tail(
+                            self._session_id,
+                            limit=min(max(n * 4, 64), _alignment_session_count),
+                        )
+                        if not self._matches_ignore_message_patterns(
+                            row, stored_row=True
+                        )
+                    ],
+                )
+            )
+            if self._replay_alignment_gate(
+                _align_form,
+                _cov,
+                _span_turns,
+                _align_mask,
+                _order_ok,
+            ):
+                if _scaffold_advance:
+                    # The mask indexes the post-cursor slice; the kept
+                    # loop's absolute_idx spans the full batch, so pad the
+                    # front with False for the scaffold prefix.
+                    deferred_replay_alignment_mask = (
+                        [False] * _scaffold_cursor + list(_align_mask)
+                    )
+                else:
+                    deferred_replay_alignment_mask = list(_align_mask)
+                    if not reconcile_ran:
+                        # The no-reconcile path takes the defer verdict
+                        # too: cursor stays 0 for this pass, the guard
+                        # arbitrates guard-eligible rows, and the mask
+                        # drops the guard-powerless ones.
+                        reconcile_deferred = True
+                        self._record_ingest_reconciliation(
+                            action="deferred to replay guard",
+                            reason="ambiguous zero cursor over non-empty store",
+                            cursor=0,
+                            incoming=n,
+                            session_count=_alignment_session_count,
+                            stored_tail_count=_alignment_session_count,
+                            effective_incoming=n,
+                        )
         cursor = min(max(self._ingest_cursor, 0), n)
+        # If the reconcile path ran THIS pass and REACHED a decision, it
+        # DECIDED what to do with the tail of this batch (advanced the cursor
+        # past a replayed prefix, or recorded the ambiguous delta as a
+        # deliberate append). That decision must not be second-guessed by the
+        # store-level whole-transcript replay guard. Keyed on this invocation,
+        # never on the historical _last_ingest_reconciliation record: stale
+        # actions from a previous pass must not disable the guard. The plain
+        # per-turn / preflight whole-transcript replay path (the incident
+        # mechanism — cursor reset to 0 without reconcile) keeps the guard
+        # active. The reconcile-duplication defect: a reconcile pass that could NOT decide (zero
+        # match against a mutated non-empty stored tail) stays un-decided —
+        # the guard arbitrates the whole batch and the tail re-scan repeats
+        # next pass.
+        dedupe_replay = reconcile_deferred or not reconcile_ran
+        recomputed_replay_messages = replay_messages
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4600,12 +4822,57 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
+            if reconcile_ran and reconcile_deferred:
+                # The reconcile-duplication defect: reconcile deferred this ambiguous replay batch to
+                # the store guard, and the guard deduped EVERY row — nothing
+                # new to persist. The whole-transcript replay is back for
+                # another pass (the batch re-arrives every inbound message),
+                # so the tail re-scan must re-run: leaving
+                # _ingest_cursor_needs_reconcile False would silently
+                # "advance" the cursor to n on this pass and drop the
+                # reconcile from the next one. Nothing was stored and the
+                # active replay is unchanged, so no revision bump, no
+                # sanitation-claim consumption, no placeholder-budget
+                # mutation.
+                return self._remember_active_replay_messages(messages, replay_messages)
+            # A replay refresh (persisted-output recovery metadata, sensitive
+            # redaction, quarantine/ignore placeholders) can change the active
+            # replay for ALREADY-INGESTED messages even when nothing new is
+            # stored, so the foreground revision must advance whenever this
+            # no-new-rows pass RECOMPUTES a divergent active replay for the
+            # message identities the remembered replay currently describes:
+            # sanitation claims are keyed on the revision and must not survive
+            # an active-state change, and the identical-prefix replay cache
+            # must not silently keep serving stale state over divergent
+            # recomputed state. Refreshes over other message sets (a
+            # foreign-list session-end flush) reflect no active-state change
+            # and must not consume a claim.
             cached_replay = self._cached_active_replay_messages(messages)
+            remembered_identities = getattr(
+                self,
+                "_last_active_replay_source_identities",
+                None,
+            )
+            replay_changed_active_state = bool(
+                [self._message_replay_identity(message) for message in messages]
+                == remembered_identities
+                and recomputed_replay_messages
+                != (cached_replay if cached_replay is not None else getattr(self, "_last_active_replay_messages", None))
+            )
+            if replay_changed_active_state:
+                self._foreground_ingest_revision += 1
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            if replay_changed_active_state:
+                # Round-3 finding 4041846907: a refresh was DETECTED (the
+                # recomputed replay differs for the same source identities) —
+                # returning the stale cached replay here would keep serving the
+                # old active state and re-bump the revision every ingest.
+                # Remember + return the recomputed view.
+                return self._remember_active_replay_messages(messages, replay_messages)
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
@@ -4779,6 +5046,36 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     or metadata_replayed_active_placeholder
                 )
                 if (
+                    deferred_replay_alignment_mask
+                    and absolute_idx < len(deferred_replay_alignment_mask)
+                    and deferred_replay_alignment_mask[absolute_idx]
+                    and (
+                        # Cursor-advance path: reconcile already DECIDED
+                        # (full-replay proof) and the guard is OFF for this
+                        # append — every masked row past the cursor is a
+                        # proven replay repeat; drop it regardless of
+                        # guard eligibility.
+                        (reconcile_ran and not reconcile_deferred)
+                        # Defer path: the guard is ON, so only rows the
+                        # guard cannot arbitrate are mask-dropped;
+                        # guard-eligible rows flow to the guard (the ingest dedupe-replay guard
+                        # semantics and its dedupe counter stay intact).
+                        or not self._store_guard_can_dedupe(
+                            replay_msg,
+                            self._session_id,
+                        )
+                    )
+                ):
+                    # The reconcile-duplication defect: this message aligned against a stored row
+                    # under mutation-tolerant matching — it is a replayed
+                    # turn even though the store guard could not dedupe it
+                    # (the stored copy was rewritten post-ingest to a
+                    # cleared/redacted placeholder, or the row carries no
+                    # source timestamp for the guard's window). Skip
+                    # storing; the durable record for that turn already
+                    # exists.
+                    continue
+                if (
                     ignored_original_messages[absolute_idx]
                     or generated_volatile_placeholder
                     or replayed_active_placeholder
@@ -4832,6 +5129,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
+            self._foreground_ingest_revision += 1
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
@@ -4881,6 +5179,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             estimates,
             source=self._session_platform,
             conversation_id=self._conversation_id,
+            dedupe_replay=dedupe_replay,
         )
         # Rollup staleness is driven by summary-node PUBLICATION
         # (_invalidate_rollups_for_published_node at every add_node site), not by
@@ -4888,6 +5187,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # would let a rebuild publish 'ready' from old sources and omit the leaf
         # (maintainer #388 P1).
         self._ingest_cursor = n
+        self._foreground_ingest_revision += 1
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}

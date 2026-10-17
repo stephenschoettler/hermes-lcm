@@ -1021,6 +1021,63 @@ def restore_ingest_payload_placeholders(
     return _INGEST_PLACEHOLDER_RE.sub(replace, text)
 
 
+def _restore_ingest_payload_placeholder_refs(
+    text: str,
+    *,
+    config=None,
+    hermes_home: str = "",
+    session_id: str = "",
+) -> str:
+    """Restore payload placeholders in a candidate identity, keeping ONLY refs
+    whose payload exists and matches the session (the same eligibility rule
+    ``restore_ingest_payload_placeholders`` applies).
+
+    Covers BOTH placeholder families that embed regeneration-sensitive
+    filenames: ``[Externalized LCM ingest payload: …]`` (the storage-boundary
+    sanitizer) and ``[Externalized payload: kind=raw_payload; …]`` /
+    ``[Externalized tool output: …]`` (the threshold externalizer). An
+    INELIGIBLE ref is returned as its ``ref=<filename>`` token rather than
+    the raw placeholder, so the identity component contributed by that
+    placeholder is the same regardless of the per-pass ``time_ns`` filename
+    embedded in the placeholder text (dedupe-replay comparisons must not
+    depend on regeneration-time uniqueness). With ``config=None`` the
+    eligibility probe degrades to a token swap for every placeholder; a
+    missing file keeps the ``ref=<filename>`` token.
+    """
+    if not isinstance(text, str):
+        return text
+    has_ingest_placeholder = _EXTERNALIZED_PLACEHOLDER_PREFIX in text
+    has_generic_placeholder = (
+        "[Externalized payload:" in text
+        or "[Externalized tool output:" in text
+        or "[GC'd externalized payload:" in text
+        or "[GC'd externalized tool output:" in text
+    )
+    if not has_ingest_placeholder and not has_generic_placeholder:
+        return text
+
+    if config is None:
+        def token_only(match: re.Match[str]) -> str:
+            return f"ref={match.group(1).strip()}"
+
+        text = _INGEST_PLACEHOLDER_RE.sub(token_only, text)
+        return _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE.sub(token_only, text)
+
+    def replace(match: re.Match[str]) -> str:
+        ref = match.group(1).strip()
+        payload = load_externalized_payload(ref, config=config, hermes_home=hermes_home)
+        if payload is None or payload.get("kind") not in ("ingest_payload", "raw_payload", "tool_result"):
+            return f"ref={ref}"
+        payload_session_id = payload.get("session_id") or ""
+        if session_id and payload_session_id and payload_session_id != session_id:
+            return f"ref={ref}"
+        content = payload.get("content")
+        return content if isinstance(content, str) else f"ref={ref}"
+
+    text = _INGEST_PLACEHOLDER_RE.sub(replace, text)
+    return _EXTERNALIZED_PAYLOAD_PLACEHOLDER_RE.sub(replace, text)
+
+
 def looks_like_long_base64(text: str, *, min_chars: int = _GENERIC_BASE64_MIN_CHARS) -> bool:
     """Conservative long-base64 heuristic.
 
