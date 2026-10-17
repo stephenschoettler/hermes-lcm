@@ -12522,6 +12522,14 @@ class TestSessionRollover:
         engine._store._conn.execute("PRAGMA busy_timeout=750")
         engine._lifecycle._conn.execute("PRAGMA busy_timeout=750")
 
+        # Pay the tokenizer's one-time lazy init BEFORE timing. It costs ~250ms
+        # on a cold interpreter versus ~0.002ms warm, which is most of this
+        # budget and has nothing to do with the lock wait being measured. In
+        # production the tokenizer is long warm by session end; only a
+        # first-touch test pays it, so leaving it inside the timed region
+        # measures interpreter warm-up rather than the bounded flush.
+        count_message_tokens({"role": "user", "content": "warm the tokenizer"})
+
         locker = sqlite3.connect(str(engine._store.db_path), timeout=1.0, isolation_level=None)
         locker.execute("PRAGMA journal_mode=WAL")
         locker.execute("BEGIN IMMEDIATE")
