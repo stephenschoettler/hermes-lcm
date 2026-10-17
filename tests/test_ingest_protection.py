@@ -2811,6 +2811,129 @@ def test_externalized_payload_integrity_scan_ignores_escaped_placeholder_example
     assert detail["missing_externalized_payload_refs"] == []
 
 
+def test_externalized_payload_integrity_scan_ignores_production_named_placeholder_in_quoted_source_literal(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized tool output: tool_call_id=call_gc; chars=12008; bytes=12008; "
+        "ref=20260809_161858_call_gc_71c66761c2bb_18ca2f6ae69a6d30.json]"
+    )
+    content = json.dumps(
+        {
+            "error": None,
+            "exit_code": 0,
+            "output": (
+                "terminal output preserves user's source text\n"
+                'assert stored_tool["content"].startswith("[GC\'d externalized tool output:")\n'
+                f"E <method startswith of str object> = '{placeholder}'.startswith\n"
+            ),
+        }
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "desktop",
+            "tool",
+            content,
+            "call_terminal",
+            None,
+            "terminal",
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 0
+    assert detail["externalized_payload_refs_missing"] == 0
+    assert detail["missing_externalized_payload_refs"] == []
+
+
+def test_externalized_payload_integrity_scan_counts_unquoted_ref_with_code_like_suffix(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized tool output: tool_call_id=call_real; chars=10; bytes=10; "
+        "ref=20260809_real_payload.json]"
+    )
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "desktop",
+            "tool",
+            placeholder + "'.startswith('suffix without an opening quote')",
+            "call_real",
+            None,
+            "terminal",
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"][0]["externalized_ref"] == "20260809_real_payload.json"
+
+
+def test_externalized_payload_integrity_scan_keeps_real_ref_after_incomplete_serialized_line(tmp_path):
+    engine = _engine(tmp_path)
+    (tmp_path / "externalized").mkdir()
+    placeholder = (
+        "[Externalized tool output: tool_call_id=call_real; chars=10; bytes=10; "
+        "ref=20260809_real_after_incomplete.json]"
+    )
+    content = "[Externalized tool output: incomplete\\n" + placeholder
+    engine._store._conn.execute(
+        """INSERT INTO messages
+           (session_id, source, role, content, tool_call_id, tool_calls, tool_name, timestamp, token_estimate, pinned)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            engine.current_session_id,
+            "desktop",
+            "tool",
+            content,
+            "call_real",
+            None,
+            "terminal",
+            1.0,
+            1,
+            0,
+        ),
+    )
+    engine._store._conn.commit()
+
+    detail = scan_externalized_payload_integrity(
+        engine._store._conn,
+        engine._config,
+        hermes_home=engine._hermes_home,
+    )
+
+    assert detail["externalized_payload_refs_total"] == 1
+    assert detail["externalized_payload_refs_missing"] == 1
+    assert detail["missing_externalized_payload_refs"][0]["externalized_ref"] == "20260809_real_after_incomplete.json"
+
+
 def test_lcm_doctor_warns_on_missing_externalized_payload_refs_when_inline_payloads_are_clean(tmp_path):
     engine = _engine(tmp_path)
     (tmp_path / "externalized").mkdir()
