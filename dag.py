@@ -156,6 +156,16 @@ class SummaryNode:
     search_directness: float = 0.0
 
 
+@dataclass(frozen=True)
+class SummaryPublicationSnapshot:
+    """Exact durable source and ownership state captured before model work."""
+    source_type: str
+    conversation_id: str
+    rows: tuple[tuple[int, tuple[Any, ...]], ...]
+    parents: tuple[tuple[int, tuple[int, ...]], ...]
+    lifecycle: tuple[Any, ...] | None
+
+
 class SummaryDAG:
     """SQLite-backed DAG of summary nodes."""
 
@@ -247,27 +257,139 @@ class SummaryDAG:
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
         with self._db_lock:
-            cur = self._conn.execute(
-                """INSERT INTO summary_nodes
-                   (session_id, depth, summary, token_count, source_token_count,
-                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    node.session_id,
-                    node.depth,
-                    node.summary,
-                    node.token_count,
-                    node.source_token_count,
-                    json.dumps(node.source_ids),
-                    node.source_type,
-                    node.created_at or time.time(),
-                    node.earliest_at,
-                    node.latest_at,
-                    node.expand_hint,
-                ),
-            )
+            node_id = self._insert_node(node)
             self._conn.commit()
-            node.node_id = cur.lastrowid
+            node.node_id = node_id
+            return node.node_id
+
+    def _insert_node(self, node: SummaryNode) -> int:
+        """Stage the existing node insert on this writer; caller owns commit."""
+        cur = self._conn.execute(
+            """INSERT INTO summary_nodes
+               (session_id, depth, summary, token_count, source_token_count,
+                source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                node.session_id,
+                node.depth,
+                node.summary,
+                node.token_count,
+                node.source_token_count,
+                json.dumps(node.source_ids),
+                node.source_type,
+                node.created_at or time.time(),
+                node.earliest_at,
+                node.latest_at,
+                node.expand_hint,
+            ),
+        )
+        return cur.lastrowid
+
+    def publication_snapshot(
+        self, source_ids: Sequence[int], source_type: str,
+        conversation_id: str = "",
+    ) -> SummaryPublicationSnapshot:
+        """Capture exact rows, covering parents and the current lifecycle binding."""
+        if source_type not in {"messages", "nodes"}:
+            raise ValueError("unsupported summary publication source type")
+        table, id_column = (
+            ("messages", "store_id") if source_type == "messages"
+            else ("summary_nodes", "node_id")
+        )
+        ids = tuple(sorted(set(source_ids)))
+        with self._db_lock:
+            if self._conn is None:
+                raise RuntimeError("summary publication writer is closed")
+            rows = {}
+            for offset in range(0, len(ids), 500):
+                batch = ids[offset:offset + 500]
+                marks = ",".join("?" for _ in batch)
+                for row in self._conn.execute(
+                    f"SELECT * FROM {table} WHERE {id_column} IN ({marks})", batch,
+                ).fetchall():
+                    rows[row[0]] = tuple(row)
+            if len(rows) != len(ids):
+                raise RuntimeError("summary source disappeared before publication")
+            parents = {source_id: [] for source_id in ids}
+            for session_id in sorted({row[1] for row in rows.values()}):
+                for parent_id, parent_sources in self._conn.execute(
+                    "SELECT node_id, source_ids FROM summary_nodes "
+                    "WHERE source_type = ? AND session_id = ? ORDER BY node_id",
+                    (source_type, session_id),
+                ).fetchall():
+                    for source_id in json.loads(parent_sources):
+                        if source_id in parents:
+                            parents[source_id].append(parent_id)
+            lifecycle = None
+            if conversation_id:
+                row = self._conn.execute(
+                    "SELECT current_session_id, current_frontier_store_id, current_bound_at "
+                    "FROM lcm_lifecycle_state WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                lifecycle = tuple(row) if row is not None else None
+            return SummaryPublicationSnapshot(
+                source_type, conversation_id, tuple(sorted(rows.items())),
+                tuple((source_id, tuple(parent_ids)) for source_id, parent_ids in parents.items()),
+                lifecycle,
+            )
+
+    def publish_node(
+        self, node: SummaryNode, snapshot: SummaryPublicationSnapshot, *,
+        frontier_store_id: int | None = None,
+        validate_runtime: Callable[[], None] | None = None,
+    ) -> int:
+        """Recheck sources, insert the node and advance its frontier in one commit.
+
+        Model work must finish first. BEGIN IMMEDIATE excludes other SQLite
+        writers until the source recheck and publication commit have completed;
+        existing FTS and rollup-outbox triggers share this transaction.
+        """
+        with self._db_lock:
+            conn = self._conn
+            if conn is None or conn.in_transaction:
+                raise RuntimeError("summary publication requires an idle DAG writer")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if validate_runtime is not None:
+                    validate_runtime()
+                current = self.publication_snapshot(
+                    [source_id for source_id, _ in snapshot.rows],
+                    snapshot.source_type, snapshot.conversation_id,
+                )
+                if current != snapshot:
+                    raise RuntimeError("summary source or lifecycle changed during model work")
+                rows = dict(snapshot.rows)
+                if node.source_type != snapshot.source_type or any(
+                    source_id not in rows for source_id in node.source_ids
+                ):
+                    raise RuntimeError("summary publication has uncaptured source identities")
+                if any(row[1] != node.session_id for row in rows.values()):
+                    raise RuntimeError("summary publication lost source session ownership")
+                conversation_id = snapshot.conversation_id
+                if conversation_id and (
+                    snapshot.lifecycle is None or snapshot.lifecycle[0] != node.session_id
+                ):
+                    raise RuntimeError("summary publication lost conversation ownership")
+                node_id = self._insert_node(node)
+                if conversation_id and frontier_store_id is not None:
+                    if frontier_store_id and frontier_store_id not in rows:
+                        raise RuntimeError("summary publication has an uncaptured frontier")
+                    updated = conn.execute(
+                        "UPDATE lcm_lifecycle_state "
+                        "SET current_frontier_store_id = MAX(current_frontier_store_id, ?), updated_at = ? "
+                        "WHERE conversation_id = ? AND current_session_id = ?",
+                        (int(frontier_store_id), time.time(), conversation_id, node.session_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise RuntimeError("summary publication lost frontier ownership")
+                if validate_runtime is not None:
+                    validate_runtime()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            node.node_id = node_id
             return node.node_id
 
     @staticmethod

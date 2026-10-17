@@ -1870,7 +1870,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         Rollups consume published summary nodes, so publication — not raw ingest
         — is the load-bearing staleness signal (maintainer #388 blocker 1). This
-        is called after every ``_dag.add_node`` on the engine so a later summary
+        is called after every summary publication on the engine so a later summary
         cannot leave an older rollup ``ready`` and apparently current. The node's
         ``earliest_at``/``latest_at`` coverage span is passed through so a summary
         crossing midnight stales BOTH days, not only its newest (maintainer #388
@@ -1904,6 +1904,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _unregister_active_engine_binding(self) -> None:
         with _ACTIVE_ENGINE_REGISTRY_LOCK:
             _remove_registry_entries_for_engine(self)
+
+    def _prepare_summary_publication(self, source_ids: List[int], source_type: str):
+        snapshot = self._dag.publication_snapshot(source_ids, source_type, self._conversation_id)
+        runtime = (self._dag, self._session_id, self._conversation_id, self._hermes_home)
+
+        def validate():
+            if runtime != (self._dag, self._session_id, self._conversation_id, self._hermes_home):
+                raise RuntimeError("summary runtime changed during model work")
+
+        return snapshot, validate
 
     def _persist_frontier_marker(self) -> None:
         if not self._session_id or not self._conversation_id:
@@ -5634,6 +5644,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         depth = nodes[0].depth
         if any(node.depth != depth for node in nodes):
             raise ValueError("condensation requires same-depth summary nodes")
+        snapshot, validate = self._prepare_summary_publication(
+            [node.node_id for node in nodes], "nodes",
+        )
+        captured_rows = dict(snapshot.rows)
+        for node in nodes:
+            persisted = self._dag._row_to_node(captured_rows[node.node_id])
+            if (node.depth, node.summary, node.token_count, node.source_ids, node.source_type, node.session_id) != (
+                persisted.depth, persisted.summary, persisted.token_count, persisted.source_ids,
+                persisted.source_type, persisted.session_id,
+            ):
+                raise RuntimeError("condensation source changed before model preparation")
         combined_text = "\n\n---\n\n".join(node.summary for node in nodes)
         source_tokens = sum(node.token_count for node in nodes)
         token_budget = max(1000, int(source_tokens * 0.40))
@@ -5680,7 +5701,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
         )
-        self._dag.add_node(condensed_node)
+        self._dag.publish_node(condensed_node, snapshot, validate_runtime=validate)
         self._invalidate_rollups_for_published_node(condensed_node)
         return source_tokens, summary_tokens, level
 

@@ -697,6 +697,14 @@ class CompactionMixin:
                 break
 
             selected_raw_chunk = to_compact
+            # Keep the selected mapping fixed across the model wait: a changed
+            # row must not silently disappear from the later lineage lookup.
+            selected_store_ids = self._get_store_id_map_for_messages(selected_raw_chunk)
+            publication_snapshot, validate_publication = self._prepare_summary_publication(
+                list(selected_store_ids.values()), "messages",
+            )
+            if selected_store_ids != self._get_store_id_map_for_messages(selected_raw_chunk):
+                raise RuntimeError("summary source changed before model preparation")
             summary_input_chunk = [
                 message for message in selected_raw_chunk if id(message) not in dependent_reply_message_ids
             ]
@@ -773,9 +781,9 @@ class CompactionMixin:
             source_lineage_chunk = [
                 message for message in source_lookup_chunk if id(message) not in dependent_reply_message_ids
             ]
-            source_store_ids = self._get_store_ids_for_messages(source_lineage_chunk)
+            source_store_ids = [selected_store_ids[id(msg)] for msg in source_lineage_chunk if id(msg) in selected_store_ids]
             source_store_ids = sorted(dict.fromkeys(source_store_ids))
-            consumed_store_ids = self._get_store_ids_for_messages(source_lookup_chunk)
+            consumed_store_ids = [selected_store_ids[id(msg)] for msg in source_lookup_chunk if id(msg) in selected_store_ids]
             consumed_store_ids = sorted(dict.fromkeys(consumed_store_ids))
             earliest_at, latest_at = self._store.get_time_bounds(source_store_ids)
             summary_tokens = count_tokens(summary_text)
@@ -793,11 +801,14 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            self._dag.add_node(node)
+            frontier = max(consumed_store_ids) if consumed_store_ids else 0
+            self._dag.publish_node(
+                node, publication_snapshot, frontier_store_id=frontier,
+                validate_runtime=validate_publication,
+            )
+            self._last_compacted_store_id = frontier
             self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
-            self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
-            self._persist_frontier_marker()
 
             pressure_remaining_messages = pressure_messages[leading_anchor_count + selected_raw_len:]
             working_messages = working_messages[:leading_anchor_count] + remaining_messages
