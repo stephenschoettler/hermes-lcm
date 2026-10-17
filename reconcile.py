@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -862,6 +863,29 @@ class ReconcileMixin:
             session_count=len(stored_tail),
             raw_session_count=session_count,
         )
+        if cursor is None or cursor <= 0 or not self._effective_replay_identities(messages[:cursor]):
+            # The exact-suffix proof covered no durable row.  A re-bind replay
+            # whose fresh tail is not an exact stored suffix (store-only rows
+            # interleaved) is matched against the stored rows since its anchor.
+            window_cursor = self._rebind_replay_stored_window_cursor(messages, stored_tail)
+            if window_cursor > (cursor or 0):
+                self._record_ingest_reconciliation(
+                    action="advanced cursor",
+                    reason="replayed stored window since anchor",
+                    cursor=window_cursor,
+                    incoming=len(messages),
+                    session_count=session_count,
+                    stored_tail_count=len(stored_tail),
+                    effective_incoming=len(self._effective_replay_identities(messages)),
+                )
+                logger.debug(
+                    "LCM reconciled re-bind replay against stored window: session=%s cursor=%d incoming=%d stored_tail=%d",
+                    self._session_id,
+                    window_cursor,
+                    len(messages),
+                    len(stored_tail),
+                )
+                return window_cursor
         if cursor is not None and cursor > 0:
             reason = (
                 "skipped scaffold-only prefix"
@@ -943,6 +967,83 @@ class ReconcileMixin:
             effective_incoming=len(incoming_identities),
         )
         return 0
+
+    def _rebind_replay_stored_window_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_tail: list[tuple[str, str, str, str]],
+    ) -> int:
+        """Cursor past the leading re-bind replay rows already stored since their anchor.
+
+        A re-bind (restart, session switch) replays the post-compaction active
+        context: scaffold + summaries + fresh tail.  The exact-suffix proof in
+        ``_find_reconciled_cursor_for_store_tail`` fails whenever the store holds
+        a row the host transcript never carries (an orphan-recovery tool row, a
+        background-review row, or an earlier duplicate replay), and the whole
+        fresh tail was then re-appended on every re-bind.  Each miss added rows
+        that made the next proof fail too.
+
+        Gate: the replay must be scaffold-headed.  Every row before the first
+        durable candidate is LCM scaffold or a system row, and at least one of
+        them is scaffold.  An anchorless delta is never deduplicated.
+
+        The first durable candidate is the anchor.  Take its LAST occurrence in
+        the stored tail; every stored row after it was ingested after the host
+        had that row.  Consume the leading candidates against the multiset of
+        stored rows from the anchor on and stop at the first one with no stored
+        copy left.  Rows past that point are appended.
+
+        Loss safety: the last occurrence gives the smallest window, and a
+        genuinely new row that repeats a stored row is appended because the
+        stored copy is used up by the replayed original.  The one residual
+        exposure is a new row that exactly matches a store-only row inside the
+        window.
+        """
+        if not messages or not stored_tail:
+            return 0
+        first = None
+        saw_scaffold = False
+        for idx, msg in enumerate(messages):
+            if self._is_replayed_context_scaffold_message(msg):
+                saw_scaffold = True
+                continue
+            if str(msg.get("role") or "") == "system":
+                continue
+            first = idx
+            break
+        if first is None or not saw_scaffold:
+            return 0
+
+        candidates: list[tuple[int, tuple[str, str, str, str]]] = []
+        for idx in range(first, len(messages)):
+            msg = messages[idx]
+            if self._is_replayed_context_scaffold_message(msg):
+                continue
+            if self._matches_ignore_message_patterns(msg):
+                continue
+            candidates.append((idx, self._message_replay_identity(msg)))
+        if not candidates:
+            return 0
+
+        anchor_identity = candidates[0][1]
+        anchor = None
+        for pos in range(len(stored_tail) - 1, -1, -1):
+            if stored_tail[pos] == anchor_identity:
+                anchor = pos
+                break
+        if anchor is None:
+            return 0
+
+        remaining = Counter(stored_tail[anchor:])
+        last_idx = None
+        for idx, identity in candidates:
+            if remaining[identity] <= 0:
+                break
+            remaining[identity] -= 1
+            last_idx = idx
+        if last_idx is None:
+            return 0
+        return last_idx + 1
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (
