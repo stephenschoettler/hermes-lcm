@@ -66,6 +66,41 @@ class CompactionMixin:
             return False
         return tokens >= self.threshold_tokens
 
+    def _maintenance_pressure_met(self, observed_tokens: int) -> bool:
+        """Whether an OPPORTUNISTIC maintenance compaction is allowed right now.
+
+        The maintenance arms ("compactable backlog outside the fresh tail",
+        "ignored-message backlog") are tidying, not overflow protection. On the
+        divergent-replay path they run with no token gate, while the identical
+        leaf-candidate check on the non-divergent path sits behind
+        ``rough >= threshold_tokens``. Since the divergent path is entered
+        whenever ingest rewrote the replay view -- typically an externalized
+        payload (inline media, base64, a large tool result) -- a media-heavy
+        session requests compaction at any size.
+
+        Returns True (allow) when the floor is disabled, when no threshold is
+        configured, or when the session has reached the configured fraction of
+        it. Deterministic ingest-cleanup adoption returns earlier and is
+        unaffected; overflow recovery is checked before this on every path.
+        """
+        ratio = getattr(self._config, "maintenance_min_pressure_ratio", 0.0) or 0.0
+        if ratio <= 0.0:
+            return True
+        if self.threshold_tokens <= 0:
+            return True
+        floor = int(self.threshold_tokens * ratio)
+        if observed_tokens >= floor:
+            return True
+        logger.debug(
+            "LCM maintenance compaction deferred: %d tokens < %d floor "
+            "(%.0f%% of %d threshold)",
+            observed_tokens,
+            floor,
+            ratio * 100,
+            self.threshold_tokens,
+        )
+        return False
+
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
         self._preflight_cleanup_only_due_to_boundary_cooldown = False
@@ -157,9 +192,11 @@ class CompactionMixin:
                     and replay_rough >= self.threshold_tokens
                 ),
             )
-            if eligible:
+            if eligible and self._maintenance_pressure_met(replay_rough):
                 return self._mark_preflight_compression_requested()
-            if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
+            if self._has_ignored_backlog_outside_fresh_tail(
+                replay_messages
+            ) and self._maintenance_pressure_met(replay_rough):
                 return self._mark_preflight_compression_requested()
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
