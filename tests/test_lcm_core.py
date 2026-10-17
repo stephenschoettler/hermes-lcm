@@ -2144,6 +2144,79 @@ class TestMessageStore:
 
         assert results == []
 
+    # --- Issue #460: natural-language punctuation reaches FTS5 safely ----
+
+    def test_search_handles_issue_460_reproducer_on_fts_path(self, store):
+        """Issue #460 reproducer: a comma-laden natural-language query must
+        sanitize to a MATCH-safe FTS5 query and find the indexed row through
+        the FTS path (no LIKE fallback, no FTS syntax error).
+
+        The triggering query is verbatim from the issue body. The indexed row
+        is seeded to contain every term in the sanitized query so the FTS path
+        can actually return it (FTS5 MATCH implies AND across terms).
+        """
+        issue_query = (
+            "The wardrobe color and style recommendations involving "
+            "chartreuse, aubergine, Dark Butterfly, and Midnight Lagoon"
+        )
+        # Seed content containing every term from the sanitized query so FTS5
+        # implicit AND has a chance to match. The bug was never about row
+        # coverage -- it was about the query RAISING an FTS5 syntax error and
+        # falling through to the LIKE full-scan that burned the recall deadline.
+        store.append(
+            "sess1",
+            {
+                "role": "user",
+                "content": (
+                    "The wardrobe color and style recommendations involving "
+                    "chartreuse aubergine Dark Butterfly and Midnight Lagoon "
+                    "today's review covered all four"
+                ),
+            },
+        )
+        store._search_like = lambda *args, **kwargs: pytest.fail(
+            "issue #460 query fell back to the LIKE full-scan"
+        )
+
+        results = store.search(issue_query, session_id="sess1")
+
+        assert len(results) == 1
+        assert "chartreuse" in results[0]["content"]
+        assert "Midnight Lagoon" in results[0]["content"]
+
+    @pytest.mark.parametrize(
+        "punctuation",
+        [
+            ",",
+            ";",
+            ":",
+            "(",
+            ")",
+            "/",
+            ".",
+            "'",
+        ],
+    )
+    def test_search_sanitizes_issue_460_punctuation_matrix(self, store, punctuation):
+        """Issue #460 'Suggested regression coverage' item 2: the natural
+        language punctuation matrix (commas, semicolons, colons, parentheses,
+        slashes, periods, apostrophes, quoted phrases) must NOT trigger an
+        FTS5 syntax error on the FTS path.
+        """
+        query = f"a{punctuation}b{punctuation}c"
+        store.append(
+            "sess1",
+            {"role": "user", "content": "a b c notes from today"},
+        )
+        store._search_like = lambda *args, **kwargs: pytest.fail(
+            f"punctuation {punctuation!r} on {query!r} fell back to LIKE"
+        )
+
+        results = store.search(query, session_id="sess1")
+
+        assert len(results) == 1
+        assert results[0]["content"] == "a b c notes from today"
+
     def test_init_low_disk_degrades_without_leaving_broken_message_fts_triggers(self, tmp_path, monkeypatch):
         db_path = tmp_path / "low-disk-broken-message-fts.db"
         conn = sqlite3.connect(db_path)

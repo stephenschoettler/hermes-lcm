@@ -4644,6 +4644,15 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     # (larger) budget rather than lcm_grep's single-arm query deadline (sprint-opt-2).
     timeout_s = max(0.001, float(getattr(engine._config, "recall_query_timeout_s", 8.0)))
     deadline = request_started + timeout_s
+    # Issue #460: the FTS arm runs first, synchronously, and would otherwise
+    # share the absolute recall deadline with the vector arms. On a large
+    # corpus a punctuation-triggered FTS5 syntax error or an expensive LIKE
+    # fallback could consume the entire budget, leaving `time.monotonic() >=
+    # deadline` true when the vector-arm gate runs -- and starving otherwise
+    # healthy summary and chunk arms. Give the FTS arm a bounded sub-deadline
+    # (half the recall budget) and let the vector arms keep the original
+    # deadline; total wallclock is still bounded by `recall_query_timeout_s`.
+    fts_arm_deadline = request_started + timeout_s * 0.5
 
     candidate_limit = min(_LCM_GREP_HYBRID_CANDIDATE_CAP, max(50, limit * 4))
     rerank_window = min(50, max(1, limit * 4))
@@ -4672,7 +4681,7 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     if run_fts:
         try:
             hits, fts_error = _lcm_recall_fts_arm(
-                engine, query, candidate_limit=candidate_limit, deadline=deadline
+                engine, query, candidate_limit=candidate_limit, deadline=fts_arm_deadline
             )
         except (_WorkerCapacityError, TimeoutError) as exc:
             hits, fts_error = [], {"error": str(exc)}
