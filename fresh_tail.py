@@ -50,6 +50,69 @@ def _assistant_group_start(messages: Sequence[Dict[str, Any]], start: int) -> in
     return start
 
 
+def _assistant_tool_group_end(
+    messages: Sequence[Dict[str, Any]], start: int
+) -> int:
+    """Advance past a boundary that opens on an assistant with tool_calls.
+
+    ``_assistant_group_start`` only handles the case where the boundary falls
+    on a ``tool`` result and retreats to the assistant that opened the group.
+    The mirror case is equally broken: when the count/token boundary falls on
+    an assistant message whose ``tool_calls`` are followed by tool results,
+    the boundary already sits at a complete group (fine). But when the
+    boundary falls on an assistant message whose tool results were consumed
+    by the compacted prefix, keeping that assistant in the fresh tail emits
+    an orphaned ``tool_calls`` message into the active context. Downstream
+    OpenAI-compatible APIs reject this with:
+
+        "An assistant message with 'tool_calls' must be followed by tool
+         messages responding to each 'tool_call_id'."
+
+    To preserve tool-call integrity (the same guarantee the forward retreat
+    gives), walk forward from ``start`` while the tail opens with a sequence
+    of assistant/tool pairs and advance past any assistant whose tool results
+    are not fully present within the tail. Returns the new start index.
+    """
+    if start >= len(messages) or messages[start].get("role") != "assistant":
+        return start
+    opening_tool_calls = messages[start].get("tool_calls") or []
+    if not opening_tool_calls:
+        return start
+
+    pending_ids = {
+        _tool_call_id(tool_call)
+        for tool_call in opening_tool_calls
+    }
+    if not pending_ids:
+        return start
+
+    index = start + 1
+    resolved = set()
+    while index < len(messages):
+        message = messages[index]
+        role = str(message.get("role") or "")
+        if role == "tool":
+            resolved.add(str(message.get("tool_call_id") or "").strip())
+            index += 1
+            continue
+        if role == "assistant" and message.get("tool_calls"):
+            # Another tool-call group follows; the opening assistant's
+            # results were never resolved inside the tail, so advance the
+            # boundary to this next assistant (its own group is intact from
+            # here on).
+            if not pending_ids.issubset(resolved):
+                return index
+            return start
+        break
+
+    if not pending_ids.issubset(resolved):
+        # Opening assistant's tool results are missing/incomplete in the
+        # tail — advance the boundary to the end of what was resolved so the
+        # orphaned tool_calls do not enter the active context.
+        return index
+    return start
+
+
 def resolve_fresh_tail_boundary(
     messages: Sequence[Dict[str, Any]],
     *,
@@ -89,6 +152,11 @@ def resolve_fresh_tail_boundary(
     group_start = _assistant_group_start(messages, start)
     tool_group_extended = group_start < start
     start = group_start
+    # Mirror integrity check: if the boundary opens on an assistant with
+    # tool_calls whose results are missing from the tail, advance the
+    # boundary so the orphaned tool_calls message does not reach the
+    # active context (OpenAI-compatible APIs reject it with a 400).
+    start = _assistant_tool_group_end(messages, start)
     tail = list(messages[start:])
     return FreshTailBoundary(
         start=start,
