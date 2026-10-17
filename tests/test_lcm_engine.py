@@ -27491,3 +27491,42 @@ class TestExtractionDuringCompress:
         result = eng.compress(messages)
         assert result[0]["role"] == "system"
         assert len(eng._dag.get_session_nodes("extract-fail")) > 0
+
+    def test_escalation_rejects_source_inclusive_echo_bounded_to_budget(self, tmp_path, monkeypatch):
+        """Regression: summarize_with_escalation's acceptance gate was
+        count_tokens(result) < source_tokens — with a large source chunk, a
+        source-inclusive LLM echo is ACCEPTED (it's smaller than the source)
+        even though it far exceeds the token budget. The accepted summary must
+        be <= the token BUDGET (12K cap), so the echo is rejected and the run
+        escalates to L2/L3 (deterministic truncation, bounded).
+        """
+        from hermes_lcm import escalation as esc_mod
+        from hermes_lcm.tokens import count_tokens
+
+        big_source = "s" * 2_000_000
+        captured = {}
+
+        def fake_invoke(l1_prompt, max_tokens, **kwargs):
+            accepts = kwargs.get("accepts_result")
+            captured["accepts"] = accepts
+            if not captured.get("attempted_l2"):
+                captured["attempted_l2"] = True
+                # Return an echo that is < source but > budget (the old gate
+                # would ACCEPT it; the new gate must reject it).
+                echo = "e" * 100_000  # 100K > 12K budget, < 2.2M source
+                return echo if accepts(echo) else None
+            return None
+
+        monkeypatch.setattr(esc_mod, "_invoke_summary_llm_chain", fake_invoke)
+
+        result, level = esc_mod.summarize_with_escalation(
+            text=big_source,
+            source_tokens=2_212_704,
+            token_budget=12_000,
+        )
+        # The result must be bounded (L3 truncation, ~512 tokens), NOT the
+        # 100K echo — the acceptance gate rejected it.
+        assert count_tokens(result) <= 12_000, (
+            f"summary {count_tokens(result)} tokens > budget — echo accepted (old bug)"
+        )
+        assert level == 3, f"expected L3 truncation, got level {level}"

@@ -635,7 +635,12 @@ def summarize_with_escalation(
         timeout=timeout,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
-        accepts_result=lambda result: count_tokens(result) < source_tokens,
+        # ACCEPTANCE GATE (2026-09-01, Clara stall fix): the accepted summary
+        # must be ≤ the token BUDGET (12K cap), not merely < source_tokens.
+        # With a 2.2M-token widened chunk, '< source_tokens' accepted a
+        # source-inclusive ~2.2M echo → 1000→9,223 message blowup (10× tokens).
+        # Enforcing the budget rejects the echo → escalates to L2/L3 → bounded.
+        accepts_result=lambda result: count_tokens(result) <= token_budget,
     )
 
     if l1_result:
@@ -661,7 +666,8 @@ def summarize_with_escalation(
         timeout=timeout,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
-        accepts_result=lambda result: count_tokens(result) < source_tokens,
+        # Same acceptance gate as L1: ≤ the L2 budget (2026-09-01).
+        accepts_result=lambda result: count_tokens(result) <= l2_budget,
     )
 
     if l2_result:
