@@ -18,6 +18,7 @@ import os
 import re
 import stat
 import time
+import uuid
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
 
@@ -79,6 +80,11 @@ def _safe_stub(value: str, fallback: str) -> str:
 
 def _content_digest_prefix(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _unique_file_suffix() -> str:
+    # Keep references compact while avoiding any clock-resolution assumption.
+    return uuid.uuid4().hex[:16]
 
 
 def _preview_sha256(preview_prefix: Any) -> str:
@@ -260,7 +266,7 @@ def _replace_externalized_payload(
     dir_fd: int | None = None,
     expected_identity: tuple[int, int] | None = None,
 ) -> None:
-    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    tmp_path = path.with_name(f"{path.name}.{_unique_file_suffix()}.tmp")
     if dir_fd is not None:
         try:
             _write_externalized_payload_at(tmp_path.name, payload, dir_fd=dir_fd)
@@ -2037,7 +2043,7 @@ def externalize_ingest_payload(
 
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    unique_suffix = f"{time.time_ns():x}"
+    unique_suffix = _unique_file_suffix()
     kind_stub = _safe_stub(kind, "ingest_payload")
     field_stub = re.sub(r"[^A-Za-z0-9_.-]+", "-", field_path or "payload")[:48]
     filename = f"{timestamp}_{kind_stub}_{field_stub}_{digest_prefix}_{unique_suffix}.json"
@@ -2155,7 +2161,7 @@ def maybe_externalize_payload(
 
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    unique_suffix = f"{time.time_ns():x}"
+    unique_suffix = _unique_file_suffix()
     if kind == "tool_result":
         # Keep the original filename shape for compatibility with existing
         # externalized tool-output stores and tests.
