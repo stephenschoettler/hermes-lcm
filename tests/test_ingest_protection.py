@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import stat
@@ -500,6 +501,42 @@ def test_externalized_payload_write_fsyncs_file_and_parent_directory(tmp_path, m
     assert result["path"].parent in fsynced_dirs
 
 
+def test_fsync_directory_noop_when_directory_handles_unsupported(tmp_path, monkeypatch):
+    """Windows regression for Issue #408.
+
+    os.open() on a directory raises PermissionError (Errno 13) on Windows
+    (no FILE_FLAG_BACKUP_SEMANTICS), so on Windows _fsync_directory must be
+    a safe no-op instead of breaking every externalized-payload write.
+    """
+    if os.name != "nt":
+        pytest.skip("Issue #408 is Windows-specific; directory handles work elsewhere")
+    real_open = os.open
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError("os.open must not be called on Windows")
+
+    monkeypatch.setattr(os, "open", fail_open)
+    externalize_module._fsync_directory(tmp_path)  # must not raise
+
+
+def test_fsync_directory_still_fsyncs_on_posix(tmp_path, monkeypatch):
+    """POSIX behavior is preserved: the directory is opened read-only with
+    O_DIRECTORY and fsynced when the platform supports directory handles."""
+    if os.name == "nt":
+        pytest.skip("Windows: directory fsync is skipped (Issue #408)")
+    opened_flags = []
+    real_open = os.open
+
+    def recording_open(path, flags, *args):
+        opened_flags.append(flags)
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    externalize_module._fsync_directory(tmp_path)
+    assert opened_flags, "directory open should be attempted on POSIX"
+    assert all(flags & os.O_DIRECTORY for flags in opened_flags)
+
+
 def test_externalized_search_prefix_rejects_path_replaced_during_open(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     target = externalize_ingest_payload(
@@ -722,7 +759,12 @@ def test_externalized_payload_reassignment_fsyncs_replacement(tmp_path, monkeypa
     )
 
     assert moved == 1
-    assert len(fsync_calls) >= 3
+    # POSIX fsyncs: tmp-file write (file + parent dir) + replaced dir = 3.
+    # Windows (Issue #408): directory handles cannot be opened, so the
+    # durability story is the tmp-file fsync + atomic os.replace + NTFS
+    # journaling = 1 fsync call.
+    expected_min_fsyncs = 3 if os.name != "nt" else 1
+    assert len(fsync_calls) >= expected_min_fsyncs
     payload = json.loads(result["path"].read_text(encoding="utf-8"))
     assert payload["session_id"] == "new-session"
 
@@ -1264,6 +1306,10 @@ def test_ingest_preserves_inline_payload_when_externalization_fails(tmp_path, mo
 
 
 def test_externalized_payload_files_are_private(tmp_path):
+    if os.name == "nt":
+        # POSIX permission bits are not exposed by stat on Windows; access
+        # control is enforced by NTFS ACLs instead (Issue #408 context).
+        pytest.skip("POSIX permission bits are not available on Windows")
     engine = _engine(tmp_path)
 
     engine._store.append(engine.current_session_id, {"role": "user", "content": DATA_URI})

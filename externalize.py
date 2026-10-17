@@ -88,6 +88,14 @@ def _preview_sha256(preview_prefix: Any) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows cannot use this POSIX directory-fsync path: opening a
+        # directory requires Windows-specific handle semantics
+        # (FILE_FLAG_BACKUP_SEMANTICS) not exposed by this os.open() call.
+        # The payload file itself has already been fsynced by the caller.
+        # Skip the parent-directory fsync on Windows; crash-durability
+        # semantics therefore differ from the POSIX path.
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
