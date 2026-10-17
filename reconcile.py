@@ -18,6 +18,7 @@ avoid an import cycle (staticmethod resolution is identical).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -50,9 +51,32 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+_COMPACT_TOOL_REPLAY_IDENTITY_CHARS = 64 * 1024
+_COMPACT_TOOL_REPLAY_IDENTITY_PREFIX = "[LCM compact tool replay identity: "
 
 
 class ReconcileMixin:
+    @staticmethod
+    def _compact_tool_replay_identity_content(role: str, content: str) -> str:
+        """Bound replay-identity memory without weakening exact tool matches."""
+
+        if role != "tool" or (
+            len(content) <= _COMPACT_TOOL_REPLAY_IDENTITY_CHARS
+            and not content.startswith(_COMPACT_TOOL_REPLAY_IDENTITY_PREFIX)
+        ):
+            return content
+        digest_builder = hashlib.sha256()
+        byte_count = 0
+        chunk_chars = 1024 * 1024
+        for start in range(0, len(content), chunk_chars):
+            encoded_chunk = content[start : start + chunk_chars].encode("utf-8")
+            digest_builder.update(encoded_chunk)
+            byte_count += len(encoded_chunk)
+        digest = digest_builder.hexdigest()
+        return _COMPACT_TOOL_REPLAY_IDENTITY_PREFIX + (
+            f"sha256={digest}; chars={len(content)}; bytes={byte_count}]"
+        )
+
     @staticmethod
     def _canonicalize_tool_call_identity_value(value: Any) -> Any:
         if isinstance(value, dict):
@@ -234,6 +258,7 @@ class ReconcileMixin:
             )
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
+        content = self._compact_tool_replay_identity_content(role, content)
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         return (
             role,
