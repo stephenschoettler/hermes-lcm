@@ -6854,6 +6854,83 @@ class TestExtraction:
         assert "[with media attachment]" in serialized
         assert "data:image/png;base64" not in serialized
 
+    def test_serialize_messages_treats_none_tool_calls_as_empty(self, tmp_path):
+        """Regression: assistant messages with tool_calls=None must not crash.
+
+        Reproduces TypeError: 'NoneType' object is not iterable in
+        LCMEngine._serialize_messages when an assistant message arrives
+        with tool_calls explicitly set to None (e.g. reconstructed from
+        a stored row that serialized an empty value as null).
+        """
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "assistant",
+                "content": "Hello there.",
+                "tool_calls": None,
+            }
+        ])
+
+        assert "[ASSISTANT]: Hello there." in serialized
+        assert "[Tool calls:" not in serialized
+
+    def test_serialize_messages_treats_none_tool_calls_as_empty_with_following_tool_result(self, tmp_path):
+        """Regression: assistant tool_calls=None must still compose cleanly
+        when a later tool result is present in the same chunk.
+
+        Note: with tool_calls=None on the assistant, _matched_tool_call_ids
+        returns an empty set (the assistant never declared any tool_call ids),
+        so the matched-tool_calls branch is intentionally NOT exercised here.
+        The unconditional tool-result branch at engine.py:5074-5078 emits the
+        tool result independently. A separate test would be needed to cover
+        the matched-tool-calls code path with a non-None tool_calls list.
+        """
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {
+                "role": "assistant",
+                "content": "Calling the tool.",
+                "tool_calls": None,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_abc",
+                "content": "result body",
+            },
+        ])
+
+        assert "[ASSISTANT]: Calling the tool." in serialized
+        assert "[TOOL RESULT call_abc]: result body" in serialized
+        assert "[Tool calls:" not in serialized
+
+    @pytest.mark.parametrize("falsy_value", [None, [], {}, "", 0, False])
+    def test_serialize_messages_tolerates_falsy_tool_calls_without_crashing(self, tmp_path, falsy_value):
+        """Contract: the assistant branch must tolerate any falsy tool_calls
+        value without raising. Real OpenAI tool_calls is always None or a list;
+        other falsy shapes (e.g. dict, string) are not expected, but should
+        degrade to an empty block rather than crash the comprehension.
+
+        This locks in the contract beyond the minimal None case.
+        """
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        engine = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm.db")))
+
+        serialized = engine._serialize_messages([
+            {"role": "assistant", "content": "x", "tool_calls": falsy_value},
+        ])
+        assert "[ASSISTANT]: x" in serialized
+        assert "[Tool calls:" not in serialized
+
     def test_serialize_messages_leaves_non_media_application_data_uri_alone(self, tmp_path):
         from hermes_lcm.config import LCMConfig
         from hermes_lcm.engine import LCMEngine
