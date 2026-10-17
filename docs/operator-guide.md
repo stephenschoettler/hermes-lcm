@@ -1087,3 +1087,16 @@ Safety and reconciliation behavior:
 - [Benchmarking and stress checks](../benchmarks/README.md)
 - [Release validation](release-validation.md)
 - [Packaging and distribution posture](packaging.md)
+
+### Guarding unusually thin summaries
+
+For sources of at least 100,000 tokens, LCM rejects L1/L2 model summaries
+shorter than 512 tokens and continues through the existing fallback chain.
+If every model result is too thin, the normal deterministic L3 fallback still
+guarantees convergence; it is not subject to the model-output minimum.
+
+Set `LCM_LARGE_SOURCE_SUMMARY_MIN_SOURCE_TOKENS` and
+`LCM_LARGE_SOURCE_SUMMARY_MIN_RESULT_TOKENS` to adjust these thresholds.
+Setting either value to `0` disables the check. Sources below the source
+threshold retain the existing acceptance behavior. These checks reject a
+particularly extreme compression ratio, not a guarantee of factual completeness.

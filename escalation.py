@@ -596,6 +596,35 @@ def _deterministic_truncate(text: str, max_tokens: int) -> str:
     return best
 
 
+def _llm_summary_is_acceptable(
+    result: str,
+    *,
+    source_tokens: int,
+    min_source_tokens: int,
+    min_result_tokens: int,
+) -> bool:
+    """Return whether an LLM summary is safe to persist as a summary node."""
+    result_tokens = count_tokens(result)
+    if result_tokens >= source_tokens:
+        return False
+    if (
+        min_source_tokens > 0
+        and min_result_tokens > 0
+        and source_tokens >= min_source_tokens
+        and result_tokens < min_result_tokens
+    ):
+        logger.warning(
+            "LCM summary rejected as too thin: source_tokens=%d result_tokens=%d "
+            "min_source_tokens=%d min_result_tokens=%d",
+            source_tokens,
+            result_tokens,
+            min_source_tokens,
+            min_result_tokens,
+        )
+        return False
+    return True
+
+
 def summarize_with_escalation(
     text: str,
     source_tokens: int,
@@ -610,6 +639,8 @@ def summarize_with_escalation(
     fallback_models: list[str] | tuple[str, ...] | None = None,
     circuit_breaker: SummaryCircuitBreaker | None = None,
     spend_guard: "SummarySpendGuard | None" = None,
+    large_source_summary_min_source_tokens: int = 100_000,
+    large_source_summary_min_result_tokens: int = 512,
     source_provenance: Mapping[str, Any] | None = None,
 ) -> tuple[str, int]:
     """Run 3-level escalation. Returns (summary, level_used).
@@ -635,7 +666,12 @@ def summarize_with_escalation(
         timeout=timeout,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
-        accepts_result=lambda result: count_tokens(result) < source_tokens,
+        accepts_result=lambda result: _llm_summary_is_acceptable(
+            result,
+            source_tokens=source_tokens,
+            min_source_tokens=large_source_summary_min_source_tokens,
+            min_result_tokens=large_source_summary_min_result_tokens,
+        ),
     )
 
     if l1_result:
@@ -661,7 +697,12 @@ def summarize_with_escalation(
         timeout=timeout,
         circuit_breaker=circuit_breaker,
         spend_guard=spend_guard,
-        accepts_result=lambda result: count_tokens(result) < source_tokens,
+        accepts_result=lambda result: _llm_summary_is_acceptable(
+            result,
+            source_tokens=source_tokens,
+            min_source_tokens=large_source_summary_min_source_tokens,
+            min_result_tokens=large_source_summary_min_result_tokens,
+        ),
     )
 
     if l2_result:

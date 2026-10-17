@@ -326,6 +326,8 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
+    _EnvFieldSpec("large_source_summary_min_source_tokens", "LCM_LARGE_SOURCE_SUMMARY_MIN_SOURCE_TOKENS", int),
+    _EnvFieldSpec("large_source_summary_min_result_tokens", "LCM_LARGE_SOURCE_SUMMARY_MIN_RESULT_TOKENS", int),
     _EnvFieldSpec("max_assembly_tokens", "LCM_MAX_ASSEMBLY_TOKENS", int),
     _EnvFieldSpec("reserve_tokens_floor", "LCM_RESERVE_TOKENS_FLOOR", int),
     _EnvFieldSpec("custom_instructions", "LCM_CUSTOM_INSTRUCTIONS", str),
@@ -492,6 +494,11 @@ class LCMConfig:
     l2_budget_ratio: float = 0.50
     # L3 deterministic truncate token limit
     l3_truncate_tokens: int = 512
+    # Reject suspiciously tiny LLM summaries for very large sources. A 100k+
+    # token source compressed to a few hundred tokens is usually degraded
+    # fallback summarization rather than a useful durable memory node.
+    large_source_summary_min_source_tokens: int = 100_000
+    large_source_summary_min_result_tokens: int = 512
 
     # -- Assembly guardrails ---
     # Hard cap for the assembled active context (0 = disabled)

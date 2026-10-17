@@ -6511,6 +6511,12 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "summary_spend_max_calls": engine._config.summary_spend_max_calls,
             "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
             "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
+            "large_source_summary_min_source_tokens": (
+                engine._config.large_source_summary_min_source_tokens
+            ),
+            "large_source_summary_min_result_tokens": (
+                engine._config.large_source_summary_min_result_tokens
+            ),
             "expansion_model": engine._config.expansion_model or "(summary model)",
         },
         "proactive_recall": {
