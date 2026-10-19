@@ -428,7 +428,7 @@ moved back to that assistant even when doing so exceeds a configured bound.
 | `LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `300` | Seconds to skip an open summary route before retrying it |
 | `LCM_EXPANSION_MODEL` | summary model / auxiliary | Override `lcm_expand_query` synthesis model |
 | `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Context budget used by the auxiliary LLM for `lcm_expand_query` |
-| `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for one summarization call |
+| `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Total operation budget across L1, fallback models and L2, including request preparation and admission waits; expiry proceeds to deterministic L3 without starting another request |
 | `LCM_EXPANSION_TIMEOUT_MS` | `120000` | Timeout for one `lcm_expand_query` synthesis call |
 | `LCM_CRITICAL_BUDGET_PRESSURE_RATIO` | `0.0` | Disabled at `0.0`; when set, permits critical-pressure bypasses for bounded deferred catch-up and cache-friendly follow-on condensation only |
 

@@ -254,10 +254,11 @@ def _hermes_compression_threshold_with_source(default: float) -> tuple[float, st
 def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
     """Read Hermes auxiliary.compression.timeout when no LCM override is present.
 
-    Hermes uses seconds for the auxiliary compression timeout, while LCM stores
-    the summary timeout in milliseconds. Aligning the default keeps LCM summary
-    calls from timing out earlier than the host compression route unless
-    ``LCM_SUMMARY_TIMEOUT_MS`` is explicitly configured.
+    Hermes expresses this setting in seconds; LCM converts it to milliseconds
+    and inherits it as the total operation budget across L1, fallback models and
+    L2, including preparation and admission waits. Individual calls receive only
+    the remaining budget. ``LCM_SUMMARY_TIMEOUT_MS`` overrides that total budget.
+    Expiry proceeds to deterministic L3 without starting another provider call.
     """
     value, _source = _hermes_auxiliary_compression_timeout_ms_with_source(default)
     return value
@@ -597,6 +598,8 @@ class LCMConfig:
     expansion_context_tokens: int = 32_000
 
     # -- Timeouts ---
+    # One absolute budget across L1, fallback routes and L2, including preparation.
+    # Expiry proceeds to L3 without another provider dispatch.
     summary_timeout_ms: int = 60_000
     expansion_timeout_ms: int = 120_000
 

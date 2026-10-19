@@ -213,7 +213,7 @@ environment variables:
 | `LCM_SUMMARY_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `300` | Seconds to skip an open summary route before retrying it |
 | `LCM_EXPANSION_MODEL` | summary model / auxiliary | Override `lcm_expand_query` synthesis model |
 | `LCM_EXPANSION_CONTEXT_TOKENS` | `32000` | Context budget used by the auxiliary LLM for `lcm_expand_query` |
-| `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Timeout for one summarization call |
+| `LCM_SUMMARY_TIMEOUT_MS` | `60000` | Total operation budget across L1, fallback models and L2, including request preparation and admission waits; expiry proceeds to deterministic L3 without starting another request |
 | `LCM_TEMPORAL_ROLLUPS_ENABLED` | `false` | Enable derived UTC day/week/month summary rollups and their maintenance hooks |
 | `LCM_ROLLUP_DAILY_TARGET_TOKENS` | `5000` | Target size for daily rollup summarization |
 | `LCM_ROLLUP_DAILY_MAX_TOKENS` | `15000` | Hard token ceiling for a daily rollup |
