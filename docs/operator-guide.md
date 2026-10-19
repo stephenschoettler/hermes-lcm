@@ -384,10 +384,51 @@ state / cache-break signals.
 
 ### Threshold ownership
 
-When `context.engine: lcm` is active, `LCM_CONTEXT_THRESHOLD` is the compaction
-threshold LCM uses. Hermes core `compression.threshold` belongs to the built-in
-compressor. Hermes core `compression.enabled` is still the global gate that
-allows compaction, so leave it enabled when using LCM.
+When `context.engine: lcm` is active, the default `legacy` trigger mode uses
+LCM's `LCM_CONTEXT_THRESHOLD` (or `lcm.context_threshold`). Hermes core
+`compression.threshold` is only the fallback source used when those LCM
+overrides are absent. Hermes core `compression.enabled` is still the global
+gate that allows compaction, so leave it enabled when using LCM.
+
+Use the plugin-side adapter when the active LCM engine should follow Hermes'
+existing threshold policy for its current host-supplied window:
+
+```yaml
+lcm:
+  trigger_mode: hermes_config
+compression:
+  threshold: 0.25
+  threshold_tokens: 250000
+  model_thresholds:
+    "example-provider:example-model": 0.25
+```
+
+`hermes_config` reads `compression.threshold`, the longest matching
+`compression.model_thresholds` entry, and `compression.threshold_tokens` from
+the active profile. Hermes raises the effective ratio to at least 75% on
+windows under 512K and applies its small-window safety floor. The effective
+trigger is the lower of that ratio times the active LCM window and the absolute
+cap. The external LCM engine does not receive Hermes' private `max_tokens`
+reservation, so its adapter uses the full active window. An absent cap leaves the ratio uncapped; an explicit `null` is ratio-only. `LCM_TRIGGER_MODE`
+wins over the YAML mode. The LCM-specific threshold keys are ignored in this
+mode, which keeps the threshold rules in one place.
+
+This is a plugin-side adapter, not a new Hermes Core signal. Hermes still
+invokes the selected context engine; LCM performs the compaction after reading
+the same policy. Inspect `lcm_status` for `trigger_mode`, cap, model override,
+and value sources.
+
+The adapter reloads changed profile YAML at threshold gates and status reads.
+Malformed updates keep the last valid policy until the file is corrected.
+Programmatic `LCMConfig(trigger_mode="hermes_config")` explicitly opts into
+Hermes policy reading; a manual `legacy` config remains isolated from profile
+thresholds. `LCMConfig.from_env()` stays environment-backed when passed to an
+engine or cloned.
+
+This adapter uses the current window supplied to LCM by the host. Reloading
+threshold policy does not resolve a new model window: model/window changes
+require the host to call `update_model()` or rebuild the engine. Hermes TUI
+window pinning is outside this adapter's policy reload contract.
 
 If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the

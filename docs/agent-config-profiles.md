@@ -15,9 +15,11 @@ each feature does and why, see [Feature overview](features-overview.md).
 2. **`~/.hermes/config.yaml`** participates in three narrow, deliberate ways:
    - `plugins.enabled: [hermes-lcm]` + `context.engine: lcm` activate the
      plugin (see [Operator guide → Activate](operator-guide.md#activate));
-   - `lcm.context_threshold` is the one LCM key supported in YAML (used only
-     when `LCM_CONTEXT_THRESHOLD` is not set; other keys under `lcm:` are
-     ignored and reported by `/lcm doctor`);
+   - `lcm.context_threshold` controls the legacy LCM threshold, and
+     `lcm.trigger_mode: hermes_config` opts into the plugin-side adapter that
+     reads Hermes' existing `compression.threshold`, `compression.threshold_tokens`,
+     and `compression.model_thresholds` (other keys under `lcm:` are ignored
+     and reported by `/lcm doctor`);
    - when neither is set, LCM inherits the Hermes global
      `compression.threshold`.
 3. **Summarization inherits Hermes auxiliary routing.** Rollup builds and
