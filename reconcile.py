@@ -801,6 +801,73 @@ class ReconcileMixin:
             return False
         return stored_head[: len(incoming_identities)] == incoming_identities
 
+    def _incoming_batch_is_fully_contained_in_store(
+        self,
+        incoming_identities: list[tuple[str, str, str, str]],
+        session_count: int,
+    ) -> bool:
+        """Return true when the entire incoming replay is already durable.
+
+        A restarted or rebound process can hand LCM a full replay of a session
+        whose history is already stored, with identity drift (redactions,
+        externalized refs, generation markers) that defeats the strict
+        suffix/head match.  Persisting such a batch re-appends every message
+        and produces duplicate rows in the UI.  Fail closed: only skip the
+        batch when containment is proven for EVERY distinct identity (stored
+        count >= incoming count) AND the batch is not shorter than the stored
+        session (a shorter batch could be a shifted slice whose identities
+        happen to all exist elsewhere in the session).
+        """
+        if not incoming_identities or session_count <= 0:
+            return False
+        if len(incoming_identities) < session_count:
+            return False
+        try:
+            stored_rows = self._store.get_session_messages(self._session_id, limit=10000)
+        except Exception as exc:  # pragma: no cover - defensive only
+            logger.debug("LCM full-duplicate containment check failed: %s", exc)
+            return False
+        stored_counts: dict[tuple[str, str, str, str], int] = {}
+        for row in stored_rows:
+            if self._matches_ignore_message_patterns(row, stored_row=True):
+                continue
+            identity = self._message_replay_identity(row, stored_row=True)
+            stored_counts[identity] = stored_counts.get(identity, 0) + 1
+        incoming_counts: dict[tuple[str, str, str, str], int] = {}
+        for identity in incoming_identities:
+            incoming_counts[identity] = incoming_counts.get(identity, 0) + 1
+        return all(
+            stored_counts.get(identity, 0) >= count
+            for identity, count in incoming_counts.items()
+        )
+
+    def _find_head_overlap_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_head: list[tuple[str, str, str, str]],
+    ) -> int | None:
+        """Advance the cursor to the largest incoming prefix already durable.
+
+        Per-turn replays always start at the session's oldest messages, so
+        when the durable-tail suffix match fails (stale/short replay of a
+        longer session), overlap with the durable head is the correct
+        boundary: the matched prefix is stored, the remainder is new and
+        must still be persisted.  Fail closed: require at least 2 matching
+        identities (a single-message prefix match is coincidental, e.g. a
+        repeated greeting) and an exact head-prefix match.
+        """
+        if not messages or not stored_head:
+            return None
+        for cursor in range(len(messages), 0, -1):
+            candidate_identities = [
+                self._message_replay_identity(msg) for msg in messages[:cursor]
+            ]
+            if len(candidate_identities) < 2 or len(candidate_identities) > len(stored_head):
+                continue
+            if stored_head[: len(candidate_identities)] == candidate_identities:
+                return cursor
+        return None
+
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
         if not self._session_id or not messages:
@@ -889,6 +956,26 @@ class ReconcileMixin:
             return cursor
 
         incoming_identities = self._effective_replay_identities(messages)
+        if self._incoming_batch_is_fully_contained_in_store(incoming_identities, session_count):
+            self._record_ingest_reconciliation(
+                action="skipped batch",
+                reason="full replay already contained in store (anti-duplicate)",
+                cursor=len(messages),
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.warning(
+                "LCM skipped fully-contained replay batch after existing-session bind: session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d",
+                self._session_id,
+                len(messages),
+                len(incoming_identities),
+                len(stored_tail),
+                session_count,
+            )
+            return len(messages)
+
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
             limit=tail_limit,
@@ -932,6 +1019,27 @@ class ReconcileMixin:
                 session_count,
             )
             return len(messages)
+
+        head_overlap_cursor = self._find_head_overlap_cursor(messages, stored_head)
+        if head_overlap_cursor is not None:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed head overlap (anti-duplicate)",
+                cursor=head_overlap_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(incoming_identities),
+            )
+            logger.info(
+                "LCM advanced cursor to head overlap after existing-session bind: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d",
+                self._session_id,
+                head_overlap_cursor,
+                len(messages),
+                len(stored_tail),
+                session_count,
+            )
+            return head_overlap_cursor
 
         self._record_ingest_reconciliation(
             action="persisted batch",
