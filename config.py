@@ -311,6 +311,12 @@ class _EnvFieldSpec:
 ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("fresh_tail_count", "LCM_FRESH_TAIL_COUNT", int),
     _EnvFieldSpec("fresh_tail_max_tokens", "LCM_FRESH_TAIL_MAX_TOKENS", int),
+    _EnvFieldSpec("fresh_tail_pressure_yield_enabled", "LCM_FRESH_TAIL_PRESSURE_YIELD_ENABLED", bool),
+    _EnvFieldSpec(
+        "fresh_tail_pressure_yield_min_observations",
+        "LCM_FRESH_TAIL_PRESSURE_YIELD_MIN_OBSERVATIONS",
+        int,
+    ),
     _EnvFieldSpec("leaf_chunk_tokens", "LCM_LEAF_CHUNK_TOKENS", int),
     _EnvFieldSpec("context_threshold", "LCM_CONTEXT_THRESHOLD", float),
     _EnvFieldSpec("incremental_max_depth", "LCM_INCREMENTAL_MAX_DEPTH", int),
@@ -449,6 +455,18 @@ class LCMConfig:
     fresh_tail_count: int = 32
     # Optional token cap for the protected suffix (0 = disabled)
     fresh_tail_max_tokens: int = 0
+    # Let the count-protected tail yield to a derived token bound when the
+    # host reports sustained over-threshold pressure and the tail is the only
+    # reason compaction cannot make progress. Fires only in a state that
+    # otherwise ends at the provider hard limit (see #441).
+    fresh_tail_pressure_yield_enabled: bool = True
+    # How many consecutive blocked entry-point invocations (preflight or
+    # compress observing over-threshold pressure with the tail as the only
+    # blocker) it takes before the yield arms. This is what "sustained" means:
+    # below this count fresh_tail_count stays a hard suffix. 1 yields on the
+    # first blocked observation; the evidence streak resets whenever pressure
+    # drops below threshold, a compaction pass succeeds, or the session resets.
+    fresh_tail_pressure_yield_min_observations: int = 3
 
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers

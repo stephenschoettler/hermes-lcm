@@ -1809,10 +1809,15 @@ class TestEngineABC:
         assert instance.should_compress(90)
 
     def test_preflight_does_not_request_compaction_when_only_fresh_tail_is_over_threshold(self, tmp_path):
+        # Yield disabled: this test pins the classic contract that preflight
+        # never advertises a pass that would no-op. With the pressure yield
+        # enabled the same state legitimately compacts instead (see
+        # test_fresh_tail_pressure_yield.py).
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_fresh_tail.db"),
             fresh_tail_count=4,
             leaf_chunk_tokens=100,
+            fresh_tail_pressure_yield_enabled=False,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "test-session"
@@ -1836,10 +1841,14 @@ class TestEngineABC:
             instance.shutdown()
 
     def test_positive_preflight_clears_prior_noop_status(self, tmp_path):
+        # Yield disabled so the first preflight still lands in the classic
+        # noop state this test transitions out of (see
+        # test_fresh_tail_pressure_yield.py for yield-on coverage).
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_clears_noop.db"),
             fresh_tail_count=4,
             leaf_chunk_tokens=100,
+            fresh_tail_pressure_yield_enabled=False,
         )
         instance = LCMEngine(config=config)
         instance._session_id = "test-session"
