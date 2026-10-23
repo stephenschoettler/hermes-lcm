@@ -20,6 +20,10 @@ from typing import Iterator, List
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
+# The ``os.supports_*`` sets are keyed by the original builtin; keep a handle on
+# it so the capability probe stays correct even if ``os.chmod`` is wrapped.
+_OS_CHMOD = os.chmod
+
 
 def _sqlite_artifact_error(path: Path, reason: str) -> OSError:
     return OSError(errno.EPERM, f"refusing SQLite artifact {path.name!r}: {reason}", str(path))
@@ -43,7 +47,7 @@ def _require_sqlite_artifact_absent(path: Path, *, directory_fd: int) -> None:
     except FileNotFoundError:
         return
     _validate_sqlite_artifact(path, current)
-    raise _sqlite_artifact_error(path, "directory entry changed while opening")
+    raise _sqlite_artifact_error(path, "directory entry changed while restricting permissions")
 
 
 def _open_private_sqlite_directory(path: Path) -> int:
@@ -63,6 +67,53 @@ def _open_private_sqlite_directory(path: Path) -> int:
     return directory_fd
 
 
+def _create_private_sqlite_file(path: Path, *, directory_fd: int) -> bool:
+    """Create a brand-new, empty, mode-0600 SQLite file; return False if it raced into existence.
+
+    This is the ONE place a descriptor is opened on a SQLite artifact, and it is
+    safe because of ``O_EXCL``: the call only succeeds when the directory entry
+    did not exist, so the inode is new and no process (this one included) can
+    hold a SQLite lock on it yet. Closing our descriptor therefore cannot
+    cancel anyone's locks (see ``_chmod_sqlite_artifact_at``).
+    """
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+    except FileExistsError:
+        return False
+    try:
+        created = os.fstat(fd)
+        _validate_sqlite_artifact(path, created)
+        # The creation mode is subject to the umask; make the result exact.
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _chmod_existing_artifact_without_descriptor(path: Path, *, directory_fd: int) -> None:
+    """chmod 0600 an existing directory entry without ever opening it.
+
+    Prefer the kernel-enforced no-follow form (``fchmodat(AT_SYMLINK_NOFOLLOW)``,
+    available on macOS/BSD): a symlink swapped in after validation is never
+    followed. Where the platform lacks it (Linux), fall back to a plain
+    ``fchmodat``; the caller has just lstat-validated a single-link regular
+    file and re-validates the same entry afterwards.
+    """
+    if _OS_CHMOD in os.supports_dir_fd and _OS_CHMOD in os.supports_follow_symlinks:
+        try:
+            os.chmod(path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+            return
+        except NotImplementedError:
+            pass
+        except OSError as exc:
+            if exc.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+    os.chmod(path.name, 0o600, dir_fd=directory_fd)
+
+
 def _chmod_sqlite_artifact_at(
     path: Path,
     *,
@@ -70,54 +121,64 @@ def _chmod_sqlite_artifact_at(
     create: bool,
     allow_sidecar_disappearance: bool = False,
 ) -> bool:
-    expected: os.stat_result | None
+    """Make one SQLite artifact private WITHOUT opening a descriptor on an existing file.
+
+    POSIX advisory locks are owned by the process, not by a descriptor:
+    ``close()`` of ANY descriptor for a file releases EVERY lock the process
+    holds on it (https://www.sqlite.org/howtocorrupt.html, section 2.2),
+    including the locks SQLite's own live connections hold on the database and
+    on the ``-shm`` WAL index. This runs from ``LCMStore._init_db`` and
+    maintenance inside processes that already hold connections to the same
+    database, so an ``open()``/``close()`` here would let a sibling process take
+    the exclusive lock on its own close, checkpoint, and unlink the
+    ``-wal``/``-shm`` the first process is still using; later openers then
+    create a second WAL generation and two generations write one file.
+
+    So an existing artifact is only ever inspected with ``lstat`` (no
+    descriptor) and tightened with path-relative ``chmod`` (no descriptor);
+    this holds whether or not the mode already is 0600. The still-checked
+    invariants are the original ones: the entry must be a single-link regular
+    file (never a symlink or hardlink), and it is re-validated after the chmod.
+
+    Residual window versus a descriptor-based ``fchmod``: validate and chmod
+    are two syscalls on the same *name*, not one atomic operation on one inode.
+    A principal able to swap the entry in between must be able to write the
+    directory, which ``_open_private_sqlite_directory`` has already required to
+    be closed to group/other. Where the OS supports no-follow chmod a swapped-in
+    symlink is never followed; a swapped-in hardlink or replacement is detected
+    by the re-validation below (after the fact, as ``fchmod`` already was for
+    link-count changes).
+    """
     try:
         expected = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         if not create:
             return False
-        expected = None
-    if expected is not None:
-        _validate_sqlite_artifact(path, expected)
-
-    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-    if expected is None:
-        flags |= os.O_CREAT | os.O_EXCL
-    try:
-        fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
-    except FileExistsError:
-        if expected is not None:
-            raise
+        if _create_private_sqlite_file(path, directory_fd=directory_fd):
+            return True
+        # Lost a creation race: the file exists now, so treat it as existing.
         return _chmod_sqlite_artifact_at(
             path,
             directory_fd=directory_fd,
             create=False,
+            allow_sidecar_disappearance=allow_sidecar_disappearance,
         )
+
+    _validate_sqlite_artifact(path, expected)
+    if stat.S_IMODE(expected.st_mode) == 0o600:
+        return True  # nothing to tighten; no syscall beyond the lstat
+
+    try:
+        _chmod_existing_artifact_without_descriptor(path, directory_fd=directory_fd)
+        restricted = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
         if not allow_sidecar_disappearance:
             raise
         _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
         return False
-    try:
-        opened = os.fstat(fd)
-        if not stat.S_ISREG(opened.st_mode):
-            raise _sqlite_artifact_error(path, "not a regular file")
-        if expected is not None and not _same_file_identity(expected, opened):
-            raise _sqlite_artifact_error(path, "directory entry changed while opening")
-        if opened.st_nlink == 0 and allow_sidecar_disappearance:
-            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
-            return False
-        _validate_sqlite_artifact(path, opened)
-        os.fchmod(fd, 0o600)
-        restricted = os.fstat(fd)
-        if restricted.st_nlink == 0 and allow_sidecar_disappearance:
-            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
-            return False
-        if restricted.st_nlink != 1:
-            raise _sqlite_artifact_error(path, "link count changed while restricting permissions")
-    finally:
-        os.close(fd)
+    if not _same_file_identity(expected, restricted):
+        raise _sqlite_artifact_error(path, "directory entry changed while restricting permissions")
+    _validate_sqlite_artifact(path, restricted)
     return True
 
 
