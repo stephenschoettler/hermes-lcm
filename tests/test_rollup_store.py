@@ -65,13 +65,19 @@ def test_core_migrations_do_not_create_rollup_tables_or_bump_schema(tmp_path):
         conn.commit()
 
         assert db_bootstrap.get_schema_version(conn) == db_bootstrap.SCHEMA_VERSION
-        assert db_bootstrap.SCHEMA_VERSION == 5
         assert ROLLUP_TABLES.isdisjoint(_table_names(conn))
-        # No numeric v6 step is recorded; the rollup tables use a named step.
-        steps = conn.execute(
-            "SELECT step_name FROM lcm_migration_state WHERE step_name LIKE 'v6%' OR step_name = 'temporal_rollups_v1'"
-        ).fetchall()
-        assert steps == []
+        # The rollup feature uses the NAMED step ``temporal_rollups_v1``; the
+        # core migration must not record it. (The core v6 numeric step IS the
+        # message identity constraint, which is a legitimate core migration and
+        # is expected to be present on a fresh DB.)
+        steps = {
+            row[0]
+            for row in conn.execute(
+                "SELECT step_name FROM lcm_migration_state"
+            ).fetchall()
+        }
+        assert "temporal_rollups_v1" not in steps
+        assert "v6_message_identity_constraint" in steps
     finally:
         conn.close()
 

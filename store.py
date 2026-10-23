@@ -456,6 +456,79 @@ class MessageStore:
 
     # -- Write operations ---------------------------------------------------
 
+    def _insert_message_conflict_safe(
+        self,
+        params: tuple,
+        *,
+        session_id: str,
+        role: str,
+        observed_at,
+        tool_call_id,
+        content,
+    ) -> int:
+        """Insert a message row, tolerating an identity conflict.
+
+        The v6 ``idx_msg_identity`` unique index (see ``db_bootstrap``) rejects
+        byte-identical re-ingests at the storage layer. On conflict we return
+        the store_id of the already-stored row instead of raising, so callers
+        keep a valid handle and no duplicate row is created. The FTS triggers
+        do not fire on the no-op insert, keeping ``messages_fts`` in sync.
+        """
+        cur = self._conn.execute(
+            """INSERT INTO messages
+               (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                tool_name, timestamp, token_estimate, pinned, ingested_at,
+                observed_at, observed_at_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
+            params,
+        )
+        if cur.rowcount == 1:
+            return cur.lastrowid
+        # Identity conflict: a row with this identity already exists. Recover
+        # its store_id by matching the unique identity key exactly (NULL
+        # observed_at handled with IS NULL; NULL/empty tool_call_id and content
+        # coalesced to '' to mirror the index semantics).
+        if observed_at is None:
+            obs_clause = "observed_at IS NULL"
+            obs_args: list = []
+        else:
+            obs_clause = "observed_at = ?"
+            obs_args = [observed_at]
+        row = self._conn.execute(
+            f"""
+            SELECT store_id FROM messages
+            WHERE session_id = ? AND role = ? AND {obs_clause}
+              AND COALESCE(tool_call_id, '') = ?
+              AND COALESCE(content, '') = ?
+            """,
+            (
+                session_id,
+                role,
+                *obs_args,
+                "" if tool_call_id is None else tool_call_id,
+                "" if content is None else content,
+            ),
+        ).fetchone()
+        if row is None and tool_call_id:
+            # Partial tool_call_id index conflict: the same tool_call_id was
+            # re-ingested with a different observed_at, so the full-identity
+            # lookup above misses. Recover the canonical row by (session_id,
+            # tool_call_id) — the partial index guarantees at most one.
+            row = self._conn.execute(
+                "SELECT store_id FROM messages "
+                "WHERE session_id = ? AND tool_call_id = ?",
+                (session_id, tool_call_id),
+            ).fetchone()
+        if row is None:
+            # Should not happen while holding the write lock on a single-writer
+            # connection. Fail loudly rather than returning a bogus id.
+            raise RuntimeError(
+                "LCM identity conflict but no existing row found "
+                f"(session_id={session_id!r}, role={role!r})"
+            )
+        return row[0]
+
     def append(self, session_id: str, msg: Dict[str, Any],
                token_estimate: int = 0, source: str = "",
                conversation_id: str = "") -> int:
@@ -472,12 +545,7 @@ class MessageStore:
         ingested_at = time.time()
 
         with self._write_lock:
-            cur = self._conn.execute(
-                """INSERT INTO messages
-                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            store_id = self._insert_message_conflict_safe(
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -494,9 +562,14 @@ class MessageStore:
                     observed_at,
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
+                session_id=session_id,
+                role=msg.get("role", "unknown"),
+                observed_at=observed_at,
+                tool_call_id=msg.get("tool_call_id"),
+                content=msg.get("content"),
             )
             self._conn.commit()
-            return cur.lastrowid
+            return store_id
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -540,12 +613,7 @@ class MessageStore:
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
                 observed_at = _normalize_observed_at(msg.get("timestamp"))
-                cur = self._conn.execute(
-                    """INSERT INTO messages
-                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                store_id = self._insert_message_conflict_safe(
                     (
                         session_id,
                         _normalize_source_value(source),
@@ -562,8 +630,13 @@ class MessageStore:
                         observed_at,
                         "host_message_timestamp" if observed_at is not None else None,
                     ),
+                    session_id=session_id,
+                    role=msg.get("role", "unknown"),
+                    observed_at=observed_at,
+                    tool_call_id=msg.get("tool_call_id"),
+                    content=msg.get("content"),
                 )
-                ids.append(cur.lastrowid)
+                ids.append(store_id)
         return ids
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
