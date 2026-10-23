@@ -917,7 +917,47 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if context_threshold_tokens > 0:
                 return min(context_threshold_tokens, assembly_cap)
             return assembly_cap
+        # Host-side hard cap (compression.threshold_tokens), installed by the live compression sync
+        # (tui_gateway/session_compression.py sets engine.threshold_tokens_cap each turn). Same
+        # clamp semantics as ContextCompressor._apply_threshold_tokens_cap: None/invalid = no cap.
+        host_cap = getattr(self, "threshold_tokens_cap", None)
+        if isinstance(host_cap, int) and host_cap > 0:
+            if context_threshold_tokens > 0:
+                return min(context_threshold_tokens, host_cap)
+            return host_cap
         return context_threshold_tokens
+
+    @staticmethod
+    def _coerce_threshold_tokens_cap(value: Any) -> int | None:
+        """Mirror of ContextCompressor._coerce_max_tokens: positive int, or None for "no cap".
+
+        The host's live compression sync (tui_gateway/session_compression.py) calls this on
+        agent.context_compressor every turn; without it the whole live apply aborts with an
+        AttributeError warning and compression.threshold_tokens from config.yaml never reaches
+        the engine.
+        """
+        try:
+            ivalue = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
+    @property
+    def threshold_tokens_cap(self) -> int | None:
+        """Host-side hard cap (compression.threshold_tokens). The host installs it each turn
+        without re-deriving the trigger, so the setter re-applies the clamp immediately."""
+        return getattr(self, "_threshold_tokens_cap", None)
+
+    @threshold_tokens_cap.setter
+    def threshold_tokens_cap(self, value: Any) -> None:
+        coerced = self._coerce_threshold_tokens_cap(value)
+        if coerced == getattr(self, "_threshold_tokens_cap", None):
+            return
+        self._threshold_tokens_cap = coerced
+        if self.context_length > 0 and self.context_threshold > 0:
+            self.threshold_tokens = self._effective_threshold_tokens(
+                int(self.context_length * self.context_threshold)
+            )
 
     def _set_context_length(
         self,
