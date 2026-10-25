@@ -80,8 +80,18 @@ def _chmod_sqlite_artifact_at(
     if expected is not None:
         _validate_sqlite_artifact(path, expected)
 
-    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    # Never open an EXISTING SQLite file read-write just to chmod it (#588, #660). POSIX
+    # releases every fcntl lock a process holds on a file when it closes ANY descriptor to
+    # it, so this helper's open/fchmod/close silently dropped the live connection's DB and
+    # WAL locks; another process's last close then unlinked the WAL underneath it. Closing
+    # an O_PATH descriptor does not touch locks (Linux), so pin the inode with O_PATH and
+    # chmod it through /proc/self/fd. New files (O_CREAT|O_EXCL) keep the read-write path.
+    use_o_path = expected is not None and hasattr(os, "O_PATH") and os.path.isdir("/proc/self/fd")
+    if use_o_path:
+        flags = os.O_PATH | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    else:
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     if expected is None:
         flags |= os.O_CREAT | os.O_EXCL
     try:
@@ -109,7 +119,10 @@ def _chmod_sqlite_artifact_at(
             _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
             return False
         _validate_sqlite_artifact(path, opened)
-        os.fchmod(fd, 0o600)
+        if use_o_path:
+            os.chmod(f"/proc/self/fd/{fd}", 0o600)
+        else:
+            os.fchmod(fd, 0o600)
         restricted = os.fstat(fd)
         if restricted.st_nlink == 0 and allow_sidecar_disappearance:
             _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
