@@ -83,4 +83,14 @@ Verification:
   2. Run: hermes plugins
   3. Confirm the plugin list includes hermes-lcm and the selected context engine is lcm.
   4. Confirm the available skills include hermes-lcm.
+  5. Confirm the WAL generation guard is armed:
+
+       cd "$PLUGIN_TARGET"
+       python3 -c "import sys; sys.path.insert(0,'.'); import wal_generation_guard as g; print(g.supported())"
+
+     Must print True. False means the guard is inert: it needs core's
+     hermes_state_lockguard, and a failed import is silent by design, so
+     lcm.db loses its protection against WAL-generation corruption with no
+     error reported anywhere. See
+     skills/hermes-lcm/references/wal-generation-corruption.md
 EOF

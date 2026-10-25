@@ -23,6 +23,7 @@ from urllib.parse import quote
 from .db_bootstrap import (
     ASSERTION_MIGRATION_STEP,
     configure_connection,
+    cross_process_gate_lock,
     ensure_assertion_tables,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
@@ -218,7 +219,9 @@ class AssertionStore:
     def __init__(self, db_path: str | Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
         self.read_only = bool(read_only)
-        self._write_lock = threading.RLock()
+        self._write_lock = cross_process_gate_lock(
+            self.db_path, "_write_lock", read_only=self.read_only
+        )
         self._conn = self._open_connection()
         try:
             self._init_db()

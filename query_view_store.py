@@ -21,8 +21,10 @@ import time
 from typing import Any, Iterator, Literal, NamedTuple, Sequence
 import uuid
 
+from . import wal_generation_guard
 from .db_bootstrap import (
     configure_connection,
+    cross_process_gate_lock,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
     run_versioned_migrations,
@@ -538,7 +540,7 @@ class QueryViewStore:
         self._conn = sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
-        self._write_lock = threading.RLock()
+        self._write_lock = cross_process_gate_lock(self.db_path, "_write_lock")
         try:
             refuse_schema_version_too_new(self._conn)
             configure_connection(self._conn)
@@ -1264,6 +1266,9 @@ class QueryViewStore:
                     conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except sqlite3.Error:
                     pass
+                # Hand the WAL generation back before the close so a true last
+                # close can still reset the sidecars (see wal_generation_guard).
+                wal_generation_guard.disarm(conn)
                 conn.close()
                 self._conn = None
 

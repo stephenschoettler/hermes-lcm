@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.4",
+  "contract_version": "1.0.5",
   "boundary": "host-owned",
   "imported_api_validation": "observed-coverage-only",
   "description": "Hermes-LCM is a source-installed Hermes Agent plugin. Hermes Agent owns the Python environment and dependency resolution; the plugin declares the host and optional feature imports it consumes without creating a second package installer or lock.",
@@ -74,6 +74,17 @@
         "hermes_cli.config.get_hermes_home",
         "hermes_cli.plugins.get_plugin_manager",
         "hermes_cli.runtime_provider._get_named_custom_provider"
+      ]
+    },
+    "hermes_state_lockguard": {
+      "distribution": "hermes-agent",
+      "availability": "optional",
+      "scope": "WAL generation guard for LCM sidecars; reuses core's state.db OFD lock protocol",
+      "version_policy": "Hermes Agent >=0.16,<1; the guard disables itself and logs when the module or its OFD-lock support is absent",
+      "imported_api": [
+        "hermes_state_lockguard.supported",
+        "hermes_state_lockguard.hold",
+        "hermes_state_lockguard.release"
       ]
     },
     "huggingface_hub": {

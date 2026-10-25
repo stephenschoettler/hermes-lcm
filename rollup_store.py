@@ -15,8 +15,10 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, NamedTuple, Optional, Sequence
 
+from . import wal_generation_guard
 from .db_bootstrap import (
     configure_connection,
+    cross_process_gate_lock,
     ensure_temporal_rollup_tables,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
@@ -56,7 +58,7 @@ class RollupStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        self._write_lock = threading.RLock()
+        self._write_lock = cross_process_gate_lock(self.db_path, "_write_lock")
         self._init_db()
 
     def _init_db(self) -> None:
@@ -835,9 +837,13 @@ class RollupStore:
         conn = getattr(self, "_conn", None)
         if conn is not None:
             try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                with self._write_lock:  # fence the checkpoint cross-process
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error:
                 pass
+            # Hand the WAL generation back before the close so a true last
+            # close can still reset the sidecars (see wal_generation_guard).
+            wal_generation_guard.disarm(conn)
             conn.close()
             self._conn = None
 

@@ -24,6 +24,7 @@ from urllib.parse import quote, unquote
 
 from .db_bootstrap import (
     configure_connection,
+    cross_process_gate_lock,
     get_fts_shadow_table_names,
     mark_migration_step_complete,
     refuse_schema_version_too_new,
@@ -589,7 +590,9 @@ class TrajectoryStore:
         self._state_semantic_cache: (
             tuple[str, tuple[int, float], list[int], Any] | None
         ) = None
-        self._lock = threading.RLock()
+        self._lock = cross_process_gate_lock(
+            self.db_path, "_lock", read_only=self.read_only
+        )
         self._conn = self._open_connection()
         try:
             self._validate_existing_schema_version()

@@ -17,6 +17,7 @@ Start here:
 
 Reference map:
 
+- Recurring corruption, `disk I/O error`, repair tooling: `references/wal-generation-corruption.md`
 - Configuration and activation: `references/configuration.md`
 - Architecture and data ownership: `references/architecture.md`
 - Diagnostics and safe operator workflow: `references/diagnostics.md`
@@ -34,3 +35,4 @@ Working rules:
 - Do not treat open-cardinality results as complete without product-verifiable enumeration or coverage.
 - Use `lcm_compile_evidence` when a historical answer needs several named facets, exact operands, conflict handling, or latest-state selection; treat its semantic proposal as untrusted until the product returns validated evidence.
 - Keep default-off assertion, query-view, adaptive-retrieval, and destructive operator paths default-off unless the user explicitly asks to enable them.
+- Never unlink `lcm.db-wal`/`-shm`, never open the database read-write merely to inspect it, and never swap the live inode while handles are open: each strands every live process on a deleted WAL generation and corrupts the file. A `disk I/O error` is a degraded environment, not corruption, and "repairing" it loops. See `references/wal-generation-corruption.md`.
