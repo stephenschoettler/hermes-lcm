@@ -387,6 +387,24 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
+    @staticmethod
+    def _coerce_threshold_tokens_cap(value):
+        """Normalize a ``threshold_tokens`` cap to a positive int, or ``None`` for "no cap".
+
+        ``tui_gateway.session_compression._apply_live_compression_config`` duck-types the
+        agent's compressor and calls ``cc._coerce_threshold_tokens_cap(...)`` when
+        ``compression.threshold_tokens`` is edited live. ``ContextCompressor`` defines it
+        (an alias of ``_coerce_max_tokens``); when LCM is the engine the call lands here
+        and raised ``AttributeError``, logging "Could not apply live compression config"
+        on every config save and skipping the cap. Mirrors the upstream normalization.
+        LCM's own pacing (context_threshold / fresh tail) does not read this value.
+        """
+        try:
+            ivalue = int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
+
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
