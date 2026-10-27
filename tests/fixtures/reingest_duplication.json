@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "Synthetic, scrubbed fixture for the LCM re-ingest duplication bug.",
+    "It keeps only the structural features observed in the live transcript:",
+    "  1. whitespace: the stored user row 'ok ' has a trailing space; the",
+    "     Hermes state.db replay hands LCM the stripped form 'ok'.",
+    "  2. an earlier partial replay is already in the stored history (the",
+    "     repeated 'stored_duplicate' chunk), so stored is no clean prefix.",
+    "  3. parallel tool results are reordered in the replay, and the stored",
+    "     side carries a failed retry (call_delta) the replay does not.",
+    "  4. a gateway notification turn appears at a different position.",
+    "No text from the real conversation is reproduced here."
+  ],
+  "stored": [
+    {"role": "user", "content": "summarize /tmp/run.log"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_alpha", "type": "function",
+       "function": {"name": "read_file", "arguments": "{\"path\": \"/tmp/run.log\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_alpha", "content": "{\"ok\": true, \"lines\": 3}"},
+    {"role": "assistant", "content": "log summarized"},
+    {"role": "user", "content": "now run both checks"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_beta", "type": "function",
+       "function": {"name": "run_check", "arguments": "{\"name\": \"beta\"}"}},
+      {"id": "call_gamma", "type": "function",
+       "function": {"name": "run_check", "arguments": "{\"name\": \"gamma\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_beta", "content": "{\"check\": \"beta\", \"ok\": true}"},
+    {"role": "tool", "tool_call_id": "call_gamma", "content": "{\"check\": \"gamma\", \"ok\": false}"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_delta", "type": "function",
+       "function": {"name": "write_file", "arguments": "{\"path\": \"/tmp/run.log\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_delta", "content": "{\"error\": \"Refusing to overwrite /tmp/run.log\"}"},
+    {"role": "assistant", "content": "beta ok, gamma failed"},
+    {"role": "user", "content": "ok "},
+    {"role": "assistant", "content": "noted"},
+    {"role": "user", "content": "[IMPORTANT: Background process proc_1a2b3c completed normally (exit code 0).\nCommand: sleep 30; tail -2 /tmp/run.log\nOutput:\nbeta ok\ngamma failed]"},
+    {"role": "assistant", "content": "notification observed"},
+    {"role": "user", "content": "final question"},
+    {"role": "assistant", "content": "final answer"}
+  ],
+  "stored_duplicate": [
+    {"role": "user", "content": "summarize /tmp/run.log"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_alpha", "type": "function",
+       "function": {"name": "read_file", "arguments": "{\"path\": \"/tmp/run.log\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_alpha", "content": "{\"ok\": true, \"lines\": 3}"},
+    {"role": "assistant", "content": "log summarized"},
+    {"role": "user", "content": "now run both checks"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_beta", "type": "function",
+       "function": {"name": "run_check", "arguments": "{\"name\": \"beta\"}"}},
+      {"id": "call_gamma", "type": "function",
+       "function": {"name": "run_check", "arguments": "{\"name\": \"gamma\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_beta", "content": "{\"check\": \"beta\", \"ok\": true}"},
+    {"role": "tool", "tool_call_id": "call_gamma", "content": "{\"check\": \"gamma\", \"ok\": false}"},
+    {"role": "assistant", "content": "beta ok, gamma failed"}
+  ],
+  "replay": [
+    {"role": "user", "content": "summarize /tmp/run.log"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_alpha", "type": "function",
+       "function": {"name": "read_file", "arguments": "{\"path\": \"/tmp/run.log\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_alpha", "content": "{\"ok\": true, \"lines\": 3}"},
+    {"role": "assistant", "content": "log summarized"},
+    {"role": "user", "content": "[IMPORTANT: Background process proc_1a2b3c completed normally (exit code 0).\nCommand: sleep 30; tail -2 /tmp/run.log\nOutput:\nbeta ok\ngamma failed]"},
+    {"role": "assistant", "content": "notification observed"},
+    {"role": "user", "content": "now run both checks"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_beta", "type": "function",
+       "function": {"name": "run_check", "arguments": "{\"name\": \"beta\"}"}},
+      {"id": "call_gamma", "type": "function",
+       "function": {"name": "run_check", "arguments": "{\"name\": \"gamma\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_gamma", "content": "{\"check\": \"gamma\", \"ok\": false}"},
+    {"role": "tool", "tool_call_id": "call_beta", "content": "{\"check\": \"beta\", \"ok\": true}"},
+    {"role": "assistant", "content": "beta ok, gamma failed"},
+    {"role": "user", "content": "ok"},
+    {"role": "assistant", "content": "noted"},
+    {"role": "user", "content": "final question"},
+    {"role": "assistant", "content": "final answer"}
+  ]
+}

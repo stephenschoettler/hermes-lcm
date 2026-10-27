@@ -886,6 +886,42 @@ class MessageStore:
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    def iter_session_message_identities(self, session_id: str, batch_size: int = 2000):
+        """Yield the identity columns of every stored message for *session_id*.
+
+        Streams in store order using keyset paging so a whole-session identity
+        scan never materializes the transcript: callers hash each row and keep
+        counts, not content.  Only the columns ingest reconciliation needs are
+        decoded (the full row, including externalized payload columns, would be
+        wasted work on a large session).
+        """
+        if batch_size <= 0:
+            batch_size = 1
+        after = 0
+        while True:
+            rows = self._conn.execute(
+                "SELECT store_id, session_id, role, content, tool_call_id, tool_calls "
+                "FROM messages WHERE session_id = ? AND store_id > ? "
+                "ORDER BY store_id LIMIT ?",
+                (session_id, after, batch_size),
+            ).fetchall()
+            if not rows:
+                return
+            for store_id, row_session_id, role, content, tool_call_id, tool_calls in rows:
+                after = int(store_id)
+                if tool_calls:
+                    try:
+                        tool_calls = json.loads(tool_calls)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                yield {
+                    "session_id": row_session_id,
+                    "role": role,
+                    "content": content,
+                    "tool_call_id": tool_call_id,
+                    "tool_calls": tool_calls,
+                }
+
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""
         row = self._conn.execute(

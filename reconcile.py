@@ -18,6 +18,7 @@ avoid an import cycle (staticmethod resolution is identical).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -50,6 +51,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+
+# A short rebound batch is indistinguishable from a deliberate delta that
+# legitimately repeats durable content (a "retry" turn, a fresh singleton
+# quirk).  The engine's existing contract preserves those, so the multiset
+# replay dedup only takes over once the incoming batch is large enough to be a
+# transcript rebuild rather than a delta.  Between the two sizes, a batch that
+# repeats a provider id is a retry sequence, not a plain transcript replay, and
+# keeps the legacy path so the retry is preserved.
+_MULTISET_REPLAY_MIN_MESSAGES = 8
+_MULTISET_REPLAY_SHORT_MIN_MESSAGES = 4
 
 
 class ReconcileMixin:
@@ -751,6 +762,8 @@ class ReconcileMixin:
         session_count: int,
         stored_tail_count: int,
         effective_incoming: int | None = None,
+        already_stored: int | None = None,
+        persisted: int | None = None,
     ) -> None:
         self._last_ingest_reconciliation = {
             "action": action,
@@ -762,6 +775,10 @@ class ReconcileMixin:
         }
         if effective_incoming is not None:
             self._last_ingest_reconciliation["effective_incoming"] = effective_incoming
+        if already_stored is not None:
+            self._last_ingest_reconciliation["already_stored"] = already_stored
+        if persisted is not None:
+            self._last_ingest_reconciliation["persisted"] = persisted
 
     def _effective_replay_identities(
         self,
@@ -801,8 +818,172 @@ class ReconcileMixin:
             return False
         return stored_head[: len(incoming_identities)] == incoming_identities
 
+    @staticmethod
+    def _tool_call_ids_from_identity(tool_calls_identity: str) -> tuple[str, ...]:
+        """Provider ids carried by a canonical ``tool_calls`` identity.
+
+        The id is what makes an assistant tool-call turn and its result unique;
+        argument text is deliberately not part of the id set.
+        """
+        if not tool_calls_identity:
+            return ()
+        try:
+            parsed = json.loads(tool_calls_identity)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return ()
+        ids: list[str] = []
+        for call in parsed:
+            if not isinstance(call, dict):
+                continue
+            for key in ("id", "call_id", "tool_call_id"):
+                value = call.get(key)
+                if isinstance(value, str) and value:
+                    ids.append(value)
+                    break
+        return tuple(sorted(set(ids)))
+
+    def _incoming_has_duplicate_provider_ids(self, messages: List[Dict[str, Any]]) -> bool:
+        """True when the batch repeats a tool id or assistant call id.
+
+        A plain transcript replay has one row per provider id.  Repeated ids
+        mean the batch contains retries and must keep the legacy path, which
+        preserves a retried result that reuses its id with new content.
+        """
+        seen_tool_ids: set[str] = set()
+        seen_call_ids: set[str] = set()
+        for msg in messages:
+            role = str(msg.get("role") or "unknown")
+            tool_call_id = str(msg.get("tool_call_id") or "")
+            if role == "tool" and tool_call_id:
+                if tool_call_id in seen_tool_ids:
+                    return True
+                seen_tool_ids.add(tool_call_id)
+                continue
+            call_ids = self._tool_call_ids_from_identity(
+                self._stable_tool_calls_identity(msg.get("tool_calls"))
+            )
+            if role == "assistant" and call_ids:
+                if any(call_id in seen_call_ids for call_id in call_ids):
+                    return True
+                seen_call_ids.update(call_ids)
+        return False
+
+    @staticmethod
+    def _multiset_text_identity(
+        role: str,
+        text: str,
+        tool_calls_identity: str = "",
+    ) -> tuple[str, str]:
+        """Normalised, hashed identity for rows that carry no unique provider id.
+
+        Leading/trailing whitespace is tolerated because Hermes reloads
+        user/assistant content through ``sanitize_context(content).strip()``
+        (hermes_state_messages.py ``_loaded_view_content``) while LCM stored
+        the live in-memory string.  Nothing else is normalised: internal
+        whitespace and every other byte must still match.  Content is hashed
+        so a whole-session scan never retains message bodies.
+        """
+        digest = hashlib.sha256()
+        digest.update(role.encode("utf-8", "surrogatepass"))
+        digest.update(b"\x00")
+        digest.update((text or "").strip().encode("utf-8", "surrogatepass"))
+        if tool_calls_identity:
+            digest.update(b"\x00")
+            digest.update(tool_calls_identity.encode("utf-8", "surrogatepass"))
+        return ("text", digest.hexdigest())
+
+    def _multiset_persisted_indices(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[list[int], int, int]:
+        """Incoming indexes whose replay identity is not already stored.
+
+        Returns ``(new_indices, stored_rows_scanned, already_stored)``.
+
+        Matching is a multiset difference over the normalised replay identity,
+        so legitimate repeats survive (two real "ok" turns are stored twice)
+        while a replayed transcript is not written again.  Rows that carry
+        provider ids are unique: an incoming tool result or assistant
+        tool-call turn whose id is already stored for this session is never
+        inserted again, however often the replay repeats it.  Parallel tool
+        results therefore match by ``tool_call_id`` in any order, and gateway
+        notification turns match by content wherever they sit in the list.
+        """
+        stored_text_counts: dict[tuple[str, str], int] = {}
+        stored_tool_ids: set[str] = set()
+        stored_call_ids: set[str] = set()
+        stored_rows = 0
+        for row in self._store.iter_session_message_identities(self._session_id):
+            stored_rows += 1
+            role = str(row.get("role") or "unknown")
+            tool_call_id = str(row.get("tool_call_id") or "")
+            if role == "tool" and tool_call_id:
+                # Tool results are unique by provider id; content may differ
+                # legitimately (an externalized stored payload vs. the live
+                # text), so the id is the whole identity.
+                stored_tool_ids.add(tool_call_id)
+                continue
+            tool_calls_identity = self._stable_tool_calls_identity(row.get("tool_calls"))
+            call_ids = self._tool_call_ids_from_identity(tool_calls_identity)
+            if role == "assistant" and call_ids:
+                stored_call_ids.update(call_ids)
+                continue
+            _role, content, _tool_call_id, identity_tool_calls = self._message_replay_identity(
+                row, stored_row=True
+            )
+            key = self._multiset_text_identity(role, content or "", identity_tool_calls)
+            stored_text_counts[key] = stored_text_counts.get(key, 0) + 1
+
+        new_indices: list[int] = []
+        already_stored = 0
+        incoming_text_counts: dict[tuple[str, str], int] = {}
+        seen_tool_ids: set[str] = set()
+        seen_call_ids: set[str] = set()
+        for idx, msg in enumerate(messages):
+            if (
+                self._is_replayed_context_scaffold_message(msg)
+                or self._matches_ignore_message_patterns(msg)
+            ):
+                # These are never persisted by _ingest_messages, so they can
+                # neither be a delta nor proof that something is stored.
+                continue
+            role = str(msg.get("role") or "unknown")
+            tool_call_id = str(msg.get("tool_call_id") or "")
+            if role == "tool" and tool_call_id:
+                if tool_call_id in stored_tool_ids or tool_call_id in seen_tool_ids:
+                    already_stored += 1
+                else:
+                    new_indices.append(idx)
+                seen_tool_ids.add(tool_call_id)
+                continue
+            tool_calls_identity = self._stable_tool_calls_identity(msg.get("tool_calls"))
+            call_ids = self._tool_call_ids_from_identity(tool_calls_identity)
+            if role == "assistant" and call_ids:
+                if any(
+                    call_id in stored_call_ids or call_id in seen_call_ids
+                    for call_id in call_ids
+                ):
+                    already_stored += 1
+                else:
+                    new_indices.append(idx)
+                seen_call_ids.update(call_ids)
+                continue
+            _role, content, _tool_call_id, identity_tool_calls = self._message_replay_identity(msg)
+            key = self._multiset_text_identity(role, content or "", identity_tool_calls)
+            incoming_text_counts[key] = incoming_text_counts.get(key, 0) + 1
+            if incoming_text_counts[key] > stored_text_counts.get(key, 0):
+                new_indices.append(idx)
+            else:
+                already_stored += 1
+        return new_indices, stored_rows, already_stored
+
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
+        self._reconcile_multiset_persist_indices = None
         if not self._session_id or not messages:
             return 0
 
@@ -863,11 +1044,56 @@ class ReconcileMixin:
             raw_session_count=session_count,
         )
         if cursor is not None and cursor > 0:
+            scaffold_only_prefix = not self._effective_replay_identities(messages[:cursor])
             reason = (
                 "skipped scaffold-only prefix"
-                if not self._effective_replay_identities(messages[:cursor])
+                if scaffold_only_prefix
                 else "replayed durable tail"
             )
+            if scaffold_only_prefix:
+                # A scaffold-only prefix (e.g. a "[Recent Summary ...]" block
+                # from a compacted session) proves nothing about the rest of
+                # the batch: after a rebind the remainder is usually the whole
+                # durable fresh tail again.  When the remainder is replay-sized,
+                # filter it with the same multiset difference as the ambiguous
+                # path instead of persisting it wholesale.  The prefix holds no
+                # effective identities, so counting over the full list is the
+                # full-replay case.
+                remainder_effective = len(self._effective_replay_identities(messages[cursor:]))
+                remainder_replay_sized = remainder_effective >= _MULTISET_REPLAY_MIN_MESSAGES or (
+                    remainder_effective >= _MULTISET_REPLAY_SHORT_MIN_MESSAGES
+                    and not self._incoming_has_duplicate_provider_ids(messages[cursor:])
+                )
+                if remainder_replay_sized:
+                    new_indices, _scanned, already_stored = self._multiset_persisted_indices(messages)
+                    new_indices = [idx for idx in new_indices if idx >= cursor]
+                    effective_incoming = len(self._effective_replay_identities(messages))
+                    if not new_indices:
+                        self._record_ingest_reconciliation(
+                            action="advanced cursor",
+                            reason="skipped scaffold-only prefix; persisted multiset delta",
+                            cursor=len(messages),
+                            incoming=len(messages),
+                            session_count=session_count,
+                            stored_tail_count=len(stored_tail),
+                            effective_incoming=effective_incoming,
+                            already_stored=already_stored,
+                            persisted=0,
+                        )
+                        return len(messages)
+                    self._reconcile_multiset_persist_indices = new_indices
+                    self._record_ingest_reconciliation(
+                        action="persisted delta",
+                        reason="skipped scaffold-only prefix; persisted multiset delta",
+                        cursor=0,
+                        incoming=len(messages),
+                        session_count=session_count,
+                        stored_tail_count=len(stored_tail),
+                        effective_incoming=effective_incoming,
+                        already_stored=already_stored,
+                        persisted=len(new_indices),
+                    )
+                    return 0
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason=reason,
@@ -933,6 +1159,59 @@ class ReconcileMixin:
             )
             return len(messages)
 
+        effective_incoming = len(incoming_identities)
+        replay_sized = effective_incoming >= _MULTISET_REPLAY_MIN_MESSAGES or (
+            effective_incoming >= _MULTISET_REPLAY_SHORT_MIN_MESSAGES
+            and not self._incoming_has_duplicate_provider_ids(messages)
+        )
+        if replay_sized:
+            new_indices, stored_rows_scanned, already_stored = self._multiset_persisted_indices(
+                messages
+            )
+            persisted = len(new_indices)
+            logger.debug(
+                "LCM multiset ingest reconciliation: session=%s incoming=%d effective_incoming=%d stored_rows_scanned=%d already_stored=%d persisted=%d",
+                self._session_id,
+                len(messages),
+                effective_incoming,
+                stored_rows_scanned,
+                already_stored,
+                persisted,
+            )
+            if not new_indices:
+                # Everything in the replay is already durable.  Return the full
+                # length so the engine cursor lands exactly where the successful
+                # full-replay path leaves it (no prefix bookkeeping involved).
+                self._record_ingest_reconciliation(
+                    action="advanced cursor",
+                    reason="persisted multiset delta",
+                    cursor=len(messages),
+                    incoming=len(messages),
+                    session_count=session_count,
+                    stored_tail_count=len(stored_tail),
+                    effective_incoming=effective_incoming,
+                    already_stored=already_stored,
+                    persisted=0,
+                )
+                return len(messages)
+
+            # Only the indexes selected by the multiset difference are persisted;
+            # _ingest_messages applies them in incoming order and still finishes
+            # with its in-memory cursor at len(messages).
+            self._reconcile_multiset_persist_indices = new_indices
+            self._record_ingest_reconciliation(
+                action="persisted delta",
+                reason="persisted multiset delta",
+                cursor=0,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=effective_incoming,
+                already_stored=already_stored,
+                persisted=persisted,
+            )
+            return 0
+
         self._record_ingest_reconciliation(
             action="persisted batch",
             reason="persisted ambiguous delta",
@@ -940,7 +1219,7 @@ class ReconcileMixin:
             incoming=len(messages),
             session_count=session_count,
             stored_tail_count=len(stored_tail),
-            effective_incoming=len(incoming_identities),
+            effective_incoming=effective_incoming,
         )
         return 0
 
