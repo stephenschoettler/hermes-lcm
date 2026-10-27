@@ -21,7 +21,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
-from contextlib import nullcontext
+
 from pathlib import Path
 from typing import Any, Dict, TYPE_CHECKING
 
@@ -40,55 +40,120 @@ if TYPE_CHECKING:
 # so a pooled store observes cross-process writes and never serves stale vectors.
 _POOL_MAX_PATHS = 2
 _pool_lock = threading.Lock()
-# (db_path, bounded_scan_rows) -> {"store": VectorStore, "lock": RLock}
+_pool_condition = threading.Condition(_pool_lock)
+# (db_path, bounded_scan_rows) -> {"store": VectorStore, "lock": RLock, "users": int}
 _vector_store_pool: "OrderedDict[tuple[str, int], dict[str, Any]]" = OrderedDict()
+_pool_closed = False
+
+
+def _close_vector_store_entry(entry: dict[str, Any]) -> None:
+    try:
+        entry["store"].close()
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _evict_idle_vector_store_entries_locked() -> None:
+    while len(_vector_store_pool) > _POOL_MAX_PATHS:
+        idle_key = next(
+            (key for key, entry in _vector_store_pool.items() if not entry["users"]),
+            None,
+        )
+        if idle_key is None:
+            return
+        _close_vector_store_entry(_vector_store_pool.pop(idle_key))
+
+
+def _close_vector_store_entries_locked() -> None:
+    while any(entry["users"] for entry in _vector_store_pool.values()):
+        _pool_condition.wait()
+    while _vector_store_pool:
+        _, entry = _vector_store_pool.popitem()
+        _close_vector_store_entry(entry)
 
 
 def _reset_vector_store_pool() -> None:
-    """Close and drop every pooled VectorStore (test hygiene / shutdown)."""
-    with _pool_lock:
-        while _vector_store_pool:
-            _, entry = _vector_store_pool.popitem()
-            try:
-                entry["store"].close()
-            except Exception:  # pragma: no cover - defensive
-                pass
+    """Close pooled stores and reopen the pool for test hygiene."""
+    global _pool_closed
+    with _pool_condition:
+        _pool_closed = True
+        _close_vector_store_entries_locked()
+        _pool_closed = False
+        _pool_condition.notify_all()
+
+
+def _open_vector_store_pool() -> None:
+    """Allow a freshly registered plugin instance to acquire pooled stores."""
+    global _pool_closed
+    with _pool_condition:
+        _pool_closed = False
+        _pool_condition.notify_all()
+
+
+def _close_vector_store_pool() -> None:
+    """Stop new acquisitions and drain every pooled store during unload."""
+    global _pool_closed
+    with _pool_condition:
+        _pool_closed = True
+        _close_vector_store_entries_locked()
 
 
 def _acquire_vector_store(
     engine: "LCMEngine", *, vector_store_cls: Any, scan_rows: int | None
-) -> tuple[Any, Any, bool]:
-    """Return ``(store, per_store_lock_or_None, is_transient)``.
+) -> tuple[Any, dict[str, Any] | None, bool]:
+    """Return ``(store, reserved_pool_entry_or_None, is_transient)``.
 
     Only the genuine pooling-capable store (``_supports_pooling``) is pooled so
     its matrix caches survive across calls; injected test doubles are constructed
     transiently and the caller closes them. The pool is an LRU bounded to
-    ``_POOL_MAX_PATHS`` (db_path, scan_rows) keys and an evicted store is closed.
-    The returned lock MUST be held while querying: a pooled sqlite connection is
-    shared across callers and is not safe for concurrent use.
+    ``_POOL_MAX_PATHS`` idle (db_path, scan_rows) keys. Busy entries may briefly
+    exceed that bound rather than blocking unrelated queries or closing in-use
+    stores. A returned pool entry owns one user reservation and has its per-store
+    lock held; the caller MUST release both after querying.
     """
     resolved_scan = int(scan_rows) if scan_rows is not None else -1
     key = (str(engine._store.db_path), resolved_scan)
-    with _pool_lock:
-        entry = _vector_store_pool.get(key)
-        if entry is not None:
-            _vector_store_pool.move_to_end(key)
-            return entry["store"], entry["lock"], False
-        store = vector_store_cls(
-            engine._store.db_path, config=engine._config, bounded_scan_rows=scan_rows
-        )
+    with _pool_condition:
+        if _pool_closed:
+            raise RuntimeError("LCM vector store pool is closed during plugin unload")
         if not getattr(vector_store_cls, "_supports_pooling", False):
-            return store, None, True  # transient: caller closes it
-        entry = {"store": store, "lock": threading.RLock()}
-        _vector_store_pool[key] = entry
-        while len(_vector_store_pool) > _POOL_MAX_PATHS:
-            _, evicted = _vector_store_pool.popitem(last=False)
-            with evicted["lock"]:  # wait out any in-flight query before closing
-                try:
-                    evicted["store"].close()
-                except Exception:  # pragma: no cover - defensive
-                    pass
-        return store, entry["lock"], False
+            store = vector_store_cls(
+                engine._store.db_path,
+                config=engine._config,
+                bounded_scan_rows=scan_rows,
+            )
+            return store, None, True
+        entry = _vector_store_pool.get(key)
+        if entry is None:
+            store = vector_store_cls(
+                engine._store.db_path,
+                config=engine._config,
+                bounded_scan_rows=scan_rows,
+            )
+            entry = {"store": store, "lock": threading.RLock(), "users": 0}
+            _vector_store_pool[key] = entry
+        else:
+            _vector_store_pool.move_to_end(key)
+        entry["users"] += 1
+        _evict_idle_vector_store_entries_locked()
+
+    try:
+        entry["lock"].acquire()
+    except BaseException:
+        _release_vector_store_entry(entry, lock_held=False)
+        raise
+    return entry["store"], entry, False
+
+
+def _release_vector_store_entry(
+    entry: dict[str, Any], *, lock_held: bool = True
+) -> None:
+    if lock_held:
+        entry["lock"].release()
+    with _pool_condition:
+        entry["users"] -= 1
+        _evict_idle_vector_store_entries_locked()
+        _pool_condition.notify_all()
 
 
 def _run_pooled_knn(
@@ -105,24 +170,25 @@ def _run_pooled_knn(
     finally so a pooled connection never carries a stale/expired deadline into the
     next caller.
     """
-    store, store_lock, transient = _acquire_vector_store(
+    store, pool_entry, transient = _acquire_vector_store(
         engine, vector_store_cls=vector_store_cls, scan_rows=scan_rows
     )
     try:
-        with (store_lock if store_lock is not None else nullcontext()):
-            vector_conn = getattr(store, "_conn", None)
+        vector_conn = getattr(store, "_conn", None)
+        if vector_conn is not None:
+            vector_conn.set_progress_handler(
+                lambda: 1 if time.monotonic() >= deadline else 0, 1000
+            )
+        try:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("semantic vector search deadline exhausted")
+            return query(store)
+        finally:
             if vector_conn is not None:
-                vector_conn.set_progress_handler(
-                    lambda: 1 if time.monotonic() >= deadline else 0, 1000
-                )
-            try:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("semantic vector search deadline exhausted")
-                return query(store)
-            finally:
-                if vector_conn is not None:
-                    vector_conn.set_progress_handler(None, 1000)
+                vector_conn.set_progress_handler(None, 1000)
     finally:
+        if pool_entry is not None:
+            _release_vector_store_entry(pool_entry)
         if transient:
             store.close()
 

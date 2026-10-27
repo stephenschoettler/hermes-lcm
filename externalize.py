@@ -18,6 +18,7 @@ import os
 import re
 import stat
 import time
+import uuid
 from pathlib import Path
 from typing import Any, BinaryIO, Dict
 
@@ -79,6 +80,11 @@ def _safe_stub(value: str, fallback: str) -> str:
 
 def _content_digest_prefix(content: str) -> str:
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _unique_file_suffix() -> str:
+    # Keep references compact while avoiding any clock-resolution assumption.
+    return uuid.uuid4().hex[:16]
 
 
 def _preview_sha256(preview_prefix: Any) -> str:
@@ -187,15 +193,31 @@ def get_large_output_storage_dir(config, hermes_home: str = "", *, create: bool)
     return path
 
 
-def _unlink_partial_payload(path: Path) -> None:
+def _unlink_partial_payload(path: Path, *, expected_identity: tuple[int, int] | None) -> None:
+    if expected_identity is None:
+        return
     try:
+        current = os.lstat(path)
+        if not stat.S_ISREG(current.st_mode) or _is_symlink_or_reparse_point(current):
+            return
+        if (current.st_dev, current.st_ino) != expected_identity:
+            return
         path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
     except OSError as exc:
         logger.warning("Could not remove partial LCM externalized payload %s: %s", path, exc)
 
 
-def _unlink_partial_payload_at(name: str, *, dir_fd: int) -> None:
+def _unlink_partial_payload_at(name: str, *, dir_fd: int, expected_identity: tuple[int, int] | None) -> None:
+    if expected_identity is None:
+        return
     try:
+        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat.S_ISREG(current.st_mode) or _is_symlink_or_reparse_point(current):
+            return
+        if (current.st_dev, current.st_ino) != expected_identity:
+            return
         os.unlink(name, dir_fd=dir_fd)
     except FileNotFoundError:
         pass
@@ -203,12 +225,15 @@ def _unlink_partial_payload_at(name: str, *, dir_fd: int) -> None:
         logger.warning("Could not remove partial LCM externalized payload %s: %s", name, exc)
 
 
-def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
+def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> tuple[int, int]:
     data = json.dumps(payload, ensure_ascii=False, indent=2)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
+    created_identity = None
     try:
+        created = os.fstat(fd)
+        created_identity = (created.st_dev, created.st_ino)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(data)
@@ -216,18 +241,22 @@ def _write_externalized_payload(path: Path, payload: Dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         _fsync_directory(path.parent)
     except OSError:
-        _unlink_partial_payload(path)
+        _unlink_partial_payload(path, expected_identity=created_identity)
         raise
     finally:
         if fd >= 0:
             os.close(fd)
+    return created_identity
 
 
-def _write_externalized_payload_at(name: str, payload: Dict[str, Any], *, dir_fd: int) -> None:
+def _write_externalized_payload_at(name: str, payload: Dict[str, Any], *, dir_fd: int) -> tuple[int, int]:
     data = json.dumps(payload, ensure_ascii=False, indent=2)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+    created_identity = None
     try:
+        created = os.fstat(fd)
+        created_identity = (created.st_dev, created.st_ino)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(data)
@@ -235,11 +264,12 @@ def _write_externalized_payload_at(name: str, payload: Dict[str, Any], *, dir_fd
             os.fsync(handle.fileno())
         os.fsync(dir_fd)
     except (OSError, TypeError, NotImplementedError):
-        _unlink_partial_payload_at(name, dir_fd=dir_fd)
+        _unlink_partial_payload_at(name, dir_fd=dir_fd, expected_identity=created_identity)
         raise
     finally:
         if fd >= 0:
             os.close(fd)
+    return created_identity
 
 
 def _revalidate_payload_name(
@@ -260,28 +290,27 @@ def _replace_externalized_payload(
     dir_fd: int | None = None,
     expected_identity: tuple[int, int] | None = None,
 ) -> None:
-    tmp_path = path.with_name(f"{path.name}.{time.time_ns():x}.tmp")
+    tmp_path = path.with_name(f"{path.name}.{_unique_file_suffix()}.tmp")
+    tmp_identity = None
     if dir_fd is not None:
         try:
-            _write_externalized_payload_at(tmp_path.name, payload, dir_fd=dir_fd)
+            tmp_identity = _write_externalized_payload_at(tmp_path.name, payload, dir_fd=dir_fd)
             if expected_identity is not None:
                 _revalidate_payload_name(
                     path.name,
                     dir_fd=dir_fd,
                     expected_identity=expected_identity,
                 )
+            _revalidate_payload_name(tmp_path.name, dir_fd=dir_fd, expected_identity=tmp_identity)
             os.replace(tmp_path.name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            tmp_identity = None
             os.fsync(dir_fd)
         except (OSError, TypeError, NotImplementedError):
-            _unlink_partial_payload_at(tmp_path.name, dir_fd=dir_fd)
+            _unlink_partial_payload_at(tmp_path.name, dir_fd=dir_fd, expected_identity=tmp_identity)
             raise
         return
     try:
-        _write_externalized_payload(tmp_path, payload)
-        tmp_stat = _legacy_payload_path_snapshot(
-            tmp_path,
-            storage_dir=path.parent,
-        )[1]
+        tmp_identity = _write_externalized_payload(tmp_path, payload)
         if expected_identity is not None:
             _revalidate_legacy_payload_path(
                 path,
@@ -289,12 +318,13 @@ def _replace_externalized_payload(
             )
         _revalidate_legacy_payload_path(
             tmp_path,
-            expected_identity=(tmp_stat.st_dev, tmp_stat.st_ino),
+            expected_identity=tmp_identity,
         )
         os.replace(tmp_path, path)
+        tmp_identity = None
         _fsync_directory(path.parent)
     except (OSError, TypeError, NotImplementedError):
-        _unlink_partial_payload(tmp_path)
+        _unlink_partial_payload(tmp_path, expected_identity=tmp_identity)
         raise
 
 
@@ -507,8 +537,19 @@ def _marker_file_not_newer_than_payload(marker: Dict[str, Any], payload: Dict[st
     created_at = payload.get("created_at")
     if not source_path or created_at is None:
         return False
+    fd = None
     try:
-        current_stat = Path(str(source_path)).stat()
+        # Recovery records descriptor metadata. Windows path stat and fstat can
+        # disagree on ctime after a rewrite; compare the same API on both sides
+        # rather than dropping the generation check for lossy redacted content.
+        path_stat = os.lstat(str(source_path))
+        if not stat.S_ISREG(path_stat.st_mode) or _is_symlink_or_reparse_point(path_stat):
+            return False
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(str(source_path), flags)
+        current_stat = os.fstat(fd)
+        if not stat.S_ISREG(current_stat.st_mode) or not _same_file_identity(path_stat, current_stat):
+            return False
         marker_size = marker.get("file_size")
         marker_mtime_ns = marker.get("file_mtime_ns")
         marker_ctime_ns = marker.get("file_ctime_ns")
@@ -521,6 +562,9 @@ def _marker_file_not_newer_than_payload(marker: Dict[str, Any], payload: Dict[st
         )
     except (OSError, TypeError, ValueError):
         return False
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _sanitize_persisted_output_marker_metadata(payload: Dict[str, Any]) -> bool:
@@ -1672,7 +1716,7 @@ def _reassign_oversize_externalized_payload(
     if opened is None:
         return False
     payload_fd, dir_fd, payload_stat = opened
-    tmp_name = f"{path.name}.{time.time_ns():x}.tmp"
+    tmp_name = f"{path.name}.{_unique_file_suffix()}.tmp"
     tmp_path = path.with_name(tmp_name)
     tmp_fd = -1
     tmp_identity: tuple[int, int] | None = None
@@ -1788,6 +1832,7 @@ def _reassign_oversize_externalized_payload(
                 expected_identity=tmp_identity,
             )
             os.replace(tmp_path, path)
+            tmp_identity = None
             _fsync_directory(storage_dir)
         else:
             _revalidate_payload_name(
@@ -1795,14 +1840,16 @@ def _reassign_oversize_externalized_payload(
                 dir_fd=dir_fd,
                 expected_identity=(payload_stat.st_dev, payload_stat.st_ino),
             )
+            _revalidate_payload_name(tmp_name, dir_fd=dir_fd, expected_identity=tmp_identity)
             os.replace(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            tmp_identity = None
             os.fsync(dir_fd)
         return True
     except (OSError, TypeError, UnicodeDecodeError, ValueError, NotImplementedError):
         if dir_fd is None:
-            _unlink_partial_payload(tmp_path)
+            _unlink_partial_payload(tmp_path, expected_identity=tmp_identity)
         else:
-            _unlink_partial_payload_at(tmp_name, dir_fd=dir_fd)
+            _unlink_partial_payload_at(tmp_name, dir_fd=dir_fd, expected_identity=tmp_identity)
         raise
     finally:
         if tmp_fd >= 0:
@@ -2037,7 +2084,7 @@ def externalize_ingest_payload(
 
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    unique_suffix = f"{time.time_ns():x}"
+    unique_suffix = _unique_file_suffix()
     kind_stub = _safe_stub(kind, "ingest_payload")
     field_stub = re.sub(r"[^A-Za-z0-9_.-]+", "-", field_path or "payload")[:48]
     filename = f"{timestamp}_{kind_stub}_{field_stub}_{digest_prefix}_{unique_suffix}.json"
@@ -2155,7 +2202,7 @@ def maybe_externalize_payload(
 
     digest_prefix = _content_digest_prefix(content)
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    unique_suffix = f"{time.time_ns():x}"
+    unique_suffix = _unique_file_suffix()
     if kind == "tool_result":
         # Keep the original filename shape for compatibility with existing
         # externalized tool-output stores and tests.

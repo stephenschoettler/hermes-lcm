@@ -1283,6 +1283,261 @@ def test_pooled_vector_store_survives_across_recall_calls(recall_engine, monkeyp
         rc._reset_vector_store_pool()
 
 
+def test_plugin_unload_closes_pooled_vector_store(
+    recall_engine, monkeypatch, request
+):
+    import hermes_lcm.retrieval_core as rc
+    from hermes_lcm import tools as lcm_tools
+
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
+    rc._reset_vector_store_pool()
+    try:
+        node = _add_summary(
+            recall_engine,
+            "pooled unload cleanup",
+            session_id="session-a",
+            created_at=5.0,
+        )
+        _seed_summary_vectors(recall_engine, [(node, [1.0, 0.0])])
+        _recall(recall_engine, monkeypatch, include="summaries", limit=5)
+        key = (str(recall_engine._store.db_path), 25_000)
+        pooled = rc._vector_store_pool[key]["store"]
+
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        lifecycle_engine = LCMEngine(
+            config=LCMConfig(database_path=str(recall_engine._store.db_path))
+        )
+        lifecycle_engine.shutdown_all_instances()
+
+        assert not rc._vector_store_pool
+        assert pooled._conn is None
+        from hermes_lcm.vector_store import VectorStore
+
+        with pytest.raises(RuntimeError, match="closed during plugin unload"):
+            rc._acquire_vector_store(
+                recall_engine,
+                vector_store_cls=VectorStore,
+                scan_rows=25_000,
+            )
+    finally:
+        rc._reset_vector_store_pool()
+
+
+def test_plugin_unload_waits_for_active_pooled_query(recall_engine):
+    import threading
+
+    import hermes_lcm.retrieval_core as rc
+
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    errors = []
+
+    class BlockingStore:
+        _supports_pooling = True
+
+        def __init__(self, *_args, **_kwargs):
+            self._conn = None
+            self.was_closed = False
+
+        def close(self):
+            self.was_closed = True
+
+    def query(store):
+        started.set()
+        if not release.wait(2):
+            raise TimeoutError("test query was not released")
+        return store
+
+    def run_query():
+        try:
+            rc._run_pooled_knn(
+                recall_engine,
+                vector_store_cls=BlockingStore,
+                scan_rows=25_000,
+                deadline=time.monotonic() + 5,
+                query=query,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def close_pool():
+        rc._close_vector_store_pool()
+        closed.set()
+
+    rc._reset_vector_store_pool()
+    worker = threading.Thread(target=run_query)
+    closer = threading.Thread(target=close_pool)
+    try:
+        worker.start()
+        assert started.wait(2)
+        closer.start()
+        assert not closed.wait(0.1)
+        release.set()
+        worker.join(2)
+        closer.join(2)
+        assert not worker.is_alive()
+        assert not closer.is_alive()
+        assert not errors
+        assert closed.is_set()
+    finally:
+        release.set()
+        worker.join(2)
+        closer.join(2)
+        rc._reset_vector_store_pool()
+
+
+def test_busy_pooled_store_does_not_block_other_pool_keys(recall_engine):
+    import threading
+
+    import hermes_lcm.retrieval_core as rc
+
+    first_started = threading.Event()
+    first_release = threading.Event()
+    same_store_entered = threading.Event()
+    other_store_done = threading.Event()
+    errors = []
+
+    class BlockingStore:
+        _supports_pooling = True
+
+        def __init__(self, *_args, **_kwargs):
+            self._conn = None
+
+        def close(self):
+            pass
+
+    def run(scan_rows, query):
+        try:
+            rc._run_pooled_knn(
+                recall_engine,
+                vector_store_cls=BlockingStore,
+                scan_rows=scan_rows,
+                deadline=time.monotonic() + 5,
+                query=query,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def first_query(_store):
+        first_started.set()
+        if not first_release.wait(2):
+            raise TimeoutError("test query was not released")
+
+    def same_store_query(_store):
+        same_store_entered.set()
+
+    def other_store_query(_store):
+        other_store_done.set()
+
+    rc._reset_vector_store_pool()
+    first = threading.Thread(target=run, args=(1, first_query))
+    same_store = threading.Thread(target=run, args=(1, same_store_query))
+    other_store = threading.Thread(target=run, args=(2, other_store_query))
+    try:
+        first.start()
+        assert first_started.wait(2)
+        same_store.start()
+        deadline = time.monotonic() + 2
+        key = (str(recall_engine._store.db_path), 1)
+        while time.monotonic() < deadline:
+            with rc._pool_condition:
+                if rc._vector_store_pool[key]["users"] == 2:
+                    break
+            time.sleep(0.01)
+        else:
+            pytest.fail("same-store query never reserved its pooled entry")
+
+        other_store.start()
+        assert other_store_done.wait(1)
+        assert not same_store_entered.is_set()
+        first_release.set()
+        for thread in (first, same_store, other_store):
+            thread.join(2)
+            assert not thread.is_alive()
+        assert not errors
+    finally:
+        first_release.set()
+        for thread in (first, same_store, other_store):
+            thread.join(2)
+        rc._reset_vector_store_pool()
+
+
+def test_plugin_unload_waits_for_timed_out_sqlite_deadline_worker(
+    tmp_path, request
+):
+    import sqlite3
+    import threading
+
+    from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
+    from hermes_lcm.config import LCMConfig
+    from hermes_lcm.engine import LCMEngine
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
+    db_path = tmp_path / "deadline-worker.db"
+    engine = LCMEngine(config=LCMConfig(database_path=str(db_path)))
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    unload_done = threading.Event()
+    unload_errors = []
+
+    def sqlite_worker():
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        try:
+            worker_started.set()
+            if not release_worker.wait(3):
+                raise TimeoutError("test did not release SQLite deadline worker")
+        finally:
+            conn.close()
+
+    def unload_plugin():
+        try:
+            engine.shutdown_all_instances()
+        except BaseException as exc:  # pragma: no cover - asserted below
+            unload_errors.append(exc)
+        finally:
+            unload_done.set()
+
+    unload_thread = threading.Thread(target=unload_plugin)
+    try:
+        with pytest.raises(TimeoutError, match="latency budget"):
+            lcm_tools._run_within_deadline(
+                sqlite_worker,
+                remaining_s=0.05,
+                name="lcm-test-sqlite-deadline",
+                track_for_unload=True,
+            )
+        assert worker_started.wait(1)
+        unload_thread.start()
+        unload_waited = not unload_done.wait(0.1)
+        release_worker.set()
+        unload_thread.join(3)
+
+        assert unload_waited
+        assert not unload_thread.is_alive()
+        assert not unload_errors
+        with pytest.raises(lcm_tools._WorkerCapacityError, match="unloading"):
+            lcm_tools._run_within_deadline(
+                lambda: None,
+                remaining_s=0.05,
+                name="lcm-test-post-unload-deadline",
+                track_for_unload=True,
+            )
+        db_path.unlink()
+        assert not db_path.exists()
+    finally:
+        release_worker.set()
+        if unload_thread.is_alive():
+            unload_thread.join(3)
+        engine.shutdown(wait_for_background_work=True)
+        if db_path.exists():
+            db_path.unlink()
+
+
 def test_matrix_cache_is_bounded_lru_not_cleared_on_miss():
     """sprint-opt-6: distinct candidate sets coexist in a bounded LRU rather than
     each miss clearing the whole cache."""

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import sqlite3
 import threading
 import time
+import weakref
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -782,10 +784,16 @@ def test_rollup_background_failure_is_logged_without_breaking_bind(
         engine.shutdown()
 
 
-def test_engine_shutdown_does_not_wait_for_background_rollup_provider(
+def test_engine_shutdown_stays_nonblocking_but_plugin_unload_waits(
     tmp_path,
     monkeypatch,
+    request,
 ):
+    from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
     config = LCMConfig(
         database_path=str(tmp_path / "shutdown-background-maintenance.db"),
         temporal_rollups_enabled=True,
@@ -817,9 +825,162 @@ def test_engine_shutdown_does_not_wait_for_background_rollup_provider(
         shutdown_elapsed = time.monotonic() - started_at
 
         assert shutdown_elapsed < 0.15
+
+        unload_done = threading.Event()
+        unload_errors = []
+
+        def unload_plugin():
+            try:
+                engine.shutdown_all_instances()
+            except BaseException as exc:  # captured for assertion in the main thread
+                unload_errors.append(exc)
+            finally:
+                unload_done.set()
+
+        unload_thread = threading.Thread(target=unload_plugin)
+        unload_thread.start()
+        unload_waited = not unload_done.wait(timeout=0.1)
+        release_maintenance.set()
+        unload_thread.join(timeout=3)
+
+        assert unload_waited
+        assert not unload_thread.is_alive()
+        assert unload_errors == []
     finally:
         release_maintenance.set()
         assert engine.drain_rollup_maintenance(timeout=2)
+
+
+def test_plugin_unload_waits_for_background_rollup_provider(
+    tmp_path, monkeypatch, request
+):
+    from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
+    db_path = tmp_path / "unload-background-maintenance.db"
+    engine = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            temporal_rollups_enabled=True,
+        )
+    )
+    maintenance_started = threading.Event()
+    release_maintenance = threading.Event()
+
+    def blocking_maintenance(*_args, **_kwargs):
+        maintenance_started.set()
+        if not release_maintenance.wait(timeout=3):
+            raise AssertionError("test did not release background maintenance")
+        return 0
+
+    monkeypatch.setattr(
+        engine_module,
+        "run_rollup_maintenance",
+        blocking_maintenance,
+    )
+    engine.on_session_start(
+        "unload-maintenance-scope",
+        conversation_id="unload-maintenance-conversation",
+    )
+    assert maintenance_started.wait(timeout=1)
+
+    unload_done = threading.Event()
+    unload_errors = []
+
+    def unload_plugin():
+        try:
+            engine.shutdown_all_instances()
+        except BaseException as exc:  # captured for assertion in the main thread
+            unload_errors.append(exc)
+        finally:
+            unload_done.set()
+
+    unload_thread = threading.Thread(target=unload_plugin)
+    unload_thread.start()
+    unload_waited = not unload_done.wait(timeout=0.1)
+    release_maintenance.set()
+    unload_thread.join(timeout=3)
+    assert engine.drain_rollup_maintenance(timeout=2)
+
+    assert unload_waited
+    assert not unload_thread.is_alive()
+    assert unload_errors == []
+    db_path.unlink()
+    assert not db_path.exists()
+
+
+def test_plugin_unload_waits_for_rollup_owned_by_collected_clone(
+    tmp_path, monkeypatch, request
+):
+    from hermes_lcm import retrieval_core
+    from hermes_lcm import tools as lcm_tools
+
+    request.addfinalizer(retrieval_core._reset_vector_store_pool)
+    request.addfinalizer(lcm_tools._open_deadline_worker_registry)
+    db_path = tmp_path / "collected-clone-rollup.db"
+    prototype = LCMEngine(
+        config=LCMConfig(
+            database_path=str(db_path),
+            temporal_rollups_enabled=True,
+        )
+    )
+    clone = prototype.clone_for_agent()
+    maintenance_started = threading.Event()
+    release_maintenance = threading.Event()
+    unload_done = threading.Event()
+    unload_errors = []
+
+    def blocking_maintenance(*_args, **_kwargs):
+        maintenance_started.set()
+        if not release_maintenance.wait(timeout=3):
+            raise AssertionError("test did not release collected clone maintenance")
+        return 0
+
+    def unload_plugin():
+        try:
+            prototype.shutdown_all_instances()
+        except BaseException as exc:  # captured for assertion in the main thread
+            unload_errors.append(exc)
+        finally:
+            unload_done.set()
+
+    monkeypatch.setattr(
+        engine_module,
+        "run_rollup_maintenance",
+        blocking_maintenance,
+    )
+    unload_thread = threading.Thread(target=unload_plugin)
+    try:
+        clone._schedule_rollup_maintenance("collected-clone")
+        assert maintenance_started.wait(timeout=1)
+        record = (
+            clone._rollup_maintenance_owner,
+            clone._assertion_extraction_idle,
+        )
+        with prototype._shutdown_group._condition:
+            assert record in prototype._shutdown_group._background_work
+        clone_ref = weakref.ref(clone)
+        del clone
+        gc.collect()
+        assert clone_ref() is None
+
+        unload_thread.start()
+        unload_waited = not unload_done.wait(timeout=0.1)
+        release_maintenance.set()
+        unload_thread.join(timeout=3)
+
+        assert unload_waited
+        assert not unload_thread.is_alive()
+        assert unload_errors == []
+        db_path.unlink()
+        assert not db_path.exists()
+    finally:
+        release_maintenance.set()
+        if unload_thread.is_alive():
+            unload_thread.join(timeout=3)
+        prototype.shutdown(wait_for_background_work=True)
 
 
 def test_pending_maintenance_query_uses_partial_index(rollup_parts):

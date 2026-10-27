@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import re
 import sqlite3
 import stat
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -500,6 +502,38 @@ def test_externalized_payload_write_fsyncs_file_and_parent_directory(tmp_path, m
     assert result["path"].parent in fsynced_dirs
 
 
+def test_ingest_payload_names_do_not_depend_on_clock_uniqueness(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    monkeypatch.setattr(externalize_module, "_fsync_directory", lambda _path: None)
+    monkeypatch.setattr(
+        externalize_module.time,
+        "time_ns",
+        lambda: pytest.fail("filename identity must not depend on clock resolution"),
+    )
+    suffixes = iter(("1" * 32, "2" * 32))
+    monkeypatch.setattr(
+        externalize_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=next(suffixes)),
+    )
+    kwargs = {
+        "role": "user",
+        "session_id": engine.current_session_id,
+        "field_path": "content",
+        "config": engine._config,
+        "hermes_home": str(tmp_path),
+    }
+
+    first = externalize_ingest_payload("same payload", **kwargs)
+    second = externalize_ingest_payload("same payload", **kwargs)
+
+    assert first is not None
+    assert second is not None
+    assert first["path"] != second["path"]
+    assert first["path"].stem.endswith("_" + "1" * 16)
+    assert second["path"].stem.endswith("_" + "2" * 16)
+
+
 def test_externalized_search_prefix_rejects_path_replaced_during_open(tmp_path, monkeypatch):
     engine = _engine(tmp_path)
     target = externalize_ingest_payload(
@@ -722,7 +756,8 @@ def test_externalized_payload_reassignment_fsyncs_replacement(tmp_path, monkeypa
     )
 
     assert moved == 1
-    assert len(fsync_calls) >= 3
+    expected_minimum = 1 if os.name == "nt" else 3
+    assert len(fsync_calls) >= expected_minimum
     payload = json.loads(result["path"].read_text(encoding="utf-8"))
     assert payload["session_id"] == "new-session"
 
@@ -1263,6 +1298,7 @@ def test_ingest_preserves_inline_payload_when_externalization_fails(tmp_path, mo
     assert _externalized_files(tmp_path) == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows confidentiality uses inherited ACLs")
 def test_externalized_payload_files_are_private(tmp_path):
     engine = _engine(tmp_path)
 

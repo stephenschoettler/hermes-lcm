@@ -2,7 +2,10 @@
 
 import importlib.util
 import sys
+import threading
 from pathlib import Path
+
+import pytest
 
 
 EXPECTED_LCM_TOOLS = {
@@ -144,6 +147,246 @@ class TestRegistrationGating:
         module.register(ctx)
         assert ctx.engine is not None
         assert ctx.engine.name == "lcm"
+
+    def test_registers_engine_shutdown_with_host_unload(self, tmp_path, monkeypatch):
+        module = _load_plugin_module("hermes_lcm_unload_cleanup")
+        callbacks = []
+        db_path = tmp_path / "lcm.db"
+        monkeypatch.setenv("LCM_DATABASE_PATH", str(db_path))
+
+        class _Ctx:
+            def register_context_engine(self, engine):
+                self.engine = engine
+
+            def on_unload(self, callback):
+                callbacks.append(callback)
+
+        ctx = _Ctx()
+        module.register(ctx)
+
+        assert len(callbacks) == 1
+        assert callbacks[0].__self__ is ctx.engine
+        clone = ctx.engine.clone_for_agent()
+        assert db_path.is_file()
+
+        callbacks[0]()
+
+        assert ctx.engine._store._conn is None
+        assert clone._store._conn is None
+        db_path.unlink()
+        assert not db_path.exists()
+
+        late_clone = None
+        try:
+            with pytest.raises(RuntimeError, match="unloading"):
+                late_clone = ctx.engine.clone_for_agent()
+        finally:
+            if late_clone is not None:
+                late_clone.shutdown()
+        if db_path.exists():
+            db_path.unlink()
+        assert not db_path.exists()
+
+    def test_unload_waits_for_clone_construction_already_in_flight(
+        self, tmp_path, monkeypatch
+    ):
+        module = _load_plugin_module("hermes_lcm_unload_inflight_clone")
+        callbacks = []
+        db_path = tmp_path / "lcm.db"
+        monkeypatch.setenv("LCM_DATABASE_PATH", str(db_path))
+
+        class _Ctx:
+            def register_context_engine(self, engine):
+                self.engine = engine
+
+            def on_unload(self, callback):
+                callbacks.append(callback)
+
+        ctx = _Ctx()
+        module.register(ctx)
+        engine_type = type(ctx.engine)
+        original_init = engine_type.__init__
+        clone_constructed = threading.Event()
+        release_clone = threading.Event()
+
+        def blocking_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            clone_constructed.set()
+            if not release_clone.wait(timeout=3):
+                raise AssertionError("test did not release clone construction")
+
+        monkeypatch.setattr(engine_type, "__init__", blocking_init)
+        clone_errors = []
+
+        def clone_engine():
+            try:
+                ctx.engine.clone_for_agent()
+            except BaseException as exc:  # captured for assertion in the main thread
+                clone_errors.append(exc)
+
+        clone_thread = threading.Thread(target=clone_engine)
+        clone_thread.start()
+        assert clone_constructed.wait(timeout=1)
+
+        unload_done = threading.Event()
+        unload_errors = []
+
+        def unload_plugin():
+            try:
+                callbacks[0]()
+            except BaseException as exc:  # captured for assertion in the main thread
+                unload_errors.append(exc)
+            finally:
+                unload_done.set()
+
+        unload_thread = threading.Thread(target=unload_plugin)
+        unload_thread.start()
+        unload_waited = not unload_done.wait(timeout=0.1)
+        release_clone.set()
+        clone_thread.join(timeout=3)
+        unload_thread.join(timeout=3)
+
+        assert unload_waited
+        assert not clone_thread.is_alive()
+        assert not unload_thread.is_alive()
+        assert unload_errors == []
+        assert len(clone_errors) == 1
+        assert isinstance(clone_errors[0], RuntimeError)
+        assert "unloading" in str(clone_errors[0])
+        db_path.unlink()
+        assert not db_path.exists()
+
+    def test_failed_clone_initialization_closes_partial_engine(self, tmp_path, monkeypatch):
+        module = _load_plugin_module("hermes_lcm_unload_failed_clone")
+        callbacks = []
+        db_path = tmp_path / "lcm.db"
+        monkeypatch.setenv("LCM_DATABASE_PATH", str(db_path))
+
+        class _Ctx:
+            def register_context_engine(self, engine):
+                self.engine = engine
+
+            def on_unload(self, callback):
+                callbacks.append(callback)
+
+        ctx = _Ctx()
+        module.register(ctx)
+        engine_type = type(ctx.engine)
+        engine_module = sys.modules[engine_type.__module__]
+
+        def fail_after_storage_bind(*_args, **_kwargs):
+            raise RuntimeError("synthetic clone initialization failure")
+
+        monkeypatch.setattr(
+            engine_module,
+            "compile_session_patterns",
+            fail_after_storage_bind,
+        )
+        with pytest.raises(RuntimeError, match="synthetic clone initialization failure") as excinfo:
+            ctx.engine.clone_for_agent()
+
+        partial_engine = None
+        traceback = excinfo.value.__traceback__
+        while traceback is not None:
+            candidate = traceback.tb_frame.f_locals.get("self")
+            if isinstance(candidate, engine_type) and candidate is not ctx.engine:
+                partial_engine = candidate
+                break
+            traceback = traceback.tb_next
+        assert partial_engine is not None
+
+        callbacks[0]()
+        partial_closed = partial_engine._store._conn is None
+        if not partial_closed:
+            for name in ("_adaptive_retrieval", "_store", "_dag", "_lifecycle", "_assertions", "_query_views"):
+                resource = getattr(partial_engine, name, None)
+                if resource is not None:
+                    resource.close()
+        if db_path.exists():
+            db_path.unlink()
+
+        assert partial_closed
+        assert not db_path.exists()
+
+    def test_unload_serializes_profile_storage_rebind(
+        self, tmp_path, monkeypatch, request
+    ):
+        from hermes_lcm import retrieval_core
+        from hermes_lcm import tools as lcm_tools
+        from hermes_lcm.config import LCMConfig
+        from hermes_lcm.engine import LCMEngine
+
+        request.addfinalizer(retrieval_core._reset_vector_store_pool)
+        request.addfinalizer(lcm_tools._open_deadline_worker_registry)
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        home_a.mkdir()
+        home_b.mkdir()
+        engine = LCMEngine(
+            config=LCMConfig(database_path=""),
+            hermes_home=str(home_a),
+        )
+        real_bind = engine._bind_storage
+        bind_started = threading.Event()
+        release_bind = threading.Event()
+        unload_done = threading.Event()
+        rebind_errors = []
+        unload_errors = []
+
+        def blocking_bind(db_path, hermes_home):
+            if str(hermes_home) == str(home_b):
+                bind_started.set()
+                if not release_bind.wait(timeout=3):
+                    raise AssertionError("test did not release profile storage bind")
+            return real_bind(db_path, hermes_home)
+
+        def rebind_storage():
+            try:
+                engine._rebind_storage_for_home(str(home_b))
+            except BaseException as exc:  # captured for assertion in the main thread
+                rebind_errors.append(exc)
+
+        def unload_plugin():
+            try:
+                engine.shutdown_all_instances()
+            except BaseException as exc:  # captured for assertion in the main thread
+                unload_errors.append(exc)
+            finally:
+                unload_done.set()
+
+        monkeypatch.setattr(engine, "_bind_storage", blocking_bind)
+        rebind_thread = threading.Thread(target=rebind_storage)
+        unload_thread = threading.Thread(target=unload_plugin)
+        db_paths = (home_a / "lcm.db", home_b / "lcm.db")
+        try:
+            rebind_thread.start()
+            assert bind_started.wait(timeout=1)
+            unload_thread.start()
+            unload_waited = not unload_done.wait(timeout=0.1)
+            release_bind.set()
+            rebind_thread.join(timeout=3)
+            unload_thread.join(timeout=3)
+
+            assert unload_waited
+            assert not rebind_thread.is_alive()
+            assert not unload_thread.is_alive()
+            assert rebind_errors == []
+            assert unload_errors == []
+            assert engine._store._conn is None
+            with pytest.raises(RuntimeError, match="plugin is unloading"):
+                engine._rebind_storage_for_home(str(home_a))
+            for path in db_paths:
+                if path.exists():
+                    path.unlink()
+                assert not path.exists()
+        finally:
+            release_bind.set()
+            rebind_thread.join(timeout=3)
+            unload_thread.join(timeout=3)
+            engine._close_storage()
+            for path in db_paths:
+                if path.exists():
+                    path.unlink()
 
 
 class TestHermesAgentRegression:
