@@ -71,9 +71,9 @@ class RollupWorkLimitExceeded(RuntimeError):
     """Raised when correctness would require more than one bounded work pass."""
 
 
-def initialize_rollup_invalidation_outbox(dag: SummaryDAG) -> None:
+def initialize_rollup_invalidation_outbox(dag: SummaryDAG, *, init_budget=None) -> None:
     """Enable mutation triggers before the feature can publish summary nodes."""
-    store = RollupStore(dag.db_path)
+    store = RollupStore(dag.db_path, init_budget=init_budget)
     store.close()
 
 

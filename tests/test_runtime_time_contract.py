@@ -151,3 +151,52 @@ def test_schema_classifier_accepts_only_declared_time_sidecars(tmp_path):
     finally:
         store.close()
         dag.close()
+
+
+def test_steady_state_open_skips_ingest_backfill_write(tmp_path, monkeypatch):
+    """Reopening a fully stamped store must not issue the full-table backfill UPDATE.
+
+    On a multi-GB lcm.db that unconditional UPDATE full-scans ``messages`` inside
+    a write transaction on every process start and, with concurrent starts,
+    queues long enough to exceed the host's per-plugin load deadline.
+    """
+    db_path = tmp_path / "steady.db"
+    store = MessageStore(db_path)
+    store.append("s1", {"role": "user", "content": "stamped"})
+    store.close()
+
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    reopened = MessageStore(db_path)
+    reopened.close()
+
+    assert not [s for s in statements if "SET ingested_at" in s]
+
+
+def test_unstamped_row_left_after_column_exists_is_backfilled_on_next_open(tmp_path):
+    """Self-healing: a NULL ingested_at left behind (e.g. crash between ALTER and
+    backfill) is still found via the pending index and backfilled."""
+    db_path = tmp_path / "heal.db"
+    store = MessageStore(db_path)
+    store.close()
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO messages(session_id, role, content, timestamp, ingested_at) "
+        "VALUES ('s', 'user', 'orphan', 77.0, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    reopened = MessageStore(db_path)
+    try:
+        row = reopened.get(1)
+    finally:
+        reopened.close()
+    assert row["ingested_at"] == 77.0

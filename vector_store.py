@@ -7,6 +7,8 @@ ladder used by later semantic retrieval work.
 
 from __future__ import annotations
 
+from .sqlite_util import connect_initializing, storage_initialization
+
 import copy
 import hashlib
 import logging
@@ -305,6 +307,7 @@ class VectorStore:
     # letting distinct candidate sets grow the cache without bound (sprint-opt-6).
     _MATRIX_CACHE_MAX_ENTRIES = 4
 
+    @storage_initialization
     def __init__(
         self,
         db_path: str | Path,
@@ -373,7 +376,7 @@ class VectorStore:
         # data_version), defeating the cross-process cache invalidation. Write
         # atomicity is preserved via the explicit BEGIN IMMEDIATE in
         # _write_transaction.
-        self._conn = sqlite3.connect(
+        self._conn = connect_initializing(self,
             str(self.db_path),
             timeout=5.0,
             check_same_thread=False,

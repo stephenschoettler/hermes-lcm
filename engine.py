@@ -8,6 +8,7 @@ import asyncio
 import copy
 import hashlib
 import json
+from contextlib import contextmanager
 import logging
 import os
 import re
@@ -136,7 +137,6 @@ from .message_content import (
 )
 from .sqlite_util import (
     _is_sqlite_locked_error,
-    _temporary_sqlite_busy_timeout,
 )
 from .store import MessageStore
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -369,6 +369,10 @@ def _normalize_total_compactions(value: Any) -> int:
     return value
 
 
+class NestedIngestTransactionError(RuntimeError):
+    """Engine cursors cannot acknowledge an uncommitted caller transaction."""
+
+
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
@@ -388,7 +392,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     """
 
     def __init__(self, config: LCMConfig | None = None,
-                 hermes_home: str = ""):
+                 hermes_home: str = "", *, init_budget=None):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
         self._assertion_extraction_metrics_lock = threading.RLock()
@@ -407,7 +411,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._assertion_extraction_last_model = ""
 
         db_path = self._resolve_db_path(hermes_home)
-        self._bind_storage(db_path, hermes_home)
+        self._bind_storage(db_path, hermes_home, init_budget=init_budget)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -690,8 +694,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return Path(hermes_home) / "lcm.db"
         return Path.home() / ".hermes" / "lcm.db"
 
-    def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
+    def _bind_storage(self, db_path: str | Path, hermes_home: str = "", *, init_budget=None) -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
+        from .sqlite_util import InitializationBudget
+        budget = init_budget or InitializationBudget()
         self._assertions = None
         self._query_views = None
         self._adaptive_retrieval = None
@@ -701,20 +707,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 db_path,
                 ingest_protection_config=self._config,
                 hermes_home=hermes_home,
+                init_budget=budget,
             )
-            self._dag = SummaryDAG(db_path)
+            self._dag = SummaryDAG(db_path, init_budget=budget)
             if self._config.temporal_rollups_enabled:
                 # Install the transaction-coupled summary mutation triggers before
                 # this engine can publish or delete a DAG node.
-                initialize_rollup_invalidation_outbox(self._dag)
-            self._lifecycle = LifecycleStateStore(db_path)
+                initialize_rollup_invalidation_outbox(self._dag, init_budget=budget)
+            self._lifecycle = LifecycleStateStore(db_path, init_budget=budget)
             self._assertions = (
-                AssertionStore(db_path)
+                AssertionStore(db_path, init_budget=budget)
                 if bool(getattr(self._config, "assertions_enabled", False))
                 else None
             )
             self._query_views = (
-                QueryViewStore(db_path)
+                QueryViewStore(db_path, init_budget=budget)
                 if bool(getattr(self._config, "query_views_enabled", False))
                 or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
                 else None
@@ -735,7 +742,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     model=self._assertion_extraction_model(),
                     timeout_seconds=self._assertion_extraction_timeout(),
                 )
-        except Exception:
+            budget.check()
+        except BaseException:
             self._close_storage()
             raise
 
@@ -754,7 +762,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if callable(close):
                 try:
                     close()
-                except Exception:
+                except BaseException:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
 
     def _assertion_extraction_model(self) -> str:
@@ -3191,6 +3199,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         source: str,
         conversation_id: str,
     ) -> list[int]:
+        with self._durable_ingest_scope():
+            return self._append_off_current_session_end_suffix_owned(
+                session_id, suffix, source=source, conversation_id=conversation_id,
+            )
+
+    def _append_off_current_session_end_suffix_owned(
+        self,
+        session_id: str,
+        suffix: List[Dict[str, Any]],
+        *,
+        source: str,
+        conversation_id: str,
+    ) -> list[int]:
         if not session_id or not suffix:
             return []
         kept: list[Dict[str, Any]] = []
@@ -3452,28 +3473,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         off_current_should_bypass = off_current_lineage and off_current_prefix_count is None
         if off_current_prefix_count is not None:
-            prefix_count = off_current_prefix_count
-            suffix = messages[prefix_count:]
-            if suffix:
-                self._append_off_current_session_end_suffix(
-                    session_id,
-                    suffix,
-                    source=(
-                        self._lcm_session_last_normal_platform.get(session_id)
-                        or self._lcm_session_last_platform.get(session_id, self._session_platform)
-                    ),
-                    conversation_id=off_current_normal_conversation_id,
-                )
-            try:
+            suffix = messages[off_current_prefix_count:]
+            def ingest_suffix():
+                if suffix:
+                    self._append_off_current_session_end_suffix(
+                        session_id, suffix,
+                        source=(self._lcm_session_last_normal_platform.get(session_id)
+                                or self._lcm_session_last_platform.get(session_id, self._session_platform)),
+                        conversation_id=off_current_normal_conversation_id,
+                    )
+            def finalize_suffix():
                 state = self._lifecycle.get_by_conversation(off_current_normal_conversation_id)
-                frontier_store_id = state.current_frontier_store_id if state is not None else 0
                 self._lifecycle.finalize_session(
-                    off_current_normal_conversation_id,
-                    session_id,
-                    frontier_store_id=frontier_store_id,
+                    off_current_normal_conversation_id, session_id,
+                    frontier_store_id=state.current_frontier_store_id if state is not None else 0,
                 )
-            except Exception:
-                logger.debug("LCM off-current session-end lifecycle finalization failed", exc_info=True)
+            self._flush_session_end(ingest_suffix, finalize_suffix)
             return
         if (
             current_session_bypasses
@@ -3488,63 +3503,43 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 current_session_bypasses=current_session_bypasses,
             )
             return
+        self._flush_session_end(
+            lambda: self._ingest_messages(messages),
+            lambda: self._lifecycle.finalize_session(
+                self._conversation_id, session_id,
+                frontier_store_id=self._last_compacted_store_id,
+            ),
+        )
+
+    def _flush_session_end(self, ingest, finalize):
+        from .sqlite_util import bounded_sqlite_owners
+        stage = "raw-message ingest"
         try:
-            with _temporary_sqlite_busy_timeout(
-                [
-                    getattr(self._store, "_conn", None),
-                    getattr(self._lifecycle, "_conn", None),
-                ],
+            with bounded_sqlite_owners(
+                [(self._store._conn, self._store._write_lock),
+                 (self._lifecycle._conn, self._lifecycle._lock)],
                 _SESSION_END_BUSY_TIMEOUT_MS,
             ):
-                try:
-                    # Best-effort final flush. Keep this path bounded because
-                    # host gateways call session-end hooks from lifecycle paths
-                    # that must not wait through SQLite's normal busy timeout.
-                    self._ingest_messages(messages)
-                except KeyboardInterrupt:
-                    logger.warning(
-                        "LCM session-end raw-message ingest interrupted; "
-                        "final messages may be absent from the plugin-local store"
-                    )
-                    return
-                except Exception as exc:
-                    if _is_sqlite_locked_error(exc):
-                        logger.warning(
-                            "LCM session-end raw-message ingest skipped due to SQLite lock after short wait; "
-                            "final messages may be absent from the plugin-local store: %s",
-                            exc,
-                        )
-                        return
-                    raise
-
-                try:
-                    self._lifecycle.finalize_session(
-                        self._conversation_id,
-                        session_id,
-                        frontier_store_id=self._last_compacted_store_id,
-                    )
-                except KeyboardInterrupt:
-                    logger.warning(
-                        "LCM session-end lifecycle finalization interrupted; "
-                        "raw messages may be ingested but lifecycle state may be finalized later"
-                    )
-                    return
-                except Exception as exc:
-                    if _is_sqlite_locked_error(exc):
-                        logger.warning(
-                            "LCM session-end lifecycle finalization skipped due to SQLite lock after short wait; "
-                            "raw messages were ingested but lifecycle state may be finalized later: %s",
-                            exc,
-                        )
-                        return
-                    raise
+                ingest()
+                stage = "lifecycle finalization"
+                finalize()
+        except NestedIngestTransactionError as exc:
+            logger.warning(
+                "LCM session-end raw-message ingest rejected; final messages may be absent "
+                "from the plugin-local store: %s", exc,
+            )
         except KeyboardInterrupt:
-            logger.warning("LCM session-end ingest/finalize interrupted before bounded flush completed")
-            return
+            logger.warning(
+                "LCM session-end %s interrupted; %s", stage,
+                "final messages may be absent from the plugin-local store" if stage == "raw-message ingest"
+                else "raw messages were ingested but lifecycle state may be finalized later",
+            )
         except Exception as exc:
-            if _is_sqlite_locked_error(exc):
+            if _is_sqlite_locked_error(exc) or getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
                 logger.warning(
-                    "LCM session-end ingest/finalize skipped due to SQLite lock before bounded flush: %s",
+                    "LCM session-end %s skipped due to SQLite lock after short wait; %s: %s", stage,
+                    "final messages may be absent from the plugin-local store" if stage == "raw-message ingest"
+                    else "raw messages were ingested but lifecycle state may be finalized later",
                     exc,
                 )
                 return
@@ -4488,7 +4483,25 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             redacted_replay_messages.append(redacted_message)
         return redacted_replay_messages
 
+    @contextmanager
+    def _durable_ingest_scope(self):
+        # Keep the check and acknowledgement under the connection's owner lock.
+        # Savepoint release is provisional; only an owned commit can advance an
+        # engine cursor or acknowledge raw persistence.
+        with self._store._write_lock:
+            if self._store._conn.in_transaction:
+                raise NestedIngestTransactionError(
+                    "LCM engine ingest cannot acknowledge a caller-owned transaction"
+                )
+            yield
+
     def _ingest_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not self._session_id or self._session_ignored or self._session_stateless:
+            return self._ingest_messages_owned(messages)
+        with self._durable_ingest_scope():
+            return self._ingest_messages_owned(messages)
+
+    def _ingest_messages_owned(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Persist new messages to the store.
 
         Uses a cursor to track which portion of the current messages list

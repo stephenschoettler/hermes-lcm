@@ -6,6 +6,8 @@ only the durable schema-facing operations used by later temporal-memory work.
 
 from __future__ import annotations
 
+from .sqlite_util import connect_initializing, storage_initialization, owned_write
+
 import logging
 import sqlite3
 import threading
@@ -52,6 +54,7 @@ class RollupBuildToken(NamedTuple):
 class RollupStore:
     """SQLite-backed store for temporal rollups and their source nodes."""
 
+    @storage_initialization
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,7 +63,7 @@ class RollupStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        self._conn = sqlite3.connect(
+        self._conn = connect_initializing(self,
             str(self.db_path),
             timeout=5.0,
             check_same_thread=False,
@@ -95,7 +98,7 @@ class RollupStore:
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         try:
-            with self._write_lock, self._conn:
+            with self._write_lock, owned_write(self._conn):
                 yield
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):

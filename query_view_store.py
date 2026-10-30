@@ -8,6 +8,8 @@ ordinary message retrieval.
 
 from __future__ import annotations
 
+from .sqlite_util import connect_initializing, storage_initialization, owned_write, execute_statements
+
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
@@ -299,7 +301,39 @@ _REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
 
 
 def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    if not _verify_query_view_schema(conn) and conn.execute(
+        "SELECT 1 FROM lcm_query_corpus_state WHERE singleton=1"
+    ).fetchone():
+        return
+    with owned_write(conn, immediate=True):
+        findings = _verify_query_view_schema(conn)
+        lost_tracking = any(item.startswith("trigger:lcm_query_corpus_message_") for item in findings)
+        had_state = not any(item == "table:lcm_query_corpus_state" for item in findings) and conn.execute(
+            "SELECT 1 FROM lcm_query_corpus_state WHERE singleton=1"
+        ).fetchone()
+        lost_singleton = not had_state and (
+            "table:lcm_query_corpus_state" not in findings
+            or "table:lcm_query_corpus_events" not in findings
+        )
+        _create_query_view_schema(conn)
+        if lost_singleton:
+            # Reusing generation zero would collide with retained event keys
+            # on the next raw INSERT. Resume beyond every retained cursor.
+            conn.execute("UPDATE lcm_query_corpus_state SET generation=max(coalesce((SELECT max(generation) FROM lcm_query_corpus_events),0), coalesce((SELECT max(corpus_generation) FROM lcm_query_view_versions),0))+1 WHERE singleton=1")
+        if lost_tracking and had_state:
+            # Mutations while a trigger was missing have no trustworthy delta
+            # history. Reconcile the singleton and invalidate derived views in
+            # the same repair transaction, never claim their cursor is current.
+            conn.execute("UPDATE lcm_query_corpus_state SET generation=generation+1, max_store_id=(SELECT coalesce(max(store_id),0) FROM messages), row_count=(SELECT count(*) FROM messages), changed_at=? WHERE singleton=1", (time.time(),))
+        if lost_singleton or (lost_tracking and had_state):
+            conn.execute("UPDATE lcm_query_views SET status='stale', stale_reason='schema_repair', generation=generation+1, build_nonce='', lease_expires_at=NULL WHERE status IN ('ready','building')")
+        missing = _verify_query_view_schema(conn)
+        if missing:
+            raise RuntimeError("query-view schema incomplete: " + ", ".join(missing))
+
+
+def _create_query_view_schema(conn: sqlite3.Connection) -> None:
+    execute_statements(conn,
         """
         CREATE TABLE IF NOT EXISTS lcm_query_corpus_state (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -457,6 +491,8 @@ def _ensure_query_view_schema(conn: sqlite3.Connection) -> None:
         END;
         """
     )
+    if conn.execute("SELECT 1 FROM lcm_query_corpus_state WHERE singleton=1").fetchone():
+        return
     conn.execute(
         """
         INSERT OR IGNORE INTO lcm_query_corpus_state(
@@ -532,10 +568,11 @@ def _verify_query_view_schema(conn: sqlite3.Connection) -> list[str]:
 class QueryViewStore:
     """Versioned, exact-provenance materialized evidence views."""
 
+    @storage_initialization
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = connect_initializing(self,
             str(self.db_path), timeout=5.0, check_same_thread=False
         )
         self._write_lock = threading.RLock()
@@ -553,8 +590,6 @@ class QueryViewStore:
             mark_migration_step_complete(self._conn, QUERY_VIEW_MIGRATION_STEP)
             self._conn.commit()
         except Exception as exc:
-            self._conn.close()
-            self._conn = None
             if isinstance(exc, sqlite3.Error):
                 raise RuntimeError(f"query-view schema ensure failed: {exc}") from exc
             raise
@@ -564,13 +599,8 @@ class QueryViewStore:
         with self._write_lock:
             if self._conn is None:
                 raise RuntimeError("query-view store is closed")
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
+            with owned_write(self._conn, immediate=True):
                 yield
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
 
     @staticmethod
     def _now() -> float:

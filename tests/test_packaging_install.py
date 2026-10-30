@@ -1407,6 +1407,9 @@ def test_post_llm_hook_resolves_registered_active_clone_without_host_context_com
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1465,6 +1468,9 @@ def test_post_llm_hook_does_not_foreground_match_side_channel_clone(monkeypatch,
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1518,6 +1524,9 @@ def test_post_llm_hook_ignores_stale_registered_clone_after_rebind(monkeypatch, 
 
             def register_context_engine(self, engine):
                 self.engine = engine
+
+            def register_hook(self, name, callback):
+                manager._hooks.setdefault(name, []).append(callback)
 
         ctx = _CtxNoTool()
         module.register(ctx)
@@ -1588,6 +1597,9 @@ def test_post_llm_hook_prefers_active_lcm_clone(monkeypatch, tmp_path):
         def register_context_engine(self, engine):
             self.engine = engine
 
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
+
     ctx = _CtxNoTool()
     module.register(ctx)
     assert ctx.engine is not None
@@ -1650,6 +1662,9 @@ def test_post_llm_hook_rebinds_legacy_singleton_between_gateway_lanes(monkeypatc
 
         def register_context_engine(self, engine):
             self.engine = engine
+
+        def register_hook(self, name, callback):
+            manager._hooks.setdefault(name, []).append(callback)
 
     ctx = _CtxNoTool()
     module.register(ctx)
