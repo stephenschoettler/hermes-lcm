@@ -6,6 +6,8 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Add `LCM_RECALL_POLICY_INJECTION=every_turn|first_turn|off` to control static recall guidance independently of pre-answer evidence, retaining `every_turn` as the compatibility default (#521).
+
 - Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
 - Declare the three registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
 

@@ -23,6 +23,12 @@ canonical runtime policy is
 `skills/hermes-lcm/references/recall-policy.md` and is injected only while LCM
 is the active context engine.
 
+The static hook policy is controlled by `LCM_RECALL_POLICY_INJECTION`:
+`every_turn` (default), `first_turn` (only explicit host `is_first_turn=True`),
+or `off`. Invalid values warn and use `every_turn`. Missing first-turn metadata
+suppresses policy in `first_turn` mode. Pre-answer evidence is independent;
+previously persisted user `api_content` policy copies are still replayed.
+
 | Tool | Use |
 |------|-----|
 | `lcm_grep` | Search current-session raw messages and summaries. `mode='full_text'` is the byte-compatible default; `mode='semantic'` searches embedded summaries; `mode='hybrid'` combines full-text and semantic ranks with RRF. Opt into `content_scope='externalized'` or `'both'` for bounded literal search over recoverable payload prefixes owned by the active session. Opt into `session_scope='all'` or `session_scope='session'` (with `session_id`) for bounded archive recovery over rows already present in `lcm.db`, including externally backfilled rows that may carry source strings such as `openclaw-lcm:*`; broader scopes return raw-message hits only in full-text mode and cannot search externalized payloads. Raw-message filters `role`, `time_from`, `time_to`, `source`, and `conversation_id` are pushed into the full-text query; when any is supplied, externalized payload results are omitted, and summary hits are omitted for the role/time filters so the filter contract stays exact. Use `session_search` for earlier separate sessions or broad cross-session recall. |

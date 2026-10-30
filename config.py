@@ -14,6 +14,17 @@ except Exception:  # pragma: no cover - optional fallback for minimal installs
 logger = logging.getLogger(__name__)
 
 
+def _normalize_recall_policy_injection(value) -> str:
+    normalized = str(value).strip().casefold()
+    if normalized in {"every_turn", "first_turn", "off"}:
+        return normalized
+    logger.warning(
+        "LCM_RECALL_POLICY_INJECTION: invalid value %r; using default 'every_turn'",
+        value,
+    )
+    return "every_turn"
+
+
 def _parse_pattern_list(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
@@ -380,6 +391,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("proactive_recall_budget_tokens", "LCM_PROACTIVE_RECALL_BUDGET_TOKENS", int),
     _EnvFieldSpec("proactive_recall_provider", "LCM_PROACTIVE_RECALL_PROVIDER", str),
     _EnvFieldSpec("preanswer_evidence_enabled", "LCM_PREANSWER_EVIDENCE_ENABLED", bool),
+    _EnvFieldSpec("recall_policy_injection", "LCM_RECALL_POLICY_INJECTION", str),
     _EnvFieldSpec("preanswer_evidence_mode", "LCM_PREANSWER_EVIDENCE_MODE", str),
     _EnvFieldSpec("selective_compiler_enabled", "LCM_SELECTIVE_COMPILER_ENABLED", bool),
     _EnvFieldSpec("selective_compiler_model", "LCM_SELECTIVE_COMPILER_MODEL", str),
@@ -698,6 +710,9 @@ class LCMConfig:
     # off | legacy_selective | requirements_v1. The master flag remains the
     # default-off activation boundary.
     preanswer_evidence_mode: str = ""
+    # Static recall guidance at the pre_llm_call seam. Keep historical bytes by
+    # default; first_turn requires an explicit host is_first_turn=True payload.
+    recall_policy_injection: str = "every_turn"
     # Optional minimal semantic selector for code-derived closed operations.
     # It is independent and default-off; enabling pre-answer evidence alone
     # still performs only the provider-free session-bundle path.
@@ -847,6 +862,18 @@ class LCMConfig:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+
+        raw_policy_injection = c.recall_policy_injection
+        c.recall_policy_injection = _normalize_recall_policy_injection(raw_policy_injection)
+        policy_source = (
+            "env:LCM_RECALL_POLICY_INJECTION"
+            if "LCM_RECALL_POLICY_INJECTION" in os.environ else "default"
+        )
+        policy_warning = None
+        if str(raw_policy_injection).strip().casefold() not in {"every_turn", "first_turn", "off"}:
+            policy_source = "default"
+            policy_warning = f"invalid env LCM_RECALL_POLICY_INJECTION={raw_policy_injection!r} ignored"
+        _record("recall_policy_injection", policy_source, policy_warning)
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")
