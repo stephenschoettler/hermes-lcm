@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
+    from hermes_constants import get_hermes_home
+except Exception:  # pragma: no cover
+    def get_hermes_home():
+        from pathlib import Path
+        import os
+        return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+
+try:
     import yaml
 except Exception:  # pragma: no cover - optional fallback for minimal installs
     yaml = None
@@ -73,7 +81,7 @@ def _hermes_compression_threshold(default: float) -> float:
     operators tune LCM compaction independently of the Hermes compression setting.
     Disabled Hermes compression should not leak its threshold into LCM.
     """
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    home = get_hermes_home()
     cfg_path = home / "config.yaml"
     try:
         text = cfg_path.read_text()
@@ -143,7 +151,7 @@ def _hermes_auxiliary_compression_timeout_ms(default: int) -> int:
     calls from timing out earlier than the host compression route unless
     ``LCM_SUMMARY_TIMEOUT_MS`` is explicitly configured.
     """
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    home = get_hermes_home()
     cfg_path = home / "config.yaml"
     try:
         text = cfg_path.read_text()
