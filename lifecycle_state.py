@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .lifecycle_repair import heal_if_corrupt, is_corruption_error
 
 
 def _synchronized(method):
@@ -27,11 +28,23 @@ def _synchronized(method):
     The lifecycle connection is shared across threads (check_same_thread=False,
     autocommit). Without serialization, two callers reading state and then
     writing can interleave and clobber each other's update.
+
+    Structural damage confined to ``lcm_lifecycle_state`` (#643/#681 signature)
+    is repaired once and the operation retried, so one corrupt b-tree does not
+    silently disable lifecycle tracking for the rest of the process lifetime.
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
-            return method(self, *args, **kwargs)
+            try:
+                return method(self, *args, **kwargs)
+            except sqlite3.DatabaseError as exc:
+                if not is_corruption_error(exc):
+                    raise
+                outcome = heal_if_corrupt(self._conn)
+                if not outcome.get("healed"):
+                    raise
+                return method(self, *args, **kwargs)
     return wrapper
 
 
@@ -77,6 +90,10 @@ class LifecycleStateStore:
         self._conn.row_factory = sqlite3.Row
         run_versioned_migrations(self._conn)
         self._conn.commit()
+        # Cheap table-scoped check: repairs lifecycle-only damage left behind by
+        # an earlier crash instead of failing every lifecycle read for the
+        # lifetime of the process (see lifecycle_repair).
+        heal_if_corrupt(self._conn)
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
