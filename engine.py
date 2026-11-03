@@ -130,6 +130,7 @@ from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
+    extract_codex_message_items_text,
     normalize_content_value,
     stored_text_content_for_pattern_matching,
     text_content_for_pattern_matching,
@@ -718,7 +719,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._query_views = None
             self._adaptive_retrieval = None
             self._assertion_extractor = None
-            deadline = time.monotonic() + 5.0
+            deadline: float | None = None
             delay = 0.02
             while True:
                 try:
@@ -764,7 +765,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                     self._close_storage()
                     msg = str(exc).lower()
-                    if not any(k in msg for k in ("locked", "busy", "disk i/o", "ioerr", "file is not a database")) or time.monotonic() >= deadline:
+                    now = time.monotonic()
+                    if deadline is None:
+                        deadline = now + 5.0
+                    if not any(k in msg for k in ("locked", "busy", "disk i/o", "ioerr", "file is not a database")) or now >= deadline:
                         raise
                     time.sleep(delay)
                     delay = min(delay * 2, 0.25)
@@ -2992,8 +2996,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         session_id: str,
     ) -> str:
+        raw_content = (message or {}).get("content")
+        if (
+            str((message or {}).get("role") or "") == "assistant"
+            and not (normalize_content_value(raw_content) or "").strip()
+            and (message or {}).get("codex_message_items")
+        ):
+            commentary_text = extract_codex_message_items_text(
+                (message or {}).get("codex_message_items")
+            )
+            if commentary_text:
+                raw_content = commentary_text
         content = self._session_end_prefix_compare_value(
-            (message or {}).get("content"),
+            raw_content,
             session_id=session_id,
         )
         content = redact_sensitive_value(
@@ -3252,7 +3267,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     excerpt,
                 )
                 continue
-            kept.append(msg)
+            store_msg = msg
+            if (
+                str(store_msg.get("role") or "") == "assistant"
+                and not (normalize_content_value(store_msg.get("content")) or "").strip()
+                and store_msg.get("codex_message_items")
+            ):
+                commentary_text = extract_codex_message_items_text(
+                    store_msg.get("codex_message_items")
+                )
+                if commentary_text:
+                    store_msg = dict(store_msg)
+                    store_msg["content"] = commentary_text
+            kept.append(store_msg)
         if not kept:
             return []
         protected_messages = protect_messages_for_ingest(
@@ -4308,6 +4335,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _copy_active_replay_messages_preserving_generated_ids(
         self,
         active_replay_messages: List[Dict[str, Any]],
+        source_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> list[Dict[str, Any]]:
         copied_replay_messages: list[Dict[str, Any]] = []
         generated_message_ids = getattr(
@@ -4315,8 +4343,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "_generated_ignored_active_replay_placeholder_message_ids",
             set(),
         )
-        for message in active_replay_messages:
+        for idx, message in enumerate(active_replay_messages):
             copied_message = dict(message)
+            if source_messages is not None and idx < len(source_messages):
+                source_msg = source_messages[idx]
+                if isinstance(source_msg, dict):
+                    for key, val in source_msg.items():
+                        if key in ("content", "tool_calls"):
+                            continue
+                        if val is not None:
+                            copied_message[key] = val
             if id(message) in generated_message_ids:
                 self._generated_ignored_active_replay_placeholder_message_ids.add(id(copied_message))
             copied_replay_messages.append(copied_message)
@@ -4331,7 +4367,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._message_replay_identity(message) for message in original_messages
         ]
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-            active_replay_messages
+            active_replay_messages,
+            source_messages=original_messages,
         )
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
@@ -4349,7 +4386,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                merged = self._copy_active_replay_messages_preserving_generated_ids(
+                    cached,
+                    source_messages=original_messages,
+                )
+                self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+                    merged
+                )
+                return merged
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -4640,7 +4684,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
                         self._copy_active_replay_messages_preserving_generated_ids(
-                            cached_active_replay_messages[:cursor]
+                            cached_active_replay_messages[:cursor],
+                            source_messages=messages[:cursor],
                         )
                         + replay_messages[cursor:]
                     )
@@ -4880,6 +4925,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                 ):
                     store_msg = original_msg
+                elif (
+                    str(store_msg.get("role") or "") == "assistant"
+                    and not (normalize_content_value(store_msg.get("content")) or "").strip()
+                    and (store_msg.get("codex_message_items") or original_msg.get("codex_message_items"))
+                ):
+                    commentary_text = extract_codex_message_items_text(
+                        store_msg.get("codex_message_items") or original_msg.get("codex_message_items")
+                    )
+                    if commentary_text:
+                        store_msg = dict(store_msg)
+                        store_msg["content"] = commentary_text
                 kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
 
@@ -5215,8 +5271,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
+            raw_content = msg.get("content") or ""
+            if (
+                role == "assistant"
+                and not (normalize_content_value(raw_content) or "").strip()
+                and msg.get("codex_message_items")
+            ):
+                commentary_text = extract_codex_message_items_text(msg.get("codex_message_items"))
+                if commentary_text:
+                    raw_content = commentary_text
             content = redact_sensitive_value(
-                msg.get("content") or "",
+                raw_content,
                 self._config,
                 parse_json_strings=False,
             )
@@ -5556,11 +5621,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         i += 1
 
                     if not matched_direct_result and insert_missing_tool_stubs:
-                        sanitized.append({
+                        stub_msg: Dict[str, Any] = {
                             "role": "tool",
                             "content": "[Result from earlier conversation — see context summary above]",
                             "tool_call_id": expected_id,
-                        })
+                        }
+                        if isinstance(msg.get("timestamp"), (int, float)) and not isinstance(msg.get("timestamp"), bool):
+                            stub_msg["timestamp"] = float(msg["timestamp"]) + 0.0001
+                        sanitized.append(stub_msg)
                         inserted_stub_results += 1
 
                 while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
@@ -6188,7 +6256,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                summary_msg: Dict[str, Any] = {"role": summary_role, "content": combined}
+                tail_timestamps = [
+                    float(m["timestamp"])
+                    for m in tail_selected
+                    if isinstance(m, dict)
+                    and isinstance(m.get("timestamp"), (int, float))
+                    and not isinstance(m.get("timestamp"), bool)
+                    and float(m["timestamp"]) > 0
+                ]
+                if tail_timestamps:
+                    min_tail_ts = min(tail_timestamps)
+                    summary_ts = min_tail_ts - 0.002
+                    if (
+                        leading_msg is not None
+                        and isinstance(leading_msg.get("timestamp"), (int, float))
+                        and not isinstance(leading_msg.get("timestamp"), bool)
+                        and float(leading_msg["timestamp"]) < min_tail_ts
+                    ):
+                        summary_ts = max(float(leading_msg["timestamp"]) + 0.001, summary_ts)
+                    summary_msg["timestamp"] = summary_ts
+                result.append(summary_msg)
 
         # Proactive memory injection (SPEC F, default-off). One bounded block is
         # placed adjacent to the summary prefix — a stable position below the
@@ -6199,6 +6287,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_messages, summary_role, active_summary_node_ids
         )
         if proactive_msg is not None:
+            tail_timestamps = [
+                float(m["timestamp"])
+                for m in tail_selected
+                if isinstance(m, dict)
+                and isinstance(m.get("timestamp"), (int, float))
+                and not isinstance(m.get("timestamp"), bool)
+                and float(m["timestamp"]) > 0
+            ]
+            if tail_timestamps:
+                proactive_msg = dict(proactive_msg)
+                proactive_msg["timestamp"] = min(tail_timestamps) - 0.001
             result.append(proactive_msg)
 
         # Fresh tail

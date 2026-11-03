@@ -486,7 +486,7 @@ class MessageStore:
         ingested_at = time.time()
 
         def _insert_single() -> int:
-            deadline = time.monotonic() + 5.0
+            deadline: float | None = None
             delay = 0.01
             while True:
                 try:
@@ -517,7 +517,10 @@ class MessageStore:
                     return cur.lastrowid
                 except sqlite3.OperationalError as exc:
                     msg_text = str(exc).lower()
-                    if any(k in msg_text for k in ("locked", "busy")) and time.monotonic() < deadline:
+                    now = time.monotonic()
+                    if deadline is None:
+                        deadline = now + 5.0
+                    if any(k in msg_text for k in ("locked", "busy")) and now < deadline:
                         time.sleep(delay)
                         delay = min(delay * 2, 0.2)
                         continue
@@ -603,7 +606,7 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         def _execute_batch():
-            deadline = time.monotonic() + 5.0
+            deadline: float | None = None
             delay = 0.01
             while True:
                 try:
@@ -641,7 +644,10 @@ class MessageStore:
                     return batch_ids
                 except sqlite3.OperationalError as exc:
                     msg_text = str(exc).lower()
-                    if any(k in msg_text for k in ("locked", "busy")) and time.monotonic() < deadline:
+                    now = time.monotonic()
+                    if deadline is None:
+                        deadline = now + 5.0
+                    if any(k in msg_text for k in ("locked", "busy")) and now < deadline:
                         time.sleep(delay)
                         delay = min(delay * 2, 0.2)
                         continue

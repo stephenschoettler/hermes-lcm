@@ -27491,3 +27491,103 @@ class TestExtractionDuringCompress:
         result = eng.compress(messages)
         assert result[0]["role"] == "system"
         assert len(eng._dag.get_session_nodes("extract-fail")) > 0
+
+    def test_codex_message_items_preserved_and_ingested(self, tmp_path):
+        config = LCMConfig(database_path=str(tmp_path / "lcm_codex_items.db"))
+        eng = LCMEngine(config=config)
+        eng.on_session_start("codex-session", platform="desktop", context_length=200000)
+
+        commentary_items = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [
+                    {"type": "output_text", "text": "Ich prüfe zuerst die Struktur."}
+                ],
+            }
+        ]
+        messages = [
+            {"role": "user", "content": "Bitte prüfen.", "timestamp": 1700000001.0},
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_message_items": commentary_items,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+                "timestamp": 1700000002.0,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "tool_name": "read_file",
+                "content": "ok",
+                "timestamp": 1700000003.0,
+            },
+            {
+                "role": "assistant",
+                "content": "Fertig geprüft.",
+                "timestamp": 1700000004.0,
+            },
+        ]
+        eng.on_session_end("codex-session", messages)
+        stored = eng._store.get_session_messages("codex-session")
+        assistant_rows = [r for r in stored if r["role"] == "assistant"]
+        assert len(assistant_rows) == 2
+        assert assistant_rows[0]["content"] == "Ich prüfe zuerst die Struktur."
+        assert assistant_rows[1]["content"] == "Fertig geprüft."
+
+    def test_compress_preserves_host_timestamps_and_orders_summary_before_tail(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_lcm.engine as engine_module
+
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_ts_order.db"),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=50,
+        )
+        eng = LCMEngine(config=config)
+        eng.on_session_start("ts-order-session", platform="desktop", context_length=200000)
+        eng.threshold_tokens = 100
+
+        def mock_summary(**kwargs):
+            return "Condensed summary of earlier turns.", 1
+
+        monkeypatch.setattr(engine_module, "summarize_with_escalation", mock_summary)
+
+        base_ts = 1700001000.0
+        messages = [{"role": "system", "content": "System prompt."}]
+        for i in range(10):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"User turn {i}: " + ("word " * 40),
+                    "timestamp": base_ts + i * 10.0,
+                }
+            )
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"Assistant turn {i}: " + ("reply " * 40),
+                    "timestamp": base_ts + i * 10.0 + 5.0,
+                    "finish_reason": "stop",
+                }
+            )
+
+        compressed = eng.compress(messages)
+        non_system = [m for m in compressed if m.get("role") != "system"]
+        assert len(non_system) >= 3
+        summary_msg = non_system[0]
+        tail_msgs = non_system[1:]
+        assert "Condensed summary of earlier turns." in (summary_msg.get("content") or "")
+        assert isinstance(summary_msg.get("timestamp"), float)
+        for m in tail_msgs:
+            assert isinstance(m.get("timestamp"), float)
+            assert summary_msg["timestamp"] < m["timestamp"]
+        assert tail_msgs[-1].get("finish_reason") == "stop"

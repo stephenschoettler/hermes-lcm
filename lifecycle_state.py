@@ -38,14 +38,17 @@ def _synchronized(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
-            deadline = time.monotonic() + 5.0
+            deadline: float | None = None
             delay = 0.01
             while True:
                 try:
                     return method(self, *args, **kwargs)
                 except sqlite3.OperationalError as exc:
                     msg = str(exc).lower()
-                    if not any(k in msg for k in ("locked", "busy")) or time.monotonic() >= deadline:
+                    now = time.monotonic()
+                    if deadline is None:
+                        deadline = now + 5.0
+                    if not any(k in msg for k in ("locked", "busy")) or now >= deadline:
                         raise
                     time.sleep(delay)
                     delay = min(delay * 2, 0.2)

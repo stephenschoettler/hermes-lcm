@@ -160,7 +160,7 @@ def _clean_active_assistant_message(msg: Dict[str, Any]) -> Dict[str, Any] | Non
         return msg
     cleaned_content = _sanitize_active_assistant_content(msg.get("content"))
     if cleaned_content is None:
-        if not msg.get("tool_calls"):
+        if not msg.get("tool_calls") and not msg.get("codex_message_items"):
             return None
         cleaned_content = ""
     if cleaned_content == msg.get("content"):
