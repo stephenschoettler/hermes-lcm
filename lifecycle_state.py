@@ -24,6 +24,7 @@ from .db_bootstrap import (
     refuse_schema_version_too_new,
     run_versioned_migrations,
 )
+from .sqlite_util import _sqlite_busy_timeout_ms
 
 
 def _synchronized(method):
@@ -47,6 +48,9 @@ def _synchronized(method):
                     msg = str(exc).lower()
                     now = time.monotonic()
                     if deadline is None:
+                        bt_ms = _sqlite_busy_timeout_ms(getattr(self, "_conn", None))
+                        if bt_ms < 1000:
+                            raise
                         deadline = now + 5.0
                     if not any(k in msg for k in ("locked", "busy")) or now >= deadline:
                         raise
@@ -91,6 +95,7 @@ class LifecycleStateStore:
             timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
             check_same_thread=False,
             isolation_level=None,
+            cached_statements=0,
         )
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)

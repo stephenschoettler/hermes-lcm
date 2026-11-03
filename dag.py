@@ -183,7 +183,12 @@ class SummaryDAG:
         return self._conn
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=SQLITE_BUSY_TIMEOUT_SECONDS, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+            check_same_thread=False,
+            cached_statements=0,
+        )
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
