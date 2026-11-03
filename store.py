@@ -23,10 +23,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .db_bootstrap import (
     ExternalContentFtsSpec,
+    SQLITE_BUSY_TIMEOUT_SECONDS,
     add_column_if_missing,
     configure_connection,
     ensure_external_content_fts,
+    is_fts_corruption_error,
+    is_migration_step_complete,
+    mark_migration_step_complete,
     refuse_schema_version_too_new,
+    repair_external_content_fts,
     run_versioned_migrations,
 )
 from .config import LCMConfig
@@ -54,6 +59,7 @@ from .message_content import normalize_content_value as _normalize_content_value
 from .sqlite_util import (
     _prepare_private_sqlite_file,
     _restrict_existing_sqlite_artifacts,
+    _sqlite_busy_timeout_ms,
     _temporary_sqlite_busy_timeout,
 )
 from .tokens import count_message_tokens
@@ -69,6 +75,7 @@ _MESSAGE_SELECT_COLUMNS = (
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
+_INGESTED_AT_BACKFILL_STEP = "messages_ingested_at_backfill_v1"
 
 
 def _same_directory_identity(left: os.stat_result, right: os.stat_result) -> bool:
@@ -355,7 +362,12 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+            check_same_thread=False,
+            cached_statements=0,
+        )
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         if not self._is_memory_database:
@@ -450,9 +462,17 @@ class MessageStore:
             "observed_at_source",
             "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
         )
-        self._conn.execute(
-            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
-        )
+        # One-time legacy backfill, gated by a done-marker. Unmarked, this UPDATE
+        # is a full-table scan on every store open: no index can serve
+        # ``ingested_at IS NULL`` on a column that is NULL for zero rows, so a
+        # large DB re-reads the whole ``messages`` table at each start only to
+        # find nothing to do. New rows get ``ingested_at`` on the write path, so
+        # once the legacy rows are filled the statement never has work again.
+        if not is_migration_step_complete(self._conn, _INGESTED_AT_BACKFILL_STEP):
+            self._conn.execute(
+                "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            )
+            mark_migration_step_complete(self._conn, _INGESTED_AT_BACKFILL_STEP)
 
     # -- Write operations ---------------------------------------------------
 
@@ -471,32 +491,93 @@ class MessageStore:
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
 
+        def _insert_single() -> int:
+            deadline: float | None = None
+            delay = 0.01
+            while True:
+                try:
+                    cur = self._conn.execute(
+                        """INSERT INTO messages
+                           (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                            tool_name, timestamp, token_estimate, pinned, ingested_at,
+                            observed_at, observed_at_source)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            session_id,
+                            _normalize_source_value(source),
+                            _normalize_conversation_id_value(conversation_id),
+                            msg.get("role", "unknown"),
+                            _normalize_content_value(msg.get("content")),
+                            msg.get("tool_call_id"),
+                            tc_json,
+                            msg.get("tool_name"),
+                            ingested_at,
+                            token_estimate,
+                            0,
+                            ingested_at,
+                            observed_at,
+                            "host_message_timestamp" if observed_at is not None else None,
+                        ),
+                    )
+                    self._conn.commit()
+                    return cur.lastrowid
+                except sqlite3.OperationalError as exc:
+                    msg_text = str(exc).lower()
+                    now = time.monotonic()
+                    if deadline is None:
+                        bt_ms = _sqlite_busy_timeout_ms(self._conn)
+                        if bt_ms < 1000:
+                            raise
+                        deadline = now + 5.0
+                    if any(k in msg_text for k in ("locked", "busy")) and now < deadline:
+                        time.sleep(delay)
+                        delay = min(delay * 2, 0.2)
+                        continue
+                    raise
+
         with self._write_lock:
-            cur = self._conn.execute(
-                """INSERT INTO messages
-                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                    tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    _normalize_source_value(source),
-                    _normalize_conversation_id_value(conversation_id),
-                    msg.get("role", "unknown"),
-                    _normalize_content_value(msg.get("content")),
-                    msg.get("tool_call_id"),
-                    tc_json,
-                    msg.get("tool_name"),
-                    ingested_at,
-                    token_estimate,
-                    0,
-                    ingested_at,
-                    observed_at,
-                    "host_message_timestamp" if observed_at is not None else None,
-                ),
-            )
-            self._conn.commit()
-            return cur.lastrowid
+            try:
+                return _insert_single()
+            except sqlite3.DatabaseError as exc:
+                if not is_fts_corruption_error(exc):
+                    raise
+                try:
+                    self._conn.execute("SELECT count(*) FROM metadata")
+                except sqlite3.DatabaseError:
+                    raise exc
+
+                msg_count = 0
+                try:
+                    row = self._conn.execute("SELECT count(*) FROM messages").fetchone()
+                    msg_count = row[0] if row else 0
+                except sqlite3.DatabaseError:
+                    pass
+
+                if msg_count > 1000:
+                    logger.warning(
+                        "FTS trigger corruption during append on large store (%d rows): %s. "
+                        "Temporarily disabling triggers to protect active turn.",
+                        msg_count, exc,
+                    )
+                    try:
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_insert")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_update")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_delete")
+                        self._conn.commit()
+                        return _insert_single()
+                    except Exception:
+                        pass
+
+                logger.warning(
+                    "Detected database/FTS corruption during message append (%s). Triggering self-healing repair and retrying...",
+                    exc,
+                )
+                repair_external_content_fts(
+                    self._conn,
+                    build_message_fts_spec(),
+                    force=True,
+                )
+                return _insert_single()
 
     def append_batch(self, session_id: str,
                      messages: List[Dict[str, Any]],
@@ -533,38 +614,100 @@ class MessageStore:
         if token_estimates is None:
             token_estimates = [0] * len(messages)
 
-        ids = []
-        with self._write_lock, self._conn:
-            for msg, est in zip(messages, token_estimates):
-                tc = msg.get("tool_calls")
-                tc_json = json.dumps(tc) if tc else None
-                ts = time.time()
-                observed_at = _normalize_observed_at(msg.get("timestamp"))
-                cur = self._conn.execute(
-                    """INSERT INTO messages
-                       (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
-                        tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        session_id,
-                        _normalize_source_value(source),
-                        _normalize_conversation_id_value(conversation_id),
-                        msg.get("role", "unknown"),
-                        _normalize_content_value(msg.get("content")),
-                        msg.get("tool_call_id"),
-                        tc_json,
-                        msg.get("tool_name"),
-                        ts,
-                        est,
-                        0,
-                        ts,
-                        observed_at,
-                        "host_message_timestamp" if observed_at is not None else None,
-                    ),
+        def _execute_batch():
+            deadline: float | None = None
+            delay = 0.01
+            while True:
+                try:
+                    batch_ids = []
+                    with self._conn:
+                        for msg, est in zip(messages, token_estimates):
+                            tc = msg.get("tool_calls")
+                            tc_json = json.dumps(tc) if tc else None
+                            ts = time.time()
+                            observed_at = _normalize_observed_at(msg.get("timestamp"))
+                            cur = self._conn.execute(
+                                """INSERT INTO messages
+                                   (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
+                                    tool_name, timestamp, token_estimate, pinned, ingested_at,
+                                    observed_at, observed_at_source)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    session_id,
+                                    _normalize_source_value(source),
+                                    _normalize_conversation_id_value(conversation_id),
+                                    msg.get("role", "unknown"),
+                                    _normalize_content_value(msg.get("content")),
+                                    msg.get("tool_call_id"),
+                                    tc_json,
+                                    msg.get("tool_name"),
+                                    ts,
+                                    est,
+                                    0,
+                                    ts,
+                                    observed_at,
+                                    "host_message_timestamp" if observed_at is not None else None,
+                                ),
+                            )
+                            batch_ids.append(cur.lastrowid)
+                    return batch_ids
+                except sqlite3.OperationalError as exc:
+                    msg_text = str(exc).lower()
+                    now = time.monotonic()
+                    if deadline is None:
+                        bt_ms = _sqlite_busy_timeout_ms(self._conn)
+                        if bt_ms < 1000:
+                            raise
+                        deadline = now + 5.0
+                    if any(k in msg_text for k in ("locked", "busy")) and now < deadline:
+                        time.sleep(delay)
+                        delay = min(delay * 2, 0.2)
+                        continue
+                    raise
+
+        with self._write_lock:
+            try:
+                return _execute_batch()
+            except sqlite3.DatabaseError as exc:
+                if not is_fts_corruption_error(exc):
+                    raise
+                try:
+                    self._conn.execute("SELECT count(*) FROM metadata")
+                except sqlite3.DatabaseError:
+                    raise exc
+
+                msg_count = 0
+                try:
+                    row = self._conn.execute("SELECT count(*) FROM messages").fetchone()
+                    msg_count = row[0] if row else 0
+                except sqlite3.DatabaseError:
+                    pass
+
+                if msg_count > 1000:
+                    logger.warning(
+                        "FTS trigger corruption during batch append on large store (%d rows): %s. "
+                        "Temporarily disabling triggers to protect active turn.",
+                        msg_count, exc,
+                    )
+                    try:
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_insert")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_update")
+                        self._conn.execute("DROP TRIGGER IF EXISTS msg_fts_delete")
+                        self._conn.commit()
+                        return _execute_batch()
+                    except Exception:
+                        pass
+
+                logger.warning(
+                    "Detected database/FTS corruption during message batch append (%s). Triggering self-healing repair and retrying...",
+                    exc,
                 )
-                ids.append(cur.lastrowid)
-        return ids
+                repair_external_content_fts(
+                    self._conn,
+                    build_message_fts_spec(),
+                    force=True,
+                )
+                return _execute_batch()
 
     def reassign_session_messages(self, old_session_id: str, new_session_id: str) -> int:
         """Move all persisted messages from one session_id to another."""
@@ -651,10 +794,11 @@ class MessageStore:
 
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
-        row = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
-        ).fetchone()
-        return self._row_to_dict(row) if row else None
+        with self._write_lock:
+            row = self._conn.execute(
+                f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
+            ).fetchone()
+            return self._row_to_dict(row) if row else None
 
     def get_batch(self, store_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Retrieve multiple messages by store_id in a single query.
@@ -664,11 +808,12 @@ class MessageStore:
         if not store_ids:
             return {}
         placeholders = ",".join("?" for _ in store_ids)
-        rows = self._conn.execute(
-            f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
-            store_ids,
-        ).fetchall()
-        return {row[0]: self._row_to_dict(row) for row in rows}
+        with self._write_lock:
+            rows = self._conn.execute(
+                f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
+                store_ids,
+            ).fetchall()
+            return {row[0]: self._row_to_dict(row) for row in rows}
 
     def scan_evidence_rows(self, *, limit: int = 4096) -> Dict[str, Any]:
         """Return one bounded, read-only whole-corpus evidence snapshot.
@@ -680,22 +825,23 @@ class MessageStore:
         coverage.  Callers must treat ``truncated`` as an honest fallback.
         """
         bounded_limit = min(4096, max(1, int(limit)))
-        rows = self._conn.execute(
-            f"""
-            WITH snapshot AS (
-                SELECT {_MESSAGE_SELECT_COLUMNS},
-                       COUNT(*) OVER () AS snapshot_total_rows,
-                       MAX(store_id) OVER () AS snapshot_max_store_id,
-                       SUM(CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END)
-                           OVER () AS snapshot_observed_at_missing_rows
-                FROM messages
-            )
-            SELECT * FROM snapshot
-            ORDER BY store_id
-            LIMIT ?
-            """,
-            (bounded_limit,),
-        ).fetchall()
+        with self._write_lock:
+            rows = self._conn.execute(
+                f"""
+                WITH snapshot AS (
+                    SELECT {_MESSAGE_SELECT_COLUMNS},
+                           COUNT(*) OVER () AS snapshot_total_rows,
+                           MAX(store_id) OVER () AS snapshot_max_store_id,
+                           SUM(CASE WHEN observed_at IS NULL THEN 1 ELSE 0 END)
+                               OVER () AS snapshot_observed_at_missing_rows
+                    FROM messages
+                )
+                SELECT * FROM snapshot
+                ORDER BY store_id
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
         if not rows:
             return {
                 "rows": [],
@@ -779,12 +925,13 @@ class MessageStore:
             time_from=time_from,
             time_to=time_to,
         )
-        return int(
-            self._conn.execute(
-                f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(where)}",
-                args,
-            ).fetchone()[0]
-        )
+        with self._write_lock:
+            return int(
+                self._conn.execute(
+                    f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(where)}",
+                    args,
+                ).fetchone()[0]
+            )
 
     def load_session_page(
         self,
@@ -809,13 +956,14 @@ class MessageStore:
         )
         where.append("store_id > ?")
         args.extend([after_store_id, limit])
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE {' AND '.join(where)}
-               ORDER BY store_id LIMIT ?""",
-            args,
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        with self._write_lock:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE {' AND '.join(where)}
+                   ORDER BY store_id LIMIT ?""",
+                args,
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
 
     def load_session_window(
         self,
@@ -828,79 +976,85 @@ class MessageStore:
         """Load one bounded ordered window around an exact message anchor."""
         before = min(12, max(0, int(before)))
         after = min(12, max(0, int(after)))
-        prior = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                FROM messages
-                WHERE session_id = ? AND store_id < ?
-                ORDER BY store_id DESC LIMIT ?""",
-            (session_id, anchor_store_id, before),
-        ).fetchall()
-        following = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                FROM messages
-                WHERE session_id = ? AND store_id >= ?
-                ORDER BY store_id LIMIT ?""",
-            (session_id, anchor_store_id, after + 1),
-        ).fetchall()
-        rows = list(reversed(prior)) + list(following)
-        return [self._row_to_dict(row) for row in rows]
+        with self._write_lock:
+            prior = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                    FROM messages
+                    WHERE session_id = ? AND store_id < ?
+                    ORDER BY store_id DESC LIMIT ?""",
+                (session_id, anchor_store_id, before),
+            ).fetchall()
+            following = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                    FROM messages
+                    WHERE session_id = ? AND store_id >= ?
+                    ORDER BY store_id LIMIT ?""",
+                (session_id, anchor_store_id, after + 1),
+            ).fetchall()
+            rows = list(reversed(prior)) + list(following)
+            return [self._row_to_dict(row) for row in rows]
 
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ?
-               ORDER BY store_id LIMIT ?""",
-            (session_id, limit),
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        with self._write_lock:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE session_id = ?
+                   ORDER BY store_id LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
 
     def get_session_messages_after(self, session_id: str,
                                    after_store_id: int = 0,
                                    limit: int = 10000) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id = ? AND store_id > ?
-               ORDER BY store_id LIMIT ?""",
-            (session_id, after_store_id, limit),
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        with self._write_lock:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
+                   WHERE session_id = ? AND store_id > ?
+                   ORDER BY store_id LIMIT ?""",
+                (session_id, after_store_id, limit),
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
 
     def get_session_tail(self, session_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
-        rows = self._conn.execute(
-            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-               FROM (
-                   SELECT {_MESSAGE_SELECT_COLUMNS}
-                   FROM messages
-                   WHERE session_id = ?
-                   ORDER BY store_id DESC
-                   LIMIT ?
-               )
-               ORDER BY store_id""",
-            (session_id, limit),
-        ).fetchall()
-        return [self._row_to_dict(r) for r in rows]
+        with self._write_lock:
+            rows = self._conn.execute(
+                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                   FROM (
+                       SELECT {_MESSAGE_SELECT_COLUMNS}
+                       FROM messages
+                       WHERE session_id = ?
+                       ORDER BY store_id DESC
+                       LIMIT ?
+                   )
+                   ORDER BY store_id""",
+                (session_id, limit),
+            ).fetchall()
+            return [self._row_to_dict(r) for r in rows]
 
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        return row[0] if row else 0
+        with self._write_lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row[0] if row else 0
 
     def get_session_token_total(self, session_id: str) -> int:
         """Sum of token estimates for a session."""
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        return row[0] if row else 0
+        with self._write_lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row[0] if row else 0
 
     def get_source_stats(self, session_id: str | None = None) -> Dict[str, int]:
         """Return raw source-bucket counts for diagnostics."""
@@ -920,7 +1074,8 @@ class MessageStore:
             {where}
             """
         query_args: list[Any] = [_UNKNOWN_SOURCE, _UNKNOWN_SOURCE, *args]
-        row = self._conn.execute(query, query_args).fetchone()
+        with self._write_lock:
+            row = self._conn.execute(query, query_args).fetchone()
 
         messages_total = int(row[0] or 0) if row else 0
         normalized_unknown = int(row[1] or 0) if row else 0
@@ -938,133 +1093,138 @@ class MessageStore:
         """Per-session ``(session_id, message_count, token_total, node_count)``
         rows across messages and summary nodes, for ``/lcm doctor clean``
         candidate scanning. Callers own the pattern/protection policy."""
-        return self._conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id, COUNT(*) AS node_count
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            ORDER BY s.session_id
-            """
-        ).fetchall()
+        with self._write_lock:
+            return self._conn.execute(
+                """
+                WITH session_ids AS (
+                    SELECT session_id FROM messages
+                    UNION
+                    SELECT session_id FROM summary_nodes
+                ),
+                message_stats AS (
+                    SELECT session_id,
+                           COUNT(*) AS message_count,
+                           COALESCE(SUM(token_estimate), 0) AS token_total
+                    FROM messages
+                    GROUP BY session_id
+                ),
+                node_stats AS (
+                    SELECT session_id, COUNT(*) AS node_count
+                    FROM summary_nodes
+                    GROUP BY session_id
+                )
+                SELECT s.session_id,
+                       COALESCE(m.message_count, 0) AS message_count,
+                       COALESCE(m.token_total, 0) AS token_total,
+                       COALESCE(n.node_count, 0) AS node_count
+                FROM session_ids s
+                LEFT JOIN message_stats m ON m.session_id = s.session_id
+                LEFT JOIN node_stats n ON n.session_id = s.session_id
+                ORDER BY s.session_id
+                """
+            ).fetchall()
 
     def scan_session_retention_stats(self, session_id: str) -> List[tuple]:
         """Per-session activity/token stats for one session (messages + summary
         nodes), for ``/lcm doctor retention`` scanning. Callers own the
         staleness/protection policy."""
-        return self._conn.execute(
-            """
-            WITH session_ids AS (
-                SELECT session_id FROM messages
-                UNION
-                SELECT session_id FROM summary_nodes
-            ),
-            message_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS message_count,
-                       COALESCE(SUM(token_estimate), 0) AS token_total,
-                       MIN(timestamp) AS first_message_at,
-                       MAX(timestamp) AS last_message_at
-                FROM messages
-                GROUP BY session_id
-            ),
-            node_stats AS (
-                SELECT session_id,
-                       COUNT(*) AS node_count,
-                       COALESCE(SUM(token_count), 0) AS node_token_total,
-                       MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
-                       MAX(COALESCE(latest_at, created_at)) AS last_node_at
-                FROM summary_nodes
-                GROUP BY session_id
-            )
-            SELECT s.session_id,
-                   COALESCE(m.message_count, 0) AS message_count,
-                   COALESCE(m.token_total, 0) AS token_total,
-                   COALESCE(n.node_count, 0) AS node_count,
-                   COALESCE(n.node_token_total, 0) AS node_token_total,
-                   m.first_message_at,
-                   m.last_message_at,
-                   n.first_node_at,
-                   n.last_node_at
-            FROM session_ids s
-            LEFT JOIN message_stats m ON m.session_id = s.session_id
-            LEFT JOIN node_stats n ON n.session_id = s.session_id
-            WHERE s.session_id = ?
-            ORDER BY s.session_id
-            """,
-            (session_id,),
-        ).fetchall()
+        with self._write_lock:
+            return self._conn.execute(
+                """
+                WITH session_ids AS (
+                    SELECT session_id FROM messages
+                    UNION
+                    SELECT session_id FROM summary_nodes
+                ),
+                message_stats AS (
+                    SELECT session_id,
+                           COUNT(*) AS message_count,
+                           COALESCE(SUM(token_estimate), 0) AS token_total,
+                           MIN(timestamp) AS first_message_at,
+                           MAX(timestamp) AS last_message_at
+                    FROM messages
+                    GROUP BY session_id
+                ),
+                node_stats AS (
+                    SELECT session_id,
+                           COUNT(*) AS node_count,
+                           COALESCE(SUM(token_count), 0) AS node_token_total,
+                           MIN(COALESCE(earliest_at, created_at)) AS first_node_at,
+                           MAX(COALESCE(latest_at, created_at)) AS last_node_at
+                    FROM summary_nodes
+                    GROUP BY session_id
+                )
+                SELECT s.session_id,
+                       COALESCE(m.message_count, 0) AS message_count,
+                       COALESCE(m.token_total, 0) AS token_total,
+                       COALESCE(n.node_count, 0) AS node_count,
+                       COALESCE(n.node_token_total, 0) AS node_token_total,
+                       m.first_message_at,
+                       m.last_message_at,
+                       n.first_node_at,
+                       n.last_node_at
+                FROM session_ids s
+                LEFT JOIN message_stats m ON m.session_id = s.session_id
+                LEFT JOIN node_stats n ON n.session_id = s.session_id
+                WHERE s.session_id = ?
+                ORDER BY s.session_id
+                """,
+                (session_id,),
+            ).fetchall()
 
     def get_source_normalization_plan(self) -> Dict[str, Any]:
         """Return a dry-run plan for normalizing legacy blank source values."""
-        stats_before = self.get_source_stats()
-        blank_clause = _legacy_blank_source_clause("source")
-        row = self._conn.execute(
-            f"""
-            SELECT COUNT(*) AS would_update_messages,
-                   COUNT(DISTINCT session_id) AS affected_sessions
-            FROM messages
-            WHERE {blank_clause}
-            """
-        ).fetchone()
-        would_update = int(row[0] or 0) if row else 0
-        affected_sessions = int(row[1] or 0) if row else 0
-        return {
-            "target_source": _UNKNOWN_SOURCE,
-            "would_update_messages": would_update,
-            "affected_sessions": affected_sessions,
-            "stats_before": stats_before,
-        }
+        with self._write_lock:
+            stats_before = self.get_source_stats()
+            blank_clause = _legacy_blank_source_clause("source")
+            row = self._conn.execute(
+                f"""
+                SELECT COUNT(*) AS would_update_messages,
+                       COUNT(DISTINCT session_id) AS affected_sessions
+                FROM messages
+                WHERE {blank_clause}
+                """
+            ).fetchone()
+            would_update = int(row[0] or 0) if row else 0
+            affected_sessions = int(row[1] or 0) if row else 0
+            return {
+                "target_source": _UNKNOWN_SOURCE,
+                "would_update_messages": would_update,
+                "affected_sessions": affected_sessions,
+                "stats_before": stats_before,
+            }
 
     def normalize_legacy_blank_sources(self) -> Dict[str, Any]:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
-        stats_before = self.get_source_stats()
-        blank_clause = _legacy_blank_source_clause("source")
-        with self._write_lock, self._conn:
-            cur = self._conn.execute(
-                f"UPDATE messages SET source = ? WHERE {blank_clause}",
-                (_UNKNOWN_SOURCE,),
-            )
-        updated = cur.rowcount if cur.rowcount is not None else 0
-        stats_after = self.get_source_stats()
-        return {
-            "target_source": _UNKNOWN_SOURCE,
-            "updated_messages": int(updated),
-            "stats_before": stats_before,
-            "stats_after": stats_after,
-        }
+        with self._write_lock:
+            stats_before = self.get_source_stats()
+            blank_clause = _legacy_blank_source_clause("source")
+            with self._conn:
+                cur = self._conn.execute(
+                    f"UPDATE messages SET source = ? WHERE {blank_clause}",
+                    (_UNKNOWN_SOURCE,),
+                )
+            updated = cur.rowcount if cur.rowcount is not None else 0
+            stats_after = self.get_source_stats()
+            return {
+                "target_source": _UNKNOWN_SOURCE,
+                "updated_messages": int(updated),
+                "stats_before": stats_before,
+                "stats_after": stats_after,
+            }
 
     def get_time_bounds(self, store_ids: List[int]) -> tuple[float | None, float | None]:
         if not store_ids:
             return None, None
         placeholders = ",".join("?" * len(store_ids))
-        row = self._conn.execute(
-            f"SELECT MIN(timestamp), MAX(timestamp) FROM messages WHERE store_id IN ({placeholders})",
-            store_ids,
-        ).fetchone()
-        if not row:
-            return None, None
-        return row[0], row[1]
+        with self._write_lock:
+            row = self._conn.execute(
+                f"SELECT MIN(timestamp), MAX(timestamp) FROM messages WHERE store_id IN ({placeholders})",
+                store_ids,
+            ).fetchone()
+            if not row:
+                return None, None
+            return row[0], row[1]
 
     # -- Metadata key/value JSON --------------------------------------------
 
@@ -1075,19 +1235,20 @@ class MessageStore:
         stored value is empty. JSON decoding is deliberately *not* wrapped: a
         malformed value raises, so callers keep the ``try``/``except`` scoping
         that decides whether one bad key aborts a multi-key load or is skipped.
-        Reads are unlocked, matching the store's other read paths (``_write_lock``
-        guards writes only).
+        Serialized on ``_write_lock`` to prevent statement-cache collisions with
+        concurrent writes.
         """
         conn = self._conn
         if conn is None:
             return None
-        row = conn.execute(
-            "SELECT value FROM metadata WHERE key = ?",
-            (key,),
-        ).fetchone()
-        if not row or not row[0]:
-            return None
-        return json.loads(str(row[0]))
+        with self._write_lock:
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if not row or not row[0]:
+                return None
+            return json.loads(str(row[0]))
 
     def write_metadata_json(
         self,
@@ -1371,18 +1532,19 @@ class MessageStore:
                     where.append("m.timestamp <= ?")
                     args.append(time_to)
                 args.extend([fetch_limit, offset])
-                rows = self._conn.execute(
-                    f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
-                              m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
-                              m.ingested_at, m.observed_at, m.observed_at_source,
-                              rank as search_rank,
-                              snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
-                       FROM messages_fts fts
-                       JOIN messages m ON m.store_id = fts.rowid
-                       WHERE {' AND '.join(where)}
-                       ORDER BY {order_by} LIMIT ? OFFSET ?""",
-                    args,
-                ).fetchall()
+                with self._write_lock:
+                    rows = self._conn.execute(
+                        f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
+                                  m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
+                                  m.ingested_at, m.observed_at, m.observed_at_source,
+                                  rank as search_rank,
+                                  snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
+                           FROM messages_fts fts
+                           JOIN messages m ON m.store_id = fts.rowid
+                           WHERE {' AND '.join(where)}
+                           ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                        args,
+                    ).fetchall()
                 scanned_rows += len(rows)
             except sqlite3.Error as exc:
                 logger.warning("FTS message search failed, falling back to LIKE: %s", exc)
@@ -1573,14 +1735,15 @@ class MessageStore:
                 batch_limit = min(fetch_limit, candidate_cap - scanned_rows)
                 if batch_limit <= 0:
                     break
-                rows = self._conn.execute(
-                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                        FROM messages
-                        WHERE {' AND '.join(where)}
-                        {order_by}
-                        LIMIT ? OFFSET ?""",
-                    [*base_args, *order_args, batch_limit, offset],
-                ).fetchall()
+                with self._write_lock:
+                    rows = self._conn.execute(
+                        f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                            FROM messages
+                            WHERE {' AND '.join(where)}
+                            {order_by}
+                            LIMIT ? OFFSET ?""",
+                        [*base_args, *order_args, batch_limit, offset],
+                    ).fetchall()
                 scanned_rows += len(rows)
                 add_rows(rows)
                 offset += len(rows)
@@ -1590,14 +1753,15 @@ class MessageStore:
                     boundary_timestamp = rows[-1][8]
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
-                        tie_rows = self._conn.execute(
-                            f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                                FROM messages
-                                WHERE {' AND '.join(where)}
-                                {order_by}
-                                LIMIT ? OFFSET ?""",
-                            [*base_args, *order_args, fetch_limit, offset],
-                        ).fetchall()
+                        with self._write_lock:
+                            tie_rows = self._conn.execute(
+                                f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                                    FROM messages
+                                    WHERE {' AND '.join(where)}
+                                    {order_by}
+                                    LIMIT ? OFFSET ?""",
+                                [*base_args, *order_args, fetch_limit, offset],
+                            ).fetchall()
                         if not tie_rows:
                             break
                         matching_tie_rows = []
@@ -1650,14 +1814,15 @@ class MessageStore:
             offset = 0
             while offset < candidate_cap:
                 batch_limit = min(fetch_limit, candidate_cap - offset)
-                rows = self._conn.execute(
-                    f"""SELECT {_MESSAGE_SELECT_COLUMNS}
-                        FROM messages
-                        WHERE {' AND '.join(where)}
-                        {order_by}
-                        LIMIT ? OFFSET ?""",
-                    [*base_args, *order_args, *exact_args, batch_limit, offset],
-                ).fetchall()
+                with self._write_lock:
+                    rows = self._conn.execute(
+                        f"""SELECT {_MESSAGE_SELECT_COLUMNS}
+                            FROM messages
+                            WHERE {' AND '.join(where)}
+                            {order_by}
+                            LIMIT ? OFFSET ?""",
+                        [*base_args, *order_args, *exact_args, batch_limit, offset],
+                    ).fetchall()
                 if not rows:
                     break
                 add_rows(rows)
@@ -1742,13 +1907,6 @@ class MessageStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
             conn.close()
             self._conn = None
 

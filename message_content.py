@@ -89,3 +89,39 @@ def stored_text_content_for_pattern_matching(content: Any) -> str | None:
         if isinstance(decoded, (list, dict)) and normalize_content_value(decoded) == content:
             return text_content_for_pattern_matching(decoded)
     return text_content_for_pattern_matching(content)
+
+
+def extract_codex_message_items_text(codex_message_items: Any) -> str:
+    """Extract operator-visible text from OpenAI Responses ``codex_message_items``.
+
+    Hermes stores intermediate commentary turns (``phase="commentary"`` emitted
+    alongside tool calls) in ``codex_message_items`` while leaving ``content``
+    empty so the Responses API replay does not duplicate the text block.  LCM
+    extracts this text for durable storage, FTS indexing, and summarization
+    without mutating the provider-facing active replay ``content`` field.
+    """
+    if not codex_message_items:
+        return ""
+    items = codex_message_items
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+    if not isinstance(items, list):
+        return ""
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_content = item.get("content")
+        if isinstance(item_content, str):
+            if item_content.strip():
+                parts.append(item_content)
+            continue
+        if isinstance(item_content, list):
+            text = text_content_for_pattern_matching(item_content)
+            if text and text.strip():
+                parts.append(text)
+    return "\n\n".join(parts)
+

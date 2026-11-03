@@ -1,3 +1,8 @@
 version = 1
 revision = 3
-requires-python = ">=3.13"
+requires-python = ">=3.11"
+
+[[package]]
+name = "hermes-lcm"
+version = "1.0.0rc1"
+source = { virtual = "." }

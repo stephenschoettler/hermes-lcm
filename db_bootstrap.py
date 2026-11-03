@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -39,7 +40,8 @@ class SchemaVersionTooNewError(RuntimeError):
 # embedding tables, fully openable by a base build, and leaves the numeric
 # counter free for the temporal train so neither collides on a v6.
 SCHEMA_VERSION = 5
-SQLITE_BUSY_TIMEOUT_MS = 30_000
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("LCM_BUSY_TIMEOUT_MS", "30000"))
+SQLITE_BUSY_TIMEOUT_SECONDS = float(os.environ.get("LCM_BUSY_TIMEOUT_SECONDS", str(SQLITE_BUSY_TIMEOUT_MS / 1000.0)))
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
     "messages",
@@ -127,12 +129,27 @@ def configure_connection(conn: sqlite3.Connection) -> None:
     - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
                                               readers cache WAL pages in RAM.
     """
-    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    busy_timeout = int(os.environ.get("LCM_BUSY_TIMEOUT_MS", str(SQLITE_BUSY_TIMEOUT_MS)))
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout}")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
+    wal_checkpoint_pages = int(os.environ.get("LCM_WAL_AUTOCHECKPOINT", "4000"))
+    conn.execute(f"PRAGMA wal_autocheckpoint={wal_checkpoint_pages}")
     conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    mmap_env = os.environ.get("LCM_MMAP_SIZE")
+    if mmap_env is not None:
+        try:
+            mmap_size = int(mmap_env)
+        except ValueError:
+            mmap_size = 0
+    elif sys.platform == "darwin":
+        # On macOS APFS, memory-mapped I/O (PRAGMA mmap_size > 0) causes cache incoherence
+        # and B-tree/FTS corruption under multi-process concurrency (gateway + desktop serve + subagents).
+        # Default to 0 (disabled) on Darwin to force POSIX pread/pwrite via the unified kernel page cache.
+        mmap_size = 0
+    else:
+        mmap_size = 268435456
+    conn.execute(f"PRAGMA mmap_size={mmap_size}")
 
 
 def _execute_wal_conversion_with_lock_retry(
@@ -155,10 +172,15 @@ def _execute_wal_conversion_with_lock_retry(
     delay_seconds = 0.005
     while True:
         try:
+            cur = conn.execute("PRAGMA journal_mode")
+            row = cur.fetchone()
+            if row and str(row[0]).lower() == "wal":
+                return
             conn.execute("PRAGMA journal_mode=WAL")
             return
-        except sqlite3.OperationalError as exc:
-            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+            msg = str(exc).lower()
+            if not any(k in msg for k in ("locked", "busy", "disk i/o", "ioerr", "file is not a database")) or time.monotonic() >= deadline:
                 raise
         time.sleep(delay_seconds)
         delay_seconds = min(delay_seconds * 2, 0.25)
@@ -2287,6 +2309,15 @@ def verify_assertion_schema(conn: sqlite3.Connection) -> list[str]:
     return sorted(set(findings))
 
 
+def is_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> bool:
+    """True once ``mark_migration_step_complete(step_name)`` has run on this DB."""
+    ensure_migration_state_table(conn)
+    row = conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = ? LIMIT 1", (step_name,)
+    ).fetchone()
+    return row is not None
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(
@@ -2832,9 +2863,12 @@ _FTS_CORRUPTION_SIGNATURES = (
 )
 
 
-def _is_fts_corruption_error(detail: str) -> bool:
-    lowered = detail.lower()
+def is_fts_corruption_error(detail_or_exc: BaseException | str) -> bool:
+    lowered = str(detail_or_exc).lower()
     return any(signature in lowered for signature in _FTS_CORRUPTION_SIGNATURES)
+
+
+_is_fts_corruption_error = is_fts_corruption_error
 
 
 def check_external_content_fts_integrity(
@@ -2996,12 +3030,15 @@ def repair_external_content_fts(
     *,
     now: float | None = None,
     throttle: bool = False,
+    force: bool = False,
 ) -> dict[str, bool]:
     rebuilt = False
     degraded = False
     fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec)
     deep_repair_needed = False
-    if not fts_structure_needs_rebuild or not throttle:
+    if force:
+        deep_repair_needed = True
+    elif not fts_structure_needs_rebuild or not throttle:
         # Preserve the cheap startup path and its background integrity-scan
         # behavior whenever the FTS table and shadow structure can support a
         # deep check. Missing triggers alone must not hide same-row-count index
@@ -3028,7 +3065,9 @@ def repair_external_content_fts(
         owner_rebuild_needed = (
             _fts_needs_rebuild_structural(conn, spec) if winner_state_needs_repair else False
         )
-        if not owner_rebuild_needed and deep_repair_needed:
+        if force:
+            owner_rebuild_needed = True
+        elif not owner_rebuild_needed and deep_repair_needed:
             # Explicit repair (and synchronous startup when background scans are
             # disabled) must revalidate same-row-count token drift while owning
             # the write boundary. A repaired winner is accepted without a second

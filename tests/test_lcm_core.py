@@ -7425,9 +7425,11 @@ class TestLCMEngineCloning:
 
             assert clone is not prototype
             assert isinstance(clone, LCMEngine)
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
+            assert clone._owns_storage is False
+            assert prototype._owns_storage is True
             assert clone._config.database_path == prototype._config.database_path
             assert clone._hermes_home == prototype._hermes_home
         finally:
@@ -7468,9 +7470,10 @@ class TestLCMEngineCloning:
             assert isinstance(clone, LCMEngine)
             assert clone.name == "lcm"
             assert clone is not prototype
-            assert clone._store is not prototype._store
-            assert clone._dag is not prototype._dag
-            assert clone._lifecycle is not prototype._lifecycle
+            assert clone._store is prototype._store
+            assert clone._dag is prototype._dag
+            assert clone._lifecycle is prototype._lifecycle
+            assert clone._owns_storage is False
             assert clone._session_id == ""
             assert clone._conversation_id == ""
             assert clone.model == prototype.model
@@ -7706,6 +7709,53 @@ class TestLCMEngineCloning:
             shutdown = getattr(clone, "shutdown", None)
             if callable(shutdown):
                 shutdown()
+
+    def test_clone_for_agent_shares_storage_without_connection_churn_or_apfs_lock_contention(self, tmp_path):
+        from hermes_lcm.engine import LCMEngine
+        import concurrent.futures
+
+        config = LCMConfig(database_path=str(tmp_path / "lcm-concurrent-clones.db"))
+        prototype = LCMEngine(config=config, hermes_home=str(tmp_path / "hermes"))
+        try:
+            prototype.on_session_start(
+                "prototype-session",
+                platform="cli",
+                conversation_id="agent:main:cli:1",
+            )
+            prototype.ingest([{"role": "user", "content": "prototype initial message"}])
+
+            def worker(index):
+                clone = prototype.clone_for_agent()
+                assert clone is not prototype
+                assert clone._owns_storage is False
+                assert clone._store is prototype._store
+                assert clone._dag is prototype._dag
+                assert clone._lifecycle is prototype._lifecycle
+
+                session_id = f"worker-session-{index}"
+                conv_id = f"agent:worker:thread:{index}"
+                clone.on_session_start(session_id, platform="worker", conversation_id=conv_id)
+                clone.ingest([{"role": "user", "content": f"worker {index} message"}])
+                clone.on_session_end(session_id, [{"role": "user", "content": f"worker {index} message"}])
+                clone.shutdown()
+                return index
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [pool.submit(worker, i) for i in range(20)]
+                results = [f.result() for f in futures]
+                assert len(results) == 20
+
+            # Prototype must remain fully functional and uncorrupted after all clones shut down
+            count = prototype._store.connection.execute("SELECT count(*) FROM messages").fetchone()[0]
+            assert count >= 21
+            prototype.ingest([
+                {"role": "user", "content": "prototype initial message"},
+                {"role": "assistant", "content": "prototype final message"},
+            ])
+            new_count = prototype._store.connection.execute("SELECT count(*) FROM messages").fetchone()[0]
+            assert new_count == count + 1
+        finally:
+            prototype.shutdown()
 
 
 def test_like_fallback_relevance_prefers_multi_term_score_over_single_exact(tmp_path):

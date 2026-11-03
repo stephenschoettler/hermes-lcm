@@ -577,8 +577,8 @@ def test_plugin_entrypoint_registers_bundled_skill_and_active_lcm_recall_policy(
     assert len(registered_skills) == 1
     name, path, description = registered_skills[0]
     assert name == "hermes-lcm"
-    assert path == Path(module.__file__).resolve().parent / "skills" / "hermes-lcm"
-    assert (path / "SKILL.md").is_file()
+    assert path == Path(module.__file__).resolve().parent / "skills" / "hermes-lcm" / "SKILL.md"
+    assert path.is_file()
     assert "recall" in description.lower()
     assert len(hooks["pre_llm_call"]) == 1
 

@@ -18,7 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .db_bootstrap import (
+    SQLITE_BUSY_TIMEOUT_SECONDS,
+    configure_connection,
+    refuse_schema_version_too_new,
+    run_versioned_migrations,
+)
+from .sqlite_util import _sqlite_busy_timeout_ms
 
 
 def _synchronized(method):
@@ -26,12 +32,30 @@ def _synchronized(method):
 
     The lifecycle connection is shared across threads (check_same_thread=False,
     autocommit). Without serialization, two callers reading state and then
-    writing can interleave and clobber each other's update.
+    writing can interleave and clobber each other's update. Transient SQLite
+    locks from concurrent transactions on sibling connections (e.g. MessageStore
+    appends) are retried with exponential backoff.
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
-            return method(self, *args, **kwargs)
+            deadline: float | None = None
+            delay = 0.01
+            while True:
+                try:
+                    return method(self, *args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    now = time.monotonic()
+                    if deadline is None:
+                        bt_ms = _sqlite_busy_timeout_ms(getattr(self, "_conn", None))
+                        if bt_ms < 1000:
+                            raise
+                        deadline = now + 5.0
+                    if not any(k in msg for k in ("locked", "busy")) or now >= deadline:
+                        raise
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.2)
     return wrapper
 
 
@@ -68,9 +92,10 @@ class LifecycleStateStore:
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(
             str(self.db_path),
-            timeout=30.0,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
             check_same_thread=False,
             isolation_level=None,
+            cached_statements=0,
         )
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
@@ -81,10 +106,6 @@ class LifecycleStateStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
             conn.close()
             self._conn = None
 
@@ -105,6 +126,7 @@ class LifecycleStateStore:
         """
         return getattr(self, "_conn", None)
 
+    @_synchronized
     def row_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()
         return int(row["count"] if row else 0)
@@ -129,6 +151,7 @@ class LifecycleStateStore:
             updated_at=float(row["updated_at"] or 0.0),
         )
 
+    @_synchronized
     def get_by_conversation(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -138,6 +161,7 @@ class LifecycleStateStore:
         ).fetchone()
         return self._row_to_state(row)
 
+    @_synchronized
     def get_by_session(self, session_id: str | None) -> LifecycleState | None:
         if not session_id:
             return None

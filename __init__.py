@@ -403,12 +403,13 @@ def register(ctx):
     # profile skill link (normal discovery). Older hosts simply lack this
     # capability and keep their existing schema-driven behavior.
     skill_root = Path(__file__).resolve().parent / "skills" / "hermes-lcm"
+    skill_md = skill_root / "SKILL.md"
     register_skill = getattr(ctx, "register_skill", None)
     if callable(register_skill):
         try:
             register_skill(
                 "hermes-lcm",
-                skill_root,
+                skill_md,
                 description=(
                     "Use, configure, diagnose, and recall exact evidence "
                     "with the Hermes-LCM lossless context plugin."

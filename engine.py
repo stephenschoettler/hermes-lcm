@@ -130,6 +130,7 @@ from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
 from .message_content import (
+    extract_codex_message_items_text,
     normalize_content_value,
     stored_text_content_for_pattern_matching,
     text_content_for_pattern_matching,
@@ -145,6 +146,7 @@ from . import tools as lcm_tools
 logger = logging.getLogger(__name__)
 
 _ASSERTION_EXTRACTION_PROCESS_SLOT = threading.BoundedSemaphore(1)
+_STORAGE_BIND_PROCESS_LOCK = threading.RLock()
 
 class _RollupMaintenanceScheduler:
     """Run deduplicated rollup jobs on one process-wide worker.
@@ -387,8 +389,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
-    def __init__(self, config: LCMConfig | None = None,
-                 hermes_home: str = ""):
+    def __init__(
+        self,
+        config: LCMConfig | None = None,
+        hermes_home: str = "",
+        *,
+        _storage_source: Optional["LCMEngine"] = None,
+    ):
         self._config = config or LCMConfig.from_env()
         self._hermes_home = hermes_home
         self._assertion_extraction_metrics_lock = threading.RLock()
@@ -406,8 +413,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._assertion_extraction_last_error = ""
         self._assertion_extraction_last_model = ""
 
-        db_path = self._resolve_db_path(hermes_home)
-        self._bind_storage(db_path, hermes_home)
+        if _storage_source is not None and getattr(_storage_source, "_store", None) is not None:
+            self._owns_storage = False
+            self._store = _storage_source._store
+            self._dag = _storage_source._dag
+            self._lifecycle = _storage_source._lifecycle
+            self._assertions = _storage_source._assertions
+            self._query_views = _storage_source._query_views
+            self._adaptive_retrieval = _storage_source._adaptive_retrieval
+            self._assertion_extractor = _storage_source._assertion_extractor
+        else:
+            self._owns_storage = True
+            db_path = self._resolve_db_path(hermes_home)
+            self._bind_storage(db_path, hermes_home)
 
         self._session_id: str = ""
         self._session_platform: str = ""
@@ -632,14 +650,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         sharing one registered instance across agents can let one conversation
         rebind another conversation's raw-message ingest and lifecycle state.
 
-        The clone shares the same durable SQLite database path/configuration,
-        but gets independent session/cursor/lifecycle runtime state. Runtime
-        model and context-window metadata is copied so the clone is immediately
-        budget-aware even before a compatible Hermes host calls update_model().
+        The clone shares the same durable SQLite database and thread-safe storage
+        helpers, but gets independent session/cursor/lifecycle runtime state.
+        Sharing the storage helpers avoids connection churn, schema migration
+        redundancy, and Darwin APFS filesystem lock contention (disk I/O error)
+        when agents are spawned concurrently. Runtime model and context-window
+        metadata is copied so the clone is immediately budget-aware even before
+        a compatible Hermes host calls update_model().
         """
         clone = type(self)(
             config=copy.deepcopy(self._config),
             hermes_home=self._hermes_home,
+            _storage_source=self,
         )
         clone.model = self.model
         clone.base_url = self.base_url
@@ -675,8 +697,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         AIAgent instances. A default object deepcopy walks into MessageStore,
         SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
         cannot be pickled. LCM already exposes clone_for_agent() as the safe
-        boundary: share durable configuration/database path, but allocate fresh
-        per-agent runtime/storage helper objects.
+        boundary: share durable configuration/database path and thread-safe
+        storage helpers, but allocate fresh per-agent runtime state.
         """
         clone = self.clone_for_agent()
         memo[id(self)] = clone
@@ -692,55 +714,83 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _bind_storage(self, db_path: str | Path, hermes_home: str = "") -> None:
         """Bind store/DAG/lifecycle helpers to one SQLite database."""
-        self._assertions = None
-        self._query_views = None
-        self._adaptive_retrieval = None
-        self._assertion_extractor = None
-        try:
-            self._store = MessageStore(
-                db_path,
-                ingest_protection_config=self._config,
-                hermes_home=hermes_home,
-            )
-            self._dag = SummaryDAG(db_path)
-            if self._config.temporal_rollups_enabled:
-                # Install the transaction-coupled summary mutation triggers before
-                # this engine can publish or delete a DAG node.
-                initialize_rollup_invalidation_outbox(self._dag)
-            self._lifecycle = LifecycleStateStore(db_path)
-            self._assertions = (
-                AssertionStore(db_path)
-                if bool(getattr(self._config, "assertions_enabled", False))
-                else None
-            )
-            self._query_views = (
-                QueryViewStore(db_path)
-                if bool(getattr(self._config, "query_views_enabled", False))
-                or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
-                else None
-            )
-            self._adaptive_retrieval = (
-                AdaptiveRetrievalRegistry(self._query_views)
-                if bool(
-                    getattr(self._config, "adaptive_retrieval_enabled", False)
-                )
-                else None
-            )
-            if (
-                self._assertions is not None
-                and bool(getattr(self._config, "assertion_extraction_enabled", False))
-            ):
-                self._assertion_extractor = ModelAssertionExtractor(
-                    self._assertions,
-                    model=self._assertion_extraction_model(),
-                    timeout_seconds=self._assertion_extraction_timeout(),
-                )
-        except Exception:
-            self._close_storage()
-            raise
+        with _STORAGE_BIND_PROCESS_LOCK:
+            self._assertions = None
+            self._query_views = None
+            self._adaptive_retrieval = None
+            self._assertion_extractor = None
+            deadline: float | None = None
+            delay = 0.02
+            while True:
+                try:
+                    self._store = MessageStore(
+                        db_path,
+                        ingest_protection_config=self._config,
+                        hermes_home=hermes_home,
+                    )
+                    self._dag = SummaryDAG(db_path)
+                    if self._config.temporal_rollups_enabled:
+                        # Install the transaction-coupled summary mutation triggers before
+                        # this engine can publish or delete a DAG node.
+                        initialize_rollup_invalidation_outbox(self._dag)
+                    self._lifecycle = LifecycleStateStore(db_path)
+                    self._assertions = (
+                        AssertionStore(db_path)
+                        if bool(getattr(self._config, "assertions_enabled", False))
+                        else None
+                    )
+                    self._query_views = (
+                        QueryViewStore(db_path)
+                        if bool(getattr(self._config, "query_views_enabled", False))
+                        or bool(getattr(self._config, "adaptive_retrieval_enabled", False))
+                        else None
+                    )
+                    self._adaptive_retrieval = (
+                        AdaptiveRetrievalRegistry(self._query_views)
+                        if bool(
+                            getattr(self._config, "adaptive_retrieval_enabled", False)
+                        )
+                        else None
+                    )
+                    if (
+                        self._assertions is not None
+                        and bool(getattr(self._config, "assertion_extraction_enabled", False))
+                    ):
+                        self._assertion_extractor = ModelAssertionExtractor(
+                            self._assertions,
+                            model=self._assertion_extraction_model(),
+                            timeout_seconds=self._assertion_extraction_timeout(),
+                        )
+                    break
+                except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                    self._close_storage()
+                    msg = str(exc).lower()
+                    now = time.monotonic()
+                    if deadline is None:
+                        deadline = now + 5.0
+                    if not any(k in msg for k in ("locked", "busy", "disk i/o", "ioerr", "file is not a database")) or now >= deadline:
+                        raise
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.25)
+                except Exception:
+                    self._close_storage()
+                    raise
 
     def _close_storage(self) -> None:
         """Best-effort close of currently bound SQLite helpers."""
+        if not getattr(self, "_owns_storage", True):
+            for attr in (
+                "_adaptive_retrieval",
+                "_store",
+                "_dag",
+                "_lifecycle",
+                "_assertions",
+                "_query_views",
+                "_assertion_extractor",
+            ):
+                setattr(self, attr, None)
+            return
+
         for attr in (
             "_adaptive_retrieval",
             "_store",
@@ -756,6 +806,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     close()
                 except Exception:
                     logger.debug("LCM failed closing %s during profile rebind", attr, exc_info=True)
+            setattr(self, attr, None)
 
     def _assertion_extraction_model(self) -> str:
         return str(
@@ -850,6 +901,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._close_storage()
         self._hermes_home = hermes_home
         self._bind_storage(db_path, hermes_home)
+        self._owns_storage = True
         self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
@@ -2944,8 +2996,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         session_id: str,
     ) -> str:
+        raw_content = (message or {}).get("content")
+        if (
+            str((message or {}).get("role") or "") == "assistant"
+            and not (normalize_content_value(raw_content) or "").strip()
+            and (message or {}).get("codex_message_items")
+        ):
+            commentary_text = extract_codex_message_items_text(
+                (message or {}).get("codex_message_items")
+            )
+            if commentary_text:
+                raw_content = commentary_text
         content = self._session_end_prefix_compare_value(
-            (message or {}).get("content"),
+            raw_content,
             session_id=session_id,
         )
         content = redact_sensitive_value(
@@ -3204,7 +3267,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     excerpt,
                 )
                 continue
-            kept.append(msg)
+            store_msg = msg
+            if (
+                str(store_msg.get("role") or "") == "assistant"
+                and not (normalize_content_value(store_msg.get("content")) or "").strip()
+                and store_msg.get("codex_message_items")
+            ):
+                commentary_text = extract_codex_message_items_text(
+                    store_msg.get("codex_message_items")
+                )
+                if commentary_text:
+                    store_msg = dict(store_msg)
+                    store_msg["content"] = commentary_text
+            kept.append(store_msg)
         if not kept:
             return []
         protected_messages = protect_messages_for_ingest(
@@ -3489,11 +3564,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
             return
         try:
-            with _temporary_sqlite_busy_timeout(
+            timeout_targets = (
                 [
                     getattr(self._store, "_conn", None),
                     getattr(self._lifecycle, "_conn", None),
-                ],
+                ]
+                if getattr(self, "_owns_storage", True)
+                else []
+            )
+            with _temporary_sqlite_busy_timeout(
+                timeout_targets,
                 _SESSION_END_BUSY_TIMEOUT_MS,
             ):
                 try:
@@ -4255,6 +4335,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
     def _copy_active_replay_messages_preserving_generated_ids(
         self,
         active_replay_messages: List[Dict[str, Any]],
+        source_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> list[Dict[str, Any]]:
         copied_replay_messages: list[Dict[str, Any]] = []
         generated_message_ids = getattr(
@@ -4262,8 +4343,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "_generated_ignored_active_replay_placeholder_message_ids",
             set(),
         )
-        for message in active_replay_messages:
+        for idx, message in enumerate(active_replay_messages):
             copied_message = dict(message)
+            if source_messages is not None and idx < len(source_messages):
+                source_msg = source_messages[idx]
+                if isinstance(source_msg, dict):
+                    for key, val in source_msg.items():
+                        if key in ("content", "tool_calls"):
+                            continue
+                        if val is not None:
+                            copied_message[key] = val
             if id(message) in generated_message_ids:
                 self._generated_ignored_active_replay_placeholder_message_ids.add(id(copied_message))
             copied_replay_messages.append(copied_message)
@@ -4278,7 +4367,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._message_replay_identity(message) for message in original_messages
         ]
         self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
-            active_replay_messages
+            active_replay_messages,
+            source_messages=original_messages,
         )
         self._write_generated_ignored_placeholder_hash_counts(
             self._generated_placeholder_digest_budget_for_active_replay(active_replay_messages)
@@ -4296,7 +4386,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if identities == getattr(self, "_last_active_replay_source_identities", None):
             cached = getattr(self, "_last_active_replay_messages", None)
             if cached is not None:
-                return self._copy_active_replay_messages_preserving_generated_ids(cached)
+                merged = self._copy_active_replay_messages_preserving_generated_ids(
+                    cached,
+                    source_messages=original_messages,
+                )
+                self._last_active_replay_messages = self._copy_active_replay_messages_preserving_generated_ids(
+                    merged
+                )
+                return merged
         return None
 
     def _is_replayed_context_scaffold_message(self, msg: Dict[str, Any]) -> bool:
@@ -4587,7 +4684,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 if current_prefix_identities == cached_source_identities[:cursor]:
                     replay_messages = (
                         self._copy_active_replay_messages_preserving_generated_ids(
-                            cached_active_replay_messages[:cursor]
+                            cached_active_replay_messages[:cursor],
+                            source_messages=messages[:cursor],
                         )
                         + replay_messages[cursor:]
                     )
@@ -4827,6 +4925,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     )
                 ):
                     store_msg = original_msg
+                elif (
+                    str(store_msg.get("role") or "") == "assistant"
+                    and not (normalize_content_value(store_msg.get("content")) or "").strip()
+                    and (store_msg.get("codex_message_items") or original_msg.get("codex_message_items"))
+                ):
+                    commentary_text = extract_codex_message_items_text(
+                        store_msg.get("codex_message_items") or original_msg.get("codex_message_items")
+                    )
+                    if commentary_text:
+                        store_msg = dict(store_msg)
+                        store_msg["content"] = commentary_text
                 kept.append((absolute_idx, store_msg))
             messages_to_store_with_index = kept
 
@@ -5162,8 +5271,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         matched_tool_ids = _matched_tool_call_ids(messages)
         for msg in messages:
             role = msg.get("role", "unknown")
+            raw_content = msg.get("content") or ""
+            if (
+                role == "assistant"
+                and not (normalize_content_value(raw_content) or "").strip()
+                and msg.get("codex_message_items")
+            ):
+                commentary_text = extract_codex_message_items_text(msg.get("codex_message_items"))
+                if commentary_text:
+                    raw_content = commentary_text
             content = redact_sensitive_value(
-                msg.get("content") or "",
+                raw_content,
                 self._config,
                 parse_json_strings=False,
             )
@@ -5503,11 +5621,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         i += 1
 
                     if not matched_direct_result and insert_missing_tool_stubs:
-                        sanitized.append({
+                        stub_msg: Dict[str, Any] = {
                             "role": "tool",
                             "content": "[Result from earlier conversation — see context summary above]",
                             "tool_call_id": expected_id,
-                        })
+                        }
+                        if isinstance(msg.get("timestamp"), (int, float)) and not isinstance(msg.get("timestamp"), bool):
+                            stub_msg["timestamp"] = float(msg["timestamp"]) + 0.0001
+                        sanitized.append(stub_msg)
                         inserted_stub_results += 1
 
                 while i + 1 < len(messages) and messages[i + 1].get("role") == "tool":
@@ -6135,7 +6256,27 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     selected_parts.append(part)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
-                result.append({"role": summary_role, "content": combined})
+                summary_msg: Dict[str, Any] = {"role": summary_role, "content": combined}
+                tail_timestamps = [
+                    float(m["timestamp"])
+                    for m in tail_selected
+                    if isinstance(m, dict)
+                    and isinstance(m.get("timestamp"), (int, float))
+                    and not isinstance(m.get("timestamp"), bool)
+                    and float(m["timestamp"]) > 0
+                ]
+                if tail_timestamps:
+                    min_tail_ts = min(tail_timestamps)
+                    summary_ts = min_tail_ts - 0.002
+                    if (
+                        leading_msg is not None
+                        and isinstance(leading_msg.get("timestamp"), (int, float))
+                        and not isinstance(leading_msg.get("timestamp"), bool)
+                        and float(leading_msg["timestamp"]) < min_tail_ts
+                    ):
+                        summary_ts = max(float(leading_msg["timestamp"]) + 0.001, summary_ts)
+                    summary_msg["timestamp"] = summary_ts
+                result.append(summary_msg)
 
         # Proactive memory injection (SPEC F, default-off). One bounded block is
         # placed adjacent to the summary prefix — a stable position below the
@@ -6146,6 +6287,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_messages, summary_role, active_summary_node_ids
         )
         if proactive_msg is not None:
+            tail_timestamps = [
+                float(m["timestamp"])
+                for m in tail_selected
+                if isinstance(m, dict)
+                and isinstance(m.get("timestamp"), (int, float))
+                and not isinstance(m.get("timestamp"), bool)
+                and float(m["timestamp"]) > 0
+            ]
+            if tail_timestamps:
+                proactive_msg = dict(proactive_msg)
+                proactive_msg["timestamp"] = min(tail_timestamps) - 0.001
             result.append(proactive_msg)
 
         # Fresh tail
@@ -6655,6 +6807,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def shutdown(self):
         self._unregister_active_engine_binding()
+        if not getattr(self, "_owns_storage", True):
+            return
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.close()
         self._store.close()

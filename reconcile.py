@@ -42,7 +42,11 @@ from .ingest_protection import (
     recover_hermes_persisted_output_with_file_stat,
     redact_sensitive_value,
 )
-from .message_content import normalize_content_value, text_content_for_pattern_matching
+from .message_content import (
+    extract_codex_message_items_text,
+    normalize_content_value,
+    text_content_for_pattern_matching,
+)
 from .sanitize import _clean_active_assistant_message
 
 import logging
@@ -127,6 +131,16 @@ class ReconcileMixin:
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
+        if role == "assistant" and not content.strip() and not stored_row and msg.get("codex_message_items"):
+            commentary_text = extract_codex_message_items_text(msg.get("codex_message_items"))
+            if commentary_text:
+                content = normalize_content_value(
+                    redact_sensitive_value(
+                        commentary_text,
+                        self._config,
+                        parse_json_strings=False,
+                    )
+                ) or ""
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)

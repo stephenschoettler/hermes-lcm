@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterator, NamedTuple, Optional, Sequence
 
 from .db_bootstrap import (
+    SQLITE_BUSY_TIMEOUT_SECONDS,
     configure_connection,
     ensure_temporal_rollup_tables,
     mark_migration_step_complete,
@@ -62,7 +63,7 @@ class RollupStore:
     def _init_db(self) -> None:
         self._conn = sqlite3.connect(
             str(self.db_path),
-            timeout=5.0,
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
             check_same_thread=False,
         )
         refuse_schema_version_too_new(self._conn)
@@ -834,10 +835,6 @@ class RollupStore:
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
         if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
             conn.close()
             self._conn = None
 
