@@ -55,6 +55,10 @@ from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_sourc
 logger = logging.getLogger(__name__)
 
 
+class _SummaryDAGRollbackError(RuntimeError):
+    """A failed node write could not be rolled back safely."""
+
+
 def _build_search_order_by(sort: str | None, recency_expr: str) -> str:
     normalized = normalize_search_sort(sort)
     if normalized == "relevance":
@@ -247,26 +251,44 @@ class SummaryDAG:
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
         with self._db_lock:
-            cur = self._conn.execute(
-                """INSERT INTO summary_nodes
-                   (session_id, depth, summary, token_count, source_token_count,
-                    source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    node.session_id,
-                    node.depth,
-                    node.summary,
-                    node.token_count,
-                    node.source_token_count,
-                    json.dumps(node.source_ids),
-                    node.source_type,
-                    node.created_at or time.time(),
-                    node.earliest_at,
-                    node.latest_at,
-                    node.expand_hint,
-                ),
-            )
-            self._conn.commit()
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("summary DAG is closed")
+            try:
+                cur = conn.execute(
+                    """INSERT INTO summary_nodes
+                       (session_id, depth, summary, token_count, source_token_count,
+                        source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        node.session_id,
+                        node.depth,
+                        node.summary,
+                        node.token_count,
+                        node.source_token_count,
+                        json.dumps(node.source_ids),
+                        node.source_type,
+                        node.created_at or time.time(),
+                        node.earliest_at,
+                        node.latest_at,
+                        node.expand_hint,
+                    ),
+                )
+                conn.commit()
+            except BaseException:
+                # Failed INSERTs/commits may leave a transaction (and a writer
+                # lock) open. Clean it up before another user takes _db_lock.
+                try:
+                    conn.rollback()
+                except BaseException as rollback_error:
+                    # This is not a recoverable BUSY publication outcome: the
+                    # connection's transaction state is now unknown. Wrap it in
+                    # a non-SQLite error so the compaction layer cannot classify
+                    # an earlier BUSY exception in its context chain as benign.
+                    raise _SummaryDAGRollbackError(
+                        "failed to roll back summary-node publication"
+                    ) from rollback_error
+                raise
             node.node_id = cur.lastrowid
             return node.node_id
 

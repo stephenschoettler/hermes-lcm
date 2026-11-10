@@ -125,7 +125,7 @@ from .message_patterns import compile_message_patterns, matches_message_pattern
 from .aux_session import AuxiliarySessionMixin
 from .placeholder_ledger import PlaceholderLedgerMixin
 from .reconcile import ReconcileMixin, _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
-from .compaction import CompactionMixin
+from .compaction import CompactionMixin, _SummaryPublicationLocked
 from .reset_state import ResetStateMixin
 from .bypass import BypassMixin
 from .lifecycle_state import LifecycleStateStore
@@ -5680,7 +5680,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             latest_at=latest_at,
             expand_hint=self._extract_expand_hint(summary_text),
         )
-        self._dag.add_node(condensed_node)
+        self._publish_summary_node(condensed_node)
         self._invalidate_rollups_for_published_node(condensed_node)
         return source_tokens, summary_tokens, level
 
@@ -5746,6 +5746,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     focus_topic=focus_topic,
                     deadline=deadline,
                 )
+            except _SummaryPublicationLocked as exc:
+                self._last_summary_error = str(exc)
+                logger.warning("%s during condensation after %d persisted pass(es)", exc, passes)
+                return passes, "condensation_publication_locked"
+            except sqlite3.Error:
+                # Storage defects other than contention are not a graceful abort.
+                raise
             except Exception as exc:
                 logger.warning(
                     "LCM threshold full sweep condensation stopped after %d pass(es): %s",
