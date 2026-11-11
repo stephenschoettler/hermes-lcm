@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from .sqlite_util import StoreClosed, guard_connection
 
 
 def _synchronized(method):
@@ -31,6 +32,10 @@ def _synchronized(method):
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._lock:
+            # close() takes the same lock: a closed store raises a typed error instead of
+            # reaching a freed connection.
+            if self._conn is None:
+                raise StoreClosed(f"LCM lifecycle store {self.db_path} is closed")
             return method(self, *args, **kwargs)
     return wrapper
 
@@ -66,12 +71,12 @@ class LifecycleStateStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        self._conn = sqlite3.connect(
+        self._conn = guard_connection(sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
             check_same_thread=False,
             isolation_level=None,
-        )
+        ))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
@@ -79,14 +84,20 @@ class LifecycleStateStore:
         self._conn.commit()
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        lock = getattr(self, "_lock", None)
+        if lock is None:  # __init__ failed before the lock existed: nothing was opened
+            return
+        # Same lock as bind_session & co.; the guarded connection additionally serializes raw
+        # ``connection`` users, so close never frees it under a live execute.
+        with lock:
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:
@@ -105,6 +116,7 @@ class LifecycleStateStore:
         """
         return getattr(self, "_conn", None)
 
+    @_synchronized
     def row_count(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) AS count FROM lcm_lifecycle_state").fetchone()
         return int(row["count"] if row else 0)
@@ -129,6 +141,7 @@ class LifecycleStateStore:
             updated_at=float(row["updated_at"] or 0.0),
         )
 
+    @_synchronized
     def get_by_conversation(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -138,6 +151,7 @@ class LifecycleStateStore:
         ).fetchone()
         return self._row_to_state(row)
 
+    @_synchronized
     def get_by_session(self, session_id: str | None) -> LifecycleState | None:
         if not session_id:
             return None
@@ -370,6 +384,7 @@ class LifecycleStateStore:
         assert updated is not None
         return updated
 
+    @_synchronized
     def get_fragmentation_stats(self, state_db_path: str | Path | None = None) -> dict[str, Any]:
         """Return read-only lifecycle/session fragmentation diagnostics.
 
@@ -627,6 +642,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -809,6 +825,7 @@ class LifecycleStateStore:
             conn.rollback()
             raise
 
+    @_synchronized
     def delete_safe_rows_for_sessions(
         self,
         session_ids: set[str] | list[str] | tuple[str, ...],
@@ -845,6 +862,7 @@ class LifecycleStateStore:
             self._conn.commit()
         return deleted, skipped
 
+    @_synchronized
     def advance_frontier(
         self,
         conversation_id: str | None,

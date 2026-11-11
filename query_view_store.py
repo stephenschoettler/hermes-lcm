@@ -21,6 +21,7 @@ import time
 from typing import Any, Iterator, Literal, NamedTuple, Sequence
 import uuid
 
+from .sqlite_util import guard_connection
 from .db_bootstrap import (
     configure_connection,
     mark_migration_step_complete,
@@ -535,9 +536,9 @@ class QueryViewStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
+        self._conn = guard_connection(sqlite3.connect(
             str(self.db_path), timeout=5.0, check_same_thread=False
-        )
+        ))
         self._write_lock = threading.RLock()
         try:
             refuse_schema_version_too_new(self._conn)
