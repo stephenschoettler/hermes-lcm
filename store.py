@@ -55,6 +55,7 @@ from .sqlite_util import (
     _prepare_private_sqlite_file,
     _restrict_existing_sqlite_artifacts,
     _temporary_sqlite_busy_timeout,
+    guard_connection,
 )
 from .tokens import count_message_tokens
 
@@ -355,7 +356,7 @@ class MessageStore:
         self._init_db()
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = guard_connection(sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         if not self._is_memory_database:
@@ -1740,17 +1741,23 @@ class MessageStore:
     # -- Lifecycle ----------------------------------------------------------
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
-            # Graceful shutdown hygiene: checkpoint committed WAL frames before
-            # releasing the connection.  This does not run on crash/kill, and
-            # PASSIVE can leave frames behind when another reader is active.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass  # best-effort only; don't let this mask the real close()
-            conn.close()
-            self._conn = None
+        lock = getattr(self, "_write_lock", None)
+        if lock is None:  # __init__ failed before the lock existed: nothing was opened
+            return
+        # Same lock as the write paths; the guarded connection additionally serializes
+        # unlocked readers, so close never frees the connection under a live execute.
+        with lock:
+            conn = getattr(self, "_conn", None)
+            if conn:
+                # Graceful shutdown hygiene: checkpoint committed WAL frames before
+                # releasing the connection.  This does not run on crash/kill, and
+                # PASSIVE can leave frames behind when another reader is active.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass  # best-effort only; don't let this mask the real close()
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

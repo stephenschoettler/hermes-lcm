@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .sqlite_util import guard_connection
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
@@ -180,7 +181,7 @@ class SummaryDAG:
         return self._conn
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = guard_connection(sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.executescript("""
@@ -875,14 +876,18 @@ class SummaryDAG:
         )
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        lock = getattr(self, "_db_lock", None)
+        if lock is None:  # __init__ failed before the lock existed: nothing was opened
+            return
+        with lock:
+            conn = getattr(self, "_conn", None)
+            if conn:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
 
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
         try:

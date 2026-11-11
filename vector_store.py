@@ -35,7 +35,7 @@ from .db_bootstrap import (
     verify_chunk_schema,
     verify_embedding_schema,
 )
-from .sqlite_util import _is_sqlite_locked_error
+from .sqlite_util import _is_sqlite_locked_error, guard_connection
 
 logger = logging.getLogger(__name__)
 
@@ -373,12 +373,12 @@ class VectorStore:
         # data_version), defeating the cross-process cache invalidation. Write
         # atomicity is preserved via the explicit BEGIN IMMEDIATE in
         # _write_transaction.
-        self._conn = sqlite3.connect(
+        self._conn = guard_connection(sqlite3.connect(
             str(self.db_path),
             timeout=5.0,
             check_same_thread=False,
             isolation_level=None,
-        )
+        ))
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         self._conn.row_factory = sqlite3.Row
@@ -2942,14 +2942,18 @@ class VectorStore:
         ).fetchone()
 
     def close(self) -> None:
-        conn = getattr(self, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except sqlite3.Error:
-                pass
-            conn.close()
-            self._conn = None
+        lock = getattr(self, "_write_lock", None)
+        if lock is None:  # __init__ failed before the lock existed: nothing was opened
+            return
+        with lock:
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+                conn.close()
+                self._conn = None
         with self._cache_lock:
             self._matrix_cache.clear()
             self._chunk_matrix_cache.clear()
