@@ -6,6 +6,7 @@ same schema-version marker, PRAGMA settings, and FTS repair behavior.
 
 from __future__ import annotations
 
+import errno
 import json
 from functools import lru_cache
 import logging
@@ -16,8 +17,19 @@ import shutil
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from typing import Iterable, Sequence
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    _msvcrt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -2465,6 +2477,194 @@ def _integrity_check_interval_hours() -> float:
     return value
 
 
+class _FtsAdvisoryGate:
+    """In-process re-entrant mutex paired with thread-local nesting depth."""
+
+    def __init__(self) -> None:
+        self.rlock = threading.RLock()
+        self.state = threading.local()
+
+
+_fts_advisory_gates_lock = threading.Lock()
+_fts_advisory_gates: dict[str, _FtsAdvisoryGate] = {}
+
+
+def _fts_advisory_lock_path(db_path: str) -> str:
+    if not db_path or db_path == ":memory:":
+        return ""
+    if db_path.startswith("file:") and "mode=memory" in db_path.lower():
+        return ""
+    return f"{os.path.abspath(db_path)}-fts.lock"
+
+
+def _get_fts_advisory_gate(lock_path: str) -> _FtsAdvisoryGate:
+    norm_key = os.path.normcase(lock_path)
+    with _fts_advisory_gates_lock:
+        gate = _fts_advisory_gates.get(norm_key)
+        if gate is None:
+            gate = _FtsAdvisoryGate()
+            _fts_advisory_gates[norm_key] = gate
+        return gate
+
+
+def _try_lock_fts_fd(fd: int) -> bool | None:
+    """Attempt a non-blocking exclusive lock on ``fd``.
+
+    Returns ``True`` when acquired, ``False`` when held by another process, or
+    ``None`` when the OS/filesystem does not support advisory file locking.
+    """
+    if _fcntl is not None:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        except OSError as exc:
+            if exc.errno in (
+                errno.EACCES,
+                errno.EAGAIN,
+                getattr(errno, "EWOULDBLOCK", errno.EAGAIN),
+            ):
+                return False
+            return None
+    if _msvcrt is not None:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if exc.errno in (
+                errno.EACCES,
+                getattr(errno, "EDEADLK", errno.EACCES),
+            ) or getattr(exc, "winerror", None) in (33, 36):
+                return False
+            return None
+    return None
+
+
+def _unlock_fts_fd(fd: int) -> None:
+    try:
+        if _fcntl is not None:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        elif _msvcrt is not None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _fts_advisory_lock(db_path: str):
+    """Serialize FTS shadow-table writes across threads and OS processes.
+
+    Uses a dedicated ``<db>-fts.lock`` sidecar so closing its descriptor never
+    perturbs SQLite's own POSIX record locks on ``lcm.db``. Re-entrant within
+    the same thread and bounded by ``SQLITE_BUSY_TIMEOUT_MS``.
+    """
+    lock_path = _fts_advisory_lock_path(db_path)
+    if not lock_path:
+        yield
+        return
+
+    gate = _get_fts_advisory_gate(lock_path)
+    depth = getattr(gate.state, "depth", 0)
+    if depth > 0:
+        gate.state.depth = depth + 1
+        try:
+            yield
+        finally:
+            gate.state.depth = depth
+        return
+
+    budget_s = max(0.0, SQLITE_BUSY_TIMEOUT_MS / 1000.0)
+    deadline = time.monotonic() + budget_s
+    if budget_s <= 0.0:
+        acquired = gate.rlock.acquire(blocking=False)
+    else:
+        acquired = gate.rlock.acquire(blocking=True, timeout=budget_s)
+    if not acquired:
+        raise sqlite3.OperationalError("database is locked")
+
+    fd: int | None = None
+    fd_locked = False
+    try:
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+        except OSError as exc:
+            logger.debug(
+                "FTS advisory lock file unavailable for '%s' (%s); using in-process lock only",
+                db_path,
+                exc,
+            )
+            fd = None
+
+        if fd is not None:
+            delay_s = 0.005
+            while True:
+                status = _try_lock_fts_fd(fd)
+                if status is True:
+                    fd_locked = True
+                    break
+                if status is None:
+                    os.close(fd)
+                    fd = None
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    os.close(fd)
+                    fd = None
+                    raise sqlite3.OperationalError("database is locked")
+                time.sleep(min(delay_s, remaining))
+                delay_s = min(delay_s * 2.0, 0.05)
+
+        gate.state.depth = 1
+        try:
+            yield
+        finally:
+            gate.state.depth = 0
+    finally:
+        try:
+            if fd is not None:
+                try:
+                    if fd_locked:
+                        _unlock_fts_fd(fd)
+                finally:
+                    os.close(fd)
+        finally:
+            gate.rlock.release()
+
+
+def _metadata_table_exists(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
+    ).fetchone()
+    return row is not None
+
+
+@contextmanager
+def _fts_metadata_savepoint(conn: sqlite3.Connection):
+    """Isolate diagnostic/throttle metadata writes from any caller transaction."""
+    savepoint = quote_sql_identifier(f"lcm_fts_meta_{uuid.uuid4().hex}")
+    conn.execute(f"SAVEPOINT {savepoint}")
+    try:
+        yield
+    except BaseException:
+        try:
+            conn.execute(f"ROLLBACK TO {savepoint}")
+            conn.execute(f"RELEASE {savepoint}")
+        except sqlite3.DatabaseError:
+            pass
+        raise
+    else:
+        conn.execute(f"RELEASE {savepoint}")
+
+
 def _integrity_marker_key(spec: ExternalContentFtsSpec) -> str:
     return f"fts_integrity_checked_at:{spec.table_name}"
 
@@ -2472,11 +2672,20 @@ def _integrity_marker_key(spec: ExternalContentFtsSpec) -> str:
 def _load_integrity_checked_at(
     conn: sqlite3.Connection, spec: ExternalContentFtsSpec
 ) -> float | None:
-    ensure_metadata_table(conn)
-    row = conn.execute(
-        "SELECT value FROM metadata WHERE key = ?",
-        (_integrity_marker_key(spec),),
-    ).fetchone()
+    try:
+        if not _metadata_table_exists(conn):
+            return None
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (_integrity_marker_key(spec),),
+        ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to read FTS integrity check marker '%s': %s",
+            _integrity_marker_key(spec),
+            exc,
+        )
+        return None
     if not row or row[0] is None:
         return None
     try:
@@ -2488,16 +2697,25 @@ def _load_integrity_checked_at(
 def _record_integrity_checked(
     conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
 ) -> None:
-    ensure_metadata_table(conn)
     current = time.time() if now is None else now
-    conn.execute(
-        """
-        INSERT INTO metadata(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (_integrity_marker_key(spec), str(current)),
-    )
+    marker_key = _integrity_marker_key(spec)
+    try:
+        with _fts_metadata_savepoint(conn):
+            ensure_metadata_table(conn)
+            conn.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (marker_key, str(current)),
+            )
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to record FTS integrity check marker '%s': %s",
+            marker_key,
+            exc,
+        )
 
 
 def _should_run_integrity_check(
@@ -2564,22 +2782,53 @@ def _record_integrity_failed(
     detail: str,
     now: float | None = None,
 ) -> None:
-    ensure_metadata_table(conn)
     current = time.time() if now is None else now
+    failed_key = _integrity_failed_key(spec)
     payload = json.dumps({"at": current, "detail": str(detail)[:2000]})
-    conn.execute(
-        """
-        INSERT INTO metadata(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (_integrity_failed_key(spec), payload),
-    )
+    try:
+        with _fts_metadata_savepoint(conn):
+            ensure_metadata_table(conn)
+            conn.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (failed_key, payload),
+            )
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to record FTS integrity failure marker '%s' (scan detail: %s): %s",
+            failed_key,
+            detail,
+            exc,
+        )
 
 
 def _clear_integrity_failed(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
-    ensure_metadata_table(conn)
-    conn.execute("DELETE FROM metadata WHERE key = ?", (_integrity_failed_key(spec),))
+    failed_key = _integrity_failed_key(spec)
+    try:
+        if not _metadata_table_exists(conn):
+            return
+        present = conn.execute(
+            "SELECT 1 FROM metadata WHERE key = ?",
+            (failed_key,),
+        ).fetchone()
+        if present is None:
+            return
+        if conn.in_transaction:
+            with _fts_metadata_savepoint(conn):
+                conn.execute("DELETE FROM metadata WHERE key = ?", (failed_key,))
+        else:
+            with _fts_advisory_lock(_database_path_for_connection(conn)):
+                with _fts_metadata_savepoint(conn):
+                    conn.execute("DELETE FROM metadata WHERE key = ?", (failed_key,))
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to clear FTS integrity failure marker '%s': %s",
+            failed_key,
+            exc,
+        )
 
 
 def load_integrity_failed(
@@ -2587,11 +2836,21 @@ def load_integrity_failed(
 ) -> dict[str, object] | None:
     """Return ``{'at': float, 'detail': str}`` when a background scan flagged the
     index as corrupt, else ``None``. Used by ``/lcm doctor`` to surface the flag."""
-    ensure_metadata_table(conn)
-    row = conn.execute(
-        "SELECT value FROM metadata WHERE key = ?",
-        (_integrity_failed_key(spec),),
-    ).fetchone()
+    failed_key = _integrity_failed_key(spec)
+    try:
+        if not _metadata_table_exists(conn):
+            return None
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (failed_key,),
+        ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to read FTS integrity failure marker '%s': %s",
+            failed_key,
+            exc,
+        )
+        return None
     if not row or row[0] is None:
         return None
     try:
@@ -2606,11 +2865,21 @@ def load_integrity_failed(
 def _load_scan_started_at(
     conn: sqlite3.Connection, spec: ExternalContentFtsSpec
 ) -> float | None:
-    ensure_metadata_table(conn)
-    row = conn.execute(
-        "SELECT value FROM metadata WHERE key = ?",
-        (_integrity_scan_started_key(spec),),
-    ).fetchone()
+    started_key = _integrity_scan_started_key(spec)
+    try:
+        if not _metadata_table_exists(conn):
+            return None
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            (started_key,),
+        ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to read FTS scan-started marker '%s': %s",
+            started_key,
+            exc,
+        )
+        return None
     if not row or row[0] is None:
         return None
     try:
@@ -2622,15 +2891,24 @@ def _load_scan_started_at(
 def _record_scan_started(
     conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float
 ) -> None:
-    ensure_metadata_table(conn)
-    conn.execute(
-        """
-        INSERT INTO metadata(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (_integrity_scan_started_key(spec), str(now)),
-    )
+    started_key = _integrity_scan_started_key(spec)
+    try:
+        with _fts_metadata_savepoint(conn):
+            ensure_metadata_table(conn)
+            conn.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (started_key, str(now)),
+            )
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to record FTS scan-started marker '%s': %s",
+            started_key,
+            exc,
+        )
 
 
 def _clear_scan_started(
@@ -2639,16 +2917,26 @@ def _clear_scan_started(
     *,
     expected: float | None = None,
 ) -> None:
-    ensure_metadata_table(conn)
-    if expected is None:
-        conn.execute(
-            "DELETE FROM metadata WHERE key = ?", (_integrity_scan_started_key(spec),)
-        )
-    else:
-        # Only clear our own stamp so a newer scan's stamp survives.
-        conn.execute(
-            "DELETE FROM metadata WHERE key = ? AND value = ?",
-            (_integrity_scan_started_key(spec), str(expected)),
+    started_key = _integrity_scan_started_key(spec)
+    try:
+        if not _metadata_table_exists(conn):
+            return
+        with _fts_metadata_savepoint(conn):
+            if expected is None:
+                conn.execute(
+                    "DELETE FROM metadata WHERE key = ?", (started_key,)
+                )
+            else:
+                # Only clear our own stamp so a newer scan's stamp survives.
+                conn.execute(
+                    "DELETE FROM metadata WHERE key = ? AND value = ?",
+                    (started_key, str(expected)),
+                )
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "Failed to clear FTS scan-started marker '%s': %s",
+            started_key,
+            exc,
         )
 
 
@@ -2660,56 +2948,116 @@ def _run_background_integrity_scan(
     Opens its own read/write connection for the scan (the FTS5 integrity-check is
     issued as an INSERT command that rolls back inside a savepoint, so it never
     mutates data, but it does require a writable handle) and a separate brief
-    connection to stamp the result. On corruption it flags rather than rebuilds.
+    connection to stamp the result. Serialized via ``_fts_advisory_lock`` so
+    concurrent startup loads never race shadow-table writes. On corruption it
+    flags rather than rebuilds.
     """
     key = (db_path, spec.table_name)
     timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
     try:
-        scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-        try:
-            scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            # Persist the scan-started stamp on this DB so a crash mid-scan is
-            # detectable cross-process via the staleness window above.
-            _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
-            result = check_external_content_fts_integrity(scan_conn, spec)
-        finally:
-            scan_conn.close()
+        with _fts_advisory_lock(db_path):
+            scan_conn = sqlite3.connect(
+                db_path, timeout=timeout, check_same_thread=False
+            )
+            try:
+                scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                # Persist the scan-started stamp on this DB so a crash mid-scan is
+                # detectable cross-process via the staleness window above.
+                try:
+                    scan_conn.execute("BEGIN IMMEDIATE")
+                    existing_started = _load_scan_started_at(scan_conn, spec)
+                    if existing_started is None or existing_started < started_at:
+                        _record_scan_started(scan_conn, spec, now=started_at)
+                    scan_conn.commit()
+                except sqlite3.DatabaseError as exc:
+                    if scan_conn.in_transaction:
+                        try:
+                            scan_conn.rollback()
+                        except sqlite3.DatabaseError:
+                            pass
+                    logger.warning(
+                        "Background FTS scan for '%s' could not persist start marker: %s",
+                        spec.table_name,
+                        exc,
+                    )
+                result = check_external_content_fts_integrity(scan_conn, spec)
+            finally:
+                scan_conn.close()
 
-        meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-        try:
-            meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             status = result.get("status")
-            if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
-            elif status == "fail":
-                _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
-                )
+            detail = result.get("detail", "")
+            if status == "fail":
+                # Emit the operator-facing corruption warning before touching
+                # metadata so a damaged metadata table/index can never silence it.
                 logger.warning(
                     "Background FTS integrity-check found corruption in '%s': %s. "
                     "Run `/lcm doctor repair apply` to rebuild the index.",
                     spec.table_name,
-                    result.get("detail", ""),
+                    detail,
                 )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
-        finally:
-            meta_conn.close()
+
+            try:
+                meta_conn = sqlite3.connect(
+                    db_path, timeout=timeout, check_same_thread=False
+                )
+                try:
+                    meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                    meta_conn.execute("BEGIN IMMEDIATE")
+                    if status == "pass":
+                        _record_integrity_checked(meta_conn, spec, now=started_at)
+                        _clear_integrity_failed(meta_conn, spec)
+                    elif status == "fail":
+                        _record_integrity_failed(
+                            meta_conn, spec, detail=detail, now=started_at
+                        )
+                    # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+                    # so the next bind retries; do not stamp or flag.
+                    _clear_scan_started(meta_conn, spec, expected=started_at)
+                    meta_conn.commit()
+                except sqlite3.DatabaseError as exc:
+                    if meta_conn.in_transaction:
+                        try:
+                            meta_conn.rollback()
+                        except sqlite3.DatabaseError:
+                            pass
+                    logger.warning(
+                        "Background FTS scan for '%s' could not persist metadata state: %s",
+                        spec.table_name,
+                        exc,
+                    )
+                finally:
+                    meta_conn.close()
+            except sqlite3.DatabaseError as exc:
+                logger.warning(
+                    "Background FTS scan for '%s' could not open metadata connection: %s",
+                    spec.table_name,
+                    exc,
+                )
+    except sqlite3.OperationalError as exc:
+        if _is_sqlite_lock_error(exc):
+            logger.debug(
+                "Background FTS integrity-check for '%s' deferred due to lock contention: %s",
+                spec.table_name,
+                exc,
+            )
+        else:  # pragma: no cover - defensive
+            logger.exception(
+                "Background FTS integrity-check for '%s' failed", spec.table_name
+            )
     except Exception:  # pragma: no cover - defensive
         logger.exception(
             "Background FTS integrity-check for '%s' failed", spec.table_name
         )
         try:
-            cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-            try:
-                _clear_scan_started(cleanup, spec, expected=started_at)
-                cleanup.commit()
-            finally:
-                cleanup.close()
+            with _fts_advisory_lock(db_path):
+                cleanup = sqlite3.connect(
+                    db_path, timeout=timeout, check_same_thread=False
+                )
+                try:
+                    _clear_scan_started(cleanup, spec, expected=started_at)
+                    cleanup.commit()
+                finally:
+                    cleanup.close()
         except sqlite3.DatabaseError:
             pass
     finally:
@@ -2719,7 +3067,11 @@ def _run_background_integrity_scan(
 
 
 def _dispatch_background_integrity_scan(
-    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    now: float | None = None,
+    respect_throttle: bool = False,
 ) -> bool:
     """Try to run the deep FTS integrity-check on a daemon thread.
 
@@ -2740,30 +3092,58 @@ def _dispatch_background_integrity_scan(
             return True
         started = _load_scan_started_at(conn, spec)
         if started is not None and (current - started) < INTEGRITY_SCAN_STALE_SECONDS:
-            # A recent scan (this or another process) owns this table; let it
-            # stamp the marker. The bind returns fast without a duplicate scan.
+            # Fast read-only check: an already-committed scan in another process
+            # owns this table, so return without waiting on the FTS advisory lock.
             return True
-        # Durably claim the scan cross-process BEFORE starting the thread. The
-        # spawned thread stamps ``scan_started_at`` on its own connection, but
-        # ``thread.start()`` returns before that stamp is committed — a second
-        # process racing ``ensure_external_content_fts`` in that window would read
-        # no stamp and dispatch a duplicate deep scan (F6). Writing the stamp here
-        # under BEGIN IMMEDIATE closes that window; best-effort (a transient lock
-        # just falls back to the thread's own stamp).
+
+        # Atomically recheck and claim ``scan_started_at`` under the cross-process
+        # FTS advisory lock + BEGIN IMMEDIATE so simultaneous plugin loads cannot
+        # both observe an empty stamp and spawn concurrent deep scans.
         claim_timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
         try:
-            claim_conn = sqlite3.connect(
-                db_path, timeout=claim_timeout, check_same_thread=False
+            with _fts_advisory_lock(db_path):
+                claim_conn = sqlite3.connect(
+                    db_path, timeout=claim_timeout, check_same_thread=False
+                )
+                try:
+                    claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+                    claim_conn.execute("BEGIN IMMEDIATE")
+                    if respect_throttle and not _should_run_integrity_check(
+                        claim_conn, spec, now=current
+                    ):
+                        claim_conn.rollback()
+                        return True
+                    started = _load_scan_started_at(claim_conn, spec)
+                    if (
+                        started is not None
+                        and (current - started) < INTEGRITY_SCAN_STALE_SECONDS
+                    ):
+                        claim_conn.rollback()
+                        return True
+                    _record_scan_started(claim_conn, spec, now=current)
+                    claim_conn.commit()
+                except BaseException:
+                    if claim_conn.in_transaction:
+                        try:
+                            claim_conn.rollback()
+                        except sqlite3.DatabaseError:
+                            pass
+                    raise
+                finally:
+                    claim_conn.close()
+        except sqlite3.DatabaseError as exc:
+            if _is_sqlite_lock_error(exc):
+                logger.debug(
+                    "Skipping duplicate background FTS scan dispatch for '%s' under lock contention: %s",
+                    spec.table_name,
+                    exc,
+                )
+                return True
+            logger.warning(
+                "Could not persist FTS scan claim for '%s': %s",
+                spec.table_name,
+                exc,
             )
-            try:
-                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
-            finally:
-                claim_conn.close()
-        except sqlite3.DatabaseError:
-            pass
 
         thread = threading.Thread(
             target=_run_background_integrity_scan,
@@ -2809,7 +3189,9 @@ def _fts_needs_rebuild(
     # corruption via metadata rather than rebuilding here. The kill-switch and
     # non-file DBs fall back to the exact old synchronous behavior below.
     if throttle and _background_integrity_enabled():
-        if _dispatch_background_integrity_scan(conn, spec, now=now):
+        if _dispatch_background_integrity_scan(
+            conn, spec, now=now, respect_throttle=True
+        ):
             return False
     result = check_external_content_fts_integrity(conn, spec)
     if result["status"] == "pass":
@@ -2837,20 +3219,24 @@ def _is_fts_corruption_error(detail: str) -> bool:
     return any(signature in lowered for signature in _FTS_CORRUPTION_SIGNATURES)
 
 
-def check_external_content_fts_integrity(
+def _classify_fts_integrity_error(exc: sqlite3.DatabaseError) -> dict[str, str]:
+    detail = str(exc)
+    lowered = detail.lower()
+    if "readonly" in lowered or "read-only" in lowered:
+        return {"status": "unchecked", "detail": detail}
+    if _is_fts_corruption_error(detail):
+        return {"status": "fail", "detail": detail}
+    # A transient lock/busy/timeout — or any other non-corruption error — must
+    # NOT be reported as corruption: the background scan would otherwise wedge
+    # a false ``fts_integrity_failed`` flag (F3). Only an actual corruption
+    # signature (malformed / disk image / not-a-database) fails the check.
+    return {"status": "unchecked", "detail": detail}
+
+
+def _run_fts_integrity_savepoint(
     conn: sqlite3.Connection,
     spec: ExternalContentFtsSpec,
 ) -> dict[str, str]:
-    """Run SQLite's FTS5 integrity-check for an external-content table.
-
-    FTS5 exposes this as a special INSERT command. Wrap it in a savepoint and
-    roll it back so diagnostics can verify the index without leaving any state
-    behind on the shared connection.
-    """
-
-    if _fts_needs_rebuild_structural(conn, spec):
-        return {"status": "fail", "detail": "structural repair needed"}
-
     savepoint = f"lcm_fts_integrity_{spec.table_name}"
     savepoint_sql = quote_sql_identifier(savepoint)
     try:
@@ -2864,17 +3250,7 @@ def check_external_content_fts_integrity(
             conn.execute(f"RELEASE {savepoint_sql}")
         except sqlite3.DatabaseError:
             pass
-        detail = str(exc)
-        lowered = detail.lower()
-        if "readonly" in lowered or "read-only" in lowered:
-            return {"status": "unchecked", "detail": detail}
-        if _is_fts_corruption_error(detail):
-            return {"status": "fail", "detail": detail}
-        # A transient lock/busy/timeout — or any other non-corruption error — must
-        # NOT be reported as corruption: the background scan would otherwise wedge
-        # a false ``fts_integrity_failed`` flag (F3). Only an actual corruption
-        # signature (malformed / disk image / not-a-database) fails the check.
-        return {"status": "unchecked", "detail": detail}
+        return _classify_fts_integrity_error(exc)
 
     try:
         conn.execute(f"ROLLBACK TO {savepoint_sql}")
@@ -2883,6 +3259,51 @@ def check_external_content_fts_integrity(
         return {"status": "fail", "detail": str(exc)}
 
     return {"status": "pass", "detail": "ok"}
+
+
+def check_external_content_fts_integrity(
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+) -> dict[str, str]:
+    """Run SQLite's FTS5 integrity-check for an external-content table.
+
+    FTS5 exposes ``'integrity-check'`` as a special writable INSERT command that
+    touches shadow tables. When the connection does not already own a
+    transaction, serialize the check behind ``_fts_advisory_lock`` and
+    ``BEGIN IMMEDIATE`` before entering the rolled-back savepoint so concurrent
+    processes/threads never race FTS5 shadow-table writes.
+    """
+    if _fts_needs_rebuild_structural(conn, spec):
+        return {"status": "fail", "detail": "structural repair needed"}
+
+    if conn.in_transaction:
+        return _run_fts_integrity_savepoint(conn, spec)
+
+    try:
+        with _fts_advisory_lock(_database_path_for_connection(conn)):
+            previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()
+            previous_timeout_ms = (
+                int(previous_timeout[0])
+                if previous_timeout and previous_timeout[0] is not None
+                else 0
+            )
+            conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if _fts_needs_rebuild_structural(conn, spec):
+                        return {"status": "fail", "detail": "structural repair needed"}
+                    return _run_fts_integrity_savepoint(conn, spec)
+                finally:
+                    if conn.in_transaction:
+                        try:
+                            conn.rollback()
+                        except sqlite3.DatabaseError:
+                            pass
+            finally:
+                conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+    except sqlite3.DatabaseError as exc:
+        return _classify_fts_integrity_error(exc)
 
 
 def _drop_fts_table(conn: sqlite3.Connection, table_name: str) -> None:
@@ -2948,10 +3369,10 @@ def _fts_repair_ownership(conn: sqlite3.Connection):
     """Own the short FTS structural-repair transaction.
 
     Fresh startup connections are normally outside a transaction, so
-    ``BEGIN IMMEDIATE`` serializes the structural recheck and all FTS DDL
-    across independent processes. A caller that already owns a transaction
-    gets a savepoint instead; committing that caller-owned transaction remains
-    the historical behavior of the repair helper.
+    ``_fts_advisory_lock`` + ``BEGIN IMMEDIATE`` serialize the structural
+    recheck and all FTS DDL across independent processes. A caller that already
+    owns a transaction gets a savepoint instead; committing that caller-owned
+    transaction remains the historical behavior of the repair helper.
     """
     if conn.in_transaction:
         savepoint = quote_sql_identifier("lcm_fts_repair_ownership")
@@ -2968,26 +3389,27 @@ def _fts_repair_ownership(conn: sqlite3.Connection):
             conn.execute(f"RELEASE {savepoint}")
         return
 
-    previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()
-    previous_timeout_ms = int(previous_timeout[0]) if previous_timeout else 0
-    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    try:
-        # A loser waits for the winner, then takes a current write snapshot and
-        # rechecks the complete FTS state before deciding whether to repair.
-        conn.execute("BEGIN IMMEDIATE")
+    with _fts_advisory_lock(_database_path_for_connection(conn)):
+        previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()
+        previous_timeout_ms = int(previous_timeout[0]) if previous_timeout else 0
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
         try:
-            yield True
-        except BaseException:
-            conn.rollback()
-            raise
-        else:
+            # A loser waits for the winner, then takes a current write snapshot and
+            # rechecks the complete FTS state before deciding whether to repair.
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.commit()
+                yield True
             except BaseException:
                 conn.rollback()
                 raise
-    finally:
-        conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+            else:
+                try:
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
 
 
 def repair_external_content_fts(
@@ -2999,6 +3421,7 @@ def repair_external_content_fts(
 ) -> dict[str, bool]:
     rebuilt = False
     degraded = False
+    caller_in_transaction = conn.in_transaction
     fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec)
     deep_repair_needed = False
     if not fts_structure_needs_rebuild or not throttle:
@@ -3013,7 +3436,21 @@ def repair_external_content_fts(
             # any observed trigger repair must pass through write ownership below.
             if not _fts_missing_triggers(conn, spec):
                 _clear_integrity_failed(conn, spec)
-                conn.commit()
+                if caller_in_transaction:
+                    conn.commit()
+                elif conn.in_transaction:
+                    try:
+                        conn.commit()
+                    except sqlite3.DatabaseError as exc:
+                        try:
+                            conn.rollback()
+                        except sqlite3.DatabaseError:
+                            pass
+                        logger.warning(
+                            "Failed to commit FTS failure-marker cleanup for '%s': %s",
+                            spec.table_name,
+                            exc,
+                        )
                 return {
                     "rebuilt": False,
                     "degraded": False,
