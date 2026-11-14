@@ -1239,3 +1239,464 @@ def test_message_store_refuses_newer_schema_before_configuring_connection(tmp_pa
     with pytest.raises(db_bootstrap.SchemaVersionTooNewError):
         MessageStore(db_path)
     assert called is False
+
+
+class _CorruptMetadataConn:
+    """Wraps a sqlite3.Connection and raises DatabaseError on FTS metadata keys."""
+
+    def __init__(self, real: sqlite3.Connection, *, fail_keys: tuple[str, ...]):
+        self._real = real
+        self._fail_keys = fail_keys
+
+    def _touches_corrupt_key(self, sql: str, params) -> bool:
+        lowered = sql.lower()
+        if "metadata" not in lowered:
+            return False
+        values = params if isinstance(params, (tuple, list)) else ()
+        for item in values:
+            text = str(item)
+            if any(prefix in text for prefix in self._fail_keys):
+                return True
+        return any(prefix in sql for prefix in self._fail_keys)
+
+    def execute(self, sql: str, parameters=(), /):
+        if self._touches_corrupt_key(sql, parameters):
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return self._real.execute(sql, parameters)
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+def test_failure_recorder_database_error_is_isolated_and_preserves_caller_transaction(
+    tmp_path, caplog
+):
+    """Issue #704: FTS diagnostic/state metadata helpers must isolate DatabaseError."""
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO metadata(key, value) VALUES('caller-tx', 'intact')")
+    wrapped = _CorruptMetadataConn(
+        conn,
+        fail_keys=(
+            "fts_integrity_failed:",
+            "fts_integrity_checked_at:",
+            "fts_integrity_scan_started_at:",
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger=db_bootstrap.logger.name):
+        db_bootstrap._record_integrity_failed(
+            wrapped, spec, detail="database disk image is malformed"
+        )
+        db_bootstrap._clear_integrity_failed(wrapped, spec)
+        assert db_bootstrap.load_integrity_failed(wrapped, spec) is None
+        db_bootstrap._record_integrity_checked(wrapped, spec)
+        assert db_bootstrap._load_integrity_checked_at(wrapped, spec) is None
+        db_bootstrap._record_scan_started(wrapped, spec, now=time.time())
+        assert db_bootstrap._load_scan_started_at(wrapped, spec) is None
+        db_bootstrap._clear_scan_started(wrapped, spec, expected=1.0)
+
+    assert conn.in_transaction is True
+    assert (
+        conn.execute("SELECT value FROM metadata WHERE key='caller-tx'").fetchone()[0]
+        == "intact"
+    )
+    assert any("fts_integrity_failed" in rec.message or "messages_fts" in rec.message for rec in caplog.records)
+    conn.rollback()
+    conn.close()
+
+
+def test_background_scan_logs_corruption_and_survives_malformed_metadata_recorder(
+    tmp_path, monkeypatch, caplog
+):
+    """Issue #704: _record_integrity_failed DatabaseError must not crash the scan or suppress warnings."""
+    monkeypatch.setenv(INTERVAL_ENV, "24")
+    monkeypatch.delenv("LCM_FTS_INTEGRITY_BACKGROUND", raising=False)
+    conn = _make_conn(tmp_path)
+    spec = _spec()
+    ensure_external_content_fts(conn, spec)
+
+    # Induce same-row-count token drift so FTS5 integrity-check reports failure.
+    conn.execute(
+        "UPDATE messages SET content = 'mutated content bypassing fts trigger' WHERE store_id = 1"
+    )
+    conn.commit()
+    _age_marker(conn)
+    conn.close()
+
+    real_connect = sqlite3.connect
+
+    def connect_with_corrupt_failed_key(*args, **kwargs):
+        raw = real_connect(*args, **kwargs)
+        return _CorruptMetadataConn(raw, fail_keys=("fts_integrity_failed:",))
+
+    monkeypatch.setattr(db_bootstrap.sqlite3, "connect", connect_with_corrupt_failed_key)
+
+    started_at = time.time()
+    verify_init = real_connect(_db_file(tmp_path))
+    try:
+        db_bootstrap._record_scan_started(verify_init, spec, now=started_at)
+        verify_init.commit()
+    finally:
+        verify_init.close()
+
+    with caplog.at_level("WARNING", logger=db_bootstrap.logger.name):
+        db_bootstrap._run_background_integrity_scan(_db_file(tmp_path), spec, started_at)
+
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert any(
+        "Background FTS integrity-check found corruption in 'messages_fts'" in msg
+        for msg in messages
+    ), messages
+    assert not any(rec.levelname == "ERROR" for rec in caplog.records), messages
+
+    verify = real_connect(_db_file(tmp_path))
+    try:
+        assert db_bootstrap._load_scan_started_at(verify, spec) is None
+    finally:
+        verify.close()
+
+
+def test_damaged_fts_metadata_rows_never_latch_permanent_plugin_load_failure(
+    tmp_path, monkeypatch
+):
+    """Issue #704: damaged metadata index entries for FTS markers must never block startup."""
+    from hermes_lcm.dag import SummaryDAG
+    from hermes_lcm.store import MessageStore, build_message_fts_spec
+
+    db_path = tmp_path / "latched-metadata.db"
+    seed_store = MessageStore(db_path)
+    seed_dag = SummaryDAG(db_path)
+    seed_store.append("s1", {"role": "user", "content": "searchable alpha beta"})
+    seed_store.commit()
+    seed_dag.close()
+    seed_store.close()
+
+    real_connect = sqlite3.connect
+
+    def connect_with_damaged_fts_metadata(*args, **kwargs):
+        raw = real_connect(*args, **kwargs)
+        return _CorruptMetadataConn(
+            raw,
+            fail_keys=(
+                "fts_integrity_failed:",
+                "fts_integrity_checked_at:",
+                "fts_integrity_scan_started_at:",
+            ),
+        )
+
+    monkeypatch.setattr(db_bootstrap.sqlite3, "connect", connect_with_damaged_fts_metadata)
+    monkeypatch.setattr("hermes_lcm.store.sqlite3.connect", connect_with_damaged_fts_metadata)
+    monkeypatch.setattr("hermes_lcm.dag.sqlite3.connect", connect_with_damaged_fts_metadata)
+
+    # Repeated reloads in both background and synchronous modes — plus explicit
+    # repair — must succeed without raising sqlite3.DatabaseError.
+    for background_flag in ("true", "false"):
+        monkeypatch.setenv("LCM_FTS_INTEGRITY_BACKGROUND", background_flag)
+        for _ in range(2):
+            store = MessageStore(db_path)
+            dag = SummaryDAG(db_path)
+            try:
+                db_bootstrap.join_background_integrity_scans(timeout=15)
+                assert store.connection is not None
+                repair_res = db_bootstrap.repair_external_content_fts(
+                    store.connection, build_message_fts_spec()
+                )
+                assert repair_res["degraded"] is False
+                hits = store.search("searchable", limit=5)
+                assert len(hits) == 1
+            finally:
+                dag.close()
+                store.close()
+
+
+def test_integrity_check_acquires_immediate_write_ownership_and_serializes_calls(
+    tmp_path, monkeypatch
+):
+    """Issue #704: FTS5 integrity-check is a write operation and must serialize under ownership."""
+    from hermes_lcm.dag import SummaryDAG, build_nodes_fts_spec
+    from hermes_lcm.store import MessageStore, build_message_fts_spec
+
+    db_path = tmp_path / "serialize-check.db"
+    store = MessageStore(db_path)
+    dag = SummaryDAG(db_path)
+    store.append("s1", {"role": "user", "content": "alpha token"})
+    store.commit()
+
+    # 1. Verify standalone connection runs integrity-check inside BEGIN IMMEDIATE
+    #    and leaves conn.in_transaction False with busy_timeout restored.
+    probe = sqlite3.connect(str(db_path))
+    try:
+        probe.execute("PRAGMA busy_timeout=4321")
+        observed_in_tx: list[bool] = []
+        observed_begin_immediate = False
+
+        def trace_sql(sql: str) -> None:
+            nonlocal observed_begin_immediate
+            upper = sql.lstrip().upper()
+            if upper.startswith("BEGIN IMMEDIATE"):
+                observed_begin_immediate = True
+            if "VALUES('INTEGRITY-CHECK'" in upper:
+                observed_in_tx.append(probe.in_transaction)
+
+        probe.set_trace_callback(trace_sql)
+        try:
+            res = db_bootstrap.check_external_content_fts_integrity(
+                probe, build_message_fts_spec()
+            )
+        finally:
+            probe.set_trace_callback(None)
+
+        assert res["status"] == "pass"
+        assert observed_begin_immediate is True
+        assert observed_in_tx == [True]
+        assert probe.in_transaction is False
+        assert probe.execute("PRAGMA busy_timeout").fetchone()[0] == 4321
+    finally:
+        probe.close()
+
+    # 2. Verify concurrent checks on separate connections (including messages_fts +
+    #    nodes_fts on the same DB) never overlap in the FTS integrity-check command.
+    dag.close()
+    store.close()
+
+    active = 0
+    max_active = 0
+    state_lock = threading.Lock()
+    entered_first = threading.Event()
+    errors: list[BaseException] = []
+
+    class _SlowCheckConn:
+        def __init__(self, real: sqlite3.Connection):
+            self._real = real
+
+        def execute(self, sql: str, *args):
+            nonlocal active, max_active
+            if "VALUES('integrity-check'" in sql:
+                with state_lock:
+                    active += 1
+                    if active > max_active:
+                        max_active = active
+                entered_first.set()
+                try:
+                    time.sleep(0.08)
+                    return self._real.execute(sql, *args)
+                finally:
+                    with state_lock:
+                        active -= 1
+            return self._real.execute(sql, *args)
+
+        def __getattr__(self, name: str):
+            return getattr(self._real, name)
+
+    def worker(spec_obj):
+        c = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
+        try:
+            out = db_bootstrap.check_external_content_fts_integrity(
+                _SlowCheckConn(c), spec_obj
+            )
+            assert out["status"] == "pass"
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+        finally:
+            c.close()
+
+    threads = [
+        threading.Thread(target=worker, args=(build_message_fts_spec(),)),
+        threading.Thread(target=worker, args=(build_nodes_fts_spec(),)),
+        threading.Thread(target=worker, args=(build_message_fts_spec(),)),
+    ]
+    for t in threads:
+        t.start()
+        if t is threads[0]:
+            entered_first.wait(timeout=5)
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    assert max_active == 1
+
+
+def _spawn_due_fts_scan_worker(db_path, start_barrier, queue, worker):
+    """Simulate concurrent multi-process plugin startup when FTS deep scans are due."""
+    store = None
+    dag = None
+    try:
+        import os as _os
+        from hermes_lcm import db_bootstrap as worker_bootstrap
+        from hermes_lcm.dag import SummaryDAG
+        from hermes_lcm.store import MessageStore
+
+        _os.environ[INTERVAL_ENV] = "24"
+        _os.environ.pop("LCM_FTS_INTEGRITY_BACKGROUND", None)
+
+        scanned_tables: list[tuple[str, float, float]] = []
+        real_savepoint = worker_bootstrap._run_fts_integrity_savepoint
+
+        def timed_savepoint(conn, spec):
+            t0 = time.monotonic()
+            time.sleep(0.06)
+            res = real_savepoint(conn, spec)
+            t1 = time.monotonic()
+            scanned_tables.append((spec.table_name, t0, t1))
+            return res
+
+        worker_bootstrap._run_fts_integrity_savepoint = timed_savepoint
+        start_barrier.wait(timeout=30)
+
+        store = MessageStore(db_path)
+        dag = SummaryDAG(db_path)
+        store.append_batch(
+            f"due-scan-{worker}",
+            [{"role": "user", "content": f"duescanworker{worker} msg{i}"} for i in range(2)],
+            [1, 1],
+            source="due-scan-regression",
+            conversation_id=f"conv-{worker}",
+        )
+        worker_bootstrap.join_background_integrity_scans(timeout=30)
+        queue.put({"ok": True, "worker": worker, "scans": scanned_tables})
+    except BaseException as exc:  # pragma: no cover
+        queue.put(
+            {
+                "ok": False,
+                "worker": worker,
+                "error": repr(exc),
+                "trace": traceback.format_exc(),
+            }
+        )
+    finally:
+        if dag is not None:
+            dag.close()
+        if store is not None:
+            store.close()
+
+
+def _run_spawn_due_fts_scan_probe(db_path):
+    workers = 4
+    ctx = mp.get_context("spawn")
+    start_barrier = ctx.Barrier(workers + 1)
+    queue = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_spawn_due_fts_scan_worker,
+            args=(db_path, start_barrier, queue, worker),
+        )
+        for worker in range(workers)
+    ]
+    started = []
+    results = []
+    deadline = time.monotonic() + 90
+    try:
+        for p in processes:
+            p.start()
+            started.append(p)
+        start_barrier.wait(timeout=30)
+        while len(results) < workers:
+            remaining = max(0.1, deadline - time.monotonic())
+            results.append(queue.get(timeout=remaining))
+    finally:
+        for p in started:
+            p.join(timeout=10)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+        queue.close()
+        queue.join_thread()
+
+    return {
+        "results": results,
+        "exitcodes": [p.exitcode for p in started],
+    }
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["--spawn-due-fts-scans"]:
+    print(json.dumps(_run_spawn_due_fts_scan_probe(sys.argv[2])))
+    raise SystemExit(0)
+
+
+def test_spawned_concurrent_startup_deduplicates_and_serializes_due_fts_scans(tmp_path):
+    """Issue #704: simultaneous plugin loads do not race FTS5 shadow-table scans."""
+    from hermes_lcm.dag import SummaryDAG, SummaryNode, build_nodes_fts_spec
+    from hermes_lcm.store import MessageStore, build_message_fts_spec
+
+    db_path = str(tmp_path / "spawn-due-fts.db")
+    seed_store = MessageStore(db_path)
+    seed_dag = SummaryDAG(db_path)
+    try:
+        seed_store.append_batch(
+            "seed",
+            [{"role": "user", "content": f"seed message {i}"} for i in range(6)],
+            [1] * 6,
+            source="seed",
+            conversation_id="seed-conv",
+        )
+        seed_dag.add_node(
+            SummaryNode(
+                session_id="seed",
+                depth=0,
+                summary="seed summary node",
+                token_count=3,
+                source_token_count=6,
+                source_ids=[1, 2],
+                source_type="messages",
+                created_at=time.time(),
+            )
+        )
+        stale_ts = str(time.time() - 100 * 3600)
+        conn = seed_store.connection
+        assert conn is not None
+        for spec in (build_message_fts_spec(), build_nodes_fts_spec()):
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (db_bootstrap._integrity_marker_key(spec), stale_ts),
+            )
+        conn.commit()
+    finally:
+        seed_dag.close()
+        seed_store.close()
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--spawn-due-fts-scans",
+            db_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    probe = json.loads(completed.stdout)
+    results = probe["results"]
+    assert all(r["ok"] for r in results), results
+    assert all(code == 0 for code in probe["exitcodes"]), probe["exitcodes"]
+
+    all_scans = [scan for r in results for scan in r["scans"]]
+    msg_scans = [s for s in all_scans if s[0] == "messages_fts"]
+    node_scans = [s for s in all_scans if s[0] == "nodes_fts"]
+    assert len(msg_scans) == 1, f"expected 1 messages_fts scan, got {msg_scans!r}"
+    assert len(node_scans) == 1, f"expected 1 nodes_fts scan, got {node_scans!r}"
+
+    # Even across distinct FTS tables on the same DB, scans must not overlap.
+    ordered = sorted(all_scans, key=lambda item: item[1])
+    for prev, curr in zip(ordered, ordered[1:]):
+        assert prev[2] <= curr[1] + 1e-6, f"overlapping FTS scans: {ordered!r}"
+
+    verify_store = MessageStore(db_path)
+    verify_dag = SummaryDAG(db_path)
+    try:
+        conn = verify_store.connection
+        assert conn is not None
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        for spec in (build_message_fts_spec(), build_nodes_fts_spec()):
+            assert db_bootstrap.check_external_content_fts_integrity(conn, spec)["status"] == "pass"
+            assert db_bootstrap.load_integrity_failed(conn, spec) is None
+    finally:
+        verify_dag.close()
+        verify_store.close()
