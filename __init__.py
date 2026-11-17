@@ -365,6 +365,7 @@ def register(ctx):
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
     from .schemas import (
+        is_tool_enabled,
         LCM_GREP,
         LCM_RECALL,
         LCM_QUERY_STATE,
@@ -497,6 +498,8 @@ def register(ctx):
     register_tool = getattr(ctx, "register_tool", None)
     if callable(register_tool) and _host_forwards_registered_tool_messages(ctx):
         for name, schema, emoji in _TOOLS:
+            if not is_tool_enabled(name, engine._config):
+                continue
             try:
                 register_tool(
                     name=name,

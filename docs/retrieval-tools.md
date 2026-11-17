@@ -41,6 +41,11 @@ is the active context engine.
 | `lcm_inspect` | Read-only operator inventory for current-session lineage, message/frontier metadata, fresh tail, externalized refs/readability, compaction skip/no-op reasons, and matched ignore/stateless patterns. It returns metadata only; use `lcm_load_session`/`lcm_expand` when you need content. |
 | `lcm_doctor` | Run database, FTS, lifecycle, config, and context-pressure diagnostics. |
 
+`lcm_retrieve` is advertised only when `LCM_ADAPTIVE_RETRIEVAL_ENABLED=true`;
+`lcm_query_state` is advertised only when `LCM_ASSERTIONS_ENABLED=true`.
+Both plugin-registry and context-engine exposure use the resolved engine config.
+The other tools remain available with default configuration.
+
 ### Retrieval contract
 
 LCM retrieval tools default to current-session scope. `lcm_grep` accepts

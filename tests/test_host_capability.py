@@ -4,15 +4,15 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 EXPECTED_LCM_TOOLS = {
     "lcm_grep",
     "lcm_recall",
-    "lcm_query_state",
     "lcm_compute",
     "lcm_compile_evidence",
     "lcm_evidence_pack",
-    "lcm_retrieve",
     "lcm_recent",
     "lcm_load_session",
     "lcm_describe",
@@ -22,6 +22,13 @@ EXPECTED_LCM_TOOLS = {
     "lcm_inspect",
     "lcm_doctor",
 }
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("LCM_ASSERTIONS_ENABLED", "false")
+    monkeypatch.setenv("LCM_ADAPTIVE_RETRIEVAL_ENABLED", "false")
 
 
 def _load_plugin_module(name: str):
@@ -198,3 +205,53 @@ class TestHermesAgentRegression:
 
         assert isinstance(result, str)
         assert len(result) > 0
+
+
+@pytest.mark.parametrize("assertions_enabled", [False, True])
+@pytest.mark.parametrize("adaptive_enabled", [False, True])
+def test_feature_gates_match_both_paths_and_preserve_schema_bytes(
+    assertions_enabled, adaptive_enabled, monkeypatch,
+):
+    import json
+
+    module = _load_plugin_module("hermes_lcm_feature_gates")
+    monkeypatch.setenv("LCM_ASSERTIONS_ENABLED", str(assertions_enabled))
+    monkeypatch.setenv("LCM_ADAPTIVE_RETRIEVAL_ENABLED", str(adaptive_enabled))
+    registered = []
+
+    class Ctx:
+        context_engine_tool_handlers_receive_messages = True
+
+        def register_context_engine(self, engine):
+            self.engine = engine
+            # Neither exposure path may re-read env after config resolution.
+            monkeypatch.setenv("LCM_ASSERTIONS_ENABLED", str(not assertions_enabled))
+            monkeypatch.setenv("LCM_ADAPTIVE_RETRIEVAL_ENABLED", str(not adaptive_enabled))
+
+        def register_tool(self, *, schema, **kwargs):
+            registered.append(schema)
+
+    ctx = Ctx()
+    module.register(ctx)
+    try:
+        schemas = sys.modules[f"{module.__name__}.schemas"]
+        # Original public order, independent of the shared gate implementation.
+        original = [getattr(schemas, name) for name in (
+            "LCM_GREP", "LCM_RECALL", "LCM_QUERY_STATE", "LCM_COMPUTE",
+            "LCM_COMPILE_EVIDENCE", "LCM_EVIDENCE_PACK", "LCM_RETRIEVE",
+            "LCM_RECENT", "LCM_LOAD_SESSION", "LCM_DESCRIBE", "LCM_EXPAND",
+            "LCM_EXPAND_QUERY", "LCM_STATUS", "LCM_INSPECT", "LCM_DOCTOR",
+        )]
+        hidden = set()
+        if not assertions_enabled:
+            hidden.add("lcm_query_state")
+        if not adaptive_enabled:
+            hidden.add("lcm_retrieve")
+        expected = [schema for schema in original if schema["name"] not in hidden]
+        expected_bytes = json.dumps(expected).encode("utf-8")
+        assert json.dumps(registered).encode("utf-8") == expected_bytes
+        assert json.dumps(ctx.engine.get_tool_schemas()).encode("utf-8") == expected_bytes
+        for name in hidden:
+            assert name not in module.get_recall_policy()
+    finally:
+        ctx.engine.shutdown()
