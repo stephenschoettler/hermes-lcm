@@ -90,6 +90,7 @@ from .assertion_store import AssertionStore, SourceSnapshot
 from .adaptive_retrieval import AdaptiveRetrievalRegistry
 from .query_view_store import QueryViewStore
 from .schemas import (
+    is_tool_enabled,
     LCM_DESCRIBE,
     LCM_DOCTOR,
     LCM_EXPAND,
@@ -3751,7 +3752,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [
+        schemas = [
             LCM_GREP,
             LCM_RECALL,
             LCM_QUERY_STATE,
@@ -3768,6 +3769,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_INSPECT,
             LCM_DOCTOR,
         ]
+        return [schema for schema in schemas if is_tool_enabled(schema["name"], self._config)]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
         # Ingest live messages if passed (enables current-turn search)
