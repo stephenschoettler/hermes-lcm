@@ -55,6 +55,12 @@ def test_recall_policy_covers_evidence_safety_and_stable_tool_routing():
         "lcm_compile_evidence",
         "lcm_evidence_pack",
         "lcm_compute",
+        "include_exact_ref=true",
+        "FTS5",
+        "requested_facets",
+        "session_search",
+        "recover exact evidence",
+        "State uncertainty",
         "Open-cardinality evidence remains incomplete",
     ):
         assert phrase in policy
