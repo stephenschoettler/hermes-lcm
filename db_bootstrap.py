@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sqlite3
+from pathlib import Path
 import threading
 import time
 from contextlib import contextmanager
@@ -41,6 +42,259 @@ class SchemaVersionTooNewError(RuntimeError):
 SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Cross-process writer serialization (2026-10-16 corruption #6 root-cause fix).
+#
+# Deployment here runs 4 OS processes (gateway, webui, dashboard, cron worker)
+# each opening their own write connection to one lcm.db. SQLite's page
+# allocator is per-connection: with 2+ concurrent writers, bookkeeping can
+# diverge and one physical page gets claimed by a btree AND as overflow storage
+# (verified byte-level on 2026-10-04: metadata root page 6's rightmost child
+# pointed at page 2753, an un-freed overflow page holding messages.content
+# text). synchronous=FULL, mmap_size=0 and fastdata relocation all predate that
+# event and none of them prevent it.
+#
+# Fix: every write path is fenced with one advisory flock on "<db-path>.lock"
+# for the duration of the write transaction (via the stores' existing
+# ``_write_lock``/``_db_lock``/``_lock`` sections, db_bootstrap's own stamp
+# writers, the FTS integrity-check savepoint, and the FTS repair body), so a
+# single WRITER is enforced cross-process while readers stay lock-free. WAL +
+# busy_timeout handle the resulting lock handoff. Constructor-time schema
+# writes stay un-fenced: SQLite's own file locks serialize them and the FTS
+# repair ownership transaction rechecks state after waiting, while holding the
+# gate there would let one process's startup fence every other process's
+# startup behind a blocking flock (observed as a cross-process barrier
+# deadlock in the spawn-fts-bootstrap regression test). Rollback: set
+# LCM_DISABLE_CROSS_PROCESS_LOCK=1 and restart the services (the lock file
+# itself is inert and can be deleted).
+# --------------------------------------------------------------------------- #
+LCM_DISABLE_CROSS_PROCESS_LOCK = bool(
+    os.environ.get("LCM_DISABLE_CROSS_PROCESS_LOCK", "")
+)
+
+
+class CrossProcessWriteGate:
+    """Serialize writers across the plugin's OS processes.
+
+    Deployment runs 4 OS processes (gateway, webui, dashboard, cron workers)
+    each with their own write connection to one lcm.db. SQLite's page
+    allocator is per-connection: with 2+ concurrent writers its bookkeeping
+    can diverge and one physical page gets claimed by a btree AND as overflow
+    storage. Verified byte-level on 2026-10-04 (corruption #6): the metadata
+    table's root page pointed at page 2753, an un-freed overflow page holding
+    messages.content text. synchronous=FULL, mmap_size=0 and the fastdata
+    relocation all predate that event; none prevents this class.
+
+    Shape: per database path, one process-wide Python mutex (``_lock``) that
+    queues ALL in-process writers FIFO, plus one advisory flock
+    (``<db>.lock`` sidecar) held for the duration of each write transaction so
+    at most one PROCESS writes at a time. Stores enter this gate immediately
+    inside their existing per-store lock, so every store's write body already
+    runs serialized in-process; the gate makes those sections exclusive
+    across processes too. Readers never take the gate.
+
+    Ordering rule: acquire ``_lock`` BEFORE the flock, release AFTER. Locking
+    in that order makes nested ``with`` in one thread (store A's write body
+    calling store B's, or engine code entering two stores' bodies around one
+    transaction) safe: the inner ``with`` re-enters via the thread-local
+    counter without touching the flock, so no thread ever waits on a mutex it
+    itself holds. The reverse order would allow thread 1 to hold ``_lock``
+    while waiting for the flock that thread 2's inner ``with`` released first,
+    a deadlock window that only the flock handoff protects against anyway.
+
+    Failure mode: fails OPEN. If flock is unavailable (e.g. a filesystem
+    without POSIX locks) the gate degrades to in-process-only serialization
+    and logs a warning; corruption risk reverts to the pre-fix status quo
+    rather than crashing the engine.
+    Rollback: set LCM_DISABLE_CROSS_PROCESS_LOCK=1 and restart the services,
+    or remove the ``<db>.lock`` sidecar files (they are inert either way).
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path.parent / f"{db_path.name}.lock"
+        self._fd: int | None = None
+        self._lock = threading.Lock()   # serializes this process's entrants
+        self._thread_local = threading.local()
+
+    def _open(self) -> int:
+        import fcntl
+
+        fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o600)
+        # Blocking acquire: the writer that holds the gate finishes its
+        # transaction in bounded time; SQLITE_BUSY_TIMEOUT_MS bounds the
+        # SQLite-level wait underneath it. POSIX flock also auto-releases if
+        # the holder dies, so a crashed writer cannot wedge the file.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def __enter__(self) -> "CrossProcessWriteGate":
+        if LCM_DISABLE_CROSS_PROCESS_LOCK:
+            return self
+        held: int = getattr(self._thread_local, "held", 0)
+        if held:
+            self._thread_local.held = held + 1   # nested same-thread entry
+            return self
+        self._lock.acquire()  # released in __exit__ (outermost entry only)
+        try:
+            self._fd = self._open()
+        except (ImportError, OSError) as exc:
+            # Keep _lock held; __exit__ releases it. _fd stays None so exit
+            # knows there is no flock to undo.
+            logger.warning(
+                "LCM cross-process write gate unavailable (%s); "
+                "multi-writer corruption risk remains", exc,
+            )
+            self._fd = None
+        self._thread_local.held = 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if LCM_DISABLE_CROSS_PROCESS_LOCK:
+            return
+        held: int = getattr(self._thread_local, "held", 0)
+        if not held:
+            return
+        if held > 1:
+            self._thread_local.held = held - 1   # outer transaction still open
+            return
+        fd = self._fd
+        self._fd = None
+        if fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            except OSError:
+                pass
+        self._thread_local.held = 0
+        self._lock.release()
+
+
+_gates: dict[str, "CrossProcessWriteGate"] = {}
+_gates_lock = threading.Lock()
+
+
+def cross_process_write_gate(db_path: Path) -> "CrossProcessWriteGate | _NullGate":
+    """One gate per database path, process-wide.
+
+    ``:memory:`` databases exist only inside their own process, so there is
+    nothing cross-process to coordinate; return a ``_NullGate`` instead of
+    creating a ``:memory:.lock`` sidecar in the caller's working directory.
+    """
+    if str(db_path) == ":memory:":
+        return _NullGate()
+    key = str(db_path)
+    with _gates_lock:
+        gate = _gates.get(key)
+        if gate is None:
+            gate = CrossProcessWriteGate(db_path)
+            _gates[key] = gate
+        return gate
+
+
+def cross_process_gate_lock(
+    db_path: Path, attr_name: str, *, read_only: bool = False
+) -> Any:
+    """Build a store's ``_write_lock``-style RLock fused with the write gate.
+    Drop-in replacement for the plain ``threading.RLock()`` every store used to
+    create: ``with self._write_lock:`` now also holds the cross-process flock
+    for the body's duration, so every lock-protected write is serialized across
+    all OS processes sharing this database, not just within one process.
+    Re-entrancy (store A's write body entering store B's) keeps one flock
+    entry via the gate's thread-local counter. Read-only stores pass
+    ``read_only=True`` and get a plain RLock: they never fence, which lets the
+    repair path open an unlocked handle during a swap.
+    """
+    if read_only or LCM_DISABLE_CROSS_PROCESS_LOCK:
+        return threading.RLock()
+
+    inner = threading.RLock()
+    gate = cross_process_write_gate(db_path)
+
+    class _GatedRLock:
+        """RLock facade: acquire takes the gate FIRST, then the inner RLock.
+
+        That order gives the invariant "inner held ⟹ gate count >= 1", which
+        is what makes nested store entry (store A's write body entering store
+        B's) deadlock-free: a thread can never hold the inner RLock while
+        waiting to enter the gate, because entering the gate always precedes
+        inner acquisition. Release mirrors it (inner first, then gate).
+        """
+
+        def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+            gate.__enter__()
+            try:
+                got = inner.acquire(blocking=blocking, timeout=timeout)
+            except BaseException:
+                gate.__exit__(None, None, None)
+                raise
+            if not got:
+                gate.__exit__(None, None, None)
+                return False
+            return True
+
+        def release(self) -> None:
+            inner.release()
+            gate.__exit__(None, None, None)
+
+        def __enter__(self) -> "_GatedRLock":
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            self.release()
+
+        def __repr__(self) -> str:
+            return f"<gated {attr_name} {self._gate_repr()}>"
+
+        def _gate_repr(self) -> str:
+            return repr(inner)
+
+    return _GatedRLock()
+
+
+def write_gate(db_path: Path):
+    """Context manager for write transactions on connections OUTSIDE a store.
+
+    Use for the paths that bypass a store's lock-protected write body:
+    constructor-time schema creation, close-time WAL checkpoints, and
+    db_bootstrap's own metadata stamp writers. Nesting inside a store's gated
+    ``_write_lock`` is safe (same-thread re-entrant gate, one flock entry).
+    """
+    return cross_process_write_gate(db_path)
+
+
+def read_gate(db_path: Path):
+    """Context manager for readers that must not straddle a file swap.
+
+    lcm.db is only replaced by the integrity guard (``~/.hermes/lcm-monitor/``
+    lcm_guard.py), which stops every writer service before it swaps the file.
+    The remaining exposure is an OPEN read-only connection (engine GC read
+    copies, read-only stores) re-opening the same inode mid-swap; this gate is
+    the seam to add a swap-in-progress wait if that ever bites. For now it is
+    a documented no-op that keeps those call sites honest.
+    """
+    return _NullGate()
+
+
+class _NullGate:
+    """Read-side pass-through context manager (see ``read_gate``)."""
+
+    def __enter__(self) -> "_NullGate":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+def gate_for_conn(conn: sqlite3.Connection):
+    """Gate for a bare connection, keyed on its actual database path."""
+    resolved = _database_path_for_connection(conn)
+    if not resolved or resolved == ":memory:":
+        return _NullGate()
+    return cross_process_write_gate(Path(resolved))
+
 REQUIRED_CORE_TABLES = (
     "messages",
     "metadata",
