@@ -4050,7 +4050,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                      provider: str = "",
                      api_mode: str = "") -> None:
         parent_session_id = self._in_process_parent_session_id({})
-        if parent_session_id:
+        # Protect an already-bound shared engine from an auxiliary caller, but
+        # initialize the child's own fresh clone. Clones have no bound session;
+        # dropping this update leaves an unconfigured prototype's clone at a
+        # zero threshold, disabling even bypass/host-fallback compaction.
+        if parent_session_id and self._session_id:
             logger.debug(
                 "LCM model update ignored for auxiliary child of %s",
                 parent_session_id,
