@@ -2287,6 +2287,15 @@ def verify_assertion_schema(conn: sqlite3.Connection) -> list[str]:
     return sorted(set(findings))
 
 
+def is_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> bool:
+    """True once ``mark_migration_step_complete(step_name)`` has run on this DB."""
+    ensure_migration_state_table(conn)
+    row = conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = ? LIMIT 1", (step_name,)
+    ).fetchone()
+    return row is not None
+
+
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
     conn.execute(
