@@ -108,6 +108,91 @@ def test_orphan_tool_result_does_not_create_a_phantom_group():
     assert boundary.tool_group_extended is False
 
 
+def test_boundary_opens_on_orphaned_assistant_tool_calls_advances():
+    """A tail opening on an assistant whose tool results are missing must
+    advance past that assistant so the orphaned tool_calls never reach the
+    active context (mirror of _assistant_group_start's forward retreat).
+
+    The boundary falls on the assistant by the message-count limit; its
+    ``tool_calls`` reference a result that is absent from the sequence
+    (e.g. compacted/GC'd before assembly).
+    """
+    messages = [
+        _user("old"),
+        {
+            "role": "assistant",
+            "content": "calling tools",
+            "tool_calls": [
+                {"id": "call-a", "function": {"name": "a", "arguments": "{}"}},
+            ],
+        },
+        _user("newest"),
+    ]
+
+    boundary = resolve_fresh_tail_boundary(
+        messages,
+        fresh_tail_count=2,
+        fresh_tail_max_tokens=0,
+    )
+
+    assert boundary.start == 2
+    assert [message["role"] for message in messages[boundary.start:]] == ["user"]
+    assert "call-a" not in str(messages[boundary.start])
+
+
+def test_complete_assistant_tool_group_stays_in_tail():
+    """When the boundary opens on an assistant and its tool results are fully
+    present in the tail, the boundary must NOT advance."""
+    messages = [_user("old"), *_tool_group(payload_a="a", payload_b="b"), _user("newest")]
+
+    boundary = resolve_fresh_tail_boundary(
+        messages,
+        fresh_tail_count=4,
+        fresh_tail_max_tokens=0,
+    )
+
+    assert boundary.start == 1
+    assert boundary.count == 4
+    assert [message["role"] for message in messages[boundary.start:]] == [
+        "assistant", "tool", "tool", "user",
+    ]
+
+
+def test_multiple_tool_groups_advances_only_broken_opening_group():
+    """A tail opening on a broken assistant group should advance to the next
+    intact assistant group, preserving that group's own tool results."""
+    messages = [
+        _user("old"),
+        {
+            "role": "assistant",
+            "content": "calling tools",
+            "tool_calls": [
+                {"id": "call-a", "function": {"name": "a", "arguments": "{}"}},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "second group",
+            "tool_calls": [
+                {"id": "call-b", "function": {"name": "b", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-b", "content": "result-b"},
+        _user("newest"),
+    ]
+
+    boundary = resolve_fresh_tail_boundary(
+        messages,
+        fresh_tail_count=4,
+        fresh_tail_max_tokens=0,
+    )
+
+    assert boundary.start == 2
+    assert [message["role"] for message in messages[boundary.start:]] == [
+        "assistant", "tool", "user",
+    ]
+
+
 def test_stored_tail_expands_backward_until_tool_group_is_complete(tmp_path):
     config = LCMConfig(
         database_path=str(tmp_path / "fresh-tail.db"),
