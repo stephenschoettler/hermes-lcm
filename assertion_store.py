@@ -19,6 +19,7 @@ import threading
 import time
 from typing import Any, Iterable, Sequence
 from urllib.parse import quote
+import copy
 
 from .db_bootstrap import (
     ASSERTION_MIGRATION_STEP,
@@ -285,6 +286,58 @@ class AssertionStore:
     def connection(self) -> sqlite3.Connection:
         return self._conn
 
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if closed.
+
+        close() nulls self._conn, and a shallow-copied sibling or GC path can
+        close the same underlying handle underneath this store. Before this
+        guard any later query raised AttributeError: 'NoneType' object has no
+        attribute 'execute' permanently. Lazy reconnection here keeps the
+        store usable; the connection property stays honest (it does not
+        reconnect).
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            # A closed sqlite3 connection is still a truthy object, so probe it
+            # and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        self._conn = self._open_connection()
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy state but never the DB handle or locks.
+
+        Default deepcopy would pickle the sqlite3.Connection (TypeError) or a
+        shallow copy would share it so the copy's GC could close the original's
+        live handle. The copy gets _conn=None and fresh locks; it lazily
+        reconnects on first use via _ensure_connection.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                new_store.__dict__[name] = None
+            elif callable(getattr(value, "acquire", None)) and callable(
+                getattr(value, "release", None)
+            ):
+                # Re-allocate any lock object (RLock/Lock) so the copy does not
+                # share the original's lock. Use the same class rather than a
+                # hard-coded threading reference (the runtime may patch it).
+                new_store.__dict__[name] = type(value)()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        return new_store
+
     def close(self) -> None:
         with self._write_lock:
             conn = self._conn
@@ -301,7 +354,7 @@ class AssertionStore:
         """Flush completed assertion work without splitting an active publish."""
         with self._write_lock:
             if not self.read_only and self._conn is not None:
-                self._conn.commit()
+                self._ensure_connection().commit()
 
     def _require_writable(self) -> None:
         if self.read_only:
@@ -309,10 +362,10 @@ class AssertionStore:
 
     def _begin_write(self) -> None:
         self._require_writable()
-        self._conn.execute("BEGIN IMMEDIATE")
+        self._ensure_connection().execute("BEGIN IMMEDIATE")
 
     def _source_row(self, store_id: int) -> sqlite3.Row | None:
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT store_id, session_id, source, role, content, timestamp,
                    observed_at
@@ -353,7 +406,7 @@ class AssertionStore:
     ) -> bool:
         """Return whether this exact source hash already has an active receipt."""
         version = _validated_version(extraction_version)
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             SELECT 1
             FROM lcm_assertion_sources
@@ -381,13 +434,13 @@ class AssertionStore:
             "AND s.invalidated_at IS NULL"
         )
         pending_count = int(
-            self._conn.execute(
+            self._ensure_connection().execute(
                 f"SELECT COUNT(*) FROM messages AS m {join} "
                 "WHERE s.source_store_id IS NULL",
                 (version,),
             ).fetchone()[0]
         )
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""
             SELECT m.store_id, m.session_id, m.source, m.role, m.content,
                    m.timestamp, m.observed_at
@@ -579,7 +632,7 @@ class AssertionStore:
                     raise AssertionSourceStaleError(
                         f"source store_id {snapshot.store_id} changed before publication"
                     )
-                existing = self._conn.execute(
+                existing = self._ensure_connection().execute(
                     """
                     SELECT source_content_sha256, candidate_digest, assertion_count, relation_count
                     FROM lcm_assertion_sources
@@ -595,7 +648,7 @@ class AssertionStore:
                         and int(existing["assertion_count"]) == len(assertion_rows)
                         and int(existing["relation_count"]) == len(relation_rows)
                     ):
-                        self._conn.execute("COMMIT")
+                        self._ensure_connection().execute("COMMIT")
                         return PublishResult(
                             source_store_id=snapshot.store_id,
                             extraction_version=version,
@@ -610,7 +663,7 @@ class AssertionStore:
                         "and extraction version; bump the extraction version"
                     )
 
-                historical = self._conn.execute(
+                historical = self._ensure_connection().execute(
                     """
                     SELECT candidate_digest, assertion_count, relation_count
                     FROM lcm_assertion_sources
@@ -629,7 +682,7 @@ class AssertionStore:
                             "historical output differs for this source hash and extraction "
                             "version; bump the extraction version"
                         )
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         """
                         UPDATE lcm_assertion_sources
                            SET source_session_id = ?, source_role = ?, source_name = ?,
@@ -649,7 +702,7 @@ class AssertionStore:
                             snapshot.content_sha256,
                         ),
                     )
-                    self._conn.execute("COMMIT")
+                    self._ensure_connection().execute("COMMIT")
                     return PublishResult(
                         source_store_id=snapshot.store_id,
                         extraction_version=version,
@@ -660,7 +713,7 @@ class AssertionStore:
                         already_current=True,
                     )
 
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_assertion_sources(
                         source_store_id, extraction_version, source_content_sha256,
@@ -683,7 +736,7 @@ class AssertionStore:
                     ),
                 )
                 for row in assertion_rows:
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         """
                         INSERT INTO lcm_assertions(
                             assertion_id, source_store_id, extraction_version,
@@ -706,7 +759,7 @@ class AssertionStore:
                 for row in relation_rows:
                     endpoints = (row["from_assertion_id"], row["to_assertion_id"])
                     for endpoint in endpoints:
-                        active_endpoint = self._conn.execute(
+                        active_endpoint = self._ensure_connection().execute(
                             """
                             SELECT 1
                             FROM lcm_assertions AS a
@@ -723,7 +776,7 @@ class AssertionStore:
                             raise ValueError(
                                 f"relation endpoint {endpoint} is missing or invalidated"
                             )
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         """
                         INSERT INTO lcm_assertion_relations(
                             relation_id, source_store_id, extraction_version,
@@ -739,9 +792,9 @@ class AssertionStore:
                         """,
                         {**row, "created_at": time.time()},
                     )
-                self._conn.execute("COMMIT")
+                self._ensure_connection().execute("COMMIT")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                self._ensure_connection().execute("ROLLBACK")
                 raise
 
         return PublishResult(
@@ -838,7 +891,7 @@ class AssertionStore:
             ])
             args.extend([boundary, boundary, boundary])
         args.append(bounded_limit)
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""
             SELECT a.*, s.source_session_id, s.source_role, s.source_name,
                    s.source_timestamp, s.invalidated_at, s.invalidation_reason,
@@ -947,7 +1000,7 @@ class AssertionStore:
             ])
             args.extend([boundary] * 7)
         args.append(bounded_limit)
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""
             SELECT r.*, s.source_session_id, s.source_timestamp,
                    s.invalidated_at, s.invalidation_reason,
@@ -1050,7 +1103,7 @@ class AssertionStore:
         with self._write_lock:
             self._begin_write()
             try:
-                cursor = self._conn.execute(
+                cursor = self._ensure_connection().execute(
                     """
                     UPDATE lcm_assertion_sources
                        SET invalidated_at = ?, invalidation_reason = ?
@@ -1059,10 +1112,10 @@ class AssertionStore:
                     (timestamp, normalized_reason, int(store_id)),
                 )
                 changed = int(cursor.rowcount or 0)
-                self._conn.execute("COMMIT")
+                self._ensure_connection().execute("COMMIT")
                 return changed
             except Exception:
-                self._conn.execute("ROLLBACK")
+                self._ensure_connection().execute("ROLLBACK")
                 raise
 
     def remove_version(self, extraction_version: str) -> dict[str, int]:
@@ -1073,26 +1126,26 @@ class AssertionStore:
             self._begin_write()
             try:
                 counts = {
-                    "sources": int(self._conn.execute(
+                    "sources": int(self._ensure_connection().execute(
                         "SELECT COUNT(*) FROM lcm_assertion_sources WHERE extraction_version = ?",
                         (version,),
                     ).fetchone()[0]),
-                    "assertions": int(self._conn.execute(
+                    "assertions": int(self._ensure_connection().execute(
                         "SELECT COUNT(*) FROM lcm_assertions WHERE extraction_version = ?",
                         (version,),
                     ).fetchone()[0]),
-                    "relations": int(self._conn.execute(
+                    "relations": int(self._ensure_connection().execute(
                         "SELECT COUNT(*) FROM lcm_assertion_relations WHERE extraction_version = ?",
                         (version,),
                     ).fetchone()[0]),
                 }
                 # The receipt-delete trigger removes owned assertion/relation rows.
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "DELETE FROM lcm_assertion_sources WHERE extraction_version = ?",
                     (version,),
                 )
-                self._conn.execute("COMMIT")
+                self._ensure_connection().execute("COMMIT")
                 return counts
             except Exception:
-                self._conn.execute("ROLLBACK")
+                self._ensure_connection().execute("ROLLBACK")
                 raise

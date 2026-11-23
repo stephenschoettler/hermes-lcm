@@ -24,6 +24,7 @@ from .db_bootstrap import (
     verify_temporal_rollup_schema,
 )
 from .sqlite_util import _is_sqlite_locked_error
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ class RollupStore:
     @contextmanager
     def _write_transaction(self) -> Iterator[None]:
         try:
-            with self._write_lock, self._conn:
+            with self._write_lock, self._ensure_connection():
                 yield
         except sqlite3.Error as exc:
             if _is_sqlite_locked_error(exc):
@@ -121,7 +122,7 @@ class RollupStore:
         if row is None:
             return None
         rollup_id = int(row["rollup_id"])
-        source_rows = self._conn.execute(
+        source_rows = self._ensure_connection().execute(
             "SELECT node_id FROM lcm_rollup_sources WHERE rollup_id = ? ORDER BY node_id",
             (rollup_id,),
         ).fetchall()
@@ -146,7 +147,7 @@ class RollupStore:
         period_start: str,
         scope: str,
     ) -> dict[str, object] | None:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             """
             SELECT *
             FROM lcm_rollups
@@ -178,7 +179,7 @@ class RollupStore:
         content as ``ready`` (maintainer #387 A2).
         """
         with self._write_transaction():
-            self._conn.execute(
+            self._ensure_connection().execute(
                 """
                 INSERT INTO lcm_rollups(
                     period_kind, period_start, scope, status, built_at,
@@ -200,7 +201,7 @@ class RollupStore:
                     self._lease_deadline(), uuid.uuid4().hex,
                 ),
             )
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 """
                 SELECT rollup_id, generation, lease_nonce
                 FROM lcm_rollups
@@ -237,7 +238,7 @@ class RollupStore:
         """
         unique_source_ids = list(dict.fromkeys(int(node_id) for node_id in source_node_ids))
         with self._write_transaction():
-            owned = self._conn.execute(
+            owned = self._ensure_connection().execute(
                 """
                 SELECT period_kind, period_start, scope FROM lcm_rollups
                 WHERE rollup_id = ? AND generation = ? AND lease_nonce = ?
@@ -246,7 +247,7 @@ class RollupStore:
                 (int(token.rollup_id), int(token.generation), str(token.nonce)),
             ).fetchone()
             if owned is None:
-                exists = self._conn.execute(
+                exists = self._ensure_connection().execute(
                     "SELECT 1 FROM lcm_rollups WHERE rollup_id = ?",
                     (int(token.rollup_id),),
                 ).fetchone()
@@ -272,7 +273,7 @@ class RollupStore:
             window_end = datetime.combine(
                 end_day + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
             ).timestamp()
-            pending_mutation = self._conn.execute(
+            pending_mutation = self._ensure_connection().execute(
                 """
                 SELECT 1 FROM lcm_rollup_invalidations
                 WHERE scope = ?
@@ -283,7 +284,7 @@ class RollupStore:
                 (str(owned["scope"]), window_end, window_start),
             ).fetchone()
             if pending_mutation is not None:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     """
                     UPDATE lcm_rollups
                     SET status='stale', generation=generation + 1,
@@ -303,20 +304,20 @@ class RollupStore:
             # invalidation to find. Validate the proposed source snapshot in the
             # publication transaction itself so a deleted source can never be
             # committed as ready.
-            has_summary_nodes = self._conn.execute(
+            has_summary_nodes = self._ensure_connection().execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='summary_nodes'"
             ).fetchone()
             if unique_source_ids and has_summary_nodes is not None:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "CREATE TEMP TABLE IF NOT EXISTS lcm_rollup_publish_sources "
                     "(node_id INTEGER PRIMARY KEY) WITHOUT ROWID"
                 )
-                self._conn.execute("DELETE FROM temp.lcm_rollup_publish_sources")
-                self._conn.executemany(
+                self._ensure_connection().execute("DELETE FROM temp.lcm_rollup_publish_sources")
+                self._ensure_connection().executemany(
                     "INSERT INTO temp.lcm_rollup_publish_sources(node_id) VALUES(?)",
                     ((node_id,) for node_id in unique_source_ids),
                 )
-                missing = self._conn.execute(
+                missing = self._ensure_connection().execute(
                     """
                     SELECT 1
                     FROM temp.lcm_rollup_publish_sources proposed
@@ -326,7 +327,7 @@ class RollupStore:
                     """
                 ).fetchone()
                 if missing is not None:
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         """
                         UPDATE lcm_rollups
                         SET status='stale', generation=generation + 1,
@@ -341,7 +342,7 @@ class RollupStore:
                         ),
                     )
                     return False
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_rollups
                 SET summary = ?, token_count = ?, status = 'ready', built_at = ?,
@@ -361,7 +362,7 @@ class RollupStore:
                 ),
             )
             if cur.rowcount == 0:
-                exists = self._conn.execute(
+                exists = self._ensure_connection().execute(
                     "SELECT 1 FROM lcm_rollups WHERE rollup_id = ?",
                     (int(token.rollup_id),),
                 ).fetchone()
@@ -369,11 +370,11 @@ class RollupStore:
                     raise ValueError(f"unknown rollup_id: {token.rollup_id}")
                 # Superseded by a newer generation: discard this build's result.
                 return False
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "DELETE FROM lcm_rollup_sources WHERE rollup_id = ?",
                 (int(token.rollup_id),),
             )
-            self._conn.executemany(
+            self._ensure_connection().executemany(
                 "INSERT INTO lcm_rollup_sources(rollup_id, node_id) VALUES(?, ?)",
                 ((int(token.rollup_id), node_id) for node_id in unique_source_ids),
             )
@@ -383,7 +384,7 @@ class RollupStore:
         """Record a build failure only while the caller owns the build lease."""
         with self._write_transaction():
             now = self._now()
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_rollups
                 SET status = 'failed', error = ?, failed_at = ?,
@@ -420,7 +421,7 @@ class RollupStore:
         """
         day_start, week_start, month_start = self._period_starts_for_day(day)
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
                 VALUES
@@ -447,7 +448,7 @@ class RollupStore:
         """
         _day_start, week_start, month_start = self._period_starts_for_day(day)
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
                 VALUES
@@ -475,7 +476,7 @@ class RollupStore:
         with self._write_transaction():
             affected = 0
             for target_kind, target_start, target_scope in targets:
-                cur = self._conn.execute(
+                cur = self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
                     VALUES(?, ?, ?, 'stale')
@@ -531,7 +532,7 @@ class RollupStore:
         affected = 0
         with self._write_transaction():
             for period_kind, period_start, scope in rows:
-                cur = self._conn.execute(
+                cur = self._ensure_connection().execute(
                     """
                     INSERT INTO lcm_rollups(period_kind, period_start, scope, status)
                     VALUES(?, ?, ?, 'stale')
@@ -559,7 +560,7 @@ class RollupStore:
         owned ``building`` row was released, ``False`` when superseded.
         """
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_rollups
                 SET status = 'stale', error = ?, lease_expires_at = NULL,
@@ -590,13 +591,13 @@ class RollupStore:
         left to rebuild).
         """
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 "DELETE FROM lcm_rollups WHERE rollup_id = ? AND generation = ? "
                 "AND lease_nonce = ? AND status = 'building'",
                 (int(token.rollup_id), int(token.generation), str(token.nonce)),
             )
             if int(cur.rowcount or 0) > 0:
-                self._conn.execute(
+                self._ensure_connection().execute(
                     "DELETE FROM lcm_rollup_sources WHERE rollup_id = ?",
                     (int(token.rollup_id),),
                 )
@@ -610,7 +611,7 @@ class RollupStore:
         """
         cutoff = now or self._now()
         with self._write_transaction():
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_rollups
                 SET status = 'stale',
@@ -633,11 +634,11 @@ class RollupStore:
     def has_pending_invalidations(self, scope: str | None = None) -> bool:
         """Check for durable mutation debt using the pending-event index."""
         if scope is None:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT 1 FROM lcm_rollup_invalidations ORDER BY event_id LIMIT 1"
             ).fetchone()
         else:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT 1 FROM lcm_rollup_invalidations WHERE scope=? "
                 "ORDER BY event_id LIMIT 1",
                 (scope,),
@@ -658,7 +659,7 @@ class RollupStore:
         if bounded_events == 0 or remaining_days == 0:
             return 0
         with self._write_transaction():
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 """
                 SELECT event_id, scope, covered_start, covered_end, next_day
                 FROM lcm_rollup_invalidations
@@ -688,7 +689,7 @@ class RollupStore:
                     day_start, week_start, month_start = self._period_starts_for_day(
                         current
                     )
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         """
                         INSERT INTO lcm_rollups(
                             period_kind, period_start, scope, status
@@ -710,12 +711,12 @@ class RollupStore:
                     processed_days += 1
                     remaining_days -= 1
                 if current > end:
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         "DELETE FROM lcm_rollup_invalidations WHERE event_id=?",
                         (int(row["event_id"]),),
                     )
                 else:
-                    self._conn.execute(
+                    self._ensure_connection().execute(
                         "UPDATE lcm_rollup_invalidations SET next_day=? WHERE event_id=?",
                         (current.isoformat(), int(row["event_id"])),
                     )
@@ -731,7 +732,7 @@ class RollupStore:
         end: str,
         scope: str,
     ) -> list[dict[str, object]]:
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             """
             SELECT *
             FROM lcm_rollups
@@ -747,7 +748,7 @@ class RollupStore:
         return [self._row_to_rollup(row) for row in rows]
 
     def get_cursor(self, period_kind: str, scope: str = "") -> str | None:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT last_build_cursor FROM lcm_rollup_state WHERE period_kind = ? AND scope = ?",
             (period_kind, scope),
         ).fetchone()
@@ -762,7 +763,7 @@ class RollupStore:
         built_at: str | None = None,
     ) -> None:
         with self._write_transaction():
-            self._conn.execute(
+            self._ensure_connection().execute(
                 """
                 INSERT INTO lcm_rollup_state(period_kind, scope, last_build_cursor, last_built_at)
                 VALUES(?, ?, ?, ?)
@@ -789,16 +790,16 @@ class RollupStore:
         if not unique_node_ids:
             return 0
         with self._write_transaction():
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "CREATE TEMP TABLE IF NOT EXISTS lcm_rollup_purge_nodes "
                 "(node_id INTEGER PRIMARY KEY) WITHOUT ROWID"
             )
-            self._conn.execute("DELETE FROM temp.lcm_rollup_purge_nodes")
-            self._conn.executemany(
+            self._ensure_connection().execute("DELETE FROM temp.lcm_rollup_purge_nodes")
+            self._ensure_connection().executemany(
                 "INSERT INTO temp.lcm_rollup_purge_nodes(node_id) VALUES(?)",
                 ((node_id,) for node_id in unique_node_ids),
             )
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """
                 UPDATE lcm_rollups
                 SET status = 'stale',
@@ -818,7 +819,7 @@ class RollupStore:
                 """,
             )
             affected = int(cur.rowcount or 0)
-            self._conn.execute(
+            self._ensure_connection().execute(
                 """
                 DELETE FROM lcm_rollup_sources
                 WHERE rollup_id IN (
@@ -830,6 +831,58 @@ class RollupStore:
                 """
             )
         return affected
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if closed.
+
+        close() nulls self._conn, and a shallow-copied sibling or GC path can
+        close the same underlying handle underneath this store. Before this
+        guard any later query raised AttributeError: 'NoneType' object has no
+        attribute 'execute' permanently. Lazy reconnection here keeps the
+        store usable; the connection property stays honest (it does not
+        reconnect).
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            # A closed sqlite3 connection is still a truthy object, so probe it
+            # and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        self._init_db()
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy state but never the DB handle or locks.
+
+        Default deepcopy would pickle the sqlite3.Connection (TypeError) or a
+        shallow copy would share it so the copy's GC could close the original's
+        live handle. The copy gets _conn=None and fresh locks; it lazily
+        reconnects on first use via _ensure_connection.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                new_store.__dict__[name] = None
+            elif callable(getattr(value, "acquire", None)) and callable(
+                getattr(value, "release", None)
+            ):
+                # Re-allocate any lock object (RLock/Lock) so the copy does not
+                # share the original's lock. Use the same class rather than a
+                # hard-coded threading reference (the runtime may patch it).
+                new_store.__dict__[name] = type(value)()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        return new_store
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)

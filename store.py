@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import threading
 import time
+import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -472,7 +473,7 @@ class MessageStore:
         ingested_at = time.time()
 
         with self._write_lock:
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned, ingested_at,
@@ -495,7 +496,7 @@ class MessageStore:
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
-            self._conn.commit()
+            self._ensure_connection().commit()
             return cur.lastrowid
 
     def append_batch(self, session_id: str,
@@ -534,13 +535,13 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
-        with self._write_lock, self._conn:
+        with self._write_lock, self._ensure_connection() as _ctx:
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 ts = time.time()
                 observed_at = _normalize_observed_at(msg.get("timestamp"))
-                cur = self._conn.execute(
+                cur = self._ensure_connection().execute(
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned, ingested_at,
@@ -571,21 +572,21 @@ class MessageStore:
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
         with self._write_lock:
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
-            self._conn.commit()
+            self._ensure_connection().commit()
             return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         with self._write_lock:
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
-            self._conn.commit()
+            self._ensure_connection().commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted
 
@@ -606,7 +607,7 @@ class MessageStore:
         offsets, returning a garbled fragment (F2).
         """
         with self._write_lock:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
             ).fetchone()
@@ -622,36 +623,36 @@ class MessageStore:
                     "tool_call_id": tool_call_id,
                 }
             )
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "UPDATE messages SET content = ?, token_estimate = ? WHERE store_id = ?",
                 (placeholder, placeholder_tokens, store_id),
             )
             if before_commit is not None:
-                before_commit(self._conn, store_id)
-            self._conn.commit()
+                before_commit(self._ensure_connection(), store_id)
+            self._ensure_connection().commit()
             return True
 
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
         with self._write_lock:
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
+            self._ensure_connection().commit()
 
     def unpin(self, store_id: int) -> None:
         with self._write_lock:
-            self._conn.execute(
+            self._ensure_connection().execute(
                 "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
+            self._ensure_connection().commit()
 
     # -- Read operations ----------------------------------------------------
 
     def get(self, store_id: int) -> Optional[Dict[str, Any]]:
         """Retrieve a single message by store_id."""
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id = ?", (store_id,)
         ).fetchone()
         return self._row_to_dict(row) if row else None
@@ -664,7 +665,7 @@ class MessageStore:
         if not store_ids:
             return {}
         placeholders = ",".join("?" for _ in store_ids)
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages WHERE store_id IN ({placeholders})",
             store_ids,
         ).fetchall()
@@ -680,7 +681,7 @@ class MessageStore:
         coverage.  Callers must treat ``truncated`` as an honest fallback.
         """
         bounded_limit = min(4096, max(1, int(limit)))
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""
             WITH snapshot AS (
                 SELECT {_MESSAGE_SELECT_COLUMNS},
@@ -734,7 +735,7 @@ class MessageStore:
             where.append("store_id <= ?")
             args.append(end_id)
         args.append(limit)
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE {' AND '.join(where)}
                ORDER BY store_id LIMIT ?""",
@@ -780,7 +781,7 @@ class MessageStore:
             time_to=time_to,
         )
         return int(
-            self._conn.execute(
+            self._ensure_connection().execute(
                 f"SELECT COUNT(*) FROM messages WHERE {' AND '.join(where)}",
                 args,
             ).fetchone()[0]
@@ -809,7 +810,7 @@ class MessageStore:
         )
         where.append("store_id > ?")
         args.extend([after_store_id, limit])
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE {' AND '.join(where)}
                ORDER BY store_id LIMIT ?""",
@@ -828,14 +829,14 @@ class MessageStore:
         """Load one bounded ordered window around an exact message anchor."""
         before = min(12, max(0, int(before)))
         after = min(12, max(0, int(after)))
-        prior = self._conn.execute(
+        prior = self._ensure_connection().execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                 FROM messages
                 WHERE session_id = ? AND store_id < ?
                 ORDER BY store_id DESC LIMIT ?""",
             (session_id, anchor_store_id, before),
         ).fetchall()
-        following = self._conn.execute(
+        following = self._ensure_connection().execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                 FROM messages
                 WHERE session_id = ? AND store_id >= ?
@@ -848,7 +849,7 @@ class MessageStore:
     def get_session_messages(self, session_id: str,
                              limit: int = 10000) -> List[Dict[str, Any]]:
         """Get all messages for a session, ordered by store_id."""
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ?
                ORDER BY store_id LIMIT ?""",
@@ -860,7 +861,7 @@ class MessageStore:
                                    after_store_id: int = 0,
                                    limit: int = 10000) -> List[Dict[str, Any]]:
         """Get session messages after a store_id, ordered by store_id."""
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
                WHERE session_id = ? AND store_id > ?
                ORDER BY store_id LIMIT ?""",
@@ -872,7 +873,7 @@ class MessageStore:
         """Get the latest messages for a session, returned in store order."""
         if limit <= 0:
             return []
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                FROM (
                    SELECT {_MESSAGE_SELECT_COLUMNS}
@@ -888,7 +889,7 @@ class MessageStore:
 
     def get_session_count(self, session_id: str) -> int:
         """Count messages in a session."""
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -896,7 +897,7 @@ class MessageStore:
 
     def get_session_token_total(self, session_id: str) -> int:
         """Sum of token estimates for a session."""
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT COALESCE(SUM(token_estimate), 0) FROM messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -920,7 +921,7 @@ class MessageStore:
             {where}
             """
         query_args: list[Any] = [_UNKNOWN_SOURCE, _UNKNOWN_SOURCE, *args]
-        row = self._conn.execute(query, query_args).fetchone()
+        row = self._ensure_connection().execute(query, query_args).fetchone()
 
         messages_total = int(row[0] or 0) if row else 0
         normalized_unknown = int(row[1] or 0) if row else 0
@@ -938,7 +939,7 @@ class MessageStore:
         """Per-session ``(session_id, message_count, token_total, node_count)``
         rows across messages and summary nodes, for ``/lcm doctor clean``
         candidate scanning. Callers own the pattern/protection policy."""
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             WITH session_ids AS (
                 SELECT session_id FROM messages
@@ -972,7 +973,7 @@ class MessageStore:
         """Per-session activity/token stats for one session (messages + summary
         nodes), for ``/lcm doctor retention`` scanning. Callers own the
         staleness/protection policy."""
-        return self._conn.execute(
+        return self._ensure_connection().execute(
             """
             WITH session_ids AS (
                 SELECT session_id FROM messages
@@ -1019,7 +1020,7 @@ class MessageStore:
         """Return a dry-run plan for normalizing legacy blank source values."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             f"""
             SELECT COUNT(*) AS would_update_messages,
                    COUNT(DISTINCT session_id) AS affected_sessions
@@ -1040,8 +1041,8 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._write_lock, self._conn:
-            cur = self._conn.execute(
+        with self._write_lock, self._ensure_connection() as _ctx:
+            cur = self._ensure_connection().execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
             )
@@ -1058,7 +1059,7 @@ class MessageStore:
         if not store_ids:
             return None, None
         placeholders = ",".join("?" * len(store_ids))
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             f"SELECT MIN(timestamp), MAX(timestamp) FROM messages WHERE store_id IN ({placeholders})",
             store_ids,
         ).fetchone()
@@ -1078,7 +1079,7 @@ class MessageStore:
         Reads are unlocked, matching the store's other read paths (``_write_lock``
         guards writes only).
         """
-        conn = self._conn
+        conn = self._ensure_connection()
         if conn is None:
             return None
         row = conn.execute(
@@ -1105,7 +1106,7 @@ class MessageStore:
         -- the ingest-hot-path optimization used by the placeholder count/ordinal
         writers. Returns ``True`` if any key was written.
         """
-        conn = self._conn
+        conn = self._ensure_connection()
         if conn is None:
             return False
         wrote = False
@@ -1162,7 +1163,7 @@ class MessageStore:
             return None
         if isinstance(increment, bool) or not isinstance(increment, int) or increment < 0:
             raise ValueError("compaction telemetry increment must be a non-negative integer")
-        conn = self._conn
+        conn = self._ensure_connection()
         if conn is None:
             return None
 
@@ -1371,7 +1372,7 @@ class MessageStore:
                     where.append("m.timestamp <= ?")
                     args.append(time_to)
                 args.extend([fetch_limit, offset])
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
                               m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
                               m.ingested_at, m.observed_at, m.observed_at_source,
@@ -1573,7 +1574,7 @@ class MessageStore:
                 batch_limit = min(fetch_limit, candidate_cap - scanned_rows)
                 if batch_limit <= 0:
                     break
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
                         WHERE {' AND '.join(where)}
@@ -1590,7 +1591,7 @@ class MessageStore:
                     boundary_timestamp = rows[-1][8]
                     boundary_role_bias = _message_role_bias(rows[-1][3])
                     while True:
-                        tie_rows = self._conn.execute(
+                        tie_rows = self._ensure_connection().execute(
                             f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                                 FROM messages
                                 WHERE {' AND '.join(where)}
@@ -1650,7 +1651,7 @@ class MessageStore:
             offset = 0
             while offset < candidate_cap:
                 batch_limit = min(fetch_limit, candidate_cap - offset)
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     f"""SELECT {_MESSAGE_SELECT_COLUMNS}
                         FROM messages
                         WHERE {' AND '.join(where)}
@@ -1719,6 +1720,85 @@ class MessageStore:
         """
         return self._conn
 
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if it was closed.
+
+        ``close()`` nulls ``self._conn`` (and ``__del__`` can invoke ``close()``
+        on a deepcopy sibling that shares this object's connection). Before this
+        guard, any query after that raised ``AttributeError: 'NoneType' object
+        has no attribute 'execute'`` permanently, because outside ``__init__``
+        nothing ever re-opened the connection. Lazy reconnection here keeps the
+        store usable; callers that genuinely need to know it was closed can read
+        the ``connection`` property, which stays honest (it does not reconnect).
+        """
+        conn = self._conn
+        if conn is not None:
+            # ``__del__`` on a deepcopy sibling shares this connection object and
+            # can close it underneath us. A closed sqlite3 connection is still a
+            # truthy object, so the ``None`` check alone misses it; probe it with
+            # a no-cost PRAGMA and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        # ``_init_db`` re-creates the schema idempotently (CREATE TABLE IF NOT
+        # EXISTS / IF NOT EXISTS indexes), so calling it on an existing,
+        # already-migrated database is a no-op beyond re-opening the handle.
+        was_gc_closed = getattr(self, "_closed_by_gc", False)
+        self._init_db()
+        # A reconnection after a GC-triggered ``__del__`` close means a deepcopy
+        # sibling finalized while the original store was still in use -- the
+        # exact bug this guard exists for. Leave a breadcrumb for diagnostics.
+        if was_gc_closed:
+            self._closed_by_gc = False
+            try:
+                logger.warning(
+                    "MessageStore connection was closed by __del__ and lazily "
+                    "reopened; a deepcopy sibling likely finalized early. "
+                    "db=%s", getattr(self.db_path, "name", self.db_path),
+                )
+            except Exception:
+                pass
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy only mutable budget/counter state, never the DB handle.
+
+        The compression pipeline deep-copies the context engine to run a
+        snapshot worker in a side thread. A default ``copy.deepcopy`` on this
+        store would duplicate the ``sqlite3.Connection`` and ``threading.RLock``
+        objects, which cannot be pickled (it raises
+        ``TypeError: cannot pickle '_thread.RLock' object``) — and a copy that
+        merely *shared* the connection would, on garbage collection, run
+        ``__del__`` → ``close()`` on the *original's* connection, killing the
+        live store with ``Cannot operate on a closed database``.
+
+        So the copy gets a freshly opened connection of its own (the schema is
+        re-created idempotently by ``_init_db``), and ``_write_lock`` is
+        re-allocated rather than shared. The copy owns everything it closes.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                # Never share or copy the handle: open a fresh one so the copy's
+                # eventual close() cannot touch the original's connection.
+                new_store.__dict__[name] = None
+            elif name == "_write_lock":
+                new_store.__dict__[name] = threading.RLock()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        if not new_store.__dict__.get("_is_memory_database", False):
+            new_store._init_db()
+        return new_store
+
     def commit(self) -> None:
         """Commit pending writes on the store connection.
 
@@ -1726,7 +1806,7 @@ class MessageStore:
         the private connection. Requires a live connection: a closed store
         raises, matching direct ``_conn.commit()`` use.
         """
-        self._conn.commit()
+        self._ensure_connection().commit()
 
     def backup(self, dest: sqlite3.Connection) -> None:
         """Copy the store's database into the already-open ``dest`` connection.
@@ -1735,7 +1815,7 @@ class MessageStore:
         store without reaching its private connection. Requires a live
         connection, matching direct ``_conn.backup(dest)`` use.
         """
-        self._conn.backup(dest)
+        self._ensure_connection().backup(dest)
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -1752,7 +1832,19 @@ class MessageStore:
             conn.close()
             self._conn = None
 
+    # ``_closed_by_gc`` marks stores that reached ``close()`` purely through
+    # ``__del__`` garbage collection rather than an explicit, intended shutdown.
+    # A GC-triggered close on a deepcopy sibling used to kill the live store's
+    # connection; ``_ensure_connection`` now reconnects, but we still want to
+    # know it happened, so a later reconnection can be logged / audited.
+    _closed_by_gc: bool = False
+
     def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
+        # Mark GC-initiated shutdowns so ``_ensure_connection`` can tell an
+        # accidental close from a deliberate one. Refcount-driven finalizers
+        # (including ``del store``, scope exit, and interpreter shutdown) are
+        # the only callers of this path in practice.
+        self._closed_by_gc = True
         try:
             self.close()
         except Exception:

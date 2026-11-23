@@ -50,6 +50,7 @@ from .search_query import (
     should_apply_directness_rank_adjustment,
 )
 from .store import _normalize_source_value, _UNKNOWN_SOURCE, _legacy_blank_source_clause
+import copy
 
 
 logger = logging.getLogger(__name__)
@@ -220,7 +221,7 @@ class SummaryDAG:
 
     def _ensure_source_window_columns(self) -> None:
         columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(summary_nodes)").fetchall()
+            row[1] for row in self._ensure_connection().execute("PRAGMA table_info(summary_nodes)").fetchall()
         }
         add_column_if_missing(
             self._conn, columns, "earliest_at",
@@ -230,14 +231,14 @@ class SummaryDAG:
             self._conn, columns, "latest_at",
             "ALTER TABLE summary_nodes ADD COLUMN latest_at REAL",
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_session_latest ON summary_nodes(session_id, latest_at, created_at)"
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_session_node "
             "ON summary_nodes(session_id, node_id)"
         )
-        self._conn.execute(
+        self._ensure_connection().execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_session_depth_node "
             "ON summary_nodes(session_id, depth, node_id)"
         )
@@ -247,7 +248,7 @@ class SummaryDAG:
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
         with self._db_lock:
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 """INSERT INTO summary_nodes
                    (session_id, depth, summary, token_count, source_token_count,
                     source_ids, source_type, created_at, earliest_at, latest_at, expand_hint)
@@ -266,7 +267,7 @@ class SummaryDAG:
                     node.expand_hint,
                 ),
             )
-            self._conn.commit()
+            self._ensure_connection().commit()
             node.node_id = cur.lastrowid
             return node.node_id
 
@@ -341,15 +342,15 @@ class SummaryDAG:
         while True:
             with self._db_lock:
                 try:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    self._ensure_connection().execute("BEGIN IMMEDIATE")
                     node_ids = self.delete_node_batch(
                         self._conn,
                         (session_id,),
                         min_depth=min_depth,
                     )
-                    self._conn.commit()
+                    self._ensure_connection().commit()
                 except Exception:
-                    self._conn.rollback()
+                    self._ensure_connection().rollback()
                     raise
             if not node_ids:
                 return deleted
@@ -395,18 +396,18 @@ class SummaryDAG:
         the fresh session while preserving node IDs and node-to-node links.
         """
         with self._db_lock:
-            cur = self._conn.execute(
+            cur = self._ensure_connection().execute(
                 "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
             moved = cur.rowcount
-            self._conn.commit()
+            self._ensure_connection().commit()
         return moved
 
     # -- Read ---------------------------------------------------------------
 
     def get_node(self, node_id: int) -> Optional[SummaryNode]:
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT * FROM summary_nodes WHERE node_id = ?", (node_id,)
         ).fetchone()
         return self._row_to_node(row) if row else None
@@ -417,14 +418,14 @@ class SummaryDAG:
         """Get nodes for a session, optionally filtered by depth."""
         with self._db_lock:
             if depth is not None:
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ? AND depth = ?
                        ORDER BY created_at LIMIT ?""",
                     (session_id, depth, limit),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     """SELECT * FROM summary_nodes
                        WHERE session_id = ?
                        ORDER BY depth, created_at LIMIT ?""",
@@ -445,12 +446,12 @@ class SummaryDAG:
         """
         with self._db_lock:
             if min_depth is None:
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     "SELECT node_id FROM summary_nodes WHERE session_id = ?",
                     (session_id,),
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     "SELECT node_id FROM summary_nodes WHERE session_id = ? AND depth < ?",
                     (session_id, min_depth),
                 ).fetchall()
@@ -459,7 +460,7 @@ class SummaryDAG:
     def count_at_depth(self, session_id: str, depth: int) -> int:
         """Count nodes at a specific depth for a session."""
         with self._db_lock:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 """SELECT COUNT(*) FROM summary_nodes
                    WHERE session_id = ? AND depth = ?""",
                 (session_id, depth),
@@ -468,7 +469,7 @@ class SummaryDAG:
 
     def get_session_node_count(self, session_id: str) -> int:
         """Count summary nodes for a session without loading node rows."""
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             "SELECT COUNT(*) FROM summary_nodes WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -476,7 +477,7 @@ class SummaryDAG:
 
     def get_session_depth_stats(self, session_id: str) -> Dict[int, Dict[str, int]]:
         """Aggregate per-depth node/token stats for a session."""
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             """SELECT depth,
                       COUNT(*) AS count,
                       COALESCE(SUM(token_count), 0) AS tokens,
@@ -507,7 +508,7 @@ class SummaryDAG:
         if per_depth_limit <= 0:
             return {}
         if depths is None:
-            depth_rows = self._conn.execute(
+            depth_rows = self._ensure_connection().execute(
                 """SELECT DISTINCT depth FROM summary_nodes
                    WHERE session_id = ?
                    ORDER BY depth""",
@@ -517,7 +518,7 @@ class SummaryDAG:
 
         samples: Dict[int, List[SummaryNode]] = {}
         for depth in depths:
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 """SELECT * FROM summary_nodes
                    WHERE session_id = ? AND depth = ?
                    ORDER BY created_at LIMIT ?""",
@@ -534,7 +535,7 @@ class SummaryDAG:
         any higher-depth node.
         """
         with self._db_lock:
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 """SELECT n.* FROM summary_nodes n
                    WHERE n.session_id = ? AND n.depth = ?
                    AND n.node_id NOT IN (
@@ -585,7 +586,7 @@ class SummaryDAG:
             try:
                 with self._db_lock:
                     if session_id is not None:
-                        rows = self._conn.execute(
+                        rows = self._ensure_connection().execute(
                             f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                                JOIN summary_nodes n ON n.node_id = fts.rowid
                                WHERE nodes_fts MATCH ? AND n.session_id = ?
@@ -593,7 +594,7 @@ class SummaryDAG:
                             (safe_query, session_id, fetch_limit, offset),
                         ).fetchall()
                     else:
-                        rows = self._conn.execute(
+                        rows = self._ensure_connection().execute(
                             f"""SELECT n.*, rank as search_rank FROM nodes_fts fts
                                JOIN summary_nodes n ON n.node_id = fts.rowid
                                WHERE nodes_fts MATCH ?
@@ -672,7 +673,7 @@ class SummaryDAG:
         source_match_cache: dict[int, bool] = {}
         while True:
             with self._db_lock:
-                rows = self._conn.execute(
+                rows = self._ensure_connection().execute(
                     f"""SELECT * FROM summary_nodes
                         WHERE {' AND '.join(where)}
                         LIMIT ? OFFSET ?""",
@@ -710,7 +711,7 @@ class SummaryDAG:
         if node.source_type != "nodes" or not node.source_ids:
             return []
         placeholders = ",".join("?" * len(node.source_ids))
-        rows = self._conn.execute(
+        rows = self._ensure_connection().execute(
             f"""SELECT * FROM summary_nodes
                 WHERE node_id IN ({placeholders})
                 ORDER BY created_at""",
@@ -733,7 +734,7 @@ class SummaryDAG:
         if limit <= 0:
             return []
         with self._db_lock:
-            rows = self._conn.execute(
+            rows = self._ensure_connection().execute(
                 """
                 WITH RECURSIVE source_walk(source_type, source_id) AS (
                     SELECT n.source_type, CAST(j.value AS INTEGER)
@@ -774,7 +775,7 @@ class SummaryDAG:
         if cache is not None and node_id in cache:
             return cache[node_id]
         legacy_blank_clause = _legacy_blank_source_clause("m.source")
-        row = self._conn.execute(
+        row = self._ensure_connection().execute(
             f"""
             WITH RECURSIVE source_walk(source_type, source_id) AS (
                 SELECT n.source_type, CAST(j.value AS INTEGER)
@@ -813,7 +814,7 @@ class SummaryDAG:
             return None, None
         placeholders = ",".join("?" * len(node_ids))
         with self._db_lock:
-            row = self._conn.execute(
+            row = self._ensure_connection().execute(
                 f"""SELECT
                         MIN(COALESCE(earliest_at, created_at)),
                         MAX(COALESCE(latest_at, created_at))
@@ -873,6 +874,58 @@ class SummaryDAG:
             expand_hint=row[11] or "",
             search_rank=row[12] if len(row) > 12 else None,
         )
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Return the live connection, transparently reconnecting if closed.
+
+        close() nulls self._conn, and a shallow-copied sibling or GC path can
+        close the same underlying handle underneath this store. Before this
+        guard any later query raised AttributeError: 'NoneType' object has no
+        attribute 'execute' permanently. Lazy reconnection here keeps the
+        store usable; the connection property stays honest (it does not
+        reconnect).
+        """
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            # A closed sqlite3 connection is still a truthy object, so probe it
+            # and fall through to the reconnect path if dead.
+            try:
+                conn.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                # Only a genuinely closed connection (Cannot operate on a
+                # closed database) triggers a reconnect. Other sqlite errors
+                # (schema problems, malformed data) must propagate to the
+                # caller, not be silently masked by a fresh handle.
+                conn = None
+        if conn is not None:
+            return conn
+        self._init_db()
+        return self._conn
+
+    def __deepcopy__(self, memo):
+        """Copy state but never the DB handle or locks.
+
+        Default deepcopy would pickle the sqlite3.Connection (TypeError) or a
+        shallow copy would share it so the copy's GC could close the original's
+        live handle. The copy gets _conn=None and fresh locks; it lazily
+        reconnects on first use via _ensure_connection.
+        """
+        cls = type(self)
+        new_store = object.__new__(cls)
+        memo[id(self)] = new_store
+        for name, value in self.__dict__.items():
+            if name == "_conn":
+                new_store.__dict__[name] = None
+            elif callable(getattr(value, "acquire", None)) and callable(
+                getattr(value, "release", None)
+            ):
+                # Re-allocate any lock object (RLock/Lock) so the copy does not
+                # share the original's lock. Use the same class rather than a
+                # hard-coded threading reference (the runtime may patch it).
+                new_store.__dict__[name] = type(value)()
+            else:
+                new_store.__dict__[name] = copy.deepcopy(value, memo)
+        return new_store
 
     def close(self) -> None:
         conn = getattr(self, "_conn", None)
