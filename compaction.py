@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
+_MIN_AUTOMATIC_FOREGROUND_SECONDS = 0.001
 
 
 class CompactionMixin:
@@ -472,7 +473,44 @@ class CompactionMixin:
             and self.threshold_tokens > 0
             and estimated_active_tokens >= self.threshold_tokens
         )
-        sweep_deadline = time.monotonic() + _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        # Automatic compaction runs inside a live turn, so an operator can cap
+        # how long it is allowed to hold that turn. Forced/manual compaction
+        # keeps the full sweep ceiling. Defaults match, so this is a no-op
+        # until the automatic ceiling is explicitly lowered.
+        automatic_foreground = not force
+        configured_automatic_passes = int(
+            self._config.automatic_foreground_max_passes
+        )
+        automatic_pass_ceiling = (
+            configured_automatic_passes
+            if configured_automatic_passes > 0
+            else _THRESHOLD_FULL_SWEEP_MAX_PASSES
+        )
+        configured_automatic_seconds = float(
+            self._config.automatic_foreground_max_seconds
+        )
+        automatic_seconds_ceiling = (
+            configured_automatic_seconds
+            if configured_automatic_seconds > 0
+            else _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        )
+        # Only diverge from upstream defaults when an operator actually lowered
+        # a ceiling, so the default automatic path stays byte-identical.
+        automatic_budget_enforced = automatic_foreground and (
+            automatic_pass_ceiling < _THRESHOLD_FULL_SWEEP_MAX_PASSES
+            or automatic_seconds_ceiling < _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        )
+        sweep_pass_budget = (
+            automatic_pass_ceiling
+            if automatic_budget_enforced
+            else _THRESHOLD_FULL_SWEEP_MAX_PASSES
+        )
+        sweep_seconds_budget = (
+            automatic_seconds_ceiling
+            if automatic_budget_enforced
+            else _THRESHOLD_FULL_SWEEP_MAX_SECONDS
+        )
+        sweep_deadline = time.monotonic() + sweep_seconds_budget
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
         sweep_target_tokens = max(
             1,
@@ -515,9 +553,11 @@ class CompactionMixin:
         base_max_leaf_passes = 4 if self._config.dynamic_leaf_chunk_enabled else 1
         max_leaf_passes = base_max_leaf_passes
         if threshold_full_sweep_active:
-            max_leaf_passes = _THRESHOLD_FULL_SWEEP_MAX_PASSES
+            max_leaf_passes = sweep_pass_budget
         if deferred_maintenance_active:
             max_leaf_passes = max(1, self._config.deferred_maintenance_max_passes)
+        if automatic_budget_enforced:
+            max_leaf_passes = max(1, min(max_leaf_passes, automatic_pass_ceiling))
 
         explicit_focus_topic = focus_topic is not None
 
@@ -528,7 +568,9 @@ class CompactionMixin:
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
         while leaf_passes < max_leaf_passes:
-            if threshold_full_sweep_active and time.monotonic() >= sweep_deadline:
+            if (
+                threshold_full_sweep_active or automatic_budget_enforced
+            ) and time.monotonic() >= sweep_deadline:
                 sweep_stop_reason = "time_budget_exhausted"
                 break
             fresh_tail_start = self._fresh_tail_start(pressure_messages)
@@ -715,8 +757,11 @@ class CompactionMixin:
                 # turns cannot leak through derived assistant/tool replies.
                 if self._config.extraction_enabled:
                     extraction_timeout = None
-                    if threshold_full_sweep_active:
-                        extraction_timeout = max(0.001, sweep_deadline - time.monotonic())
+                    if threshold_full_sweep_active or automatic_budget_enforced:
+                        extraction_timeout = max(
+                            _MIN_AUTOMATIC_FOREGROUND_SECONDS,
+                            sweep_deadline - time.monotonic(),
+                        )
                     self._run_pre_compaction_extraction(
                         summary_input_chunk,
                         timeout_seconds=extraction_timeout,
@@ -732,7 +777,7 @@ class CompactionMixin:
 
                 try:
                     summary_kwargs: dict[str, Any] = {"focus_topic": focus_topic}
-                    if threshold_full_sweep_active:
+                    if threshold_full_sweep_active or automatic_budget_enforced:
                         summary_kwargs["deadline"] = sweep_deadline
                     (
                         compacted_chunk,
@@ -931,7 +976,7 @@ class CompactionMixin:
             if sweep_raw_drained:
                 remaining_passes = max(
                     0,
-                    _THRESHOLD_FULL_SWEEP_MAX_PASSES - leaf_passes,
+                    sweep_pass_budget - leaf_passes,
                 )
                 condensation_passes, sweep_stop_reason = (
                     self._run_threshold_sweep_condensation(
@@ -947,6 +992,11 @@ class CompactionMixin:
                 leaf_compacted_this_turn=True,
                 force_overflow=force_overflow,
                 critical_budget_pressure=critical_budget_pressure,
+                deadline=(
+                    sweep_deadline
+                    if (threshold_full_sweep_active or automatic_budget_enforced)
+                    else None
+                ),
             )
 
         # Step 7: Assemble new active context

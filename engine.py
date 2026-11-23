@@ -5563,6 +5563,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         leaf_compacted_this_turn: bool = False,
         force_overflow: bool = False,
         critical_budget_pressure: bool = False,
+        deadline: Optional[float] = None,
     ) -> None:
         """Check if any depth level has enough nodes for condensation."""
         self._last_condensation_suppressed_reason = ""
@@ -5585,6 +5586,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         fanin = max(1, self._config.condensation_fanin)
 
         for depth in range(upper):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             uncondensed = self._dag.get_uncondensed_at_depth(
                 self._session_id, depth
             )
@@ -5606,6 +5609,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             source_tokens, summary_tokens, level = self._condense_summary_nodes(
                 to_condense,
                 focus_topic=focus_topic,
+                deadline=deadline,
             )
             condensed_any = True
 
