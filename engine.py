@@ -4550,47 +4550,50 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             scan_start=scan_start,
             ignored_messages=ignored_original_messages,
         )
-        if self._ingest_cursor_needs_reconcile:
-            reconcile_messages = [
-                original_msg
-                if (
-                    (
-                        str(original_msg.get("role") or "") == "tool"
-                        and _is_hermes_persisted_output_marker(
-                            normalize_content_value(original_msg.get("content")) or ""
+        # Turn-start cost: memoise replay identities for the reconcile +
+        # cached-prefix checks, which re-identify the same rows several times.
+        with self._replay_identity_memo_scope():
+            if self._ingest_cursor_needs_reconcile:
+                reconcile_messages = [
+                    original_msg
+                    if (
+                        (
+                            str(original_msg.get("role") or "") == "tool"
+                            and _is_hermes_persisted_output_marker(
+                                normalize_content_value(original_msg.get("content")) or ""
+                            )
+                            and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
                         )
-                        and self._has_any_durable_persisted_output_payload_for_marker(original_msg)
+                        or (
+                            self._compiled_ignore_message_patterns
+                            and ignored_original_messages[idx]
+                        )
                     )
-                    or (
-                        self._compiled_ignore_message_patterns
-                        and ignored_original_messages[idx]
-                    )
-                )
-                else replay_msg
-                for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
-            ]
-            self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
-            self._ingest_cursor_needs_reconcile = False
-        cursor = min(max(self._ingest_cursor, 0), n)
-        if cursor > 0:
-            cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
-            cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
-            if (
-                cached_source_identities is not None
-                and cached_active_replay_messages is not None
-                and len(cached_source_identities) >= cursor
-                and len(cached_active_replay_messages) >= cursor
-            ):
-                current_prefix_identities = [
-                    self._message_replay_identity(message) for message in messages[:cursor]
+                    else replay_msg
+                    for idx, (original_msg, replay_msg) in enumerate(zip(messages, replay_messages))
                 ]
-                if current_prefix_identities == cached_source_identities[:cursor]:
-                    replay_messages = (
-                        self._copy_active_replay_messages_preserving_generated_ids(
-                            cached_active_replay_messages[:cursor]
+                self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
+                self._ingest_cursor_needs_reconcile = False
+            cursor = min(max(self._ingest_cursor, 0), n)
+            if cursor > 0:
+                cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
+                cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
+                if (
+                    cached_source_identities is not None
+                    and cached_active_replay_messages is not None
+                    and len(cached_source_identities) >= cursor
+                    and len(cached_active_replay_messages) >= cursor
+                ):
+                    current_prefix_identities = [
+                        self._message_replay_identity(message) for message in messages[:cursor]
+                    ]
+                    if current_prefix_identities == cached_source_identities[:cursor]:
+                        replay_messages = (
+                            self._copy_active_replay_messages_preserving_generated_ids(
+                                cached_active_replay_messages[:cursor]
+                            )
+                            + replay_messages[cursor:]
                         )
-                        + replay_messages[cursor:]
-                    )
         logger.debug(
             "Ingest: session=%s cursor=%d incoming=%d",
             self._session_id, cursor, n,

@@ -18,6 +18,7 @@ avoid an import cycle (staticmethod resolution is identical).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from pathlib import Path
@@ -124,7 +125,40 @@ class ReconcileMixin:
                 return False
         return True
 
+    @contextlib.contextmanager
+    def _replay_identity_memo_scope(self):
+        """Memoise replay identities for the duration of one reconcile pass.
+
+        An identity is a pure function of the message dict (plus files that are
+        only ever appended while NEW rows are persisted, which happens after this
+        scope closes).  Turn-start reconciliation asks for the identity of the
+        same incoming message up to ~6 times and of every stored-tail row again
+        for the stale-snapshot probe; memoising by object identity makes the
+        pass O(rows) identity computations.  Nested scopes reuse the outer memo.
+        """
+        if getattr(self, "_replay_identity_memo", None) is not None:
+            yield
+            return
+        self._replay_identity_memo = {}
+        try:
+            yield
+        finally:
+            self._replay_identity_memo = None
+
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
+        memo = getattr(self, "_replay_identity_memo", None)
+        if memo is None:
+            return self._compute_message_replay_identity(msg, stored_row=stored_row)
+        key = (id(msg), stored_row)
+        hit = memo.get(key)
+        # Hold a reference to ``msg`` so its id() cannot be recycled mid-scope.
+        if hit is not None and hit[0] is msg:
+            return hit[1]
+        identity = self._compute_message_replay_identity(msg, stored_row=stored_row)
+        memo[key] = (msg, identity)
+        return identity
+
+    def _compute_message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
         content = normalize_content_value(msg.get("content")) or ""
         if (
@@ -249,9 +283,16 @@ class ReconcileMixin:
     ) -> bool:
         if not candidate_prefix:
             return True
-        if len(candidate_prefix) > len(stored_tail):
+        width = len(candidate_prefix)
+        if width > len(stored_tail):
             return False
-        return stored_tail[-len(candidate_prefix) :] == candidate_prefix
+        # Compare from the END: the reconcile scan calls this once per candidate
+        # cursor and a mismatch almost always shows at the newest row, so this
+        # fails in O(1) instead of slicing and comparing O(width) rows.
+        for offset in range(1, width + 1):
+            if stored_tail[-offset] != candidate_prefix[-offset]:
+                return False
+        return True
 
     @staticmethod
     def _strip_inline_persisted_output_generation_identity(
@@ -446,54 +487,130 @@ class ReconcileMixin:
                 })
         effective_fresh_tail_count = self._fresh_tail_boundary(boundary_messages).count
         empty_prefix_cursor: int | None = None
-        for cursor in range(len(messages), -1, -1):
-            candidate_messages = messages[:cursor]
-            candidate_visible_messages = [
-                msg
-                for msg in candidate_messages
-                if not self._is_replayed_context_scaffold_message(msg)
-                and not self._matches_ignore_message_patterns(msg)
-            ]
-            candidate_non_placeholder_messages = [
-                msg
-                for msg in candidate_visible_messages
-                if not self._is_volatile_ignored_quarantine_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                and not (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
+
+        # Turn-start cost contract: every per-message predicate and
+        # replay identity below is a pure function of ONE message, so compute it
+        # ONCE per message and answer each candidate cursor from prefix counts.
+        # The previous shape rebuilt every filtered list and recomputed every
+        # identity for messages[:cursor] at EACH cursor -- O(n^2) identity
+        # computations (JSON canonicalisation + externalized-payload reads) on
+        # the post-compaction replay shape, which scans all the way to cursor 0.
+        # Semantics are unchanged: each derived value is the same expression the
+        # old loop evaluated, just memoised by index.
+        n_msgs = len(messages)
+        compiled_ignore = bool(self._compiled_ignore_message_patterns)
+        identities: list[tuple[str, str, str, str]] = []
+        contents: list[str] = []
+        is_scaffold: list[bool] = []
+        is_visible: list[bool] = []
+        is_dropped: list[bool] = []
+        is_quarantined: list[bool] = []
+        is_marker: list[bool] = []
+        is_unrecoverable_marker: list[bool] = []
+        is_inline_generation_marker: list[bool] = []
+        is_preserved_objective: list[bool] = []
+        for msg in messages:
+            identity = self._message_replay_identity(msg)
+            identities.append(identity)
+            scaffold = self._is_replayed_context_scaffold_message(msg)
+            is_scaffold.append(scaffold)
+            is_visible.append(not scaffold and not self._matches_ignore_message_patterns(msg))
+            pattern_text = text_content_for_pattern_matching(msg.get("content")) or ""
+            quarantined = self._is_quarantined_assistant_replay_identity(identity)
+            is_quarantined.append(quarantined)
+            is_dropped.append(
+                self._is_volatile_ignored_quarantine_placeholder(msg, pattern_text)
+                or self._is_ignored_active_replay_placeholder(msg, pattern_text)
+                or (
+                    compiled_ignore
+                    and quarantined
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
-            ]
-            filtered_candidate_placeholders = len(candidate_non_placeholder_messages) < len(candidate_visible_messages)
-            candidate_has_scaffold_evidence = any(
-                self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
-            candidate_has_quarantined_replay_evidence = any(
-                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
-                for msg in candidate_messages
+            content = normalize_content_value(msg.get("content")) or ""
+            contents.append(content)
+            role_text = str(msg.get("role") or "")
+            marker = role_text == "tool" and _is_hermes_persisted_output_marker(content)
+            is_marker.append(marker)
+            is_unrecoverable_marker.append(
+                marker and recover_hermes_persisted_output_with_file_stat(content) is None
             )
-            candidate_identity_messages = (
-                candidate_non_placeholder_messages
-                if candidate_non_placeholder_messages or filtered_candidate_placeholders
-                else candidate_visible_messages
+            is_inline_generation_marker.append(
+                marker and _has_inline_persisted_output_generation_metadata(content)
             )
-            candidate_visible_prefix = [
-                self._message_replay_identity(msg)
-                for msg in candidate_visible_messages
-            ]
-            candidate_prefix = [
-                self._message_replay_identity(msg)
-                for msg in candidate_identity_messages
-            ]
+            is_preserved_objective.append(
+                role_text != "system"
+                and content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX)
+            )
+
+        visible_idx = [i for i in range(n_msgs) if is_visible[i]]
+        # "Identity messages" == visible rows that are not dropped placeholders.
+        # (The old fallback to the visible list only applied when both lists
+        # were empty, so it is the same list.)
+        identity_idx = [i for i in visible_idx if not is_dropped[i]]
+        visible_ids = [identities[i] for i in visible_idx]
+        identity_ids = [identities[i] for i in identity_idx]
+
+        def _prefix_counts(flags: list[bool]) -> list[int]:
+            counts = [0] * (n_msgs + 1)
+            running = 0
+            for i, flag in enumerate(flags):
+                if flag:
+                    running += 1
+                counts[i + 1] = running
+            return counts
+
+        identity_member = [False] * n_msgs
+        for i in identity_idx:
+            identity_member[i] = True
+        cnt_visible = _prefix_counts(is_visible)
+        cnt_identity = _prefix_counts(identity_member)
+        cnt_scaffold = _prefix_counts(is_scaffold)
+        cnt_quarantined = _prefix_counts(is_quarantined)
+        cnt_dropped = _prefix_counts(is_dropped)
+        cnt_objective = _prefix_counts(is_preserved_objective)
+        cnt_identity_marker = _prefix_counts(
+            [identity_member[i] and is_marker[i] for i in range(n_msgs)]
+        )
+        cnt_identity_unrecoverable = _prefix_counts(
+            [identity_member[i] and is_unrecoverable_marker[i] for i in range(n_msgs)]
+        )
+        cnt_identity_inline_generation = _prefix_counts(
+            [identity_member[i] and is_inline_generation_marker[i] for i in range(n_msgs)]
+        )
+        cnt_identity_system = _prefix_counts(
+            [identity_member[i] and identities[i][0] == "system" for i in range(n_msgs)]
+        )
+        cnt_identity_user = _prefix_counts(
+            [identity_member[i] and identities[i][0] == "user" for i in range(n_msgs)]
+        )
+        marker_idx = [i for i in range(n_msgs) if is_marker[i]]
+        durable_marker_memo: dict[int, bool] = {}
+
+        def _durable_marker(i: int) -> bool:
+            if i not in durable_marker_memo:
+                durable_marker_memo[i] = self._has_durable_persisted_output_replay_identity(messages[i])
+            return durable_marker_memo[i]
+
+        generationless_sanitized_tail: list[tuple[str, str, str, str]] | None = None
+        generationless_identity_ids: list[tuple[str, str, str, str]] | None = None
+        cleanup_needed_memo: dict[int, bool] = {}
+
+        def _raw_suffix_needs_cleanup(k: int) -> bool:
+            if k not in cleanup_needed_memo:
+                cleanup_needed_memo[k] = any(
+                    self._active_cleanup_replay_identity(identity) != identity
+                    for identity in (stored_tail[-k:] if k else [])
+                )
+            return cleanup_needed_memo[k]
+
+        for cursor in range(n_msgs, -1, -1):
+            k_visible = cnt_visible[cursor]
+            k_identity = cnt_identity[cursor]
+            filtered_candidate_placeholders = k_identity < k_visible
+            candidate_has_scaffold_evidence = cnt_scaffold[cursor] > 0
+            candidate_has_quarantined_replay_evidence = cnt_quarantined[cursor] > 0
+            candidate_prefix = identity_ids[:k_identity]
             if not candidate_prefix:
                 empty_prefix_cursor = cursor
                 if allow_empty_prefix and (
@@ -509,66 +626,51 @@ class ReconcileMixin:
                 and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_prefix)
             )
             matches_raw_tail = self._matches_store_tail_suffix(stored_tail, candidate_prefix)
-            matches_visible_sanitized_tail = (
-                filtered_candidate_placeholders
-                and bool(candidate_visible_prefix)
-                and len(candidate_visible_prefix) <= len(sanitized_replay_tail)
-                and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_visible_prefix)
-            )
-            matches_visible_raw_tail = (
-                filtered_candidate_placeholders
-                and bool(candidate_visible_prefix)
-                and self._matches_store_tail_suffix(stored_tail, candidate_visible_prefix)
-            )
-            early_candidate_has_unrecoverable_persisted_marker = any(
-                str(msg.get("role") or "") == "tool"
-                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
+            matches_visible_sanitized_tail = False
+            matches_visible_raw_tail = False
+            if filtered_candidate_placeholders and k_visible:
+                candidate_visible_prefix = visible_ids[:k_visible]
+                matches_visible_sanitized_tail = (
+                    len(candidate_visible_prefix) <= len(sanitized_replay_tail)
+                    and self._matches_store_tail_suffix(sanitized_replay_tail, candidate_visible_prefix)
                 )
-                is None
-                for msg in candidate_identity_messages
-            )
-            if (matches_visible_sanitized_tail or matches_visible_raw_tail) and not early_candidate_has_unrecoverable_persisted_marker:
+                matches_visible_raw_tail = self._matches_store_tail_suffix(
+                    stored_tail, candidate_visible_prefix
+                )
+            candidate_has_unrecoverable_persisted_marker = cnt_identity_unrecoverable[cursor] > 0
+            if (
+                (matches_visible_sanitized_tail or matches_visible_raw_tail)
+                and not candidate_has_unrecoverable_persisted_marker
+            ):
                 return cursor
-            candidate_has_persisted_marker = any(
-                str(msg.get("role") or "") == "tool"
-                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                for msg in candidate_identity_messages
-            )
-            matches_durable_persisted_output_full_replay = self._matches_persisted_output_durable_full_replay(
-                candidate_identity_messages,
-                candidate_prefix,
-                stored_tail,
-                stored_tail_rows,
-            )
-            candidate_has_unrecoverable_persisted_marker = any(
-                str(msg.get("role") or "") == "tool"
-                and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
+            candidate_has_persisted_marker = cnt_identity_marker[cursor] > 0
+            matches_durable_persisted_output_full_replay = bool(
+                stored_tail_rows
+                and len(candidate_prefix) == len(stored_tail)
+                and self._matches_persisted_output_durable_full_replay(
+                    [messages[i] for i in identity_idx[:k_identity]],
+                    candidate_prefix,
+                    stored_tail,
+                    stored_tail_rows,
                 )
-                is None
-                for msg in candidate_identity_messages
             )
             matches_inline_generation_cleanup_tail = False
             if candidate_has_unrecoverable_persisted_marker:
-                generationless_sanitized_tail = [
-                    self._strip_inline_persisted_output_generation_identity(identity)
-                    for identity in sanitized_replay_tail
-                ]
-                generationless_candidate_prefix = [
-                    self._strip_inline_persisted_output_generation_identity(identity)
-                    for identity in candidate_prefix
-                ]
+                if generationless_sanitized_tail is None:
+                    generationless_sanitized_tail = [
+                        self._strip_inline_persisted_output_generation_identity(identity)
+                        for identity in sanitized_replay_tail
+                    ]
+                    generationless_identity_ids = [
+                        self._strip_inline_persisted_output_generation_identity(identity)
+                        for identity in identity_ids
+                    ]
                 matches_inline_generation_cleanup_tail = self._matches_store_tail_suffix(
                     generationless_sanitized_tail,
-                    generationless_candidate_prefix,
+                    generationless_identity_ids[:k_identity],
                 )
-            raw_tail_suffix = stored_tail[-len(candidate_prefix) :] if matches_raw_tail else []
-            raw_suffix_needs_cleanup_equivalence = any(
-                self._active_cleanup_replay_identity(identity) != identity
-                for identity in raw_tail_suffix
+            raw_suffix_needs_cleanup_equivalence = (
+                _raw_suffix_needs_cleanup(len(candidate_prefix)) if matches_raw_tail else False
             )
             if (
                 not matches_sanitized_tail
@@ -588,25 +690,8 @@ class ReconcileMixin:
             # is accepted only when active cleanup did not collapse the durable
             # tail; otherwise a fresh delta can repeat the remaining visible
             # suffix and must be preserved.
-            candidate_has_system = any(identity[0] == "system" for identity in candidate_prefix)
-            candidate_dropped_quarantine_replay_placeholder = any(
-                self._is_volatile_ignored_quarantine_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                or self._is_ignored_active_replay_placeholder(
-                    msg,
-                    text_content_for_pattern_matching(msg.get("content")) or "",
-                )
-                or (
-                    self._compiled_ignore_message_patterns
-                    and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
-                    )
-                    and self._matches_ignore_message_patterns(msg, stored_row=True)
-                )
-                for msg in candidate_messages
-            )
+            candidate_has_system = cnt_identity_system[cursor] > 0
+            candidate_dropped_quarantine_replay_placeholder = cnt_dropped[cursor] > 0
             has_quarantined_singleton_replay = (
                 matches_sanitized_tail
                 and len(candidate_prefix) == 1
@@ -615,9 +700,7 @@ class ReconcileMixin:
                 and self._is_quarantined_assistant_replay_identity(sanitized_replay_tail[0])
             )
             candidate_singleton_original_content = (
-                normalize_content_value(candidate_identity_messages[0].get("content")) or ""
-                if len(candidate_identity_messages) == 1
-                else ""
+                contents[identity_idx[0]] if k_identity == 1 else ""
             )
             has_externalized_singleton_replay = (
                 matches_raw_tail
@@ -637,12 +720,7 @@ class ReconcileMixin:
             )
             has_durable_persisted_marker_suffix_replay = (
                 (matches_sanitized_tail or matches_raw_tail)
-                and any(
-                    str(msg.get("role") or "") == "tool"
-                    and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                    and self._has_durable_persisted_output_replay_identity(msg)
-                    for msg in candidate_messages
-                )
+                and any(_durable_marker(i) for i in marker_idx if i < cursor)
             )
             has_filtered_full_replay = (
                 matches_sanitized_tail
@@ -658,12 +736,7 @@ class ReconcileMixin:
             )
             has_inline_persisted_generation_suffix_replay = (
                 matches_sanitized_tail
-                and any(
-                    str(msg.get("role") or "") == "tool"
-                    and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                    and _has_inline_persisted_output_generation_metadata(normalize_content_value(msg.get("content")) or "")
-                    for msg in candidate_identity_messages
-                )
+                and cnt_identity_inline_generation[cursor] > 0
             )
             if candidate_has_unrecoverable_persisted_marker:
                 continue
@@ -694,24 +767,16 @@ class ReconcileMixin:
                 )
             )
 
-            has_scaffold_evidence = any(
-                self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
-            )
+            has_scaffold_evidence = candidate_has_scaffold_evidence
             has_raw_full_replay = (
                 has_persisted_marker_specific_replay_evidence
                 and matches_raw_tail
                 and not has_scaffold_evidence
-                and len(candidate_messages) >= raw_session_count
+                and cursor >= raw_session_count
                 and raw_session_count > 1
             )
-            has_preserved_objective_scaffold = any(
-                str(msg.get("role") or "") != "system"
-                and (normalize_content_value(msg.get("content")) or "").lstrip().startswith(
-                    _PRESERVED_OBJECTIVE_CONTEXT_PREFIX
-                )
-                for msg in candidate_messages
-            )
-            candidate_suffix_has_user_turn = any(identity[0] == "user" for identity in candidate_prefix)
+            has_preserved_objective_scaffold = cnt_objective[cursor] > 0
+            candidate_suffix_has_user_turn = cnt_identity_user[cursor] > 0
             has_scaffold_suffix_replay = (
                 has_persisted_marker_specific_replay_evidence
                 and matches_sanitized_tail
@@ -722,7 +787,7 @@ class ReconcileMixin:
                 has_persisted_marker_specific_replay_evidence
                 and matches_raw_tail
                 and has_scaffold_evidence
-                and cursor < len(messages)
+                and cursor < n_msgs
                 and len(candidate_prefix) >= max(1, effective_fresh_tail_count)
                 and raw_suffix_needs_cleanup_equivalence
             )
