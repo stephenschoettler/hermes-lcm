@@ -311,6 +311,13 @@ The canonical bytes live in
 not inject them when another context engine is serving the session. Older hosts
 without skill or hook registration keep their existing schema-driven behavior.
 
+The policy is hard-capped at 8 KiB (`MAX_RECALL_POLICY_BYTES`). An empty or
+oversized policy file fails validation, the `pre_llm_call` hook registration
+aborts with a warning, and the tool schemas remain available without the
+policy being injected — so the agent loses its recall-safety guidance for that
+session instead of failing loudly. `recall_policy_sha256()` is the digest an
+operator can check to prove exactly which bytes a run used.
+
 ### Slash commands
 
 Slash commands are disabled by default. Enable them only in trusted operator
