@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import inspect
 import logging
-import sqlite3
 import threading
 import weakref
 from pathlib import Path
 from typing import Any, Dict
+
+from .db_bootstrap import open_readonly_connection
 
 logger = logging.getLogger(__name__)
 
@@ -696,8 +697,7 @@ class AuxiliarySessionMixin:
         if not path.exists():
             return False
         try:
-            uri = path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = open_readonly_connection(path)
             try:
                 row = conn.execute(
                     """
@@ -759,8 +759,7 @@ class AuxiliarySessionMixin:
         visited: set[str] = set()
         current = session_id
         try:
-            uri = state_db_path.resolve().as_uri() + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
+            conn = open_readonly_connection(state_db_path)
             try:
                 for _ in range(32):
                     if not current or current in visited:
