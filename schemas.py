@@ -686,14 +686,12 @@ LCM_COMPILE_EVIDENCE = {
             },
         },
         "required": ["question", "baseline_refs"],
-        "allOf": [
-            {
-                "if": {
-                    "properties": {"mode": {"const": "proposal"}},
-                },
-                "then": {"required": ["proposal"]},
-            }
-        ],
+        # NOTE: the conditional "mode=proposal → required: [proposal]" hint previously
+        # lived here as a top-level allOf/if-then. Strict tool-schema validators
+        # (Azure OpenAI gpt-5.6 via Bifrost) reject top-level combinators with
+        # HTTP 400 invalid_function_parameters, killing the whole turn. The runtime
+        # tool handler validates the mode/proposal pairing in Python, so the wire
+        # schema stays flat and the contract is enforced at dispatch.
     },
 }
 

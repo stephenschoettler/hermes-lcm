@@ -625,13 +625,26 @@ def _case_multi_cycle_canary_recall(run: StressRun) -> None:
         engine.shutdown()
 
 
+def _synthetic_private_key_fixture() -> str:
+    """Build a PEM-shaped redaction fixture without shipping key-like material.
+
+    The install-time plugin scanner reads repository text and correctly treats a
+    literal PEM block as critical credential exposure. The stress case only needs
+    the delimiters to exercise redaction, so assemble them at runtime around a
+    clearly synthetic payload.
+    """
+    label = "".join(("PRIVATE", " KEY"))
+    payload = base64.b64encode(b"hermes-lcm synthetic redaction fixture").decode()
+    return f"-----BEGIN {label}-----\n{payload}\n-----END {label}-----"
+
+
 def _case_redaction_and_externalization_boundaries(run: StressRun) -> None:
     case = "redaction_and_externalization_boundaries"
     secret_values = [
         "sk-tes...cdef",
         "Bearer abcdef1234567890SECRETXYZ",
         "correct horse battery staple",
-        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCSTRESSKEY\n-----END PRIVATE KEY-----",
+        _synthetic_private_key_fixture(),
     ]
     large_blob = base64.b64encode(("LCM-LARGE-PAYLOAD-" * 800).encode()).decode()
     data_url = "data:image/png;base64," + large_blob

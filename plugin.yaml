@@ -18,3 +18,10 @@ provides_tools:
   - lcm_status
   - lcm_inspect
   - lcm_doctor
+
+# Context-engine schemas are surfaced via register_context_engine on message-blind hosts.
+# PluginContext.register_tool is conditional to avoid shadowing message-aware dispatch.
+provides_hooks:
+  - pre_llm_call
+  - subagent_start
+  - subagent_stop
