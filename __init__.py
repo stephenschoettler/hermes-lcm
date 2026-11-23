@@ -408,7 +408,7 @@ def register(ctx):
         try:
             register_skill(
                 "hermes-lcm",
-                skill_root,
+                skill_root / "SKILL.md",
                 description=(
                     "Use, configure, diagnose, and recall exact evidence "
                     "with the Hermes-LCM lossless context plugin."
