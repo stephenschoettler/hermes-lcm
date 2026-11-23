@@ -18,7 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .db_bootstrap import configure_connection, refuse_schema_version_too_new, run_versioned_migrations
+from . import wal_generation_guard
+from .db_bootstrap import (
+    configure_connection,
+    cross_process_gate_lock,
+    refuse_schema_version_too_new,
+    run_versioned_migrations
+)
 
 
 def _synchronized(method):
@@ -61,8 +67,9 @@ class LifecycleStateStore:
         # The connection is opened check_same_thread=False in autocommit mode
         # and is shared across the gateway thread, dispatcher, and sub-agents.
         # Serialize read-modify-write flows so concurrent binds/frontier
-        # advances cannot interleave and regress the checkpoint.
-        self._lock = threading.RLock()
+        # advances cannot interleave and regress the checkpoint; the gate
+        # wrapper extends that serialization across OS processes.
+        self._lock = cross_process_gate_lock(self.db_path, "_lock")
         self._init_db()
 
     def _init_db(self) -> None:
@@ -82,9 +89,13 @@ class LifecycleStateStore:
         conn = getattr(self, "_conn", None)
         if conn is not None:
             try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                with self._lock:  # fence the checkpoint cross-process
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error:
                 pass
+            # Hand the WAL generation back before the close so a true last
+            # close can still reset the sidecars (see wal_generation_guard).
+            wal_generation_guard.disarm(conn)
             conn.close()
             self._conn = None
 
@@ -627,6 +638,7 @@ class LifecycleStateStore:
         self._conn.commit()
         return self.get_by_conversation(conversation_id)
 
+    @_synchronized
     def clear_debt(self, conversation_id: str | None) -> LifecycleState | None:
         if not conversation_id:
             return None
@@ -809,6 +821,7 @@ class LifecycleStateStore:
             conn.rollback()
             raise
 
+    @_synchronized
     def delete_safe_rows_for_sessions(
         self,
         session_ids: set[str] | list[str] | tuple[str, ...],

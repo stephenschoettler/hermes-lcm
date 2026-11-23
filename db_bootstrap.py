@@ -17,7 +17,18 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+# db_bootstrap is imported both as a package member (``hermes_lcm.db_bootstrap``,
+# production and most tests) and bare (``import db_bootstrap``, the
+# cross-process gate tests run from the plugin directory). It is the only module
+# here with no intra-package imports, which is what makes both shapes work, so
+# this one dependency has to resolve under either.
+try:
+    from . import wal_generation_guard
+except ImportError:  # pragma: no cover - bare-module import shape
+    import wal_generation_guard  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +52,260 @@ class SchemaVersionTooNewError(RuntimeError):
 SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Cross-process writer serialization (2026-10-16 corruption #6 root-cause fix).
+#
+# Deployment here runs 4 OS processes (gateway, webui, dashboard, cron worker)
+# each opening their own write connection to one lcm.db. SQLite's page
+# allocator is per-connection: with 2+ concurrent writers, bookkeeping can
+# diverge and one physical page gets claimed by a btree AND as overflow storage
+# (verified byte-level on 2026-10-04: metadata root page 6's rightmost child
+# pointed at page 2753, an un-freed overflow page holding messages.content
+# text). synchronous=FULL, mmap_size=0 and fastdata relocation all predate that
+# event and none of them prevent it.
+#
+# Fix: every write path is fenced with one advisory flock on "<db-path>.lock"
+# for the duration of the write transaction (via the stores' existing
+# ``_write_lock``/``_db_lock``/``_lock`` sections, db_bootstrap's own stamp
+# writers, the FTS integrity-check savepoint, and the FTS repair body), so a
+# single WRITER is enforced cross-process while readers stay lock-free. WAL +
+# busy_timeout handle the resulting lock handoff. Constructor-time schema
+# writes stay un-fenced: SQLite's own file locks serialize them and the FTS
+# repair ownership transaction rechecks state after waiting, while holding the
+# gate there would let one process's startup fence every other process's
+# startup behind a blocking flock (observed as a cross-process barrier
+# deadlock in the spawn-fts-bootstrap regression test). Rollback: set
+# LCM_DISABLE_CROSS_PROCESS_LOCK=1 and restart the services (the lock file
+# itself is inert and can be deleted).
+# --------------------------------------------------------------------------- #
+LCM_DISABLE_CROSS_PROCESS_LOCK = bool(
+    os.environ.get("LCM_DISABLE_CROSS_PROCESS_LOCK", "")
+)
+
+
+class CrossProcessWriteGate:
+    """Serialize writers across the plugin's OS processes.
+
+    Deployment runs 4 OS processes (gateway, webui, dashboard, cron workers)
+    each with their own write connection to one lcm.db. SQLite's page
+    allocator is per-connection: with 2+ concurrent writers its bookkeeping
+    can diverge and one physical page gets claimed by a btree AND as overflow
+    storage. Verified byte-level on 2026-10-04 (corruption #6): the metadata
+    table's root page pointed at page 2753, an un-freed overflow page holding
+    messages.content text. synchronous=FULL, mmap_size=0 and the fastdata
+    relocation all predate that event; none prevents this class.
+
+    Shape: per database path, one process-wide Python mutex (``_lock``) that
+    queues ALL in-process writers FIFO, plus one advisory flock
+    (``<db>.lock`` sidecar) held for the duration of each write transaction so
+    at most one PROCESS writes at a time. Stores enter this gate immediately
+    inside their existing per-store lock, so every store's write body already
+    runs serialized in-process; the gate makes those sections exclusive
+    across processes too. Readers never take the gate.
+
+    Ordering rule: acquire ``_lock`` BEFORE the flock, release AFTER. Locking
+    in that order makes nested ``with`` in one thread (store A's write body
+    calling store B's, or engine code entering two stores' bodies around one
+    transaction) safe: the inner ``with`` re-enters via the thread-local
+    counter without touching the flock, so no thread ever waits on a mutex it
+    itself holds. The reverse order would allow thread 1 to hold ``_lock``
+    while waiting for the flock that thread 2's inner ``with`` released first,
+    a deadlock window that only the flock handoff protects against anyway.
+
+    Failure mode: fails OPEN. If flock is unavailable (e.g. a filesystem
+    without POSIX locks) the gate degrades to in-process-only serialization
+    and logs a warning; corruption risk reverts to the pre-fix status quo
+    rather than crashing the engine.
+    Rollback: set LCM_DISABLE_CROSS_PROCESS_LOCK=1 and restart the services,
+    or remove the ``<db>.lock`` sidecar files (they are inert either way).
+    """
+
+    def __init__(self, db_path: Path) -> None:
+        self._path = db_path.parent / f"{db_path.name}.lock"
+        self._fd: int | None = None
+        self._lock = threading.Lock()   # serializes this process's entrants
+        self._thread_local = threading.local()
+
+    def _open(self) -> int:
+        import fcntl
+
+        fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o600)
+        # Blocking acquire: the writer that holds the gate finishes its
+        # transaction in bounded time; SQLITE_BUSY_TIMEOUT_MS bounds the
+        # SQLite-level wait underneath it. POSIX flock also auto-releases if
+        # the holder dies, so a crashed writer cannot wedge the file.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def __enter__(self) -> "CrossProcessWriteGate":
+        if LCM_DISABLE_CROSS_PROCESS_LOCK:
+            return self
+        held: int = getattr(self._thread_local, "held", 0)
+        if held:
+            self._thread_local.held = held + 1   # nested same-thread entry
+            return self
+        self._lock.acquire()  # released in __exit__ (outermost entry only)
+        try:
+            self._fd = self._open()
+        except (ImportError, OSError) as exc:
+            # Keep _lock held; __exit__ releases it. _fd stays None so exit
+            # knows there is no flock to undo.
+            logger.warning(
+                "LCM cross-process write gate unavailable (%s); "
+                "multi-writer corruption risk remains", exc,
+            )
+            self._fd = None
+        self._thread_local.held = 1
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if LCM_DISABLE_CROSS_PROCESS_LOCK:
+            return
+        held: int = getattr(self._thread_local, "held", 0)
+        if not held:
+            return
+        if held > 1:
+            self._thread_local.held = held - 1   # outer transaction still open
+            return
+        fd = self._fd
+        self._fd = None
+        if fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            except OSError:
+                pass
+        self._thread_local.held = 0
+        self._lock.release()
+
+
+_gates: dict[str, "CrossProcessWriteGate"] = {}
+_gates_lock = threading.Lock()
+
+
+def cross_process_write_gate(db_path: Path) -> "CrossProcessWriteGate | _NullGate":
+    """One gate per database path, process-wide.
+
+    ``:memory:`` databases exist only inside their own process, so there is
+    nothing cross-process to coordinate; return a ``_NullGate`` instead of
+    creating a ``:memory:.lock`` sidecar in the caller's working directory.
+    """
+    if str(db_path) == ":memory:":
+        return _NullGate()
+    key = str(db_path)
+    with _gates_lock:
+        gate = _gates.get(key)
+        if gate is None:
+            gate = CrossProcessWriteGate(db_path)
+            _gates[key] = gate
+        return gate
+
+
+def cross_process_gate_lock(
+    db_path: Path, attr_name: str, *, read_only: bool = False
+) -> Any:
+    """Build a store's ``_write_lock``-style RLock fused with the write gate.
+    Drop-in replacement for the plain ``threading.RLock()`` every store used to
+    create: ``with self._write_lock:`` now also holds the cross-process flock
+    for the body's duration, so every lock-protected write is serialized across
+    all OS processes sharing this database, not just within one process.
+    Re-entrancy (store A's write body entering store B's) keeps one flock
+    entry via the gate's thread-local counter. Read-only stores pass
+    ``read_only=True`` and get a plain RLock: they never fence, which lets the
+    repair path open an unlocked handle during a swap.
+    """
+    if read_only or LCM_DISABLE_CROSS_PROCESS_LOCK:
+        return threading.RLock()
+
+    inner = threading.RLock()
+    gate = cross_process_write_gate(db_path)
+
+    class _GatedRLock:
+        """RLock facade: acquire takes the gate FIRST, then the inner RLock.
+
+        That order gives the invariant "inner held ⟹ gate count >= 1", which
+        is what makes nested store entry (store A's write body entering store
+        B's) deadlock-free: a thread can never hold the inner RLock while
+        waiting to enter the gate, because entering the gate always precedes
+        inner acquisition. Release mirrors it (inner first, then gate).
+        """
+
+        def acquire(self, blocking: bool = True, timeout: float = -1.0) -> bool:
+            gate.__enter__()
+            try:
+                got = inner.acquire(blocking=blocking, timeout=timeout)
+            except BaseException:
+                gate.__exit__(None, None, None)
+                raise
+            if not got:
+                gate.__exit__(None, None, None)
+                return False
+            return True
+
+        def release(self) -> None:
+            inner.release()
+            gate.__exit__(None, None, None)
+
+        def __enter__(self) -> "_GatedRLock":
+            self.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            self.release()
+
+        def __repr__(self) -> str:
+            return f"<gated {attr_name} {self._gate_repr()}>"
+
+        def _gate_repr(self) -> str:
+            return repr(inner)
+
+    return _GatedRLock()
+
+
+def write_gate(db_path: Path):
+    """Context manager for write transactions on connections OUTSIDE a store.
+
+    Use for the paths that bypass a store's lock-protected write body:
+    constructor-time schema creation, close-time WAL checkpoints, and
+    db_bootstrap's own metadata stamp writers. Nesting inside a store's gated
+    ``_write_lock`` is safe (same-thread re-entrant gate, one flock entry).
+    """
+    return cross_process_write_gate(db_path)
+
+
+def read_gate(db_path: Path):
+    """Context manager for readers that must not straddle a file swap.
+
+    lcm.db is only replaced by the integrity guard (``~/.hermes/lcm-monitor/``
+    lcm_guard.py), which stops every writer service before it swaps the file.
+    The remaining exposure is an OPEN read-only connection (engine GC read
+    copies, read-only stores) re-opening the same inode mid-swap; this gate is
+    the seam to add a swap-in-progress wait if that ever bites. For now it is
+    a documented no-op that keeps those call sites honest.
+    """
+    return _NullGate()
+
+
+class _NullGate:
+    """Read-side pass-through context manager (see ``read_gate``)."""
+
+    def __enter__(self) -> "_NullGate":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+def gate_for_conn(conn: sqlite3.Connection):
+    """Gate for a bare connection, keyed on its actual database path."""
+    resolved = _database_path_for_connection(conn)
+    if not resolved or resolved == ":memory:":
+        return _NullGate()
+    return cross_process_write_gate(Path(resolved))
+
+
 REQUIRED_CORE_TABLES = (
     "messages",
     "metadata",
@@ -124,15 +389,28 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                              or cap growth while another
                                              connection holds an old WAL
                                              end mark.
-    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM.
+    - mmap_size=0 (2026-09-29 fix; was 268435456 = 256 MiB) : mmap reads were
+      the suspect in corruption #4 — 4 concurrent processes each mmap'ing the
+      same 5 MB main db while a 229 s compaction write ran. With mmap off,
+      every read is a normal page-cache read; the corruption class disappears.
+      Rollback: set back to 268435456 and restart the 3 hermes services.
+    - WAL generation guard (2026-10-18 root-cause fix) : the settings above all
+      target concurrent *writes*, and none of them could stop the real failure.
+      SQLite's POSIX locks on the main file and ``-shm`` are owned per process,
+      so this plugin's own read-only probe connections cancelled the long-lived
+      stores' locks every time one of them closed; the next sibling close (a
+      gateway restart) then unlinked ``-wal``/``-shm`` under the survivors and
+      two WAL generations began checkpointing into one db file. ``arm()``
+      re-takes those ranges as OFD locks, which a stray close cannot cancel.
+      See ``wal_generation_guard`` for the full mechanism and rollback.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute("PRAGMA mmap_size=0")
+    wal_generation_guard.arm(conn)
 
 
 def _execute_wal_conversion_with_lock_retry(
@@ -2670,8 +2948,9 @@ def _run_background_integrity_scan(
             scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             # Persist the scan-started stamp on this DB so a crash mid-scan is
             # detectable cross-process via the staleness window above.
-            _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
+            with gate_for_conn(scan_conn):  # fence the stamp write cross-process
+                _record_scan_started(scan_conn, spec, now=started_at)
+                scan_conn.commit()
             result = check_external_content_fts_integrity(scan_conn, spec)
         finally:
             scan_conn.close()
@@ -2679,24 +2958,25 @@ def _run_background_integrity_scan(
         meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
         try:
             meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            status = result.get("status")
-            if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
-            elif status == "fail":
-                _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
-                )
-                logger.warning(
-                    "Background FTS integrity-check found corruption in '%s': %s. "
-                    "Run `/lcm doctor repair apply` to rebuild the index.",
-                    spec.table_name,
-                    result.get("detail", ""),
-                )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
+            with gate_for_conn(meta_conn):  # all writes below are fenced cross-process
+                status = result.get("status")
+                if status == "pass":
+                    _record_integrity_checked(meta_conn, spec, now=started_at)
+                    _clear_integrity_failed(meta_conn, spec)
+                elif status == "fail":
+                    _record_integrity_failed(
+                        meta_conn, spec, detail=result.get("detail", ""), now=started_at
+                    )
+                    logger.warning(
+                        "Background FTS integrity-check found corruption in '%s': %s. "
+                        "Run `/lcm doctor repair apply` to rebuild the index.",
+                        spec.table_name,
+                        result.get("detail", ""),
+                    )
+                # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
+                # so the next bind retries; do not stamp or flag.
+                _clear_scan_started(meta_conn, spec, expected=started_at)
+                meta_conn.commit()
         finally:
             meta_conn.close()
     except Exception:  # pragma: no cover - defensive
@@ -2706,8 +2986,9 @@ def _run_background_integrity_scan(
         try:
             cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
             try:
-                _clear_scan_started(cleanup, spec, expected=started_at)
-                cleanup.commit()
+                with gate_for_conn(cleanup):  # fence the cleanup write cross-process
+                    _clear_scan_started(cleanup, spec, expected=started_at)
+                    cleanup.commit()
             finally:
                 cleanup.close()
         except sqlite3.DatabaseError:
@@ -2757,9 +3038,10 @@ def _dispatch_background_integrity_scan(
             )
             try:
                 claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
+                with gate_for_conn(claim_conn):  # fence the claim stamp cross-process
+                    claim_conn.execute("BEGIN IMMEDIATE")
+                    _record_scan_started(claim_conn, spec, now=current)
+                    claim_conn.commit()
             finally:
                 claim_conn.close()
         except sqlite3.DatabaseError:
@@ -2853,34 +3135,38 @@ def check_external_content_fts_integrity(
 
     savepoint = f"lcm_fts_integrity_{spec.table_name}"
     savepoint_sql = quote_sql_identifier(savepoint)
-    try:
-        conn.execute(f"SAVEPOINT {savepoint_sql}")
-        conn.execute(
-            f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
-        )
-    except sqlite3.DatabaseError as exc:
+    # The integrity-check INSERT is a real (rolled-back) write transaction on
+    # the shared file: fence it cross-process like any other write. Callers
+    # that already hold a gated store lock re-enter harmlessly.
+    with gate_for_conn(conn):
+        try:
+            conn.execute(f"SAVEPOINT {savepoint_sql}")
+            conn.execute(
+                f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
+            )
+        except sqlite3.DatabaseError as exc:
+            try:
+                conn.execute(f"ROLLBACK TO {savepoint_sql}")
+                conn.execute(f"RELEASE {savepoint_sql}")
+            except sqlite3.DatabaseError:
+                pass
+            detail = str(exc)
+            lowered = detail.lower()
+            if "readonly" in lowered or "read-only" in lowered:
+                return {"status": "unchecked", "detail": detail}
+            if _is_fts_corruption_error(detail):
+                return {"status": "fail", "detail": detail}
+            # A transient lock/busy/timeout — or any other non-corruption error — must
+            # NOT be reported as corruption: the background scan would otherwise wedge
+            # a false ``fts_integrity_failed`` flag (F3). Only an actual corruption
+            # signature (malformed / disk image / not-a-database) fails the check.
+            return {"status": "unchecked", "detail": detail}
+
         try:
             conn.execute(f"ROLLBACK TO {savepoint_sql}")
             conn.execute(f"RELEASE {savepoint_sql}")
-        except sqlite3.DatabaseError:
-            pass
-        detail = str(exc)
-        lowered = detail.lower()
-        if "readonly" in lowered or "read-only" in lowered:
-            return {"status": "unchecked", "detail": detail}
-        if _is_fts_corruption_error(detail):
-            return {"status": "fail", "detail": detail}
-        # A transient lock/busy/timeout — or any other non-corruption error — must
-        # NOT be reported as corruption: the background scan would otherwise wedge
-        # a false ``fts_integrity_failed`` flag (F3). Only an actual corruption
-        # signature (malformed / disk image / not-a-database) fails the check.
-        return {"status": "unchecked", "detail": detail}
-
-    try:
-        conn.execute(f"ROLLBACK TO {savepoint_sql}")
-        conn.execute(f"RELEASE {savepoint_sql}")
-    except sqlite3.DatabaseError as exc:
-        return {"status": "fail", "detail": str(exc)}
+        except sqlite3.DatabaseError as exc:
+            return {"status": "fail", "detail": str(exc)}
 
     return {"status": "pass", "detail": "ok"}
 
@@ -2997,9 +3283,33 @@ def repair_external_content_fts(
     now: float | None = None,
     throttle: bool = False,
 ) -> dict[str, bool]:
+    # Fast-path structural probe is READ-ONLY: run it before taking the gate so
+    # cross-process synchronization around it (e.g. spawned-constructor test
+    # barriers) stays reachable while another process holds the write gate.
+    # The actual write window below (marker clears, ownership transaction,
+    # rebuild DDL) is still fully fenced; the ownership transaction re-checks
+    # the complete state after waiting, so a stale probe is harmless.
+    fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec)
+    with gate_for_conn(conn):
+        return _repair_external_content_fts_locked(
+            conn,
+            spec,
+            fts_structure_needs_rebuild=fts_structure_needs_rebuild,
+            now=now,
+            throttle=throttle,
+        )
+
+
+def _repair_external_content_fts_locked(
+    conn: sqlite3.Connection,
+    spec: ExternalContentFtsSpec,
+    *,
+    fts_structure_needs_rebuild: bool,
+    now: float | None = None,
+    throttle: bool = False,
+) -> dict[str, bool]:
     rebuilt = False
     degraded = False
-    fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec)
     deep_repair_needed = False
     if not fts_structure_needs_rebuild or not throttle:
         # Preserve the cheap startup path and its background integrity-scan

@@ -21,10 +21,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from . import wal_generation_guard
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
     configure_connection,
+    cross_process_gate_lock,
     ensure_external_content_fts,
     refuse_schema_version_too_new,
     run_versioned_migrations,
@@ -351,7 +353,10 @@ class MessageStore:
         # aliasing could intersect SQLite's flush of a write. It does not
         # change semantics for single-threaded callers and adds only a single
         # uncontended ``RLock.acquire``/``release`` pair per operation.
-        self._write_lock = threading.RLock()
+        # See ``CrossProcessWriteGate``: this lock also enters the
+        # cross-process flock so concurrent OS processes cannot interleave
+        # write transactions (the corruption #6 root cause).
+        self._write_lock = cross_process_gate_lock(self.db_path, "_write_lock")
         self._init_db()
 
     def _init_db(self):
@@ -1746,9 +1751,13 @@ class MessageStore:
             # releasing the connection.  This does not run on crash/kill, and
             # PASSIVE can leave frames behind when another reader is active.
             try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                with self._write_lock:  # fence the checkpoint cross-process
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error:
                 pass  # best-effort only; don't let this mask the real close()
+            # Hand the WAL generation back before the close so a true last
+            # close can still reset the sidecars (see wal_generation_guard).
+            wal_generation_guard.disarm(conn)
             conn.close()
             self._conn = None
 

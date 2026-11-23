@@ -24,9 +24,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
+from . import wal_generation_guard
 from .config import LCMConfig
 from .db_bootstrap import (
     configure_connection,
+    cross_process_gate_lock,
     ensure_chunk_tables,
     ensure_embedding_tables,
     mark_migration_step_complete,
@@ -337,7 +339,7 @@ class VectorStore:
             getattr(resolved_config, "embedding_binary_prescreen", False)
         )
         self._conn: Optional[sqlite3.Connection] = None
-        self._write_lock = threading.RLock()
+        self._write_lock = cross_process_gate_lock(self.db_path, "_write_lock")
         self._cache_lock = threading.RLock()
         # Nesting depth for _write_transaction. The outermost entry owns the
         # BEGIN IMMEDIATE/COMMIT (one fsync); a re-entrant inner entry (e.g. a
@@ -2945,9 +2947,13 @@ class VectorStore:
         conn = getattr(self, "_conn", None)
         if conn is not None:
             try:
-                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                with self._write_lock:  # fence the checkpoint cross-process
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except sqlite3.Error:
                 pass
+            # Hand the WAL generation back before the close so a true last
+            # close can still reset the sidecars (see wal_generation_guard).
+            wal_generation_guard.disarm(conn)
             conn.close()
             self._conn = None
         with self._cache_lock:
