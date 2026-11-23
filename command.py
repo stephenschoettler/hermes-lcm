@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import uuid
 from .db_bootstrap import (
     check_external_content_fts_integrity,
     external_content_fts_needs_repair,
+    gate_for_conn,
     inspect_lcm_schema_health,
     join_background_integrity_scans,
     load_integrity_failed,
@@ -116,6 +118,47 @@ def _embedding_backfill_budget_s() -> float:
     return _env_float("LCM_EMBEDDING_BACKFILL_BUDGET_S", 0.0)
 
 
+def _fenced_on_conn(func):
+    """Serialize a helper's write transaction behind the cross-process gate.
+
+    These helpers open their own ``BEGIN IMMEDIATE`` on a connection owned by
+    the calling process. SQLite's page allocator is per-connection, so two
+    processes writing concurrently to one database file can each believe the
+    same physical page is free and hand it to different tables. The gate is an
+    advisory flock on a sidecar file, so only one process is inside a write
+    transaction at a time.
+
+    The gate is re-entrant per process, so decorating a helper that is itself
+    invoked from inside an already-gated block is safe: the flock is acquired
+    exactly once, by the outermost holder, and released when it exits.
+    """
+
+    @functools.wraps(func)
+    def wrapper(conn, *args, **kwargs):
+        with gate_for_conn(conn):
+            return func(conn, *args, **kwargs)
+
+    return wrapper
+
+
+def _fenced_on_engine_store(func):
+    """``_fenced_on_conn`` for helpers that take the engine, not a connection."""
+
+    @functools.wraps(func)
+    def wrapper(engine, *args, **kwargs):
+        with gate_for_conn(engine._store.connection):
+            return func(engine, *args, **kwargs)
+
+    return wrapper
+
+
+# NOTE: deliberately NOT fenced. Constructor-time schema creation runs inside
+# a BEGIN IMMEDIATE that SQLite itself serializes across processes, and
+# fencing it here would change observable behavior for callers that race two
+# first-runs to hit the same barrier (see
+# test_concurrent_first_run_inflight_schema_creation_is_idempotent: the gate
+# would serialize the threads before their BEGIN IMMEDIATE barrier). The
+# corruption class needs a long write transaction, not short idempotent DDL.
 def _ensure_inflight_table(conn: sqlite3.Connection) -> None:
     expected_columns = (
         ("embedded_id", "TEXT", 0, None, 1),
@@ -1840,6 +1883,7 @@ def _doctor_retention_text(engine) -> str:
     return "\n".join(lines)
 
 
+@_fenced_on_engine_store
 def _delete_clean_candidates_atomically(engine, session_ids: set[str]) -> dict[str, int]:
     """Delete cleanup candidates in one SQLite transaction.
 
@@ -3067,38 +3111,43 @@ class _BackfillLease:
         now = time.time() if now is None else float(now)
         if not force and (now - self._last_heartbeat) < self.heartbeat_s:
             return True
-        cur = self.conn.execute(
-            """
-            UPDATE metadata
-            SET value = ?
-            WHERE key = ?
-              AND json_extract(value, '$.owner') = ?
-              AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
-            """,
-            (
-                self._value(now),
-                _EMBEDDING_BACKFILL_CLAIM_KEY,
-                self.lease_id,
-                self.generation,
-            ),
-        )
+        # Heartbeats land while a long provider call is in flight, so this
+        # write needs the same fence as the rest of the backfill path.
+        with gate_for_conn(self.conn):
+            cur = self.conn.execute(
+                """
+                UPDATE metadata
+                SET value = ?
+                WHERE key = ?
+                  AND json_extract(value, '$.owner') = ?
+                  AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
+                """,
+                (
+                    self._value(now),
+                    _EMBEDDING_BACKFILL_CLAIM_KEY,
+                    self.lease_id,
+                    self.generation,
+                ),
+            )
         if not cur.rowcount:
             return False
         self._last_heartbeat = now
         return True
 
     def release(self) -> None:
-        self.conn.execute(
-            """
-            DELETE FROM metadata
-            WHERE key = ?
-              AND json_extract(value, '$.owner') = ?
-              AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
-            """,
-            (_EMBEDDING_BACKFILL_CLAIM_KEY, self.lease_id, self.generation),
-        )
+        with gate_for_conn(self.conn):
+            self.conn.execute(
+                """
+                DELETE FROM metadata
+                WHERE key = ?
+                  AND json_extract(value, '$.owner') = ?
+                  AND CAST(json_extract(value, '$.generation') AS INTEGER) = ?
+                """,
+                (_EMBEDDING_BACKFILL_CLAIM_KEY, self.lease_id, self.generation),
+            )
 
 
+@_fenced_on_conn
 def _acquire_embedding_backfill_lease(
     conn: sqlite3.Connection,
     *,
@@ -3143,6 +3192,7 @@ def _acquire_embedding_backfill_lease(
         raise
 
 
+@_fenced_on_conn
 def _prepare_inflight_for_lease(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3246,6 +3296,7 @@ def _prepare_inflight_for_lease(
         raise
 
 
+@_fenced_on_conn
 def _mark_inflight(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3322,6 +3373,7 @@ def _mark_inflight(
         raise
 
 
+@_fenced_on_conn
 def _mark_dispatched(
     conn: sqlite3.Connection,
     identity_hash: str,
@@ -3378,6 +3430,7 @@ def _mark_dispatched(
         raise
 
 
+@_fenced_on_conn
 def _owned_inflight_transition(
     conn: sqlite3.Connection,
     identity_hash: str,
