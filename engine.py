@@ -38,6 +38,7 @@ from .engine_registry import (
 from .escalation import (
     SummaryCircuitBreaker,
     SummarySpendGuard,
+    _deterministic_truncate,
     summarize_with_escalation,
 )
 from .externalize import (
@@ -359,6 +360,10 @@ _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
 
 _PRESERVED_TODO_CONTEXT_PREFIX = "[Your active task list was preserved across context compression]"
+_OVERFLOW_RECOVERY_PLACEHOLDER = (
+    "[LCM overflow recovery: prior active context was reduced; "
+    "recover needed details from LCM history before answering.]"
+)
 _LCM_MESSAGE_PREFIX_FINGERPRINT_LIMIT = 8
 
 
@@ -4310,6 +4315,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             )
         if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX):
             return True
+        if content.strip() == _OVERFLOW_RECOVERY_PLACEHOLDER:
+            return True
         if "[Expand for details:" not in content:
             return False
         return bool(
@@ -4683,6 +4690,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 absolute_idx = cursor + offset
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
+                if replay_text.strip() == _OVERFLOW_RECOVERY_PLACEHOLDER:
+                    # The synthetic overflow fallback is provider-only context
+                    # and must not become a durable conversation row on a
+                    # restart/replay.
+                    continue
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
                     replay_msg,
                     replay_text,
@@ -6315,6 +6327,42 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     # -- Internal: helpers -------------------------------------------------
 
+    def _bound_overflow_recovery_user_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        prefix: List[Dict[str, Any]],
+        assembly_cap_override: Optional[int],
+    ) -> Dict[str, Any]:
+        """Keep a user fallback bounded without mutating the durable source row."""
+        assembly_cap = (
+            assembly_cap_override
+            if assembly_cap_override is not None
+            else self._effective_assembly_token_cap()
+        )
+        candidate = dict(message)
+        if assembly_cap is None or count_messages_tokens(prefix + [candidate]) <= assembly_cap:
+            return candidate
+
+        content = text_content_for_pattern_matching(candidate.get("content")) or ""
+        empty_candidate = dict(candidate)
+        empty_candidate["content"] = ""
+        content_budget = max(
+            0,
+            assembly_cap - count_messages_tokens(prefix + [empty_candidate]),
+        )
+        candidate["content"] = (
+            _deterministic_truncate(content, content_budget)
+            if content and content_budget > 0
+            else _OVERFLOW_RECOVERY_PLACEHOLDER
+        )
+        logger.warning(
+            "LCM overflow recovery bounded oversized user fallback from %d to %d tokens",
+            count_message_tokens(message),
+            count_message_tokens(candidate),
+        )
+        return candidate
+
     def _assemble_overflow_recovery_context(
         self,
         system_msg: Optional[Dict[str, Any]],
@@ -6346,8 +6394,86 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
         minimum_candidate_len = 1 if system_msg is not None else 0
         if len(candidate) == minimum_candidate_len and tail_messages:
-            fallback = ([system_msg] if system_msg is not None else []) + [tail_messages[-1]]
-            return self._sanitize_active_context_messages(fallback)
+            fallback: list[Dict[str, Any]] = []
+            if system_msg is not None:
+                fallback.append(system_msg)
+
+            selected_fallback: Optional[Dict[str, Any]] = None
+            # Prefer the newest visible user turn, which is the smallest useful
+            # provider-valid continuation of the current request.
+            for message in reversed(tail_messages):
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                content = text_content_for_pattern_matching(message.get("content")) or ""
+                if not content.strip():
+                    continue
+                if self._is_preserved_todo_context_message(message):
+                    continue
+                if self._is_replayed_context_scaffold_message(message):
+                    continue
+                if (
+                    self._matches_ignore_message_patterns(message)
+                    or self._mapped_stored_row_matches_ignore_message_patterns(message)
+                    or self._is_volatile_ignored_quarantine_placeholder(message, content)
+                    or self._is_ignored_active_replay_placeholder(message, content)
+                ):
+                    continue
+                selected_fallback = message
+                break
+
+            if selected_fallback is None:
+                # If no user turn survived, retain a pending assistant tool call
+                # when one exists. Sanitization will insert its missing result
+                # stub, preserving a provider-valid tool sequence.
+                for message in reversed(tail_messages):
+                    if not isinstance(message, dict) or message.get("role") != "assistant":
+                        continue
+                    if not message.get("tool_calls"):
+                        continue
+                    cleaned_message = _clean_active_assistant_message(message)
+                    if cleaned_message is not None:
+                        selected_fallback = cleaned_message
+                        break
+
+            if selected_fallback is not None:
+                if selected_fallback.get("role") == "user":
+                    selected_fallback = self._bound_overflow_recovery_user_message(
+                        selected_fallback,
+                        prefix=fallback,
+                        assembly_cap_override=assembly_cap_override,
+                    )
+                else:
+                    # Provider replays must start the conversational portion
+                    # with a user turn. Keep a pending tool call only after a
+                    # bounded recovery instruction, so its result stub remains
+                    # adjacent and provider-valid.
+                    fallback.append({
+                        "role": "user",
+                        "content": _OVERFLOW_RECOVERY_PLACEHOLDER,
+                    })
+                fallback.append(selected_fallback)
+            elif system_msg is None:
+                # A provider needs a user-starting active transcript. If
+                # cleanup removed every real user turn, return an explicit,
+                # bounded recovery instruction rather than [] so the next
+                # turn can continue and use LCM retrieval tools.
+                fallback = [{
+                    "role": "user",
+                    "content": _OVERFLOW_RECOVERY_PLACEHOLDER,
+                }]
+
+            sanitized_fallback = self._sanitize_active_context_messages(fallback)
+            if sanitized_fallback:
+                logger.warning(
+                    "LCM overflow recovery used a non-empty active-context fallback (%d message(s))",
+                    len(sanitized_fallback),
+                )
+                return sanitized_fallback
+            if system_msg is not None:
+                # The system anchor itself is still safer than returning an empty
+                # transcript if a future sanitizer grows stricter.
+                return [system_msg]
+            return [{"role": "user", "content": _OVERFLOW_RECOVERY_PLACEHOLDER}]
         return candidate
 
     @staticmethod
