@@ -428,6 +428,40 @@ class ReconcileMixin:
         session_count: int,
         raw_session_count: int,
     ) -> int | None:
+        # Reconciliation evaluates progressively shorter prefixes. A replay
+        # identity can be expensive: externalized tool-result identities may
+        # read their backing payload from disk. Resolving every identity again
+        # for every candidate cursor makes this loop quadratic in both calls
+        # and file I/O, which can block the synchronous post-turn ingest hook
+        # long enough to trip the gateway inactivity watchdog. Message objects
+        # remain live and immutable for this pass, so one identity per object
+        # is sufficient and preserves the existing comparison semantics.
+        identity_cache: dict[int, tuple[str, str, str, str]] = {}
+        persisted_output_recovery_cache: dict[
+            int,
+            tuple[str, dict[str, int]] | None,
+        ] = {}
+
+        def replay_identity(message: Dict[str, Any]) -> tuple[str, str, str, str]:
+            cache_key = id(message)
+            identity = identity_cache.get(cache_key)
+            if identity is None:
+                identity = self._message_replay_identity(message)
+                identity_cache[cache_key] = identity
+            return identity
+
+        def recover_persisted_output(
+            message: Dict[str, Any],
+        ) -> tuple[str, dict[str, int]] | None:
+            cache_key = id(message)
+            if cache_key not in persisted_output_recovery_cache:
+                persisted_output_recovery_cache[cache_key] = (
+                    recover_hermes_persisted_output_with_file_stat(
+                        normalize_content_value(message.get("content")) or ""
+                    )
+                )
+            return persisted_output_recovery_cache[cache_key]
+
         sanitized_replay_tail = self._stored_tail_for_sanitized_active_replay(stored_tail)
         effective_session_count = len(sanitized_replay_tail)
         sanitized_tail_collapsed = len(sanitized_replay_tail) < len(stored_tail)
@@ -468,7 +502,7 @@ class ReconcileMixin:
                 and not (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        replay_identity(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
@@ -478,7 +512,7 @@ class ReconcileMixin:
                 self._is_replayed_context_scaffold_message(msg) for msg in candidate_messages
             )
             candidate_has_quarantined_replay_evidence = any(
-                self._is_quarantined_assistant_replay_identity(self._message_replay_identity(msg))
+                self._is_quarantined_assistant_replay_identity(replay_identity(msg))
                 for msg in candidate_messages
             )
             candidate_identity_messages = (
@@ -487,11 +521,11 @@ class ReconcileMixin:
                 else candidate_visible_messages
             )
             candidate_visible_prefix = [
-                self._message_replay_identity(msg)
+                replay_identity(msg)
                 for msg in candidate_visible_messages
             ]
             candidate_prefix = [
-                self._message_replay_identity(msg)
+                replay_identity(msg)
                 for msg in candidate_identity_messages
             ]
             if not candidate_prefix:
@@ -523,10 +557,7 @@ class ReconcileMixin:
             early_candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and recover_persisted_output(msg) is None
                 for msg in candidate_identity_messages
             )
             if (matches_visible_sanitized_tail or matches_visible_raw_tail) and not early_candidate_has_unrecoverable_persisted_marker:
@@ -545,10 +576,7 @@ class ReconcileMixin:
             candidate_has_unrecoverable_persisted_marker = any(
                 str(msg.get("role") or "") == "tool"
                 and _is_hermes_persisted_output_marker(normalize_content_value(msg.get("content")) or "")
-                and recover_hermes_persisted_output_with_file_stat(
-                    normalize_content_value(msg.get("content")) or ""
-                )
-                is None
+                and recover_persisted_output(msg) is None
                 for msg in candidate_identity_messages
             )
             matches_inline_generation_cleanup_tail = False
@@ -601,7 +629,7 @@ class ReconcileMixin:
                 or (
                     self._compiled_ignore_message_patterns
                     and self._is_quarantined_assistant_replay_identity(
-                        self._message_replay_identity(msg)
+                        replay_identity(msg)
                     )
                     and self._matches_ignore_message_patterns(msg, stored_row=True)
                 )
