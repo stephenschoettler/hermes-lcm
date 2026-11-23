@@ -453,8 +453,9 @@ class LCMConfig:
     # -- Compaction thresholds ---
     # Max source tokens in a leaf chunk before summarization triggers
     leaf_chunk_tokens: int = 20_000
-    # Fraction of context window that triggers compaction (0.0–1.0)
-    context_threshold: float = 0.35
+    # Fraction of context window that triggers compaction (0.0‑1.0)
+    # Set to 0.80-0.85 as requested to fire at 80-85% of active model context window
+    context_threshold: float = 0.85
     # Mirror Hermes Agent's Codex gpt-5.5 route-specific threshold auto-raise
     # when LCM is inheriting the host compression threshold. Explicit LCM
     # threshold overrides remain authoritative.

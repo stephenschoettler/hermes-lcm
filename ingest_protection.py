@@ -2017,6 +2017,118 @@ def scan_sqlite_payload_risks(conn, *, limit: int = 5) -> dict[str, Any]:
         "heartbeat_noise_rows": heartbeat_noise_rows,
     }
 
+def clean_orphaned_externalized_payload_refs(
+    conn,
+    *,
+    missing_refs: list[str] | None = None,
+    dry_run: bool = True,
+    hermes_home: str = "",
+) -> dict[str, Any]:
+    """Remove database rows that reference non-existent externalized payload files.
+
+    This fixes the bug where a placeholder is written to SQLite but the
+    corresponding JSON payload file is never created (or is later deleted),
+    leaving an orphaned reference that makes `lcm expand` fail with
+    "payload not found" even though the row still exists in the database.
+
+    Args:
+        conn: SQLite connection to the LCM database.
+        missing_refs: If provided, only clean rows referencing these refs.
+            If None, scan for all missing refs first.
+        dry_run: If True, report what would be deleted without deleting.
+        hermes_home: Path to Hermes home directory (used to locate storage dir).
+
+    Returns:
+        Dict with counts of rows deleted/scanned and list of cleaned refs.
+    """
+    if missing_refs is None:
+        # Re-scan to find all missing refs
+        from .externalize import get_large_output_storage_dir
+
+        config = type("Config", (), {
+            "large_output_externalization_path": "",
+            "large_output_externalization_enabled": True,
+            "large_output_externalization_threshold_chars": 12000,
+        })()
+        storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
+        existing_files: set[str] = set()
+        if storage_dir.exists() and storage_dir.is_dir():
+            existing_files = {path.name for path in storage_dir.glob("*.json") if path.is_file()}
+
+        referenced_refs: set[str] = set()
+        for row in conn.execute(
+            """
+            SELECT content, tool_calls FROM messages
+            WHERE COALESCE(content, '') LIKE '%ref=%]'
+               OR COALESCE(tool_calls, '') LIKE '%ref=%]'
+            """
+        ).fetchall():
+            for value in (row[0], row[1]):
+                if isinstance(value, str):
+                    for ref in extract_all_externalized_payload_refs(value):
+                        referenced_refs.add(ref)
+
+        missing_refs = sorted(ref for ref in referenced_refs if ref not in existing_files)
+
+    if not missing_refs:
+        return {"rows_scanned": 0, "rows_deleted": 0, "refs_cleaned": [], "dry_run": dry_run}
+
+    # Find all rows referencing missing refs
+    rows_to_delete: list[tuple[int, str, str]] = []  # (store_id, session_id, ref)
+    for ref in missing_refs:
+        for row in conn.execute(
+            """
+            SELECT store_id, session_id,
+                   CASE
+                     WHEN content LIKE ? THEN 'content'
+                     WHEN tool_calls LIKE ? THEN 'tool_calls'
+                     ELSE NULL
+                   END AS field
+            FROM messages
+            WHERE (content LIKE ? OR tool_calls LIKE ?)
+              AND (content LIKE ? OR tool_calls LIKE ?)
+            """,
+            (f"%ref={ref}%]", f"%ref={ref}%]", f"%ref={ref}%]", f"%ref={ref}%]", f"%ref={ref}%]", f"%ref={ref}%]"),
+        ).fetchall():
+            store_id, session_id, field = row
+            if store_id and session_id:
+                rows_to_delete.append((int(store_id), str(session_id), ref))
+
+    if dry_run:
+        return {
+            "rows_scanned": len(rows_to_delete),
+            "rows_deleted": 0,
+            "refs_cleaned": list(dict.fromkeys(ref for _, _, ref in rows_to_delete)),
+            "dry_run": True,
+            "sample_rows": rows_to_delete[:10],
+        }
+
+    # Delete rows in a transaction
+    deleted_count = 0
+    cleaned_refs: set[str] = set()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for store_id, session_id, ref in rows_to_delete:
+            conn.execute(
+                "DELETE FROM messages WHERE store_id = ? AND session_id = ? "
+                "AND (content LIKE ? OR tool_calls LIKE ?)",
+                (store_id, session_id, f"%ref={ref}%]", f"%ref={ref}%]"),
+            )
+            deleted_count += 1
+            cleaned_refs.add(ref)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "rows_scanned": len(rows_to_delete),
+        "rows_deleted": deleted_count,
+        "refs_cleaned": sorted(cleaned_refs),
+        "dry_run": False,
+    }
+
+
 def externalized_payload_stats(config, hermes_home: str = "") -> dict[str, Any]:
     from .externalize import get_large_output_storage_dir
 

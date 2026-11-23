@@ -430,8 +430,8 @@ def register(ctx):
     if callable(register_hook):
         from .aux_session import record_subagent_start, record_subagent_stop
         try:
-            register_hook("subagent_start", lambda **payload: record_subagent_start(payload))
-            register_hook("subagent_stop", lambda **payload: record_subagent_stop(payload))
+            register_hook("subagent_start", lambda ctx, **payload: record_subagent_start(payload))
+            register_hook("subagent_stop", lambda ctx, **payload: record_subagent_stop(payload))
         except Exception as exc:
             logger.info(
                 "LCM explicit subagent-lineage hooks unavailable on this Hermes "
