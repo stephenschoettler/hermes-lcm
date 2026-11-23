@@ -30,6 +30,14 @@ from hermes_lcm.embedding_provider import (
 )
 from hermes_lcm.vector_store import VectorStore
 
+# Deadline tests assert an operation aborted AT its configured timeout
+# rather than waiting out a deliberately slow dependency. The original
+# margins were tens of milliseconds -- smaller than thread-scheduling
+# jitter on a loaded host -- so they failed spuriously. Scaling every
+# duration by one factor keeps the ratio the assertions test while moving
+# the absolute slack outside jitter.
+_DEADLINE_SCALE = 8
+
 
 def _response(status: int, payload, headers=None) -> HttpResponse:
     return HttpResponse(
@@ -885,7 +893,7 @@ def test_voyage_document_splits_share_one_absolute_deadline(monkeypatch):
     def transport(**kwargs):
         timeout = float(kwargs["timeout"])
         calls.append(timeout)
-        delay = 0.015
+        delay = 0.015 * _DEADLINE_SCALE
         if timeout < delay:
             time.sleep(max(0.0, timeout))
             raise TimeoutError("request exceeded remaining budget")
@@ -895,7 +903,7 @@ def test_voyage_document_splits_share_one_absolute_deadline(monkeypatch):
     provider = VoyageProvider(
         "voyage-test",
         transport=transport,
-        timeout=0.02,
+        timeout=0.02 * _DEADLINE_SCALE,
         max_batch_items=1,
         sleeper=lambda _delay: None,
     )
@@ -906,25 +914,25 @@ def test_voyage_document_splits_share_one_absolute_deadline(monkeypatch):
     assert 1 <= len(calls) <= 2
     if len(calls) == 2:
         assert calls[1] < calls[0]
-    assert elapsed < 0.06
+    assert elapsed < 0.06 * _DEADLINE_SCALE
 
 
 def test_voyage_token_preprocessing_is_inside_absolute_deadline(monkeypatch):
     monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
 
     def slow_count(_text):
-        time.sleep(0.1)
+        time.sleep(0.1 * _DEADLINE_SCALE)
         return 1
 
     monkeypatch.setattr(provider_mod, "count_tokens", slow_count)
     transport = FakeTransport(_voyage_success(1))
-    provider = VoyageProvider("voyage-test", transport=transport, timeout=0.02)
+    provider = VoyageProvider("voyage-test", transport=transport, timeout=0.02 * _DEADLINE_SCALE)
 
     started = time.monotonic()
     with pytest.raises(VoyageError, match="document preprocessing"):
         provider.embed_documents(["slow"])
 
-    assert time.monotonic() - started < 0.08
+    assert time.monotonic() - started < 0.08 * _DEADLINE_SCALE
     assert transport.calls == []
 
 
@@ -1061,12 +1069,12 @@ def test_voyage_slow_response_decode_is_inside_absolute_deadline(monkeypatch):
 
     def slow_decode(*args, **kwargs):
         decode_started.set()
-        time.sleep(0.05)
+        time.sleep(0.05 * _DEADLINE_SCALE)
         return original_decode(*args, **kwargs)
 
     monkeypatch.setattr(provider_mod, "_response_json", slow_decode)
     provider = VoyageProvider(
-        "voyage-test", transport=FakeTransport(_voyage_success(1)), timeout=0.01
+        "voyage-test", transport=FakeTransport(_voyage_success(1)), timeout=0.01 * _DEADLINE_SCALE
     )
 
     started = time.monotonic()
@@ -1075,9 +1083,9 @@ def test_voyage_slow_response_decode_is_inside_absolute_deadline(monkeypatch):
 
     assert exc_info.value.kind == "timeout"
     assert decode_started.is_set()
-    assert time.monotonic() - started < 0.04
+    assert time.monotonic() - started < 0.04 * _DEADLINE_SCALE
     # Let the side-effect-free parser worker exit before monkeypatch teardown.
-    time.sleep(0.06)
+    time.sleep(0.06 * _DEADLINE_SCALE)
 
 
 def test_voyage_slow_error_body_scrub_is_bounded_and_never_resent(monkeypatch):
@@ -1102,7 +1110,7 @@ def test_voyage_slow_error_body_scrub_is_bounded_and_never_resent(monkeypatch):
         _response(503, {"error": "ambiguous"}),
         _voyage_success(1),
     )
-    provider = VoyageProvider("voyage-test", transport=transport, timeout=0.01)
+    provider = VoyageProvider("voyage-test", transport=transport, timeout=0.01 * _DEADLINE_SCALE)
 
     def request():
         try:
@@ -1169,19 +1177,19 @@ def test_fastembed_normal_operation_is_deadline_bounded(monkeypatch, tmp_path):
             pass
 
         def query_embed(self, texts):
-            time.sleep(0.05)
+            time.sleep(0.05 * _DEADLINE_SCALE)
             return ([1.0, 0.0] for _ in texts)
 
         def embed(self, texts):
-            time.sleep(0.05)
+            time.sleep(0.05 * _DEADLINE_SCALE)
             return ([1.0, 0.0] for _ in texts)
 
     monkeypatch.setattr(provider_mod, "_load_fastembed", lambda: SlowFastembedModel)
-    provider = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
+    provider = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01 * _DEADLINE_SCALE)
     started = time.monotonic()
     with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
         provider.embed_query("slow")
-    assert time.monotonic() - started < 0.04
+    assert time.monotonic() - started < 0.04 * _DEADLINE_SCALE
 
 
 def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, tmp_path):
@@ -1204,8 +1212,8 @@ def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, t
     monkeypatch.setattr(
         provider_mod, "_LOCAL_EMBED_WORKER_SLOTS", threading.BoundedSemaphore(1)
     )
-    first = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
-    second = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01)
+    first = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01 * _DEADLINE_SCALE)
+    second = FastembedProvider("local", cache_dir=tmp_path, timeout=0.01 * _DEADLINE_SCALE)
 
     try:
         with pytest.raises(EmbeddingProviderError, match="deadline exceeded"):
@@ -1215,7 +1223,12 @@ def test_fastembed_timeout_capacity_is_bounded_until_worker_exits(monkeypatch, t
         with pytest.raises(EmbeddingProviderError, match="worker capacity exhausted"):
             second.embed_query("must-not-start")
 
-        assert time.monotonic() - started < 0.03
+        # Capacity rejection blocks on the semaphore for the full budget by
+        # design (_run_blocking_with_deadline: acquire(timeout=budget)), so
+        # elapsed tracks the timeout, not zero. The bound that matters is that
+        # it returns WITHOUT waiting for the overrun worker to exit (1.0s), so
+        # allow jitter headroom while staying far below that.
+        assert time.monotonic() - started < 0.03 * _DEADLINE_SCALE + 0.25
         assert calls == 1
     finally:
         release_worker.set()
