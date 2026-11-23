@@ -1324,6 +1324,17 @@ class VoyageProvider(_ResilientProvider):
         )
 
 
+# Per-document token budget for Ollama backfill batching. Ollama models have
+# small, model-specific context windows (the setup-doc default nomic-embed-text
+# is 2K; bge-m3 is 8K), and /api/embed is called with truncate:false so one
+# over-context document fails the WHOLE batch with a 400. Pre-screen each
+# document against this budget and record over-context documents in
+# last_skipped_documents (same contract as VoyageProvider) so the backfill loop
+# reports them per document instead of failing their batch-mates.
+# Override with LCM_OLLAMA_DOCUMENT_TOKEN_BUDGET for a larger-window model.
+_OLLAMA_DOCUMENT_TOKEN_BUDGET_DEFAULT = 2000
+
+
 class OllamaProvider(_ResilientProvider):
     provider_id = "ollama"
 
@@ -1476,8 +1487,22 @@ class OllamaProvider(_ResilientProvider):
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         # Normal operations also get ONE absolute deadline across attempts +
         # backoff (self.timeout), so retryable failures cannot stack backoff
-        # sleeps beyond the configured budget.
-        return self._embed(texts, deadline_budget_s=self.timeout)
+        # sleeps beyond the configured budget. Route through the batching path
+        # so over-context documents are skipped-and-reported, not fatal.
+        return [
+            list(vector)
+            for batch in self.embed_document_batches(texts)
+            for vector in batch.vectors
+        ]
+
+    def _document_token_budget(self) -> int:
+        raw = os.environ.get("LCM_OLLAMA_DOCUMENT_TOKEN_BUDGET", "").strip()
+        if not raw:
+            return _OLLAMA_DOCUMENT_TOKEN_BUDGET_DEFAULT
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return _OLLAMA_DOCUMENT_TOKEN_BUDGET_DEFAULT
 
     def embed_document_batches(
         self,
@@ -1485,22 +1510,44 @@ class OllamaProvider(_ResilientProvider):
         *,
         before_dispatch: BeforeDispatch | None = None,
     ) -> Iterator[EmbeddedDocumentBatch]:
+        # Pre-screen per document: /api/embed runs with truncate:false, so one
+        # over-context input fails the WHOLE batch with a 400. Record over-
+        # budget documents in last_skipped_documents (VoyageProvider contract)
+        # and dispatch only the remainder; the backfill loop reports each skip
+        # as provider_document_token_cap instead of failing batch-mates.
         normalized = tuple(str(text) for text in texts)
         if not normalized:
             return
-        indexes = tuple(range(len(normalized)))
+        budget = self._document_token_budget()
+        self.last_skipped_documents = []
+        keep_indexes: list[int] = []
+        keep_texts: list[str] = []
+        for index, text in enumerate(normalized):
+            if count_tokens(text) > budget:
+                self.last_skipped_documents.append(index)
+                logger.warning(
+                    "Skipping Ollama document index=%d tokens>%d limit",
+                    index,
+                    budget,
+                )
+                continue
+            keep_indexes.append(index)
+            keep_texts.append(text)
+        if not keep_indexes:
+            return
+        keep_tuple = tuple(keep_indexes)
         vectors = self._embed(
-            normalized,
+            tuple(keep_texts),
             max_attempts=1 if before_dispatch is not None else _MAX_ATTEMPTS,
             deadline_budget_s=self.timeout,
             before_transport=(
-                (lambda: before_dispatch(indexes))
+                (lambda: before_dispatch(keep_tuple))
                 if before_dispatch is not None
                 else None
             ),
         )
         yield EmbeddedDocumentBatch(
-            indexes,
+            keep_tuple,
             tuple(tuple(vector) for vector in vectors),
         )
 
