@@ -352,13 +352,18 @@ class CompactionMixin:
                  focus_topic: Optional[str] = None,
                  force: bool = False) -> List[Dict[str, Any]]:
         """Run compaction and leave a terminal public status on every failure."""
+        self._last_compression_made_progress = False
         try:
-            return self._compress_impl(
+            compressed = self._compress_impl(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
             )
+            # Hermes verifies the next provider prompt after it commits this change.
+            # Include cleanup and overflow recovery, which need no new summary node.
+            self._last_compression_made_progress = compressed != messages
+            return compressed
         except BaseException:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
