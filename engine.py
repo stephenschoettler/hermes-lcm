@@ -6209,10 +6209,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if compressed != original_messages or ingest_cleanup_changed_active_context:
             self._last_compression_status = "overflow_recovery"
             self._last_compression_noop_reason = ""
-            self._ingest_cursor = len(compressed)
-            self._ingest_cursor_needs_reconcile = False
+            # ``compressed`` is a DIFFERENT list from the one that is ingested
+            # next. A cursor is a position inside one specific list, so a
+            # length read off the replacement list must never be re-applied to
+            # the incoming history: it re-appends every already-stored message
+            # between len(compressed) and the incoming length, once per turn.
+            # Keep the previous cursor and re-derive it from the store by
+            # identity — which is what the reconciliation exists for — instead
+            # of clearing the flag that would have caught this here.
+            self._ingest_cursor_needs_reconcile = True
             logger.info(
-                "LCM assembly guardrail recovery: %d messages → %d (no new summary node)",
+                "LCM assembly guardrail recovery: %d messages → %d "
+                "(no new summary node; ingest cursor deferred to reconciliation)",
                 len(original_messages),
                 len(compressed),
             )
