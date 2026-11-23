@@ -387,6 +387,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
+    def load_externalized_payload_sidecar(self, ref: str) -> Dict[str, Any] | None:
+        """Load one externalized payload through LCM's public safe reader."""
+        return load_externalized_payload(
+            ref,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
@@ -570,9 +578,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Cooldown timestamp to prevent compression cascade after boundary skip.
         # Set when skip-carry-over path is taken in _continue_compression_boundary.
         self._last_boundary_skip_time: float = 0
-        # One-shot handoff from preflight: adopt an already-durable replay
-        # cleanup during boundary cooldown without running summary work.
-        self._preflight_cleanup_only_due_to_boundary_cooldown = False
+        # One-shot handoff from preflight: publish deterministic replay cleanup
+        # without letting below-threshold work invoke the summarizer.
+        self._preflight_cleanup_only = False
+        self._sanitation_claim_lock = threading.RLock()
+        self._pending_sanitation_claim = None
+        self._foreground_ingest_revision = 0
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -773,6 +784,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        self._invalidate_sanitation_operation()
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
@@ -834,11 +846,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
-            self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
-            if store is not None:
-                store._hermes_home = hermes_home
-            self._reset_profile_runtime_state()
+            # Serialize the configured-database swap too (round-3 finding
+            # 4041846904): the mutation below is the same half-swap hazard — a
+            # claimed sanitation running concurrently must not read the NEW
+            # profile home under the OLD session id mid-swap.
+            with self._sanitation_claim_lock:
+                self._hermes_home = hermes_home
+                store = getattr(self, "_store", None)
+                if store is not None:
+                    store._hermes_home = hermes_home
+                self._reset_profile_runtime_state()
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
@@ -847,10 +864,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
-        self._close_storage()
-        self._hermes_home = hermes_home
-        self._bind_storage(db_path, hermes_home)
-        self._reset_profile_runtime_state()
+        # Serialize the ENTIRE swap with claimed sanitation (round-8 finding):
+        # closing the old store before the claim lock was acquired let a claimed
+        # sanitation resume against a half-swapped engine (closed helpers) or the
+        # NEW profile's store (foreground messages written into the wrong
+        # profile). Claimed compressions and ingests take this same lock.
+        with self._sanitation_claim_lock:
+            self._close_storage()
+            self._hermes_home = hermes_home
+            self._bind_storage(db_path, hermes_home)
+            self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 
@@ -1013,10 +1036,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
 
-    def _mark_preflight_compression_requested(self) -> bool:
-        """Record that preflight found work and clear any stale no-op reason."""
+    def _mark_preflight_compression_requested(
+        self,
+        *,
+        operation: str,
+        reason: str,
+        trigger: str = "",
+    ) -> bool:
+        """Record and explain a positive preflight decision without content."""
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
+        if trigger:
+            logger.info(
+                "LCM preflight decision operation=%s reason=%s trigger=%s",
+                operation,
+                reason,
+                trigger,
+            )
+        else:
+            logger.info(
+                "LCM preflight decision operation=%s reason=%s",
+                operation,
+                reason,
+            )
         return True
 
     @property
@@ -1615,21 +1657,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
-            try:
-                self._remember_lcm_normal_message_prefix(
-                    self._session_id,
-                    messages,
-                    conversation_id=self._conversation_id,
-                )
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                logger.debug(
-                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
-                )
-            except Exception as e:
-                self._record_ingest_failure("per-turn ingest()", e)
+            with self._sanitation_claim_lock:
+                try:
+                    self._remember_lcm_normal_message_prefix(
+                        self._session_id,
+                        messages,
+                        conversation_id=self._conversation_id,
+                    )
+                    self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    logger.debug(
+                        "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                        self._session_id, len(messages), self._ingest_cursor,
+                    )
+                except Exception as e:
+                    self._record_ingest_failure("per-turn ingest()", e)
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -2786,6 +2829,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return
             if self._compression_boundary_from_lcm_bypassed_session(old_session_id):
+                self._invalidate_sanitation_operation()
                 self._handoff_lcm_bypass_lineage(
                     old_session_id,
                     session_id,
@@ -2816,6 +2860,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return
             self._clear_thread_context_stateless()
+            self._invalidate_sanitation_operation()
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
@@ -2844,6 +2889,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 previous_session_id,
             )
             return
+        self._invalidate_sanitation_operation()
         start_platform = str(kwargs.get("platform") or "")
         side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
             session_id,
@@ -3222,8 +3268,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        # Classify the callback BEFORE invalidating sanitation state. A stale
+        # auxiliary end for an id the foreground has since reused satisfies the
+        # string equality above, but nonzero ended_generation / lineage-suppressed
+        # reuse proves the callback is not the bound foreground ending - and must
+        # not destroy a fresh foreground sanitation claim.
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
         active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
+        if session_id == self._session_id and not (
+            ended_generation
+            or (
+                session_id != self._thread_context_session_id()
+                and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            )
+        ):
+            self._invalidate_sanitation_operation()
         if (
             self._has_auxiliary_lineage_session(session_id)
             and session_id != self._session_id
@@ -3551,6 +3610,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
 
     def on_session_reset(self) -> None:
+        self._invalidate_sanitation_operation()
         if self._host_fallback_compressor is not None:
             compressor = self._host_fallback_compressor
             on_session_reset = getattr(compressor, "on_session_reset", None)
@@ -3774,17 +3834,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages = kwargs.get("messages")
 
         if name != "lcm_inspect" and messages and self._session_id:
-            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            elif not (
-                self._session_ignored or self._session_stateless or self._thread_context_stateless()
-            ):
-                try:
-                    self._ingest_messages(messages)
-                    self._record_ingest_success()
-                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                except Exception as e:
-                    self._record_ingest_failure("tool-call ingest", e)
+            # Serialize with claimed compression exactly like ingest(): a
+            # tool-call ingest must not advance _ingest_cursor /
+            # _foreground_ingest_revision underneath a validated sanitation
+            # claim, or a stale claim could be echoed for a message set that
+            # no longer matches active replay.
+            with self._sanitation_claim_lock:
+                if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
+                    self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+                elif not (
+                    self._session_ignored or self._session_stateless or self._thread_context_stateless()
+                ):
+                    try:
+                        self._ingest_messages(messages)
+                        self._record_ingest_success()
+                        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    except Exception as e:
+                        self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
@@ -4572,6 +4638,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
+        recomputed_replay_messages = replay_messages
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4600,12 +4667,44 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
+            # A replay refresh (persisted-output recovery metadata, sensitive
+            # redaction, quarantine/ignore placeholders) can change the active
+            # replay for ALREADY-INGESTED messages even when nothing new is
+            # stored, so the foreground revision must advance whenever this
+            # no-new-rows pass RECOMPUTES a divergent active replay for the
+            # message identities the remembered replay currently describes:
+            # sanitation claims are keyed on the revision and must not survive
+            # an active-state change, and the identical-prefix replay cache
+            # must not silently keep serving stale state over divergent
+            # recomputed state. Refreshes over other message sets (a
+            # foreign-list session-end flush) reflect no active-state change
+            # and must not consume a claim.
             cached_replay = self._cached_active_replay_messages(messages)
+            remembered_identities = getattr(
+                self,
+                "_last_active_replay_source_identities",
+                None,
+            )
+            replay_changed_active_state = bool(
+                [self._message_replay_identity(message) for message in messages]
+                == remembered_identities
+                and recomputed_replay_messages
+                != (cached_replay if cached_replay is not None else getattr(self, "_last_active_replay_messages", None))
+            )
+            if replay_changed_active_state:
+                self._foreground_ingest_revision += 1
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            if replay_changed_active_state:
+                # Round-3 finding 4041846907: a refresh was DETECTED (the
+                # recomputed replay differs for the same source identities) —
+                # returning the stale cached replay here would keep serving the
+                # old active state and re-bump the revision every ingest.
+                # Remember + return the recomputed view.
+                return self._remember_active_replay_messages(messages, replay_messages)
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)
@@ -4832,6 +4931,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
+            self._foreground_ingest_revision += 1
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
@@ -4888,6 +4988,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # would let a rebuild publish 'ready' from old sources and omit the leaf
         # (maintainer #388 P1).
         self._ingest_cursor = n
+        self._foreground_ingest_revision += 1
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}

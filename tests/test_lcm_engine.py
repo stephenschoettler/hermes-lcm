@@ -1879,6 +1879,49 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_preflight_defers_eligible_backlog_below_threshold_as_debt(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_below_threshold_debt.db"),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            deferred_maintenance_enabled=True,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("test-session", platform="cli", context_length=10_000)
+        instance.threshold_tokens = 5_000
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old backlog " + "segment " * 100},
+            {"role": "assistant", "content": "old answer " + "detail " * 100},
+            {"role": "user", "content": "fresh request"},
+        ]
+        summary_calls = []
+
+        def summarize_spy(**kwargs):
+            summary_calls.append(kwargs)
+            return "summary", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize_spy)
+
+        try:
+            assert count_messages_tokens(messages) < instance.threshold_tokens
+            requested = instance.should_compress_preflight(messages)
+            if requested:
+                instance.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            assert requested is False
+            state = instance._lifecycle.get_by_conversation(instance._conversation_id)
+            assert state is not None
+            assert state.debt_kind == "raw_backlog"
+            assert state.debt_size_estimate > 0
+            assert summary_calls == []
+        finally:
+            instance.shutdown()
+
     def test_preflight_requests_compaction_for_deferred_maintenance_under_critical_pressure(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_deferred_critical.db"),
@@ -1890,7 +1933,7 @@ class TestEngineABC:
         instance = LCMEngine(config=config)
         instance._bind_lifecycle_state("test-session")
         instance.context_length = 200
-        instance.threshold_tokens = 100
+        instance.threshold_tokens = 10_000
         messages = [
             {"role": "system", "content": "system"},
             {"role": "user", "content": "tiny old backlog"},
@@ -1901,7 +1944,11 @@ class TestEngineABC:
         ]
         try:
             rough = count_messages_tokens(messages)
-            assert rough >= instance.threshold_tokens
+            assert rough < instance.threshold_tokens
+            assert instance._critical_budget_pressure_reached(
+                observed_tokens=rough,
+                messages=messages,
+            )
             eligible, reason = instance._leaf_compaction_candidate_status(messages)
             assert not eligible
             assert "below leaf chunk threshold" in reason
@@ -7538,6 +7585,71 @@ class TestMessageFiltering:
         finally:
             second.shutdown()
 
+    def test_stored_ignored_backlog_cleanup_below_threshold_does_not_summarize(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        db_path = tmp_path / "lcm_msg_ignore_stored_below_threshold.db"
+        hermes_home = tmp_path / "hermes-stored-ignore-below-threshold"
+        first = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=1,
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=50,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        first.on_session_start("session", platform="telegram", context_length=1000)
+        ignored_store_id = first._store.append(
+            "session",
+            {"role": "user", "content": "SECRET_PAYLOAD_MARKER " + "x" * 200},
+        )
+        stored_externalized_row = first._store.get(ignored_store_id)
+        assert stored_externalized_row is not None
+        first.shutdown()
+
+        second = LCMEngine(
+            config=LCMConfig(
+                database_path=str(db_path),
+                fresh_tail_count=1,
+                leaf_chunk_tokens=1,
+                ignore_message_patterns=["SECRET_PAYLOAD_MARKER"],
+                large_output_externalization_enabled=True,
+                large_output_externalization_threshold_chars=10_000,
+            ),
+            hermes_home=str(hermes_home),
+        )
+        second.on_session_start("session", platform="telegram", context_length=1000)
+        second.threshold_tokens = 100_000
+        messages = [
+            stored_externalized_row,
+            {"role": "user", "content": "visible eligible backlog " + "v" * 200},
+            {"role": "assistant", "content": "fresh tail"},
+        ]
+        summary_calls = []
+
+        def summarize_spy(**kwargs):
+            summary_calls.append(kwargs)
+            return "summary", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize_spy)
+
+        try:
+            assert count_messages_tokens(messages) < second.threshold_tokens
+            assert second.should_compress_preflight(messages) is True
+            result = second.compress(messages, current_tokens=count_messages_tokens(messages))
+
+            result_text = "\n".join(str(msg.get("content", "")) for msg in result)
+            assert "Externalized payload:" not in result_text
+            assert "visible eligible backlog" in result_text
+            assert second._dag.get_session_node_count("session") == 0
+            assert summary_calls == []
+        finally:
+            second.shutdown()
+
     def test_user_copied_externalized_placeholder_after_ignored_externalized_row_is_not_filtered(
         self, tmp_path, monkeypatch
     ):
@@ -8858,6 +8970,89 @@ class TestMessageFiltering:
             "LCM active replay placeholder: message ignored" not in str(msg.get("content", ""))
             for msg in result
         )
+
+    def test_ignored_backlog_cleanup_below_threshold_does_not_summarize(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preflight_below_threshold.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            ignore_message_patterns=["SECRET"],
+        )
+        engine.threshold_tokens = 100_000
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog " + "x" * 200},
+            {"role": "user", "content": "visible eligible backlog " + "y" * 200},
+            {"role": "user", "content": "fresh request"},
+        ]
+        summary_calls = []
+
+        def summarize_spy(**kwargs):
+            summary_calls.append(kwargs)
+            return "summary", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize_spy)
+
+        assert count_messages_tokens(messages) < engine.threshold_tokens
+        assert engine.should_compress_preflight(messages) is True
+        result = engine.compress(messages, current_tokens=count_messages_tokens(messages))
+
+        assert all("SECRET" not in str(msg.get("content", "")) for msg in result)
+        assert any("visible eligible backlog" in str(msg.get("content", "")) for msg in result)
+        assert engine._dag.get_session_node_count(engine._session_id) == 0
+        assert summary_calls == []
+
+    def test_ignored_backlog_cleanup_below_threshold_keeps_critical_maintenance(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preflight_critical_pressure.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=["SECRET"],
+            deferred_maintenance_enabled=True,
+            critical_budget_pressure_ratio=0.90,
+        )
+        engine.context_length = 100
+        engine.threshold_tokens = 100_000
+        engine._lifecycle.record_debt(
+            engine._conversation_id,
+            kind="raw_backlog",
+            size_estimate=500,
+        )
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog " + "x" * 200},
+            {"role": "user", "content": "visible eligible backlog " + "y" * 200},
+            {"role": "user", "content": "fresh request"},
+        ]
+        summary_calls = []
+
+        def summarize_spy(**kwargs):
+            summary_calls.append(kwargs)
+            return "critical maintenance summary", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize_spy)
+
+        rough = count_messages_tokens(messages)
+        assert rough < engine.threshold_tokens
+        assert engine._critical_budget_pressure_reached(
+            observed_tokens=rough,
+            messages=messages,
+        )
+        assert engine.should_compress_preflight(messages) is True
+        assert engine._preflight_cleanup_only is False
+        result = engine.compress(messages, current_tokens=rough)
+
+        assert all("SECRET" not in str(msg.get("content", "")) for msg in result)
+        assert engine._dag.get_session_node_count(engine._session_id) == 1
+        assert summary_calls
 
     def test_preflight_uses_replay_view_when_ignored_backlog_masks_tiny_visible_chunk(self, tmp_path):
         engine = self._make_engine(
@@ -10622,8 +10817,8 @@ class TestEngineCompress:
         assert len(result) < len(messages)
         assert instance._ingest_cursor == len(result)
         assert nodes == []
-        assert instance._last_compression_status == "noop"
-        assert "raw store lineage" in instance._last_compression_noop_reason
+        assert instance._last_compression_status == "reassembled"
+        assert instance._last_compression_noop_reason == ""
 
     def test_compress_reassembles_backed_active_summary_marker_on_noop(
         self,
@@ -10684,7 +10879,7 @@ class TestEngineCompress:
         assert len(nodes) == 1
         assert nodes[0].node_id == node_id
         assert instance._ingest_cursor == len(result)
-        assert instance._last_compression_status == "sanitized"
+        assert instance._last_compression_status == "reassembled"
         assert instance._last_compression_noop_reason == ""
 
     def test_compress_handles_multimodal_first_user_message_without_system(self, engine, monkeypatch):
@@ -20535,7 +20730,7 @@ class TestDeferredMaintenanceDebt:
         assert state is not None
         assert state.debt_kind == "raw_backlog"
         assert state.debt_size_estimate > 0
-        assert engine.should_compress_preflight(compressed) is True
+        assert engine.should_compress_preflight(compressed) is False
         refreshed = engine._lifecycle.get_by_conversation(engine._conversation_id)
         assert refreshed is not None
         assert refreshed.debt_kind == "raw_backlog"
