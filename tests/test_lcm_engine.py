@@ -3860,10 +3860,11 @@ class TestEngineABC:
         after_restart._ingest_messages(active_context)
 
         rows = after_restart._store.get_session_messages("compacted-session")
+        # The fresh tail ("fresh user tail" / "fresh assistant tail") is already
+        # durable; a restart replay must not store it a second time (re-ingest
+        # duplication fix).  Only the genuinely new tool turn is appended.
         assert [row["role"] for row in rows] == [
             "system",
-            "user",
-            "assistant",
             "user",
             "assistant",
             "assistant",

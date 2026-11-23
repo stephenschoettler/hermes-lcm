@@ -463,6 +463,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # next ingest.
         self._ingest_cursor: int = 0
         self._ingest_cursor_needs_reconcile = False
+        # When multiset reconciliation runs, it returns cursor=0 (there is no
+        # contiguous prefix to advance) and records the exact incoming indexes
+        # that are genuinely new.  _ingest_messages consumes and clears this on
+        # the same call.
+        self._reconcile_multiset_persist_indices: list[int] | None = None
         self._last_ingest_reconciliation: Dict[str, Any] = {
             "action": "none",
             "reason": "not run",
@@ -4596,8 +4601,19 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._session_id, cursor, n,
         )
 
-        new_messages = replay_messages[cursor:] if cursor < n else []
-        original_new_messages = messages[cursor:] if cursor < n else []
+        pending_persist_indices = self._reconcile_multiset_persist_indices
+        self._reconcile_multiset_persist_indices = None
+        if pending_persist_indices is None:
+            new_message_indices = list(range(cursor, n))
+        else:
+            # Multiset reconciliation selected non-prefix messages: persist
+            # only those, in incoming order.  Everything else in the replay is
+            # already durable.  The cursor still advances to n at the end.
+            new_message_indices = [
+                idx for idx in pending_persist_indices if cursor <= idx < n
+            ]
+        new_messages = [replay_messages[idx] for idx in new_message_indices]
+        original_new_messages = [messages[idx] for idx in new_message_indices]
 
         if not new_messages:
             cached_replay = self._cached_active_replay_messages(messages)
@@ -4623,8 +4639,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 empty_session_placeholder_budget = {}
                 empty_session_placeholder_ordinals = {}
         messages_to_store_with_index: list[tuple[int, Dict[str, Any]]] = [
-            (cursor + offset, replay_msg)
-            for offset, replay_msg in enumerate(new_messages)
+            (idx, replay_messages[idx]) for idx in new_message_indices
         ]
         if messages_to_store_with_index:
             kept: list[tuple[int, Dict[str, Any]]] = []
@@ -4679,8 +4694,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     for msg in new_messages
                 )
             )
-            for offset, (original_msg, replay_msg) in enumerate(zip(original_new_messages, new_messages)):
-                absolute_idx = cursor + offset
+            for absolute_idx, original_msg, replay_msg in zip(
+                new_message_indices, original_new_messages, new_messages
+            ):
                 replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
                 original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
                 volatile_placeholder = self._is_volatile_ignored_quarantine_placeholder(
