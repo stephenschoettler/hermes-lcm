@@ -25,13 +25,14 @@ from .codex_routing import (
     _codex_oauth_context_cap,
     _is_codex_gpt55_route,
 )
-from .config import LCMConfig
+from .config import LCMConfig, resolve_hermes_home
 from .dag import SummaryDAG, SummaryNode
 from .diagnostics import _enforce_state_db_containment
 from .engine_registry import (
     _ACTIVE_ENGINE_REGISTRY_LOCK,
     _ACTIVE_ENGINES_BY_CONVERSATION_ID,
     _ACTIVE_ENGINES_BY_SESSION_ID,
+    _profile_registry_key,
     _remove_registry_entries_for_engine,
     resolve_active_lcm_engine,  # noqa: F401  (re-exported: hosts import it from .engine)
 )
@@ -389,7 +390,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
-        self._config = config or LCMConfig.from_env()
+        self._config_from_env = config is None
+        if self._config_from_env:
+            hermes_home = hermes_home or str(resolve_hermes_home())
+        self._config = config or LCMConfig.from_env(hermes_home)
         self._hermes_home = hermes_home
         self._assertion_extraction_metrics_lock = threading.RLock()
         self._assertion_extraction_idle = threading.Event()
@@ -433,15 +437,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._session_match_keys: list[str] = []
         self._session_ignored = False
         self._session_stateless = False
-        self._compiled_ignore_session_patterns = compile_session_patterns(
-            self._config.ignore_session_patterns
-        )
-        self._compiled_stateless_session_patterns = compile_session_patterns(
-            self._config.stateless_session_patterns
-        )
-        self._compiled_ignore_message_patterns = compile_message_patterns(
-            self._config.ignore_message_patterns
-        )
+
         self._ignored_message_count: int = 0
         # Raw messages permanently dropped because they matched
         # ignore_message_patterns. These are NOT persisted anywhere, so an
@@ -508,7 +504,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._last_compaction_duration_ms = 0.0
         # run_agent.py reads these for preflight checks
         self.protect_first_n = 3
-        self.protect_last_n = self._config.fresh_tail_count
+
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
@@ -517,20 +513,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # remain explicit.
         self.emit_automatic_compaction_status = False
         self.quiet_mode = True
-        self.summary_model = self._config.summary_model
-        self._summary_circuit_breaker = SummaryCircuitBreaker(
-            failure_threshold=self._config.summary_circuit_breaker_failure_threshold,
-            cooldown_seconds=self._config.summary_circuit_breaker_cooldown_seconds,
-        )
-        # Summary spend guard: process-local sliding window so a loop that
-        # keeps succeeding cannot burn auxiliary-model budget without bound. When
-        # tripped, escalation falls back to deterministic L3 truncation. Set
-        # summary_spend_max_calls=0 to disable.
-        self._summary_spend_guard = SummarySpendGuard(
-            max_calls=int(self._config.summary_spend_max_calls),
-            window_seconds=float(self._config.summary_spend_window_seconds),
-            backoff_seconds=float(self._config.summary_spend_backoff_seconds),
-        )
+
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
         self._last_threshold_full_sweep: dict[str, Any] = {
@@ -621,6 +604,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # The scheduler associates this identity only with outstanding work, so
         # diagnostic drains do not retain every historical session key forever.
         self._rollup_maintenance_owner = object()
+        self._initialize_config_runtime()
+
+    def _initialize_config_runtime(self) -> None:
+        """Build config-derived runtime helpers at construction/profile rebind."""
+        self._compiled_ignore_session_patterns = compile_session_patterns(
+            self._config.ignore_session_patterns
+        )
+        self._compiled_stateless_session_patterns = compile_session_patterns(
+            self._config.stateless_session_patterns
+        )
+        self._compiled_ignore_message_patterns = compile_message_patterns(
+            self._config.ignore_message_patterns
+        )
+        self.protect_last_n = self._config.fresh_tail_count
+        self.summary_model = self._config.summary_model
+        self._summary_circuit_breaker = SummaryCircuitBreaker(
+            failure_threshold=self._config.summary_circuit_breaker_failure_threshold,
+            cooldown_seconds=self._config.summary_circuit_breaker_cooldown_seconds,
+        )
+        # Summary spend guard: process-local sliding window so a loop that
+        # keeps succeeding cannot burn auxiliary-model budget without bound. When
+        # tripped, escalation falls back to deterministic L3 truncation. Set
+        # summary_spend_max_calls=0 to disable.
+        self._summary_spend_guard = SummarySpendGuard(
+            max_calls=int(self._config.summary_spend_max_calls),
+            window_seconds=float(self._config.summary_spend_window_seconds),
+            backoff_seconds=float(self._config.summary_spend_backoff_seconds),
+        )
 
     def clone_for_agent(self) -> "LCMEngine":
         """Return a fresh runtime engine for one AIAgent instance.
@@ -632,14 +643,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         sharing one registered instance across agents can let one conversation
         rebind another conversation's raw-message ingest and lifecycle state.
 
-        The clone shares the same durable SQLite database path/configuration,
-        but gets independent session/cursor/lifecycle runtime state. Runtime
+        Environment-backed prototypes resolve the active profile afresh; explicit
+        caller-supplied configs retain their database/home. Each clone gets
+        independent session/cursor/lifecycle runtime state. Runtime
         model and context-window metadata is copied so the clone is immediately
         budget-aware even before a compatible Hermes host calls update_model().
         """
         clone = type(self)(
-            config=copy.deepcopy(self._config),
-            hermes_home=self._hermes_home,
+            config=None if self._config_from_env else copy.deepcopy(self._config),
+            hermes_home="" if self._config_from_env else self._hermes_home,
         )
         clone.model = self.model
         clone.base_url = self.base_url
@@ -829,6 +841,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """
         if not hermes_home:
             return False
+        if self._config_from_env and str(self._hermes_home) != str(hermes_home):
+            # Storage helpers capture config as well as paths. Reload before
+            # binding them, even when LCM_DATABASE_PATH explicitly pins the DB.
+            config = LCMConfig.from_env(hermes_home)
+            self._close_storage()
+            self._config = config
+            self._hermes_home = hermes_home
+            self._bind_storage(self._resolve_db_path(hermes_home), hermes_home)
+            self._reset_profile_runtime_state()
+            self._initialize_config_runtime()
+            self._set_context_length(
+                self.raw_context_length or self.context_length,
+                source=self._context_length_source,
+                model=self.model,
+                provider=self.provider,
+            )
+            return True
         if self._config.database_path:
             current_home = str(self._hermes_home or "")
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
@@ -1891,15 +1920,18 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         conversation_id = str(self._conversation_id or "")
         if not session_id:
             return
+        profile = _profile_registry_key(self._hermes_home)
+        session_key = (profile, session_id)
+        conversation_key = (profile, conversation_id)
         with _ACTIVE_ENGINE_REGISTRY_LOCK:
             _remove_registry_entries_for_engine(
                 self,
-                keep_session_id=session_id,
-                keep_conversation_id=conversation_id,
+                keep_session_id=session_key,
+                keep_conversation_id=conversation_key,
             )
-            _ACTIVE_ENGINES_BY_SESSION_ID[session_id] = self
+            _ACTIVE_ENGINES_BY_SESSION_ID[session_key] = self
             if conversation_id:
-                _ACTIVE_ENGINES_BY_CONVERSATION_ID[conversation_id] = self
+                _ACTIVE_ENGINES_BY_CONVERSATION_ID[conversation_key] = self
 
     def _unregister_active_engine_binding(self) -> None:
         with _ACTIVE_ENGINE_REGISTRY_LOCK:
@@ -2600,8 +2632,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
-        if "hermes_home" in kwargs:
-            self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
+        hermes_home = str(kwargs.get("hermes_home") or "")
+        if not hermes_home and self._config_from_env:
+            hermes_home = str(resolve_hermes_home())
+        if hermes_home:
+            self._rebind_storage_for_home(hermes_home)
 
         boundary_reason = str(kwargs.get("boundary_reason") or "")
         old_session_id = str(kwargs.get("old_session_id") or "")

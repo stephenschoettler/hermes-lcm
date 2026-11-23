@@ -13,11 +13,18 @@ from __future__ import annotations
 
 import threading
 import weakref
+from pathlib import Path
 from typing import Any
+
+from .config import resolve_hermes_home
 
 _ACTIVE_ENGINE_REGISTRY_LOCK = threading.RLock()
 _ACTIVE_ENGINES_BY_SESSION_ID = weakref.WeakValueDictionary()
 _ACTIVE_ENGINES_BY_CONVERSATION_ID = weakref.WeakValueDictionary()
+
+
+def _profile_registry_key(hermes_home: str = "") -> str:
+    return str((Path(hermes_home) if hermes_home else resolve_hermes_home()).resolve())
 
 
 def _is_usable_lcm_engine(engine: Any) -> bool:
@@ -80,8 +87,8 @@ def _engine_matches_foreground_binding(
 def _remove_registry_entries_for_engine(
     engine: Any,
     *,
-    keep_session_id: str = "",
-    keep_conversation_id: str = "",
+    keep_session_id: tuple[str, str] | None = None,
+    keep_conversation_id: tuple[str, str] | None = None,
 ) -> None:
     for registered_session_id, registered_engine in list(_ACTIVE_ENGINES_BY_SESSION_ID.items()):
         if registered_engine is engine and registered_session_id != keep_session_id:
@@ -107,17 +114,20 @@ def resolve_active_lcm_engine(
     post-turn ingest can still follow the active clone instead of rebinding the
     process-wide plugin singleton.
     """
+    profile = _profile_registry_key()
     session_id = str(session_id or "")
     conversation_id = str(conversation_id or "")
+    session_key = (profile, session_id)
+    conversation_key = (profile, conversation_id)
     with _ACTIVE_ENGINE_REGISTRY_LOCK:
         if session_id:
-            engine = _ACTIVE_ENGINES_BY_SESSION_ID.get(session_id)
+            engine = _ACTIVE_ENGINES_BY_SESSION_ID.get(session_key)
             if _engine_matches_session_binding(engine, session_id):
                 return engine
             if engine is not None:
-                _ACTIVE_ENGINES_BY_SESSION_ID.pop(session_id, None)
+                _ACTIVE_ENGINES_BY_SESSION_ID.pop(session_key, None)
         if conversation_id:
-            engine = _ACTIVE_ENGINES_BY_CONVERSATION_ID.get(conversation_id)
+            engine = _ACTIVE_ENGINES_BY_CONVERSATION_ID.get(conversation_key)
             conversation_matches = _engine_matches_conversation_binding(
                 engine,
                 conversation_id,
@@ -129,7 +139,7 @@ def resolve_active_lcm_engine(
             if conversation_matches and session_matches:
                 return engine
             if engine is not None and not conversation_matches:
-                _ACTIVE_ENGINES_BY_CONVERSATION_ID.pop(conversation_id, None)
+                _ACTIVE_ENGINES_BY_CONVERSATION_ID.pop(conversation_key, None)
         if not allow_foreground:
             return None
         # Operator commands may target the stable foreground view while a side
@@ -137,10 +147,12 @@ def resolve_active_lcm_engine(
         # this fallback or they can rebind the side-channel clone mid-turn.
         # Registry size is bounded by live AIAgent clones and values are weak.
         seen: set[int] = set()
-        for engine in (
-            list(_ACTIVE_ENGINES_BY_SESSION_ID.values())
-            + list(_ACTIVE_ENGINES_BY_CONVERSATION_ID.values())
+        for (registered_profile, _), engine in (
+            list(_ACTIVE_ENGINES_BY_SESSION_ID.items())
+            + list(_ACTIVE_ENGINES_BY_CONVERSATION_ID.items())
         ):
+            if registered_profile != profile:
+                continue
             engine_id = id(engine)
             if engine_id in seen:
                 continue
