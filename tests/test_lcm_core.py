@@ -4714,7 +4714,7 @@ class TestAssemblyBudgetSelection:
 
         assert replay._store.get_session_count("assembly-session") == len(messages) + 1
 
-    def test_preserved_objective_scaffold_does_not_skip_new_repeated_user_tail(self, tmp_path, monkeypatch):
+    def test_preserved_objective_scaffold_skips_replayed_user_tail_but_keeps_new_followup(self, tmp_path, monkeypatch):
         engine = self._engine(tmp_path, monkeypatch, max_assembly_tokens=450)
         persisted_messages = [
             {"role": "system", "content": "sys"},
@@ -4740,8 +4740,9 @@ class TestAssemblyBudgetSelection:
         ])
 
         rows = replay._store.get_session_messages("assembly-session")
-        assert len(rows) == len(persisted_messages) + 2
-        assert [row["content"] for row in rows].count("repeat me") == 2
+        # "repeat me" is the replayed stored tail; only the follow-up is new.
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows].count("repeat me") == 1
         assert rows[-1]["content"] == "new followup"
 
     def test_assembly_skips_oversized_summary_and_keeps_later_fit_summary(self, tmp_path, monkeypatch):

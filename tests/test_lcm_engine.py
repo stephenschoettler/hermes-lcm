@@ -3815,7 +3815,7 @@ class TestEngineABC:
         assert rows[-1]["tool_call_id"] == "call_1"
         assert after_restart._ingest_cursor == len(active_context)
 
-    def test_existing_compacted_session_restart_skips_synthetic_context_but_persists_new_tool(self, tmp_path):
+    def test_existing_compacted_session_restart_skips_synthetic_context_and_replayed_tail_but_persists_new_tool(self, tmp_path):
         db_path = tmp_path / "restart-compacted.db"
         config = LCMConfig(database_path=str(db_path))
         before_restart = LCMEngine(config=config)
@@ -3860,10 +3860,9 @@ class TestEngineABC:
         after_restart._ingest_messages(active_context)
 
         rows = after_restart._store.get_session_messages("compacted-session")
+        # The replayed fresh tail is already stored; only the new tool turn is appended.
         assert [row["role"] for row in rows] == [
             "system",
-            "user",
-            "assistant",
             "user",
             "assistant",
             "assistant",
@@ -4300,7 +4299,7 @@ class TestEngineABC:
         assert [row["content"] for row in rows] == ["retry", "retry", "next answer"]
         assert after_restart._ingest_cursor == len(active_context)
 
-    def test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail(self, tmp_path):
+    def test_existing_session_restart_skips_scaffolded_replay_matching_store_tail(self, tmp_path):
         db_path = tmp_path / "restart-scaffolded-repeated-tail-delta.db"
         config = LCMConfig(database_path=str(db_path))
         before_restart = LCMEngine(config=config)
@@ -4337,15 +4336,13 @@ class TestEngineABC:
 
         after_restart._ingest_messages(active_context)
 
-        rows = after_restart._store.get_session_messages(
-            "scaffold-repeat-tail-delta-session",
-            limit=len(persisted_messages) + 1,
-        )
-        assert len(rows) == len(persisted_messages) + 1
-        assert [row["content"] for row in rows[-2:]] == ["retry", "retry"]
+        rows = after_restart._store.get_session_messages("scaffold-repeat-tail-delta-session")
+        # A scaffold-headed re-bind replay of the stored tail is not re-appended.
+        assert [row["content"] for row in rows] == [m["content"] for m in persisted_messages]
+        assert after_restart._last_ingest_reconciliation["reason"] == "replayed stored window since anchor"
         assert after_restart._ingest_cursor == len(active_context)
 
-    def test_existing_session_restart_persists_scaffolded_delta_message_matching_store_tail_with_followup(self, tmp_path):
+    def test_existing_session_restart_skips_scaffolded_replay_matching_store_tail_but_persists_followup(self, tmp_path):
         db_path = tmp_path / "restart-scaffolded-repeated-tail-followup.db"
         config = LCMConfig(database_path=str(db_path))
         before_restart = LCMEngine(config=config)
@@ -4383,15 +4380,13 @@ class TestEngineABC:
 
         after_restart._ingest_messages(active_context)
 
-        rows = after_restart._store.get_session_messages(
-            "scaffold-repeat-tail-followup-session",
-            limit=len(persisted_messages) + 2,
-        )
-        assert len(rows) == len(persisted_messages) + 2
-        assert [row["content"] for row in rows[-3:]] == ["retry", "retry", "next answer"]
+        rows = after_restart._store.get_session_messages("scaffold-repeat-tail-followup-session")
+        # The replayed "retry" is already stored; the follow-up after it is new.
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows[-3:]] == ["initial answer", "retry", "next answer"]
         assert after_restart._ingest_cursor == len(active_context)
 
-    def test_existing_session_restart_persists_cleanup_sensitive_scaffolded_repeated_tail(self, tmp_path):
+    def test_existing_session_restart_skips_cleanup_sensitive_scaffolded_replayed_tail(self, tmp_path):
         db_path = tmp_path / "restart-cleanup-sensitive-scaffold-repeat-tail.db"
         config = LCMConfig(database_path=str(db_path))
         before_restart = LCMEngine(config=config)
@@ -4433,22 +4428,15 @@ class TestEngineABC:
 
         after_restart._ingest_messages(active_context)
 
-        rows = after_restart._store.get_session_messages(
-            "cleanup-sensitive-scaffold-repeat-tail-session",
-            limit=len(persisted_messages) + 2,
-        )
-        assert len(rows) == len(persisted_messages) + 2
-        assert [row["content"] for row in rows[-4:]] == [
-            "retry",
-            literal_json_text,
-            "retry",
-            literal_json_text,
-        ]
+        rows = after_restart._store.get_session_messages("cleanup-sensitive-scaffold-repeat-tail-session")
+        # The literal-JSON assistant row still matches its stored copy, so the
+        # replayed tail is recognised as already stored and not re-appended.
+        assert [row["content"] for row in rows] == [m["content"] for m in persisted_messages]
         assert after_restart._last_ingest_reconciliation["action"] == "advanced cursor"
-        assert after_restart._last_ingest_reconciliation["reason"] == "skipped scaffold-only prefix"
+        assert after_restart._last_ingest_reconciliation["reason"] == "replayed stored window since anchor"
         assert after_restart._ingest_cursor == len(active_context)
 
-    def test_existing_session_restart_persists_cleanup_sensitive_scaffolded_repeated_tail_with_followup(self, tmp_path):
+    def test_existing_session_restart_skips_cleanup_sensitive_scaffolded_replayed_tail_but_persists_followup(self, tmp_path):
         db_path = tmp_path / "restart-cleanup-sensitive-scaffold-repeat-tail-followup.db"
         config = LCMConfig(database_path=str(db_path))
         before_restart = LCMEngine(config=config)
@@ -4492,19 +4480,16 @@ class TestEngineABC:
         after_restart._ingest_messages(active_context)
 
         rows = after_restart._store.get_session_messages(
-            "cleanup-sensitive-scaffold-repeat-tail-followup-session",
-            limit=len(persisted_messages) + 3,
+            "cleanup-sensitive-scaffold-repeat-tail-followup-session"
         )
-        assert len(rows) == len(persisted_messages) + 3
-        assert [row["content"] for row in rows[-5:]] == [
-            "retry",
-            literal_json_text,
+        assert len(rows) == len(persisted_messages) + 1
+        assert [row["content"] for row in rows[-3:]] == [
             "retry",
             literal_json_text,
             "new follow-up",
         ]
         assert after_restart._last_ingest_reconciliation["action"] == "advanced cursor"
-        assert after_restart._last_ingest_reconciliation["reason"] == "skipped scaffold-only prefix"
+        assert after_restart._last_ingest_reconciliation["reason"] == "replayed stored window since anchor"
         assert after_restart._ingest_cursor == len(active_context)
 
     def test_existing_session_restart_persists_new_system_message(self, tmp_path):
