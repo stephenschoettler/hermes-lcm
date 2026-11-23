@@ -390,7 +390,7 @@ def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(
     monkeypatch.setattr(engine, "_ingest_messages", lambda _messages: cleanup_messages)
 
     assert engine.should_compress_preflight(messages) is True
-    assert engine._preflight_cleanup_only_due_to_boundary_cooldown is True
+    assert engine._preflight_cleanup_only is True
 
 
 def test_flag_off_replay_cleanup_cooldown_publishes_without_summary_llm(
@@ -453,6 +453,40 @@ def test_live_stub_cooldown_adoption_skips_eligible_leaf_work(make_engine, monke
     result = engine.compress(messages, current_tokens=1_000)
 
     assert assembled_tool(result, "cooldown-eligible-call")["content"].startswith(
+        "[Externalized tool output:"
+    )
+    assert any(message.get("content") == "old request with eligible raw backlog" for message in result)
+    assert engine._dag.get_session_node_count(engine._session_id) == 0
+    assert engine.last_compression_status == "sanitized"
+
+
+def test_live_stub_subthreshold_adoption_skips_eligible_leaf_work(make_engine, monkeypatch):
+    """Replay cleanup must not smuggle in an early summary compaction.
+
+    Hermes calls ``should_compress_preflight`` only after its normal threshold
+    path declined to run.  A large-output stub may still need immediate
+    adoption, but that deterministic cleanup must not piggyback eligible leaf
+    work and rewrite the conversation hundreds of thousands of tokens early.
+    """
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    payload = "fresh durable payload with old eligible backlog " * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("subthreshold-eligible-call", payload),
+    ]
+
+    def fail_if_summarized(**_kwargs):
+        raise AssertionError("subthreshold replay cleanup must not summarize")
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fail_if_summarized)
+
+    assert engine.should_compress_preflight(messages) is True
+    result = engine.compress(messages, current_tokens=1_000)
+
+    assert assembled_tool(result, "subthreshold-eligible-call")["content"].startswith(
         "[Externalized tool output:"
     )
     assert any(message.get("content") == "old request with eligible raw backlog" for message in result)
@@ -545,3 +579,26 @@ def test_live_interceptor_keeps_media_and_recovery_results_inline(make_engine):
     assert cached is not None
     assert assembled_tool(cached, "media-live-call")["content"] == media_payload
     assert assembled_tool(cached, "recovery-live-call")["content"] == "recovered payload " * 100
+
+
+def test_flag_off_ingest_failure_clears_one_shot_cleanup_flag(make_engine, monkeypatch):
+    """Transient ingest failure must not leave a stale cleanup-only flag.
+
+    Regression test for PR #541 review feedback: compress() consumed the
+    one-shot _preflight_cleanup_only handoff only after _ingest_messages()
+    succeeded, so an exception there left the flag set and diverted the next
+    threshold-crossed compress() into the cleanup-only path.
+    """
+    engine = make_engine(large_output_active_replay_stubbing_enabled=False)
+    engine.threshold_tokens = 100_000
+    messages = [{"role": "user", "content": "plain sub-threshold payload"}]
+
+    engine._preflight_cleanup_only = True
+    monkeypatch.setattr(
+        engine, "_ingest_messages", Mock(side_effect=RuntimeError("boom-ingest"))
+    )
+
+    with pytest.raises(RuntimeError, match="boom-ingest"):
+        engine.compress(messages, current_tokens=1_000)
+
+    assert engine._preflight_cleanup_only is False
