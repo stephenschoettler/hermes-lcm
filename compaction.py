@@ -16,10 +16,12 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
 from .dag import SummaryNode
+from .db_bootstrap import _is_sqlite_lock_error
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
@@ -30,7 +32,19 @@ _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
+class _SummaryPublicationLocked(RuntimeError):
+    """Only raised for SQLite contention at the DAG publication boundary."""
+
+
 class CompactionMixin:
+    def _publish_summary_node(self, node: SummaryNode) -> None:
+        try:
+            self._dag.add_node(node)
+        except sqlite3.Error as exc:
+            if not _is_sqlite_lock_error(exc):
+                raise
+            raise _SummaryPublicationLocked("LCM summary publication blocked by SQLite lock") from exc
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -352,6 +366,9 @@ class CompactionMixin:
                  focus_topic: Optional[str] = None,
                  force: bool = False) -> List[Dict[str, Any]]:
         """Run compaction and leave a terminal public status on every failure."""
+        # Hermes checks these fields even when compression is a no-op.
+        self._last_compress_aborted = False
+        self._last_summary_error = None
         try:
             return self._compress_impl(
                 messages,
@@ -459,6 +476,7 @@ class CompactionMixin:
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False
+        publication_locked = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
         estimated_active_tokens = (
@@ -793,7 +811,26 @@ class CompactionMixin:
                 latest_at=latest_at,
                 expand_hint=self._extract_expand_hint(summary_text),
             )
-            self._dag.add_node(node)
+            try:
+                self._publish_summary_node(node)
+            except _SummaryPublicationLocked as exc:
+                self._last_summary_error = str(exc)
+                logger.warning("%s after %d persisted leaf pass(es)", exc, leaf_passes)
+                if not leaf_compacted_this_turn:
+                    self._last_compress_aborted = True
+                    self._last_compression_status = "error"
+                    self._last_compression_noop_reason = ""
+                    if threshold_full_sweep_active:
+                        self._last_threshold_full_sweep.update(
+                            status="error", stop_reason="leaf_publication_locked",
+                            duration_ms=round((time.perf_counter() - _compress_started) * 1000.0, 3),
+                        )
+                    return messages
+                # Earlier leaves are already durable: finalize just that progress,
+                # retaining this failed chunk in working_messages for the caller.
+                publication_locked = True
+                sweep_stop_reason = "leaf_publication_locked"
+                break
             self._invalidate_rollups_for_published_node(node)
             self._maybe_gc_compacted_tool_results(compacted_chunk, source_store_ids)
             self._last_compacted_store_id = max(consumed_store_ids) if consumed_store_ids else 0
@@ -927,33 +964,41 @@ class CompactionMixin:
         # condenses after the eligible raw prefix has been drained, and shares
         # the same total pass/deadline budget as its leaf work.
         condensation_passes = 0
-        if threshold_full_sweep_active:
-            if sweep_raw_drained:
-                remaining_passes = max(
-                    0,
-                    _THRESHOLD_FULL_SWEEP_MAX_PASSES - leaf_passes,
-                )
-                condensation_passes, sweep_stop_reason = (
-                    self._run_threshold_sweep_condensation(
-                        target_tokens=sweep_target_tokens,
-                        pass_budget=remaining_passes,
-                        deadline=sweep_deadline,
-                        focus_topic=focus_topic,
+        try:
+            if threshold_full_sweep_active and not publication_locked:
+                if sweep_raw_drained:
+                    remaining_passes = max(
+                        0,
+                        _THRESHOLD_FULL_SWEEP_MAX_PASSES - leaf_passes,
                     )
+                    condensation_passes, sweep_stop_reason = (
+                        self._run_threshold_sweep_condensation(
+                            target_tokens=sweep_target_tokens,
+                            pass_budget=remaining_passes,
+                            deadline=sweep_deadline,
+                            focus_topic=focus_topic,
+                        )
+                    )
+                    publication_locked = sweep_stop_reason == "condensation_publication_locked"
+            elif not publication_locked:
+                self._maybe_condense(
+                    focus_topic=focus_topic,
+                    leaf_compacted_this_turn=True,
+                    force_overflow=force_overflow,
+                    critical_budget_pressure=critical_budget_pressure,
                 )
-        else:
-            self._maybe_condense(
-                focus_topic=focus_topic,
-                leaf_compacted_this_turn=True,
-                force_overflow=force_overflow,
-                critical_budget_pressure=critical_budget_pressure,
-            )
+        except _SummaryPublicationLocked as exc:
+            publication_locked = True
+            sweep_stop_reason = "condensation_publication_locked"
+            self._last_summary_error = str(exc)
+            logger.warning("%s during condensation; preserving committed leaves", exc)
 
         # Step 7: Assemble new active context
-        self._refresh_raw_backlog_debt(
-            working_messages,
-            observed_tokens=observed_prompt_tokens,
-        )
+        if not publication_locked:
+            self._refresh_raw_backlog_debt(
+                working_messages,
+                observed_tokens=observed_prompt_tokens,
+            )
         leading_anchor_count = self._leading_anchor_count(working_messages)
         anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
         self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
@@ -1012,6 +1057,8 @@ class CompactionMixin:
                 "pass_budget_exhausted",
                 "time_budget_exhausted",
                 "leaf_summary_error",
+                "leaf_publication_locked",
+                "condensation_publication_locked",
                 "condensation_error",
                 "condensation_no_progress",
                 "no_same_depth_condensation_group",
@@ -1031,18 +1078,19 @@ class CompactionMixin:
                 "budget_exhausted": final_stop_reason
                 in {"pass_budget_exhausted", "time_budget_exhausted"},
             }
-        self._write_generated_ignored_placeholder_hash_counts(
-            self._generated_placeholder_digest_budget_for_active_replay(compressed)
-        )
-        self._write_generated_ignored_placeholder_hash_ordinals(
-            self._generated_placeholder_digest_ordinals_for_active_replay(compressed)
-        )
-        record_successful_compaction = getattr(
-            self,
-            "_record_successful_compaction_telemetry",
-            None,
-        )
-        if callable(record_successful_compaction):
-            record_successful_compaction()
+        if not publication_locked:
+            self._write_generated_ignored_placeholder_hash_counts(
+                self._generated_placeholder_digest_budget_for_active_replay(compressed)
+            )
+            self._write_generated_ignored_placeholder_hash_ordinals(
+                self._generated_placeholder_digest_ordinals_for_active_replay(compressed)
+            )
+            record_successful_compaction = getattr(
+                self,
+                "_record_successful_compaction_telemetry",
+                None,
+            )
+            if callable(record_successful_compaction):
+                record_successful_compaction()
 
         return compressed
