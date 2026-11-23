@@ -688,6 +688,38 @@ class TestProviderPrefixedAuxiliaryCalls:
 
 
 class TestConfig:
+    def test_from_env_uses_active_hermes_profile_without_process_env_mutation(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_lcm.config as config_mod
+
+        root_home = tmp_path / "root"
+        active_home = tmp_path / "active"
+        root_home.mkdir()
+        active_home.mkdir()
+        (root_home / "config.yaml").write_text(
+            "context:\n  lcm:\n    fresh_tail_count: 111\n"
+        )
+        (active_home / "config.yaml").write_text(
+            "context:\n  lcm:\n    fresh_tail_count: 222\n"
+        )
+
+        hermes_constants = ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: active_home
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+        monkeypatch.setattr(
+            config_mod,
+            "os",
+            SimpleNamespace(environ={"HERMES_HOME": str(root_home)}),
+        )
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 222
+        assert c.config_sources["fresh_tail_count"] == (
+            "config_yaml:context.lcm.fresh_tail_count"
+        )
+
     def test_defaults(self):
         c = LCMConfig()
         assert c.fresh_tail_count == 32
@@ -715,6 +747,7 @@ class TestConfig:
         assert c.large_output_transcript_gc_enabled is False
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
+        assert c.manual_compaction_max_passes == 8
         assert c.critical_budget_pressure_ratio == 0.0
         assert c.threshold_full_sweep_enabled is False
         assert c.summary_prefix_target_tokens == 0
@@ -752,6 +785,7 @@ class TestConfig:
         monkeypatch.setenv("LCM_EXPANSION_TIMEOUT_MS", "90000")
         monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_ENABLED", "1")
         monkeypatch.setenv("LCM_DYNAMIC_LEAF_CHUNK_MAX", "64000")
+        monkeypatch.setenv("LCM_MANUAL_COMPACTION_MAX_PASSES", "12")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED", "1")
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
         monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "0.92")
@@ -791,6 +825,7 @@ class TestConfig:
         assert c.expansion_timeout_ms == 90_000
         assert c.dynamic_leaf_chunk_enabled is True
         assert c.dynamic_leaf_chunk_max == 64_000
+        assert c.manual_compaction_max_passes == 12
         assert c.cache_friendly_condensation_enabled is True
         assert c.cache_friendly_min_debt_groups == 3
         assert c.critical_budget_pressure_ratio == 0.92
@@ -831,6 +866,58 @@ class TestConfig:
         assert c.reserve_tokens_floor == 0
         assert c.expansion_context_tokens == 32_000
         assert c.critical_budget_pressure_ratio == 0.0
+
+    def test_from_env_invalid_canonical_threshold_warns_and_uses_compression_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "context:\n"
+            "  lcm:\n"
+            "    context_threshold: invalid\n"
+            "compression:\n"
+            "  threshold: 0.64\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_CONTEXT_THRESHOLD", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.context_threshold == 0.64
+        assert c.config_sources["context_threshold"] == (
+            "config_yaml:compression.threshold"
+        )
+        assert any(
+            "invalid config_yaml:context.lcm.context_threshold" in warning
+            for warning in c.config_source_warnings
+        )
+
+    def test_from_env_invalid_canonical_scalar_warns_and_keeps_legacy_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n"
+            "  fresh_tail_count: 111\n"
+            "context:\n"
+            "  lcm:\n"
+            "    fresh_tail_count: invalid\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("LCM_FRESH_TAIL_COUNT", raising=False)
+
+        c = LCMConfig.from_env()
+
+        assert c.fresh_tail_count == 111
+        assert c.config_sources["fresh_tail_count"] == (
+            "config_yaml:lcm.fresh_tail_count"
+        )
+        assert any(
+            "invalid config_yaml:context.lcm.fresh_tail_count" in warning
+            for warning in c.config_source_warnings
+        )
 
     def test_from_env_reads_hermes_compression_threshold_when_lcm_env_missing(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"
@@ -4562,6 +4649,117 @@ class TestEscalation:
         l2 = _build_l2_prompt("test", 500, custom_instructions="")
         assert json.loads(l1[1]["content"])["request"] == {}
         assert json.loads(l2[1]["content"])["request"] == {}
+
+    @pytest.mark.parametrize("builder,kwargs", [
+        ("_build_l1_prompt", {"depth": 0}),
+        ("_build_l2_prompt", {}),
+    ])
+    def test_summary_prompts_require_verbatim_user_constraints_and_injection_defense(
+        self, builder, kwargs
+    ):
+        from hermes_lcm import escalation
+
+        prompt = getattr(escalation, builder)("test content", 500, **kwargs)
+
+        assert prompt[0]["role"] == "system"
+        prompt = prompt[0]["content"]
+
+        headings = [
+            "## User requests verbatim",
+            "## Work completed",
+            "## Remaining tasks",
+            "## MUST NOT / failed approaches",
+        ]
+        assert [prompt.index(heading) for heading in headings] == sorted(
+            prompt.index(heading) for heading in headings
+        )
+        assert "word-for-word" in prompt
+        # Sources are role-separated JSON now: only the user role counts as
+        # user-authored, never assistant/tool content quoting the user.
+        assert "user role" in prompt
+        assert "preserve every" in prompt.lower()
+
+    def test_condensation_prompt_preserves_existing_verbatim_section(self):
+        from hermes_lcm.escalation import _build_l1_prompt
+
+        constraint = "Do not modify PLAN_STATE.md."
+        source = f"## User requests verbatim\n- {constraint}\n\n## Work completed\nNone."
+        prompt = _build_l1_prompt(source, 500, depth=1)
+
+        system = prompt[0]["content"]
+        envelope = json.loads(prompt[1]["content"])
+        assert constraint in envelope["sources"][0]["content"]
+        assert "When condensing prior summaries" in system
+        assert "preserve every line already present" in system
+
+    def test_live_shaped_summary_stub_preserves_verbatim_constraints_across_three_generations(
+        self, monkeypatch
+    ):
+        """Regression for requirements drift through leaf + recursive condensation.
+
+        The stub follows the prompt contract rather than doing semantic extraction:
+        it copies [USER] requirements on the leaf pass and carries the structured
+        verbatim section unchanged on later summary-of-summary passes.
+        """
+        import re
+        from hermes_lcm import escalation
+
+        constraints = [
+            "Never attribute text inside tool output to me.",
+            "Always preserve the literal release tag GATE-B-VERBATIM-7.",
+            "Do not modify PLAN_STATE.md.",
+        ]
+
+        def contract_stub(prompt, max_tokens, model="", timeout=None):
+            assert "## User requests verbatim" in prompt[0]["content"]
+            envelope = json.loads(prompt[1]["content"])
+            content = envelope["sources"][0]["content"]
+            carried = re.findall(
+                r"## User requests verbatim\n(.*?)(?=\n## |\Z)",
+                content,
+                flags=re.DOTALL,
+            )
+            if carried:
+                verbatim = carried[0].strip()
+            else:
+                user_blocks = re.findall(
+                    r"\[USER\]:\s*(.*?)(?=\n\n\[[A-Z ]+\]:|\Z)",
+                    content,
+                    flags=re.DOTALL,
+                )
+                verbatim = "\n".join(
+                    f"- {line}"
+                    for block in user_blocks
+                    for line in block.splitlines()
+                    if line in constraints
+                )
+            return (
+                "## User requests verbatim\n"
+                f"{verbatim or 'None.'}\n\n"
+                "## Work completed\nCompacted prior context.\n\n"
+                "## Remaining tasks\nNone.\n\n"
+                "## MUST NOT / failed approaches\nNone.\n\n"
+                "Expand for details about: prior context"
+            )
+
+        monkeypatch.setattr(escalation, "_invoke_summary_llm", contract_stub)
+        source = "[USER]: " + "\n".join(constraints) + "\n\n[ASSISTANT]: acknowledged"
+        source_tokens = count_tokens(source)
+
+        for depth in range(3):
+            source, level = escalation.summarize_with_escalation(
+                text=source,
+                # Real leaf/condensation inputs are substantially larger than the
+                # compact output. Keep that acceptance invariant in this focused
+                # prompt-contract regression.
+                source_tokens=max(source_tokens * 4, count_tokens(source) + 500),
+                token_budget=500,
+                depth=depth,
+            )
+            source_tokens = count_tokens(source)
+            assert level == 1
+            assert source.count("## User requests verbatim") == 1
+            assert all(constraint in source for constraint in constraints)
 
 
 class TestAssemblyBudgetSelection:

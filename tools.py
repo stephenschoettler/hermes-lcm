@@ -6494,6 +6494,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "leaf_chunk_tokens": engine._config.leaf_chunk_tokens,
             "dynamic_leaf_chunk_enabled": engine._config.dynamic_leaf_chunk_enabled,
             "dynamic_leaf_chunk_max": engine._config.dynamic_leaf_chunk_max,
+            "manual_compaction_max_passes": engine._config.manual_compaction_max_passes,
             "cache_friendly_condensation_enabled": engine._config.cache_friendly_condensation_enabled,
             "cache_friendly_min_debt_groups": engine._config.cache_friendly_min_debt_groups,
             "deferred_maintenance_enabled": engine._config.deferred_maintenance_enabled,
