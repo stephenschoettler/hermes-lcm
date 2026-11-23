@@ -95,6 +95,93 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
     return False
 
 
+_JOURNAL_MODES = ("wal", "delete")
+
+# Process-wide latch so a per-connection call cannot emit the same warning on
+# every open (the gateway opens several). Mirrors core's
+# ``_log_configured_delete_overridden_once``.
+_journal_mode_config_warned = False
+
+
+def _resolve_journal_mode_from_config(log_failure: bool = True) -> str:
+    """Read ``database.journal_mode`` from the operator's config.
+
+    Returns ``"wal"`` or ``"delete"``, or ``""`` when the config could not be
+    READ at all. The caller decides what an unreadable config means; this
+    function never silently substitutes a mode.
+
+    WHY THE "" RETURN EXISTS: this used to be
+
+        try:
+            ...
+        except Exception:
+            return "wal"
+
+    which discarded the operator's setting whenever the read failed for ANY
+    reason — and logged nothing. The failure is realistic, not theoretical:
+    ``hermes_cli`` is importable only from the Hermes Agent install, so a
+    cwd/PYTHONPATH change, a Python older than the host's syntax baseline (the
+    host uses PEP-604 ``int | None`` annotations, so 3.9 raises TypeError at
+    import), a relocated checkout or a partially-installed host all land in that
+    ``except``. In each case ``database.journal_mode: delete`` was requested and
+    ignored, with no signal to the operator — the exact class of silent
+    substitution that let a corrupting configuration persist undetected.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        database = (load_config_readonly() or {}).get("database", {})
+        raw = database.get("journal_mode") if isinstance(database, dict) else None
+    except Exception as exc:
+        if log_failure:
+            logger.warning(
+                "LCM: could not read database.journal_mode from the Hermes "
+                "config (%s: %s). The operator's journal-mode setting is NOT "
+                "being applied on this connection.",
+                type(exc).__name__,
+                exc,
+            )
+        return ""
+    mode = raw.strip().lower() if isinstance(raw, str) else ""
+    return mode if mode in _JOURNAL_MODES else ""
+
+
+def _configured_journal_mode() -> str:
+    """The operator's requested LCM journal mode: ``wal`` (default) or ``delete``.
+
+    WHY THIS EXISTS: this module used to run ``PRAGMA journal_mode=WAL``
+    unconditionally, so ``database.journal_mode`` was silently ignored for
+    lcm.db and DELETE was unavailable as an escape hatch. That matters because
+    WAL is what makes a multi-process lcm.db unsafe: the gateway, the dashboard
+    and an interactive TUI each keep their own ``-wal`` inode, and unlinking a
+    held sidecar produces the split-brain that tears the FTS shadow tables —
+    observed as four separate lcm.db corruptions in five days.
+
+    Mirrors ``hermes_state_wal.resolve_journal_mode`` (Hermes core) rather than
+    re-implementing policy: only ``delete`` is honoured, anything unrecognised
+    falls back to ``wal``. Core's never-live-downgrade rule is preserved by
+    :func:`_execute_wal_conversion_with_lock_retry`, which leaves an
+    already-WAL database in WAL. Overridable with ``LCM_JOURNAL_MODE``.
+
+    Resolution order is env override, then config, then the ``wal`` default.
+    A config read that fails is reported by
+    :func:`_resolve_journal_mode_from_config` and falls back to ``wal`` (the
+    documented default) rather than raising: a broken config must not make
+    lcm.db unopenable, and the warning is what makes the fallback traceable.
+    """
+    global _journal_mode_config_warned
+
+    override = (os.environ.get("LCM_JOURNAL_MODE") or "").strip().lower()
+    if override in _JOURNAL_MODES:
+        return override
+
+    mode = _resolve_journal_mode_from_config(log_failure=not _journal_mode_config_warned)
+    if mode:
+        return mode
+    _journal_mode_config_warned = True
+    return "wal"
+
+
 def configure_connection(conn: sqlite3.Connection) -> None:
     """Configure SQLite connection for WAL durability and hygiene.
 
@@ -128,7 +215,26 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                               readers cache WAL pages in RAM.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    _execute_wal_conversion_with_lock_retry(conn)
+    if _configured_journal_mode() == "delete":
+        # Explicit operator request (database.journal_mode / LCM_JOURNAL_MODE).
+        # Never live-downgrade: only honour it when the on-disk header is not
+        # already WAL, because other gateway/cron/worker connections may hold
+        # the database open and a live downgrade destroys their uncheckpointed
+        # commits. Mirrors hermes_state_wal.apply_wal_with_fallback.
+        try:
+            current = conn.execute("PRAGMA journal_mode").fetchone()
+            current_mode = str(current[0]).lower() if current and current[0] else None
+        except sqlite3.Error:
+            current_mode = None  # probe blocked by a concurrent opener — fail safe
+        if current_mode is None:
+            logger.warning(
+                "LCM: could not verify the on-disk journal mode; leaving it "
+                "unchanged rather than risking a live downgrade to DELETE."
+            )
+        elif current_mode != "wal":
+            conn.execute("PRAGMA journal_mode=DELETE")
+    else:
+        _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
@@ -150,6 +256,10 @@ def _execute_wal_conversion_with_lock_retry(
     Once the database is in WAL mode the pragma is a plain read and never
     takes this path, so the retry only matters on first boot after an
     install/upgrade or on a rollback-journal restore.
+
+    Honours ``database.journal_mode``: a configured ``delete`` is applied by the
+    caller instead of this function, so DELETE stays available as an escape
+    hatch from WAL coherency problems.
     """
     deadline = time.monotonic() + budget_ms / 1000.0
     delay_seconds = 0.005

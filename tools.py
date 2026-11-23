@@ -6682,16 +6682,50 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         quick_check_row = engine._store.connection.execute("PRAGMA quick_check").fetchone()
         db_path = Path(engine._store.db_path)
         wal_path = Path(str(db_path) + "-wal")
+        journal_mode = journal_mode_row[0] if journal_mode_row else "unknown"
+
+        # A clean quick_check is NOT sufficient for this check. WAL is the
+        # documented hazard of a multi-process lcm.db — this module's own
+        # configure_connection docstring says so — because every holder keeps
+        # its OWN -wal inode, and unlinking a held sidecar is what produces the
+        # split-brain that tears the FTS shadow tables. A database can sit in
+        # that configuration and report quick_check=ok the whole time (observed
+        # across four corruptions in five days, with integrity_check returning
+        # ok throughout a live split-brain). So surface it as a warning with the
+        # reason and the remedy, and keep the remedy reachable: DELETE is
+        # available via database.journal_mode / LCM_JOURNAL_MODE, but core never
+        # downgrades a live WAL database, so it must be applied while no process
+        # holds the file.
+        wal_warning = ""
+        if isinstance(journal_mode, str) and journal_mode.strip().lower() == "wal":
+            wal_warning = (
+                "journal_mode is WAL. With more than one process holding this "
+                "database, each keeps its own -wal inode and unlinking a held "
+                "sidecar can tear the FTS shadow tables while quick_check still "
+                "reports ok. If lcm.db is opened by more than one long-lived "
+                "process (gateway, dashboard, TUI), set database.journal_mode: "
+                "delete and apply it while no process holds the file; a live WAL "
+                "database is deliberately never downgraded in place."
+            )
+
+        if not (quick_check_row and quick_check_row[0] == "ok"):
+            storage_status = "fail"
+        elif wal_warning:
+            storage_status = "warn"
+        else:
+            storage_status = "pass"
+
         checks.append({
             "check": "sqlite_storage",
-            "status": "pass" if quick_check_row and quick_check_row[0] == "ok" else "fail",
+            "status": storage_status,
             "detail": {
                 "database_path": str(db_path),
                 "database_exists": db_path.exists(),
-                "journal_mode": journal_mode_row[0] if journal_mode_row else "unknown",
+                "journal_mode": journal_mode,
                 "quick_check": quick_check_row[0] if quick_check_row else "unknown",
                 "database_size_bytes": db_path.stat().st_size if db_path.exists() else 0,
                 "wal_size_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+                **({"warning": wal_warning} if wal_warning else {}),
             },
         })
         payload_risks = scan_sqlite_payload_risks(engine._store.connection)
