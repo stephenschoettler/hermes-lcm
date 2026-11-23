@@ -24,6 +24,7 @@ from agent.context_engine import ContextEngine
 from .codex_routing import (
     _codex_oauth_context_cap,
     _is_codex_gpt55_route,
+    _minimum_viable_threshold,
 )
 from .config import LCMConfig
 from .dag import SummaryDAG, SummaryNode
@@ -351,6 +352,11 @@ _SESSION_END_BUSY_TIMEOUT_MS = 50
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 _TOTAL_COMPACTIONS_SCOPE = "current_conversation"
 
+# Ceiling for the fresh-tail floor guard. Above this the trigger is so close to the window that a
+# turn's own output can overflow before compaction runs, so we stop raising and let the oversized
+# fresh tail surface as a real error instead of hiding it behind a near-disabled trigger.
+_MAX_FLOOR_GUARD_THRESHOLD = 0.85
+
 # Auto-focus topic derivation: infer a compact focus hint from the most recent
 # real user turns so that summarization can prioritise current user intent.
 # Mirrors Hermes upstream fix/compression-auto-focus-topic (#44687 branch).
@@ -488,7 +494,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             if getattr(self._config, "config_sources", None)
             else "manual_or_default"
         )
-        self._context_threshold_autoraised: dict[str, float] | None = None
+        self._context_threshold_autoraised: dict[str, float | str] | None = None
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -859,7 +865,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         *,
         model: str | None = None,
         provider: str | None = None,
-    ) -> tuple[float, str, dict[str, float] | None]:
+    ) -> tuple[float, str, dict[str, float | str] | None]:
         configured = float(self._config.context_threshold)
         source = (
             self._config.config_sources.get("context_threshold", "manual_or_default")
@@ -883,6 +889,30 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 "codex_gpt55_autoraise",
                 {"from": configured, "to": _CODEX_GPT55_COMPACTION_THRESHOLD},
             )
+        # Route-aware floor guard. The gpt-5.5 autoraise above is model-specific, but the failure it
+        # protects against is arithmetic and applies to EVERY route: when the trigger
+        # (context_length * threshold) sits at or below the verbatim fresh-tail floor, compaction
+        # can never clear it. Each preflight then re-compacts, logs "insufficient progress", and
+        # eventually latches attempts_exhausted. A ratio tuned for a 1M window (0.22 -> 220K) yields
+        # only ~60K on a 272K route while the floor stays put, which is exactly that state.
+        # This intentionally overrides an explicit operator ratio: the configured value is not
+        # merely aggressive there, it is unsatisfiable, and honouring it means livelock.
+        floor = int(getattr(self._config, "fresh_tail_max_tokens", 0) or 0)
+        context_length = int(getattr(self, "context_length", 0) or 0)
+        minimum = _minimum_viable_threshold(context_length, floor)
+        if minimum is not None and configured < minimum:
+            capped = min(minimum, _MAX_FLOOR_GUARD_THRESHOLD)
+            if capped > configured:
+                # Report the guard via the autoraised payload, NOT by replacing `source`:
+                # `source` is provenance (where the operator's value came from) and stays
+                # config_yaml:/env: so `/lcm status` keeps attributing the configured ratio
+                # correctly. The dedicated context_threshold_autoraised line already renders
+                # the effective raise.
+                return (
+                    capped,
+                    source,
+                    {"from": configured, "to": capped, "guard": "fresh_tail_floor_guard"},
+                )
         return configured, source, None
 
     def _effective_context_length(

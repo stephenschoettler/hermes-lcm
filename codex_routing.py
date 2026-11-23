@@ -9,6 +9,8 @@ policy constants (for example the gpt-5.5 compaction threshold).
 
 from __future__ import annotations
 
+import math
+
 # Only these exact normalized bare slugs have a proven 900k Codex OAuth route.
 # Keep them separate from the family fallbacks below so suffixes and synthetic
 # aliases cannot inherit the larger window.
@@ -38,6 +40,11 @@ _CODEX_OAUTH_CONTEXT_CAPS: dict[str, int] = {
     "gpt-5.6": 372_000,
     "gpt-5": 272_000,
 }
+
+# Multiplier applied to the fresh-tail floor when deriving a viable trigger. 1.35 leaves ~35%
+# working room between the floor and the trigger, so a pass that compacts everything above the
+# tail makes real progress instead of immediately re-triggering.
+_FLOOR_HEADROOM = 1.35
 
 
 def _bare_model_slug(model: str | None) -> str:
@@ -70,6 +77,39 @@ def _codex_oauth_context_cap(model: str | None, provider: str | None) -> int | N
         if slug in bare_model:
             return cap
     return None
+
+
+def _minimum_viable_threshold(
+    context_length: int,
+    fresh_tail_floor_tokens: int,
+    *,
+    headroom: float = _FLOOR_HEADROOM,
+) -> float | None:
+    """Smallest context_threshold that compaction can actually satisfy on this route.
+
+    Compaction can never reduce the active context below the fresh tail, which is kept verbatim.
+    If ``context_length * context_threshold`` lands at or below that floor, every preflight pass
+    re-triggers, makes "insufficient progress", and the engine eventually latches
+    ``attempts_exhausted`` -- burning minutes per turn while never clearing the trigger.
+
+    Returns the ratio that puts the trigger ``headroom`` above the floor, or None when the
+    configured ratio is already safe (or the inputs are unknown).
+    """
+    if context_length <= 0 or fresh_tail_floor_tokens <= 0:
+        return None
+    # The engine derives its trigger with int(context_length * ratio), which truncates. Ceil the
+    # target token count first and nudge the ratio up by one ULP-ish step so the truncated trigger
+    # still lands at or above the target -- otherwise the guard can come back one token short and
+    # the livelock survives the fix.
+    target_tokens = math.ceil(fresh_tail_floor_tokens * headroom)
+    if target_tokens >= context_length:
+        # The floor alone fills the window: raising the trigger cannot fix this, and clamping to
+        # ~1.0 would disable compaction entirely. Leave it to the caller's own reporting.
+        return None
+    needed = target_tokens / context_length
+    while int(context_length * needed) < target_tokens:
+        needed = math.nextafter(needed, 1.0)
+    return needed
 
 
 def _is_codex_gpt55_route(model: str | None, provider: str | None) -> bool:
