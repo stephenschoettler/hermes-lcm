@@ -19,6 +19,20 @@ from typing import Iterator, List
 
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_PRIVATE_SQLITE_MODE = 0o600
+
+# Closing ANY descriptor for a file releases every POSIX lock this process holds
+# on it, including the locks SQLite holds through open connections. Tightening
+# an artifact through a regular descriptor therefore unlocks those connections,
+# and another process can then take the last-connection path and delete the
+# live -wal/-shm files. See "POSIX advisory locks canceled by a separate thread
+# doing close()" in https://sqlite.org/howtocorrupt.html. Closing an O_PATH
+# descriptor releases no locks, and chmod through its /proc/self/fd link keeps
+# the no-follow and identity checks (the mechanism glibc's
+# fchmodat(AT_SYMLINK_NOFOLLOW) uses).
+_O_PATH = getattr(os, "O_PATH", 0)
+_PROC_SELF_FD = "/proc/self/fd"
+_CHMOD_THROUGH_PATH_DESCRIPTOR = bool(_O_PATH) and os.path.isdir(_PROC_SELF_FD)
 
 
 def _sqlite_artifact_error(path: Path, reason: str) -> OSError:
@@ -79,9 +93,17 @@ def _chmod_sqlite_artifact_at(
         expected = None
     if expected is not None:
         _validate_sqlite_artifact(path, expected)
+        if stat.S_IMODE(expected.st_mode) == _PRIVATE_SQLITE_MODE:
+            # Already private: opening and closing it would release this
+            # process's SQLite locks on the file for no benefit.
+            return True
 
-    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    use_path_descriptor = expected is not None and _CHMOD_THROUGH_PATH_DESCRIPTOR
+    if use_path_descriptor:
+        flags = _O_PATH | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    else:
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     if expected is None:
         flags |= os.O_CREAT | os.O_EXCL
     try:
@@ -109,7 +131,10 @@ def _chmod_sqlite_artifact_at(
             _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
             return False
         _validate_sqlite_artifact(path, opened)
-        os.fchmod(fd, 0o600)
+        if use_path_descriptor:
+            os.chmod(f"{_PROC_SELF_FD}/{fd}", _PRIVATE_SQLITE_MODE)
+        else:
+            os.fchmod(fd, _PRIVATE_SQLITE_MODE)
         restricted = os.fstat(fd)
         if restricted.st_nlink == 0 and allow_sidecar_disappearance:
             _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
