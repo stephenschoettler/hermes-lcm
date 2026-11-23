@@ -311,6 +311,16 @@ The canonical bytes live in
 not inject them when another context engine is serving the session. Older hosts
 without skill or hook registration keep their existing schema-driven behavior.
 
+Set `LCM_RECALL_POLICY_INJECTION` (`recall_policy_injection` in `LCMConfig`)
+to `every_turn` (default, unchanged behavior), `first_turn` (only when the host
+payload explicitly sets `is_first_turn=True`), or `off` (never inject the policy).
+Invalid values warn and fall back to `every_turn`. A missing first-turn flag
+suppresses policy in `first_turn` mode. Pre-answer evidence remains independent.
+Hermes persists injected context in user `api_content` and replays it on later
+turns: `first_turn` avoids adding further policy copies, while `off` prevents new
+copies. Neither mode removes policy already persisted in a session. The policy
+bytes and system prompt stay unchanged; injection still uses the user role.
+
 ### Slash commands
 
 Slash commands are disabled by default. Enable them only in trusted operator

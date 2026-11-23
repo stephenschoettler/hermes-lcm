@@ -146,7 +146,7 @@ For source checkouts, `lcm_status`, `/lcm status`, `lcm_inspect`,
 best-effort git identity:
 `plugin_git_commit`, `plugin_git_branch`, and `plugin_git_dirty`.
 
-The product-owned recall policy is injected through the host's ephemeral
+The product-owned recall policy is injected through the host's
 `pre_llm_call` user-context seam only after an LCM engine is bound to the
 session. It does not modify the system prompt or activate when another context
 engine is serving the turn. Its canonical file and digest source is
@@ -263,6 +263,7 @@ engine. Exposure is not activation. On a stock install:
 | `LCM_ASSERTION_EXTRACTION_TIMEOUT_SECONDS` | `30` | Timeout for each exact-source extraction call; runtime clamps to 0.1-120 seconds. |
 | `LCM_QUERY_VIEWS_ENABLED` | `false` | Create and bind demand-shaped evidence views without invoking a model or retrieval provider. |
 | `LCM_ADAPTIVE_RETRIEVAL_ENABLED` | `false` | Enable `lcm_retrieve` and bind query views for evidence reuse. Episodes are bounded to existing retrieval tools and store evidence/traces, never final prose. |
+| `LCM_RECALL_POLICY_INJECTION` | `every_turn` | Static recall policy: `every_turn` preserves existing bytes, `first_turn` injects only with explicit host `is_first_turn=True` (missing means suppressed), and `off` suppresses policy. Invalid values warn and use `every_turn`. Evidence context is independent. Historical `api_content` copies remain replayable; start a new session to clear old copies. |
 | `LCM_PREANSWER_EVIDENCE_ENABLED` | `false` | Enable the automatic pre-answer evidence hook. Disabled preserves the ordinary hook context and performs no retrieval or computation. |
 | `LCM_PREANSWER_EVIDENCE_MODE` | empty | When the master flag is enabled, empty selects legacy selective behavior; explicit values are `off`, `legacy_selective`, or `requirements_v1`. |
 | `LCM_SELECTIVE_COMPILER_ENABLED` | `false` | Separately opt into the semantic selector for code-derived closed operations. Disabling the selective compiler does not prevent the pre-answer hook from retrieving a baseline. |

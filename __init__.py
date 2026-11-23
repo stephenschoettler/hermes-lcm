@@ -162,7 +162,7 @@ def _effective_preanswer_mode(config) -> str:
     return raw if raw in {"off", "legacy_selective", "requirements_v1"} else "off"
 
 
-def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
+def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict | None:
     """Keep ordinary baseline bytes, or add one bounded product-owned delta."""
     enabled_toolsets = payload.get("enabled_toolsets")
     context_engine_enabled = not (
@@ -170,13 +170,27 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
         and "context_engine" not in enabled_toolsets
     )
     config = getattr(active_engine, "_config", None)
+    from .config import _normalize_recall_policy_injection
+
+    injection = _normalize_recall_policy_injection(
+        getattr(config, "recall_policy_injection", "every_turn")
+    )
+    if injection == "off" or (
+        injection == "first_turn" and payload.get("is_first_turn") is not True
+    ):
+        recall_policy = ""
+
+    def compose_context(*evidence):
+        parts = [value for value in (recall_policy, *evidence) if value]
+        return {"context": "\n\n".join(parts)} if parts else None
+
     mode = _effective_preanswer_mode(config)
     if mode == "off" or not context_engine_enabled:
-        return {"context": recall_policy}
+        return compose_context()
     try:
         question = str(payload.get("user_message") or "").strip()
         if not question:
-            return {"context": recall_policy}
+            return compose_context()
         question_date = _hook_question_date(payload)
 
         if mode == "requirements_v1":
@@ -185,7 +199,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
 
             contract = compile_answer_contract(question, question_date)
             if contract.status != "planned":
-                return {"context": recall_policy}
+                return compose_context()
             baseline_was_internal = not isinstance(
                 payload.get("baseline_refs"), (list, tuple)
             )
@@ -207,8 +221,8 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
                 pass
             context = result.get("context") if isinstance(result, dict) else None
             if not isinstance(context, str) or not context:
-                return {"context": recall_policy}
-            return {"context": f"{recall_policy}\n\n{context}"}
+                return compose_context()
+            return compose_context(context)
 
         from .selective_recall import (
             build_selective_session_bundle,
@@ -219,7 +233,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
         if route["route"] == "ordinary":
             # This branch deliberately performs no recall, session load, or
             # auxiliary-model call.  The ordinary policy bytes stay identical.
-            return {"context": recall_policy}
+            return compose_context()
 
         # Official Hermes hook payloads do not currently include answer-ready
         # refs.  Create that bounded baseline in product code when absent; the
@@ -284,7 +298,7 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
                 logger.warning("LCM selective compiler failed open: %s", exc)
     except Exception as exc:  # pragma: no cover - outer host safety net
         logger.warning("LCM pre-answer evidence failed open: %s", exc)
-        return {"context": recall_policy}
+        return compose_context()
     try:
         active_engine._last_preanswer_evidence_trace = (
             {
@@ -306,8 +320,8 @@ def _pre_llm_context(active_engine, recall_policy: str, payload: dict) -> dict:
         if isinstance(value, str) and value:
             augmentations.append(value)
     if not augmentations:
-        return {"context": recall_policy}
-    return {"context": f"{recall_policy}\n\n" + "\n\n".join(augmentations)}
+        return compose_context()
+    return compose_context(*augmentations)
 
 
 def _session_context_value(name: str) -> str:

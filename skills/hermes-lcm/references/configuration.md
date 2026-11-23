@@ -36,6 +36,7 @@ Use `docs/operator-guide.md` as the complete current source. Start with:
 - `LCM_CONTEXT_THRESHOLD`: when normal context pressure triggers compaction;
 - `LCM_FRESH_TAIL_COUNT`: newest messages kept raw;
 - `LCM_LEAF_CHUNK_TOKENS`: maximum raw material per leaf compaction group;
+- `LCM_RECALL_POLICY_INJECTION`: `every_turn` (default), `first_turn` (requires explicit host `is_first_turn=True`; absent suppresses), or `off`; invalid values warn and fall back to `every_turn`. Controls static policy only; pre-answer evidence still runs. Existing policy copies in historical `api_content` remain until removed from active history;
 - `LCM_DATABASE_PATH`: profile-local SQLite path when the default is unsuitable;
 - `LCM_IGNORE_SESSION_PATTERNS` and `LCM_STATELESS_SESSION_PATTERNS`: storage ownership boundaries;
 - summary/embedding provider settings only after confirming credentials, cost, and data handling.
