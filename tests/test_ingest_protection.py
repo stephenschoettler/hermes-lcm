@@ -4061,6 +4061,58 @@ def test_sensitive_private_key_redaction_is_redos_safe_on_pathological_input(tmp
     assert isinstance(result, str)
 
 
+def test_private_key_redaction_stays_cheap_on_pathological_input(tmp_path):
+    """Pathological input must not cost a fixed multi-second stall.
+
+    The previous implementation ran a timeout-bounded quadratic regex, so cost
+    was pinned near the timeout regardless of input size (~1.1s for 5k headers
+    and ~1.4s for 20k -- the clamp, not the work). The linear scanner does the
+    same redaction in a fraction of that, so assert an absolute budget well under
+    the old floor: the quadratic path cannot reach it at any of these sizes, and
+    the linear one clears it with room for a loaded runner.
+    """
+    import time as _time
+
+    engine = _sensitive_engine(tmp_path)
+    block = "-----BEGIN PRIVATE KEY-----\n" + "A" * 64 + "\n"
+
+    def elapsed(headers):
+        text = block * headers
+        start = _time.perf_counter()
+        redact_sensitive_text(text, engine._config)
+        return _time.perf_counter() - start
+
+    elapsed(2000)  # warm caches so the first call is not charged for import work
+    for headers in (5000, 10000):
+        cost = elapsed(headers)
+        assert cost < 0.75, (
+            f"{headers} pathological headers took {cost:.3f}s; the timeout-clamped "
+            "quadratic path cost ~1.1s+ here, so this indicates a regression to it"
+        )
+
+
+def test_private_key_redaction_never_leaks_on_pathological_input(tmp_path):
+    """A real key buried in pathological input must still be redacted.
+
+    Regression guard: the previous implementation ran a timeout-bounded regex and
+    fell back on TimeoutError. If that fallback were ever dropped in favour of
+    returning the text unchanged, a genuine key would survive ingest in exactly
+    this shape of payload -- a silent secret leak.
+    """
+    engine = _sensitive_engine(tmp_path)
+    secret_body = "MIIEowIBAAKCAQEAsecretkeymaterial1234567890"
+    real_key = (
+        "-----BEGIN RSA PRIVATE KEY-----\n" + secret_body + "\n-----END RSA PRIVATE KEY-----"
+    )
+    noise = ("-----BEGIN PRIVATE KEY-----\n" + "A" * 64 + "\n") * 20000
+    payload = noise + "\n" + real_key + "\n" + noise
+
+    redacted = redact_sensitive_text(payload, engine._config)
+
+    assert secret_body not in redacted
+    assert "-----END RSA PRIVATE KEY-----" not in redacted
+
+
 def test_sensitive_private_key_fallback_bounds_input_without_regex(tmp_path, monkeypatch):
     import hermes_lcm.ingest_protection as ip
 

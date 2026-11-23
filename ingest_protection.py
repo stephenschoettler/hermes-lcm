@@ -217,36 +217,20 @@ def _regex_pattern_for(name: str) -> Any:
 
 
 def _apply_sensitive_pattern(name: str, repl, text: str) -> str:
-    """Substitute one sensitive pattern with a ReDoS-safe strategy.
-
-    Fails open (leaves the span unredacted) with a one-time warning rather than
-    blocking the ingest path on a pathological input.
-    """
-    # Only the private_key pattern (lazy `.*?` under DOTALL, which rescans to
-    # end-of-string per unmatched BEGIN header) is O(n^2) and needs a guard.
-    # The other patterns are character-class-bounded and linear, so they always
-    # run via stdlib and never fail open - a redaction bypass under CPU load
-    # would be a silent secret leak, so we restrict fail-open to the one
-    # pattern that genuinely requires it.
+    """Substitute one sensitive pattern with a ReDoS-safe strategy."""
+    # The private_key pattern (lazy `.*?` under DOTALL) rescans to end-of-string
+    # for every unmatched BEGIN header, so a multi-MB payload with many headers
+    # and no END is O(n^2). Redact those blocks with the linear BEGIN/END scanner
+    # instead of running the quadratic pattern at all: both emit
+    # _sensitive_placeholder() over the whole block (the pattern has no named
+    # secret group, so _redact_match falls through to match.group(0)), so this is
+    # the same output by a bounded route rather than a fallback after a stall.
+    #
+    # The other patterns are character-class-bounded and linear, so they run via
+    # stdlib -- a redaction bypass under CPU load would be a silent secret leak,
+    # so no pattern is allowed to fail open.
     if name in _BACKTRACKING_RISKY_SENSITIVE_PATTERNS:
-        regex_pattern = _regex_pattern_for(name)
-        if regex_pattern is not None:
-            try:
-                return regex_pattern.sub(
-                    repl, text, timeout=_SENSITIVE_MATCH_TIMEOUT_SECONDS
-                )
-            except TimeoutError:
-                if name not in _SENSITIVE_TIMEOUT_WARNED:
-                    _SENSITIVE_TIMEOUT_WARNED.add(name)
-                    logger.warning(
-                        "LCM sensitive redaction %r timed out after %.3gs; leaving "
-                        "span unredacted for this input",
-                        name,
-                        _SENSITIVE_MATCH_TIMEOUT_SECONDS,
-                    )
-                return _redact_private_key_blocks(text)
-        elif name == "private_key":
-            return _redact_private_key_blocks(text)
+        return _redact_private_key_blocks(text)
     return _SENSITIVE_PATTERN_CATALOG[name].sub(repl, text)
 
 
