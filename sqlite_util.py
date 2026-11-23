@@ -12,10 +12,23 @@ import errno
 import os
 from pathlib import Path
 import sqlite3
+import time
 import stat
 import uuid
 from contextlib import contextmanager
 from typing import Iterator, List
+
+# Poll granularity while waiting for a write lock inside a bounded window.
+# Zero, deliberately. time.sleep() cannot be trusted at this scale on this
+# platform: requesting 1ms measured ~42ms and 2ms measured ~106ms here, so ANY
+# nonzero sleep can blow a 50ms budget in a single poll. sleep(0) yields the
+# GIL without arming a timer.
+#
+# Tradeoff: this makes the wait a bounded busy-spin (repeated BEGIN IMMEDIATE)
+# rather than a blocking sleep. Acceptable only because the window is small and
+# explicitly budgeted by the caller — do NOT reuse this helper for long waits.
+# A multi-second budget should sleep between probes and tolerate the overshoot.
+_LOCK_POLL_INTERVAL_S = 0.0
 
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -218,20 +231,92 @@ def _sqlite_savepoint(conn: sqlite3.Connection) -> Iterator[None]:
         conn.execute(f"RELEASE SAVEPOINT {name}")
 
 
+def _wait_for_write_lock(conn: sqlite3.Connection, deadline: float) -> bool:
+    """Poll until ``conn`` can take the write lock, or ``deadline`` passes.
+
+    Returns True when the lock was observed free, False when the deadline
+    passed with it still held. The probe transaction is always released, so
+    this never leaves a transaction open on ``conn``.
+    """
+    if conn.in_transaction:
+        # The caller owns an open transaction; probing would corrupt its scope.
+        return True
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_locked_error(exc):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # Never sleep past the deadline: an unclamped sleep is what makes a
+            # short budget overshoot when the OS rounds small sleeps up.
+            time.sleep(min(_LOCK_POLL_INTERVAL_S, remaining))
+            continue
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+        return True
+
+
 @contextmanager
 def _temporary_sqlite_busy_timeout(
     connections: List[sqlite3.Connection | None],
     timeout_ms: int,
 ) -> Iterator[None]:
-    """Temporarily bound SQLite lock waits for gateway-critical paths."""
+    """Temporarily bound SQLite lock waits for gateway-critical paths.
+
+    ``PRAGMA busy_timeout`` alone cannot honor a short budget. Measured here
+    against a held WAL writer lock, a single statement with ``busy_timeout=50``
+    blocked ~850ms — 17x its own budget — deterministically. SQLite's busy
+    handler sleeps in a fixed escalating pattern (1, 2, 5, 10, 15, 20, 25ms...)
+    and only compares total elapsed time *between* those sleeps, so when short
+    sleeps cost far more than requested (they do on this platform) it sails
+    past a small budget before it next looks at the clock. Whatever the precise
+    cause, the empirical result is what matters: the PRAGMA does not bound a
+    sub-100ms window, which defeats the point of bounding a gateway hook.
+
+    A progress handler does not help either — measured, not assumed: it fires
+    per VM instruction, and a statement parked in the busy handler runs none.
+
+    So bound the wait in Python instead. Poll for the write lock against a real
+    wall-clock deadline with ``busy_timeout=0`` (each probe fails instantly).
+    Once the lock looks free, install ``timeout_ms`` and run the caller's block
+    normally.
+
+    If the deadline passes while the lock is still held, do NOT raise from the
+    context manager: enter the block with ``busy_timeout=0`` so the caller's
+    own first statement fails immediately with "database is locked". That keeps
+    the failure attributable to the specific operation the caller was running,
+    so per-step diagnostics and recovery branches stay intact, rather than
+    collapsing every lock loss into one generic error at the wrong layer.
+
+    Residual race: the probe releases the lock before yielding, so another
+    writer can take it in between. ``timeout_ms`` stays installed as a backstop
+    for that window, which can still overshoot — but the common case this
+    guards (a long-lived writer holding the lock) is now genuinely bounded.
+    A connection already inside a transaction is left alone, since probing
+    would disturb the caller's transaction.
+    """
     bounded_timeout = max(0, int(timeout_ms))
     originals: list[tuple[sqlite3.Connection, int]] = []
-    for conn in connections:
-        if conn is None:
-            continue
-        original = _sqlite_busy_timeout_ms(conn)
-        conn.execute(f"PRAGMA busy_timeout={bounded_timeout}")
-        originals.append((conn, original))
+    live = [conn for conn in connections if conn is not None]
+    deadline = time.monotonic() + (bounded_timeout / 1000.0)
+    try:
+        for conn in live:
+            originals.append((conn, _sqlite_busy_timeout_ms(conn)))
+            # Probe with no internal wait so the Python clock is authoritative.
+            conn.execute("PRAGMA busy_timeout=0")
+            acquired = _wait_for_write_lock(conn, deadline)
+            # Still locked at the deadline: leave busy_timeout at 0 so the
+            # caller's own statement fails fast instead of waiting again.
+            conn.execute(f"PRAGMA busy_timeout={bounded_timeout if acquired else 0}")
+    except BaseException:
+        for conn, original in reversed(originals):
+            conn.execute(f"PRAGMA busy_timeout={original}")
+        raise
     try:
         yield
     finally:
