@@ -50,6 +50,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
+# Minimum contiguous stored run an incoming prefix must replay before the
+# block-anchored reconciliation trusts it (see _find_replayed_durable_block_cursor).
+_REPLAYED_DURABLE_BLOCK_MIN_ROWS = 4
 
 
 class ReconcileMixin:
@@ -888,6 +891,37 @@ class ReconcileMixin:
             )
             return cursor
 
+        # Full-replay proof is unavailable: the durable session already holds
+        # rows the incoming history does not (a rewound turn's discarded pair,
+        # a row whose stored text differs from its replayed text, or an earlier
+        # ambiguous-delta re-append). The suffix rule above can never advance
+        # again once the store outgrows the history, so every rebind would
+        # re-append the whole history. Accept the longest incoming prefix that
+        # replays a contiguous stored run instead; a fresh delta does not
+        # repeat four-plus consecutive stored rows including both a user and
+        # an assistant turn, so duplicate-over-loss still governs everything
+        # shorter or non-contiguous.
+        block_cursor = self._find_replayed_durable_block_cursor(messages, stored_tail_rows)
+        if block_cursor > 0:
+            self._record_ingest_reconciliation(
+                action="advanced cursor",
+                reason="replayed contiguous durable block",
+                cursor=block_cursor,
+                incoming=len(messages),
+                session_count=session_count,
+                stored_tail_count=len(stored_tail),
+                effective_incoming=len(self._effective_replay_identities(messages)),
+            )
+            logger.warning(
+                "LCM reconciled ingest cursor from a contiguous durable block after existing-session bind: session=%s cursor=%d incoming=%d stored_tail=%d session_count=%d (no full-replay proof; the store already outgrew the history)",
+                self._session_id,
+                block_cursor,
+                len(messages),
+                len(stored_tail),
+                session_count,
+            )
+            return block_cursor
+
         incoming_identities = self._effective_replay_identities(messages)
         stored_head_rows = self._store.get_session_messages(
             self._session_id,
@@ -942,7 +976,78 @@ class ReconcileMixin:
             stored_tail_count=len(stored_tail),
             effective_incoming=len(incoming_identities),
         )
+        logger.warning(
+            "LCM persisted an ambiguous delta after existing-session bind: session=%s incoming=%d effective_incoming=%d stored_tail=%d session_count=%d (no durable-tail overlap; rows the batch replays are now stored twice)",
+            self._session_id,
+            len(messages),
+            len(incoming_identities),
+            len(stored_tail),
+            session_count,
+        )
         return 0
+
+    def _find_replayed_durable_block_cursor(
+        self,
+        messages: List[Dict[str, Any]],
+        stored_rows: List[Dict[str, Any]],
+    ) -> int:
+        """Cursor past the longest incoming prefix that replays contiguous stored runs.
+
+        Compares replay identities of the rows ingest would persist (context
+        scaffolding, ignore-pattern rows, and active-replay placeholders are
+        skipped, as ingest skips them) against the stored rows in store order.
+        The prefix is consumed run by run: each run is the longest contiguous
+        stored match anchored at a stored row equal to the next unconsumed
+        incoming identity, searched only after the previous run, so a rewound
+        turn's discarded pair between two stored runs is stepped over.
+        A run counts only when it has at least
+        ``_REPLAYED_DURABLE_BLOCK_MIN_ROWS`` rows and contains both a user and
+        an assistant identity; the prefix ends at the first run that does not.
+        Returns 0 when no run qualifies.
+        """
+        live: list[tuple[int, tuple[str, str, str, str]]] = []
+        for idx, msg in enumerate(messages):
+            text = text_content_for_pattern_matching(msg.get("content")) or ""
+            if (
+                self._is_replayed_context_scaffold_message(msg)
+                or self._matches_ignore_message_patterns(msg)
+                or self._is_volatile_ignored_quarantine_placeholder(msg, text)
+                or self._is_ignored_active_replay_placeholder(msg, text)
+            ):
+                continue
+            live.append((idx, self._message_replay_identity(msg)))
+        if not stored_rows:
+            return 0
+        stored = [self._message_replay_identity(row, stored_row=True) for row in stored_rows]
+        consumed = 0
+        stored_from = 0
+        while len(live) - consumed >= _REPLAYED_DURABLE_BLOCK_MIN_ROWS:
+            first = live[consumed][1]
+            best = 0
+            best_end = stored_from
+            for start in range(stored_from, len(stored)):
+                if stored[start] != first:
+                    continue
+                n = 0
+                while (
+                    consumed + n < len(live)
+                    and start + n < len(stored)
+                    and stored[start + n] == live[consumed + n][1]
+                ):
+                    n += 1
+                if n > best:
+                    best = n
+                    best_end = start + n
+            if best < _REPLAYED_DURABLE_BLOCK_MIN_ROWS:
+                break
+            roles = {live[consumed + i][1][0] for i in range(best)}
+            if "user" not in roles or "assistant" not in roles:
+                break
+            consumed += best
+            stored_from = best_end
+        if consumed == 0:
+            return 0
+        return live[consumed - 1][0] + 1
 
     def _raw_externalized_placeholder_replay_identity(self, msg: Dict[str, Any]) -> tuple[str, str, str, str]:
         return (
