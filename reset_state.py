@@ -43,6 +43,7 @@ class ResetStateMixin:
         self._ingest_cursor = 0
         self._ingest_cursor_needs_reconcile = False
         self._last_ingest_reconciliation = {"action": "none", "reason": "not run"}
+        self._deferred_replay_alignment_mask = []
 
     def _reset_session_scoped_runtime_state(self) -> None:
         """Reset all session-scoped runtime state.
