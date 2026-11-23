@@ -31,6 +31,7 @@ from .db_bootstrap import (
 )
 from .config import LCMConfig
 from .ingest_protection import protect_message_for_ingest, protect_messages_for_ingest
+from .message_content import extract_reasoning_text
 from .search_query import (
     build_snippet,
     compute_search_candidate_cap,
@@ -65,7 +66,7 @@ _MESSAGE_ROLE_BIAS_SQL = "CASE m.role WHEN 'user' THEN 0 WHEN 'assistant' THEN 1
 _MESSAGE_SELECT_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
     "tool_calls, tool_name, timestamp, token_estimate, pinned, conversation_id, "
-    "ingested_at, observed_at, observed_at_source"
+    "ingested_at, observed_at, observed_at_source, reasoning_content"
 )
 _MESSAGE_SELECT_COLUMN_COUNT = len(_MESSAGE_SELECT_COLUMNS.split(","))
 _UNKNOWN_SOURCE = "unknown"
@@ -376,7 +377,8 @@ class MessageStore:
                 pinned INTEGER DEFAULT 0,
                 ingested_at REAL,
                 observed_at REAL,
-                observed_at_source TEXT
+                observed_at_source TEXT,
+                reasoning_content TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_msg_session
                 ON messages(session_id, store_id);
@@ -396,6 +398,7 @@ class MessageStore:
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
+        self._ensure_reasoning_column()
         self._conn.commit()
 
     def _ensure_source_column(self) -> None:
@@ -454,6 +457,25 @@ class MessageStore:
             "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
         )
 
+    def _ensure_reasoning_column(self) -> None:
+        """Add the provider-visible reasoning sidecar column (V: reasoning replay).
+
+        Hermes replays assistant ``reasoning_content`` to the provider when
+        ``model.reasoning_echo`` is on, so the raw store must persist that
+        text to stay lossless.  The column stays OUT of ``messages_fts``
+        (the FTS triggers index ``content`` only): hidden reasoning is
+        preserved and counted, never promoted to searchable evidence.
+        """
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        add_column_if_missing(
+            self._conn,
+            columns,
+            "reasoning_content",
+            "ALTER TABLE messages ADD COLUMN reasoning_content TEXT",
+        )
+
     # -- Write operations ---------------------------------------------------
 
     def append(self, session_id: str, msg: Dict[str, Any],
@@ -470,14 +492,15 @@ class MessageStore:
         tc_json = json.dumps(tool_calls) if tool_calls else None
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
+        reasoning = extract_reasoning_text(msg)
 
         with self._write_lock:
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                     tool_name, timestamp, token_estimate, pinned, ingested_at,
-                    observed_at, observed_at_source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    observed_at, observed_at_source, reasoning_content)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     _normalize_source_value(source),
@@ -493,6 +516,7 @@ class MessageStore:
                     ingested_at,
                     observed_at,
                     "host_message_timestamp" if observed_at is not None else None,
+                    reasoning,
                 ),
             )
             self._conn.commit()
@@ -544,8 +568,8 @@ class MessageStore:
                     """INSERT INTO messages
                        (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
                         tool_name, timestamp, token_estimate, pinned, ingested_at,
-                        observed_at, observed_at_source)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        observed_at, observed_at_source, reasoning_content)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         _normalize_source_value(source),
@@ -561,6 +585,7 @@ class MessageStore:
                         ts,
                         observed_at,
                         "host_message_timestamp" if observed_at is not None else None,
+                        extract_reasoning_text(msg),
                     ),
                 )
                 ids.append(cur.lastrowid)
@@ -1374,7 +1399,7 @@ class MessageStore:
                 rows = self._conn.execute(
                     f"""SELECT m.store_id, m.session_id, m.source, m.role, m.content, m.tool_call_id,
                               m.tool_calls, m.tool_name, m.timestamp, m.token_estimate, m.pinned, m.conversation_id,
-                              m.ingested_at, m.observed_at, m.observed_at_source,
+                              m.ingested_at, m.observed_at, m.observed_at_source, m.reasoning_content,
                               rank as search_rank,
                               snippet(messages_fts, 0, '>>>', '<<<', '...', 40) as snippet
                        FROM messages_fts fts
@@ -1679,7 +1704,7 @@ class MessageStore:
         cols = [
             "store_id", "session_id", "source", "role", "content", "tool_call_id",
             "tool_calls", "tool_name", "timestamp", "token_estimate", "pinned", "conversation_id",
-            "ingested_at", "observed_at", "observed_at_source",
+            "ingested_at", "observed_at", "observed_at_source", "reasoning_content",
         ]
         d = dict(zip(cols, row[:len(cols)]))
         d["source"] = _normalize_source_value(d.get("source"))
@@ -1703,6 +1728,11 @@ class MessageStore:
             msg["tool_call_id"] = stored["tool_call_id"]
         if stored.get("tool_name"):
             msg["name"] = stored["tool_name"]
+        if stored.get("reasoning_content"):
+            # Provider-visible reasoning sidecar: reconstructed messages must
+            # replay under the wire key so the provider sees the same cost
+            # the accounting charged.
+            msg["reasoning_content"] = stored["reasoning_content"]
         return msg
 
     # -- Connection access --------------------------------------------------

@@ -8,7 +8,7 @@ import threading
 from functools import lru_cache
 from typing import Any, Dict, List
 
-from .message_content import normalize_content_value
+from .message_content import extract_reasoning_text, normalize_content_value
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,11 @@ def count_message_tokens(msg: Dict[str, Any]) -> int:
     total = 4  # role + overhead
     content = normalize_content_value(msg.get("content")) or ""
     total += count_tokens(content)
+    # Reasoning replay is provider-visible cost: Hermes echoes the wire key
+    # ``reasoning_content`` back on later requests (and host history may
+    # carry the same text under the internal ``reasoning`` key), so the
+    # reasoning sidecar must be counted, never assumed free.
+    total += count_tokens(extract_reasoning_text(msg) or "")
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
             fn = tc.get("function", {})
