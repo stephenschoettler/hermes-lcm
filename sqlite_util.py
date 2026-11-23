@@ -9,10 +9,13 @@ example the session-end timeout budget).
 from __future__ import annotations
 
 import errno
+import json
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
 import uuid
 from contextlib import contextmanager
 from typing import Iterator, List
@@ -63,37 +66,119 @@ def _open_private_sqlite_directory(path: Path) -> int:
     return directory_fd
 
 
-def _chmod_sqlite_artifact_at(
+# Set only in the isolated Darwin permission worker (see ``__main__``). That
+# process holds no SQLite locks, so it must use the inode-pinned descriptor
+# path instead of the name-based ``chmod(..., follow_symlinks=False)`` path,
+# which cannot pin the inode between its stat and chmod.
+_IN_PERMISSION_WORKER = False
+
+
+def _sqlite_artifact_supports_descriptor_free_chmod() -> bool:
+    """True when an existing artifact can be chmod'ed without opening it."""
+    if _IN_PERMISSION_WORKER:
+        return False
+    return os.name == "posix" and os.chmod in os.supports_follow_symlinks
+
+
+def _sqlite_artifact_supports_opath_chmod() -> bool:
+    """True when O_PATH plus procfs can chmod an artifact without lock impact."""
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_PATH")
+        and os.path.exists("/proc/self/fd")
+    )
+
+
+def _chmod_existing_sqlite_artifact_without_opening(
     path: Path,
     *,
     directory_fd: int,
-    create: bool,
-    allow_sidecar_disappearance: bool = False,
+    expected: os.stat_result,
+    allow_sidecar_disappearance: bool,
 ) -> bool:
-    expected: os.stat_result | None
-    try:
-        expected = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        if not create:
-            return False
-        expected = None
-    if expected is not None:
-        _validate_sqlite_artifact(path, expected)
+    """Tighten permissions on an existing artifact without disturbing SQLite locks.
 
+    Opening a database file (or its ``-wal``/``-shm``/``-journal`` sidecar) and
+    closing that descriptor cancels every POSIX advisory lock this process holds
+    on the file, including the locks held by a live SQLite connection (see
+    SQLite "How To Corrupt An SQLite Database File" section 2.2). Dropping those
+    locks lets another process take the WAL-index lock underneath a running
+    connection, which can desynchronize the shared memory index and abort the
+    process with SIGBUS. So an artifact that already exists is chmod'ed through
+    a handle that does not participate in lock release.
+    """
+    if _sqlite_artifact_supports_descriptor_free_chmod():
+        try:
+            os.chmod(path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+            restricted = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if not allow_sidecar_disappearance:
+                raise
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        if not _same_file_identity(expected, restricted):
+            raise _sqlite_artifact_error(path, "directory entry changed while restricting permissions")
+        if restricted.st_nlink == 0 and allow_sidecar_disappearance:
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        _validate_sqlite_artifact(path, restricted)
+        return True
+
+    if _sqlite_artifact_supports_opath_chmod():
+        flags = os.O_PATH | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path.name, flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            if not allow_sidecar_disappearance:
+                raise
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        try:
+            opened = os.fstat(fd)
+            if not _same_file_identity(expected, opened):
+                raise _sqlite_artifact_error(path, "directory entry changed while opening")
+            if opened.st_nlink == 0 and allow_sidecar_disappearance:
+                _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+                return False
+            _validate_sqlite_artifact(path, opened)
+            try:
+                os.chmod(f"/proc/self/fd/{fd}", 0o600)
+            except FileNotFoundError:
+                if not allow_sidecar_disappearance:
+                    raise
+                _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+                return False
+            restricted = os.fstat(fd)
+            if restricted.st_nlink == 0 and allow_sidecar_disappearance:
+                _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+                return False
+            if restricted.st_nlink != 1:
+                raise _sqlite_artifact_error(path, "link count changed while restricting permissions")
+            return True
+        finally:
+            # O_PATH descriptors hold no advisory locks, so closing one is safe.
+            os.close(fd)
+
+    return _chmod_existing_sqlite_artifact_via_descriptor(
+        path,
+        directory_fd=directory_fd,
+        expected=expected,
+        allow_sidecar_disappearance=allow_sidecar_disappearance,
+    )
+
+
+def _chmod_existing_sqlite_artifact_via_descriptor(
+    path: Path,
+    *,
+    directory_fd: int,
+    expected: os.stat_result,
+    allow_sidecar_disappearance: bool,
+) -> bool:
+    """Last-resort chmod for platforms lacking both safe chmod paths (Windows)."""
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-    if expected is None:
-        flags |= os.O_CREAT | os.O_EXCL
     try:
         fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
-    except FileExistsError:
-        if expected is not None:
-            raise
-        return _chmod_sqlite_artifact_at(
-            path,
-            directory_fd=directory_fd,
-            create=False,
-        )
     except FileNotFoundError:
         if not allow_sidecar_disappearance:
             raise
@@ -103,7 +188,7 @@ def _chmod_sqlite_artifact_at(
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
             raise _sqlite_artifact_error(path, "not a regular file")
-        if expected is not None and not _same_file_identity(expected, opened):
+        if not _same_file_identity(expected, opened):
             raise _sqlite_artifact_error(path, "directory entry changed while opening")
         if opened.st_nlink == 0 and allow_sidecar_disappearance:
             _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
@@ -121,8 +206,93 @@ def _chmod_sqlite_artifact_at(
     return True
 
 
+def _chmod_sqlite_artifact_at(
+    path: Path,
+    *,
+    directory_fd: int,
+    create: bool,
+    allow_sidecar_disappearance: bool = False,
+) -> bool:
+    expected: os.stat_result | None
+    try:
+        expected = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            return False
+        expected = None
+    if expected is not None:
+        _validate_sqlite_artifact(path, expected)
+        return _chmod_existing_sqlite_artifact_without_opening(
+            path,
+            directory_fd=directory_fd,
+            expected=expected,
+            allow_sidecar_disappearance=allow_sidecar_disappearance,
+        )
+
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    flags |= os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+    except FileExistsError:
+        return _chmod_sqlite_artifact_at(
+            path,
+            directory_fd=directory_fd,
+            create=False,
+        )
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _sqlite_artifact_error(path, "not a regular file")
+        if opened.st_nlink == 0 and allow_sidecar_disappearance:
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        _validate_sqlite_artifact(path, opened)
+        os.fchmod(fd, 0o600)
+        restricted = os.fstat(fd)
+        if restricted.st_nlink == 0 and allow_sidecar_disappearance:
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        if restricted.st_nlink != 1:
+            raise _sqlite_artifact_error(path, "link count changed while restricting permissions")
+    finally:
+        os.close(fd)
+    return True
+
+
+def _permission_worker_required() -> bool:
+    # Darwin has no O_PATH. A name-based chmod introduces a hardlink-swap
+    # race; opening/closing an ordinary fd here would drop the caller's POSIX
+    # SQLite locks. Keep the original inode-pinned checks in another process.
+    return sys.platform == "darwin" and __name__ != "__main__"
+
+
+def _run_sqlite_permission_worker(operation: str, path: Path) -> None:
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", str(Path(__file__).absolute()), operation, str(path.absolute())],
+            capture_output=True, text=True, timeout=15, close_fds=True,
+        )
+        if result.returncode != 0 or len(result.stdout) > 65536:
+            raise ValueError("permission worker failed")
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
+            raise ValueError("invalid permission worker response")
+    except (subprocess.SubprocessError, ValueError) as exc:
+        raise _sqlite_artifact_error(path, "permission worker failed") from exc
+    if not payload["ok"]:
+        code = payload.get("errno")
+        reason = payload.get("reason")
+        raise OSError(code if type(code) is int and code > 0 else errno.EPERM,
+                      reason if isinstance(reason, str) and reason else "permission worker refused artifact",
+                      str(path))
+
+
 def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
     """Restrict verified, single-link SQLite files without following links."""
+    if _permission_worker_required():
+        _run_sqlite_permission_worker("restrict", db_path)
+        return
     if os.name != "posix":  # pragma: no cover - Windows compatibility fallback
         for artifact in (
             db_path,
@@ -154,6 +324,9 @@ def _restrict_existing_sqlite_artifacts(db_path: Path) -> None:
 
 def _prepare_private_sqlite_file(path: Path) -> None:
     """Create or tighten one SQLite file and its existing sidecars safely."""
+    if _permission_worker_required():
+        _run_sqlite_permission_worker("prepare", path)
+        return
     if os.name != "posix":  # pragma: no cover - Windows compatibility fallback
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
         fd = os.open(path, flags, 0o600)
@@ -237,3 +410,17 @@ def _temporary_sqlite_busy_timeout(
     finally:
         for conn, original in reversed(originals):
             conn.execute(f"PRAGMA busy_timeout={original}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3 or sys.argv[1] not in ("prepare", "restrict"):
+        raise SystemExit(2)
+    _IN_PERMISSION_WORKER = True
+    try:
+        operation = (_prepare_private_sqlite_file if sys.argv[1] == "prepare"
+                     else _restrict_existing_sqlite_artifacts)
+        operation(Path(sys.argv[2]))
+    except OSError as exc:
+        print(json.dumps({"ok": False, "errno": exc.errno, "reason": exc.strerror}))
+    else:
+        print(json.dumps({"ok": True}))
