@@ -1684,10 +1684,12 @@ def _synthesize_expansion_answer(
     prompt: str,
     context_blocks: list[dict[str, Any]],
     model: str,
+    reasoning_effort: str = "",
     max_tokens: int,
     timeout: float,
 ) -> str:
     from agent.auxiliary_client import call_llm
+    from .model_routing import apply_lcm_reasoning_effort
 
     system_prompt = (
         "Answer request.question using only facts supported by the retrieved sources. "
@@ -1716,6 +1718,7 @@ def _synthesize_expansion_answer(
         "timeout": timeout,
     }
     apply_lcm_model_route(call_kwargs, model)
+    apply_lcm_reasoning_effort(call_kwargs, reasoning_effort)
     response = call_llm(**call_kwargs)
     content = response.choices[0].message.content
     if not isinstance(content, str):
@@ -5731,13 +5734,16 @@ def lcm_expand_query(args: Dict[str, Any], **kwargs) -> str:
     model = engine._config.expansion_model or engine._config.summary_model or ""
     timeout = engine._config.expansion_timeout_ms / 1000
     try:
-        answer = _synthesize_expansion_answer(
-            prompt=prompt,
-            context_blocks=context_blocks,
-            model=model,
-            max_tokens=max_tokens,
-            timeout=timeout,
-        )
+        synthesize_kwargs = {
+            "prompt": prompt,
+            "context_blocks": context_blocks,
+            "model": model,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+        }
+        if engine._config.expansion_reasoning_effort:
+            synthesize_kwargs["reasoning_effort"] = engine._config.expansion_reasoning_effort
+        answer = _synthesize_expansion_answer(**synthesize_kwargs)
     except TimeoutError:
         logger.warning("LCM expand_query synthesis timed out after %.3fs", timeout)
         return _degraded_payload(
@@ -6507,11 +6513,13 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "max_depth": engine._config.incremental_max_depth,
             "condensation_fanin": engine._config.condensation_fanin,
             "summary_model": engine._config.summary_model or "(auxiliary)",
+            "summary_reasoning_effort": engine._config.summary_reasoning_effort or "(task default)",
             "summary_timeout_ms": engine._config.summary_timeout_ms,
             "summary_spend_max_calls": engine._config.summary_spend_max_calls,
             "summary_spend_window_seconds": engine._config.summary_spend_window_seconds,
             "summary_spend_backoff_seconds": engine._config.summary_spend_backoff_seconds,
             "expansion_model": engine._config.expansion_model or "(summary model)",
+            "expansion_reasoning_effort": engine._config.expansion_reasoning_effort or "(task default)",
         },
         "proactive_recall": {
             "enabled": bool(getattr(engine._config, "proactive_recall_enabled", False)),

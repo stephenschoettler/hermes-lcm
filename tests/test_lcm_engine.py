@@ -800,6 +800,23 @@ def test_lcm_status_surfaces_capped_context_and_effective_threshold(tmp_path):
         engine.shutdown()
 
 
+def test_lcm_status_surfaces_configured_reasoning_efforts(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "reasoning-status.db"),
+        summary_reasoning_effort="high",
+        expansion_reasoning_effort="low",
+    )
+    engine = LCMEngine(config=config)
+    engine.on_session_start("reasoning-status", platform="cli", context_length=200_000)
+    try:
+        payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+        routing = payload["config"]
+        assert routing["summary_reasoning_effort"] == "high"
+        assert routing["expansion_reasoning_effort"] == "low"
+    finally:
+        engine.shutdown()
+
+
 def test_session_start_does_not_overwrite_update_model_with_stale_runtime_identity(engine):
     engine.update_model(
         model="deepseek-v4-flash",
@@ -1441,6 +1458,45 @@ class TestEscalationStripReasoning:
         assert "</think>" not in result
         assert "Summary: docker rollout completed" in result
 
+    def test_engine_summary_routes_configured_reasoning_effort_to_auxiliary_request(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "summary-reasoning-effort.db"),
+            fresh_tail_count=1,
+            leaf_chunk_tokens=1,
+            summary_reasoning_effort="high",
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start(
+            "summary-reasoning-effort", platform="cli", context_length=200_000
+        )
+        seen = {}
+        response = ModuleType("response")
+        message = ModuleType("message")
+        message.content = "summary"
+        choice = ModuleType("choice")
+        choice.message = message
+        response.choices = [choice]
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            return response
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        try:
+            instance.compress([
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "old message to summarize"},
+                {"role": "assistant", "content": "old response to summarize"},
+                {"role": "user", "content": "fresh tail"},
+            ])
+        finally:
+            instance.shutdown()
+
+        assert seen["reasoning_config"] == {"effort": "high"}
+        assert "reasoning" not in seen.get("extra_body", {})
+
     def test_sanitize_reasoning_summary_discards_unclosed_and_reasoning_only(self):
         from hermes_lcm.escalation import _sanitize_reasoning_summary
 
@@ -1537,6 +1593,52 @@ class TestEscalationStripReasoning:
         assert "<think>" not in result
         assert "</think>" not in result
         assert "We discussed the docker rollout plan" in result
+
+    @pytest.mark.parametrize(
+        "effort,expected",
+        [
+            ("high", {"effort": "high"}),
+            ("none", {"enabled": False, "effort": "none"}),
+            ("", None),
+        ],
+    )
+    def test_synthesize_expansion_routes_reasoning_config_to_hermes(
+        self, monkeypatch, effort, expected
+    ):
+        import hermes_lcm.tools as tools_mod
+
+        seen = {}
+
+        def fake_call_llm(**kwargs):
+            seen.update(kwargs)
+            response = ModuleType("response")
+            message = ModuleType("message")
+            message.content = "expanded answer"
+            choice = ModuleType("choice")
+            choice.message = message
+            response.choices = [choice]
+            return response
+
+        self._install_fake_auxiliary_client(monkeypatch, fake_call_llm)
+        monkeypatch.setattr(
+            tools_mod,
+            "apply_lcm_model_route",
+            lambda kwargs, model: kwargs.update(extra_body={"unrelated": True}),
+        )
+
+        result = tools_mod._synthesize_expansion_answer(
+            prompt="What was discussed?",
+            context_blocks=[{"role": "user", "content": "context"}],
+            model="any",
+            reasoning_effort=effort,
+            max_tokens=200,
+            timeout=10.0,
+        )
+
+        assert result == "expanded answer"
+        assert seen["extra_body"] == {"unrelated": True}
+        assert seen.get("reasoning_config") == expected
+        assert "reasoning" not in seen["extra_body"]
 
     def test_adversarial_summary_round_trip_keeps_node_lineage_local_and_prompt_boundary(
         self,
@@ -11328,6 +11430,28 @@ class TestEngineCompress:
         parent = next(node for node in nodes if node.depth == 1)
         assert parent.earliest_at == child_windows[0][0]
         assert parent.latest_at == child_windows[-1][1]
+
+    def test_condensation_routes_configured_reasoning_effort_to_summary_call(self, engine, monkeypatch):
+        engine._config.summary_reasoning_effort = "high"
+        for index in range(engine._config.condensation_fanin):
+            engine._dag.add_node(SummaryNode(
+                session_id="test-session",
+                depth=0,
+                summary=f"child {index}",
+                token_count=10,
+                source_ids=[index],
+                source_type="messages",
+            ))
+        captured = {}
+
+        def fake_summary(**kwargs):
+            captured.update(kwargs)
+            return "condensed summary", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", fake_summary)
+        engine._maybe_condense()
+
+        assert captured["reasoning_effort"] == "high"
 
     def test_dynamic_leaf_chunk_sizing_compacts_only_oldest_bounded_raw_chunk(self, tmp_path, monkeypatch):
         config = LCMConfig(
@@ -23779,6 +23903,26 @@ class TestEngineTools:
         assert second["expanded"][0]["content"] == "b"
         assert second["expanded"][0]["content_offset"] == 1
         assert second["pagination"]["next_content_offset"] == 2
+
+    def test_expand_query_routes_configured_reasoning_effort_to_synthesis(self, engine, monkeypatch):
+        engine._config.expansion_reasoning_effort = "low"
+        engine._store.append(
+            "test-session", {"role": "user", "content": "reasoning expansion evidence"}
+        )
+        captured = {}
+
+        def fake_synthesize(**kwargs):
+            captured.update(kwargs)
+            return "expanded answer"
+
+        monkeypatch.setattr(lcm_tools, "_synthesize_expansion_answer", fake_synthesize)
+        result = json.loads(engine.handle_tool_call("lcm_expand_query", {
+            "prompt": "What is the evidence?",
+            "query": "reasoning expansion evidence",
+        }))
+
+        assert result["answer"] == "expanded answer"
+        assert captured["reasoning_effort"] == "low"
 
     def test_handle_expand_query_recursively_descends_parent_nodes_to_leaf_messages(self, engine, monkeypatch):
         captured = {}

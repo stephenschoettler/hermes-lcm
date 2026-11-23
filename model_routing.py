@@ -6,6 +6,8 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .config import _validate_reasoning_effort
+
 logger = logging.getLogger(__name__)
 
 
@@ -102,3 +104,14 @@ def apply_lcm_model_route(call_kwargs: dict, model: str | None) -> None:
             route.provider or "(task default)",
             route.model,
         )
+
+
+def apply_lcm_reasoning_effort(call_kwargs: dict, effort: str | None) -> None:
+    """Apply an LCM-specific reasoning-effort override to auxiliary kwargs."""
+    normalized = _validate_reasoning_effort(effort or "", "LCM")
+    if not normalized:
+        return
+    if normalized == "none":
+        call_kwargs["reasoning_config"] = {"enabled": False, "effort": "none"}
+    else:
+        call_kwargs["reasoning_config"] = {"effort": normalized}
