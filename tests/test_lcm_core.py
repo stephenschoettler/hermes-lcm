@@ -7782,3 +7782,62 @@ class TestSummaryDagLikeSanitization:
             assert emoji_only in {node.node_id for node in results}
         finally:
             dag.close()
+
+
+class TestMessageIdentityDedup:
+    """Storage-boundary identity guard (issue #513 / #568 family).
+
+    The host re-sends already-persisted windows after compaction/rebind/
+    recovery replay. The store must be structurally unable to re-stamp a
+    message it already has: same (session, role, observed_at, tool_call_id,
+    content) is one logical message and maps to one surviving store_id.
+    """
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        return MessageStore(tmp_path / "dedup.db")
+
+    def test_append_same_identity_returns_existing_id(self, store):
+        first = store.append("s", {"role": "user", "content": "hi", "timestamp": 100.0},
+                             token_estimate=2)
+        second = store.append("s", {"role": "user", "content": "hi", "timestamp": 100.0},
+                              token_estimate=2)
+        assert second == first
+        assert store.get_session_count("s") == 1
+
+    def test_append_batch_partial_replay_returns_id_aligned_list(self, store):
+        a = store.append("s", {"role": "user", "content": "u1", "timestamp": 1.0})
+        b = store.append("s", {"role": "assistant", "content": "a1", "timestamp": 2.0})
+        ids = store.append_batch(
+            "s",
+            [
+                {"role": "assistant", "content": "a1", "timestamp": 2.0},  # replay -> b
+                {"role": "user", "content": "u2", "timestamp": 3.0},        # new
+            ],
+        )
+        assert len(ids) == 2
+        assert ids[0] == b
+        assert ids[1] not in (a, b)
+        assert store.get_session_count("s") == 3
+
+    def test_fts_stays_consistent_after_conflict_skip(self, store):
+        first = store.append("s", {"role": "user", "content": "needle word", "timestamp": 5.0})
+        store.append("s", {"role": "user", "content": "needle word", "timestamp": 5.0})
+        hits = [r["store_id"] for r in store.search("needle", session_id="s")]
+        assert hits == [first]  # exactly one FTS hit for the surviving row
+        store._conn.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')"
+        )
+
+    def test_distinct_repeats_are_both_kept(self, store):
+        # Same text, genuinely different observed_at -> two rows (no false dedup).
+        a = store.append("s", {"role": "user", "content": "repeat", "timestamp": 10.0})
+        b = store.append("s", {"role": "user", "content": "repeat", "timestamp": 20.0})
+        assert a != b and store.get_session_count("s") == 2
+
+    def test_tool_call_id_participates_in_identity(self, store):
+        a = store.append("s", {"role": "tool", "content": "out", "timestamp": 30.0,
+                               "tool_call_id": "tc1"})
+        b = store.append("s", {"role": "tool", "content": "out", "timestamp": 30.0,
+                               "tool_call_id": "tc2"})
+        assert a != b  # different call ids -> distinct messages
