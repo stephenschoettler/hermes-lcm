@@ -828,7 +828,7 @@ class TestConfig:
         assert c.leaf_chunk_tokens == 20_000
         assert c.context_threshold == 0.35
         assert c.max_assembly_tokens == 0
-        assert c.reserve_tokens_floor == 0
+        assert c.reserve_tokens_floor == -1
         assert c.expansion_context_tokens == 32_000
         assert c.critical_budget_pressure_ratio == 0.0
 

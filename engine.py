@@ -6297,14 +6297,17 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if self._config.max_assembly_tokens > 0:
             caps.append(self._config.max_assembly_tokens)
 
-        if self.context_length > 0 and self._config.reserve_tokens_floor > 0:
-            reserve_cap = self.context_length - self._config.reserve_tokens_floor
+        reserve_tokens_floor = self._config.reserve_tokens_floor
+        if reserve_tokens_floor < 0:
+            reserve_tokens_floor = self._automatic_reserve_tokens_floor(self.context_length)
+        if self.context_length > 0 and reserve_tokens_floor > 0:
+            reserve_cap = self.context_length - reserve_tokens_floor
             if reserve_cap > 0:
                 caps.append(reserve_cap)
             else:
                 logger.warning(
                     "LCM reserve_tokens_floor=%d disables reserve-based assembly cap because context_length=%d",
-                    self._config.reserve_tokens_floor,
+                    reserve_tokens_floor,
                     self.context_length,
                 )
 
@@ -6312,6 +6315,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             return None
 
         return max(1, min(caps))
+
+    @staticmethod
+    def _automatic_reserve_tokens_floor(context_length: int) -> int:
+        if context_length < 65_536:
+            return 0
+        return max(1, min(24_000, int(context_length * 0.10)))
 
     # -- Internal: helpers -------------------------------------------------
 
