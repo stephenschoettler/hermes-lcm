@@ -372,9 +372,9 @@ def _normalize_total_compactions(value: Any) -> int:
 class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessionMixin, PlaceholderLedgerMixin, BypassMixin, ContextEngine):
     """Lossless Context Management engine.
 
-    Automatic LCM compaction is routine background maintenance. Hosts that
-    support user-visible compaction status opt-outs should keep successful
-    automatic LCM passes silent unless the user explicitly asks for diagnostics.
+    Automatic LCM compaction emits the host lifecycle used to track session
+    availability. Hosts remain responsible for filtering routine notices from
+    human-facing surfaces.
 
     Architecture:
       1. Every message is persisted verbatim in an immutable MessageStore
@@ -512,10 +512,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # run_agent.py reads these for context probing
         self._context_probed = False
         self._context_probe_persistable = False
-        # Host compatibility: LCM treats successful automatic compaction as
-        # silent maintenance. Manual /lcm diagnostics and warning/error paths
-        # remain explicit.
-        self.emit_automatic_compaction_status = False
+        # Preserve the host's compaction lifecycle so GUI clients can track
+        # session availability. Human-facing noise filtering remains host-owned.
+        self.emit_automatic_compaction_status = True
         self.quiet_mode = True
         self.summary_model = self._config.summary_model
         self._summary_circuit_breaker = SummaryCircuitBreaker(
