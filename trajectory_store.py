@@ -8,6 +8,8 @@ remain traceable to protected canonical source JSON.
 
 from __future__ import annotations
 
+from .sqlite_util import storage_initialization, connect_initializing, execute_statements
+
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 import hashlib
@@ -23,6 +25,8 @@ from typing import Any, Callable, Iterable, Protocol, Sequence
 from urllib.parse import quote, unquote
 
 from .db_bootstrap import (
+    ExternalContentFtsSpec,
+    ensure_external_content_fts,
     configure_connection,
     get_fts_shadow_table_names,
     mark_migration_step_complete,
@@ -533,9 +537,36 @@ def _bounded_text(value: Any, field: str, *, allow_empty: bool = True) -> str:
     return text
 
 
+def _trajectory_fts_spec():
+    return ExternalContentFtsSpec(
+        table_name="lcm_trajectory_states_fts", content_table="lcm_trajectory_states",
+        content_rowid="state_id", indexed_column="search_text",
+        trigger_sqls=(
+            """CREATE TRIGGER IF NOT EXISTS lcm_trajectory_fts_insert
+            AFTER INSERT ON lcm_trajectory_states BEGIN
+                INSERT INTO lcm_trajectory_states_fts(rowid, search_text)
+                VALUES (new.state_id, new.search_text);
+            END;""",
+            """CREATE TRIGGER IF NOT EXISTS lcm_trajectory_fts_delete
+            AFTER DELETE ON lcm_trajectory_states BEGIN
+                INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts, rowid, search_text)
+                VALUES ('delete', old.state_id, old.search_text);
+            END;""",
+            """CREATE TRIGGER IF NOT EXISTS lcm_trajectory_fts_update
+            AFTER UPDATE OF search_text ON lcm_trajectory_states BEGIN
+                INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts, rowid, search_text)
+                VALUES ('delete', old.state_id, old.search_text);
+                INSERT INTO lcm_trajectory_states_fts(rowid, search_text)
+                VALUES (new.state_id, new.search_text);
+            END;""",
+        ),
+    )
+
+
 class TrajectoryStore:
     """SQLite trajectory store bound to the same physical file as LCM core."""
 
+    @storage_initialization
     def __init__(
         self,
         db_path: str | Path,
@@ -595,15 +626,13 @@ class TrajectoryStore:
             self._validate_existing_schema_version()
             self._init_schema()
             self._bind_identity()
-        except Exception:
-            self._conn.close()
-            self._conn = None  # type: ignore[assignment]
+        except BaseException:
             raise
 
     def _open_connection(self) -> sqlite3.Connection:
         if self.read_only:
             uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
-            conn = sqlite3.connect(
+            conn = connect_initializing(self,
                 uri,
                 uri=True,
                 timeout=5.0,
@@ -614,7 +643,7 @@ class TrajectoryStore:
             conn.execute("PRAGMA busy_timeout=30000")
         else:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(
+            conn = connect_initializing(self,
                 str(self.db_path),
                 timeout=5.0,
                 check_same_thread=False,
@@ -670,10 +699,12 @@ class TrajectoryStore:
             return
 
         run_versioned_migrations(self._conn)
-        fts_preexisting = self._conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE name = 'lcm_trajectory_states_fts'"
-        ).fetchone() is not None
-        self._conn.executescript(
+        if not _verify_trajectory_schema(self._conn):
+            mark_migration_step_complete(self._conn, TRAJECTORY_MIGRATION_STEP)
+            ensure_external_content_fts(self._conn, _trajectory_fts_spec())
+            self._conn.commit()
+            return
+        execute_statements(self._conn,
             """
             CREATE TABLE IF NOT EXISTS lcm_trajectory_corpora (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -749,52 +780,11 @@ class TrajectoryStore:
                 UNIQUE(source_id, post_state_id)
             );
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS lcm_trajectory_states_fts
-            USING fts5(search_text, content='lcm_trajectory_states', content_rowid='state_id');
-
-            CREATE TRIGGER IF NOT EXISTS lcm_trajectory_fts_insert
-            AFTER INSERT ON lcm_trajectory_states BEGIN
-                INSERT INTO lcm_trajectory_states_fts(rowid, search_text)
-                VALUES (new.state_id, new.search_text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS lcm_trajectory_fts_delete
-            AFTER DELETE ON lcm_trajectory_states BEGIN
-                INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts, rowid, search_text)
-                VALUES ('delete', old.state_id, old.search_text);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS lcm_trajectory_fts_update
-            AFTER UPDATE OF search_text ON lcm_trajectory_states BEGIN
-                INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts, rowid, search_text)
-                VALUES ('delete', old.state_id, old.search_text);
-                INSERT INTO lcm_trajectory_states_fts(rowid, search_text)
-                VALUES (new.state_id, new.search_text);
-            END;
-
             CREATE INDEX IF NOT EXISTS lcm_trajectory_states_source_sequence
             ON lcm_trajectory_states(source_id, sequence_ordinal);
             """
         )
-        state_count = int(
-            self._conn.execute("SELECT COUNT(*) FROM lcm_trajectory_states").fetchone()[0]
-        )
-        fts_count = int(
-            self._conn.execute("SELECT COUNT(*) FROM lcm_trajectory_states_fts").fetchone()[0]
-        )
-        fts_needs_rebuild = not fts_preexisting or state_count != fts_count
-        if not fts_needs_rebuild:
-            try:
-                self._conn.execute(
-                    "INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts, rank) "
-                    "VALUES ('integrity-check', 1)"
-                )
-            except sqlite3.DatabaseError:
-                fts_needs_rebuild = True
-        if fts_needs_rebuild:
-            self._conn.execute(
-                "INSERT INTO lcm_trajectory_states_fts(lcm_trajectory_states_fts) VALUES ('rebuild')"
-            )
+        ensure_external_content_fts(self._conn, _trajectory_fts_spec())
         marker = self._conn.execute(
             "SELECT 1 FROM lcm_migration_state WHERE step_name = ?",
             (TRAJECTORY_MIGRATION_STEP,),
@@ -1134,7 +1124,7 @@ class TrajectoryStore:
                     """
                 )
                 self._conn.commit()
-            except Exception:
+            except BaseException:
                 self._conn.rollback()
                 raise
         return TrajectoryInsertResult(
@@ -1208,7 +1198,7 @@ class TrajectoryStore:
                 )
                 self._conn.commit()
                 return corpus_uid
-            except Exception:
+            except BaseException:
                 self._conn.rollback()
                 raise
 
@@ -1470,7 +1460,7 @@ class TrajectoryStore:
                     ],
                 )
                 self._conn.commit()
-            except Exception:
+            except BaseException:
                 self._conn.rollback()
                 raise
         return {
@@ -1779,7 +1769,7 @@ class TrajectoryStore:
                         (profile_digest,),
                     )
                 self._conn.commit()
-            except Exception:
+            except BaseException:
                 self._conn.rollback()
                 raise
 
@@ -1852,7 +1842,7 @@ class TrajectoryStore:
                         ],
                     )
                     self._conn.commit()
-                except Exception:
+                except BaseException:
                     self._conn.rollback()
                     raise
 
@@ -1956,7 +1946,7 @@ class TrajectoryStore:
                     (profile_digest,),
                 )
                 self._conn.commit()
-            except Exception:
+            except BaseException:
                 self._conn.rollback()
                 raise
         stats["status"] = "current" if not pending else "built"

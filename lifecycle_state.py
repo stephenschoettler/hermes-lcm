@@ -10,6 +10,8 @@ This is the smallest viable substrate for cross-turn/session lifecycle state:
 
 from __future__ import annotations
 
+from .sqlite_util import connect_initializing, storage_initialization, owned_write
+
 import functools
 import sqlite3
 import threading
@@ -54,6 +56,7 @@ class LifecycleState:
 
 
 class LifecycleStateStore:
+    @storage_initialization
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,7 +69,7 @@ class LifecycleStateStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        self._conn = sqlite3.connect(
+        self._conn = connect_initializing(self,
             str(self.db_path),
             timeout=30.0,
             check_same_thread=False,
@@ -720,8 +723,7 @@ class LifecycleStateStore:
         assert conn is not None
         protected = {str(s) for s in (protected_session_ids or ()) if s}
 
-        conn.execute("BEGIN IMMEDIATE")
-        try:
+        with self._lock, owned_write(conn, immediate=True):
             sessions_with_data: set[str] = set()
             tables = {
                 row[0] for row in conn.execute(
@@ -800,14 +802,7 @@ class LifecycleStateStore:
                 )
                 deleted += 1
 
-            if deleted:
-                conn.commit()
-            else:
-                conn.rollback()
             return deleted
-        except Exception:
-            conn.rollback()
-            raise
 
     def delete_safe_rows_for_sessions(
         self,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .sqlite_util import connect_initializing, storage_initialization, owned_write, execute_statements
+
 """Immutable-first message store — the source of truth.
 
 Every message is persisted durably in SQLite. The normal model is append-only,
@@ -55,6 +57,7 @@ from .sqlite_util import (
     _prepare_private_sqlite_file,
     _restrict_existing_sqlite_artifacts,
     _temporary_sqlite_busy_timeout,
+    _wait_for_write_lock,
 )
 from .tokens import count_message_tokens
 
@@ -327,6 +330,7 @@ def build_message_fts_spec() -> ExternalContentFtsSpec:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
+    @storage_initialization
     def __init__(self, db_path: str | Path, *, ingest_protection_config=None, hermes_home: str = ""):
         self.db_path = Path(db_path)
         self._is_memory_database = str(self.db_path) == ":memory:"
@@ -354,13 +358,19 @@ class MessageStore:
         self._write_lock = threading.RLock()
         self._init_db()
 
+    # Retained compatibility knob; initialization now shares one explicit budget.
+    _INIT_LOCK_RETRY_BUDGET_S = 5.0
+
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._init_db_once()
+
+    def _init_db_once(self):
+        self._conn = connect_initializing(self, str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
         if not self._is_memory_database:
             _restrict_existing_sqlite_artifacts(self.db_path)
-        self._conn.executescript("""
+        execute_statements(self._conn,"""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -450,9 +460,27 @@ class MessageStore:
             "observed_at_source",
             "ALTER TABLE messages ADD COLUMN observed_at_source TEXT",
         )
+        # Every write path stamps ``ingested_at``, so after the one-time backfill
+        # no NULL rows exist. An unconditional ``UPDATE ... WHERE ingested_at IS
+        # NULL`` still full-scans ``messages`` inside a write transaction on every
+        # store construction; on a multi-GB lcm.db with several processes
+        # starting at once that queues on the write lock long enough to blow the
+        # host's per-plugin load deadline. A partial index over the
+        # still-unstamped rows keeps the probe O(1) and read-only, and stays
+        # self-healing: any row left NULL (e.g. a crash between ALTER and
+        # backfill) is still found and backfilled on the next start.
         self._conn.execute(
-            "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            "CREATE INDEX IF NOT EXISTS idx_messages_ingested_at_pending "
+            "ON messages(store_id) WHERE ingested_at IS NULL"
         )
+        pending = self._conn.execute(
+            "SELECT 1 FROM messages INDEXED BY idx_messages_ingested_at_pending "
+            "WHERE ingested_at IS NULL LIMIT 1"
+        ).fetchone()
+        if pending is not None:
+            self._conn.execute(
+                "UPDATE messages SET ingested_at = timestamp WHERE ingested_at IS NULL"
+            )
 
     # -- Write operations ---------------------------------------------------
 
@@ -471,7 +499,7 @@ class MessageStore:
         observed_at = _normalize_observed_at(msg.get("timestamp"))
         ingested_at = time.time()
 
-        with self._write_lock:
+        with self._write_lock, owned_write(self._conn):
             cur = self._conn.execute(
                 """INSERT INTO messages
                    (session_id, source, conversation_id, role, content, tool_call_id, tool_calls,
@@ -495,7 +523,6 @@ class MessageStore:
                     "host_message_timestamp" if observed_at is not None else None,
                 ),
             )
-            self._conn.commit()
             return cur.lastrowid
 
     def append_batch(self, session_id: str,
@@ -534,7 +561,7 @@ class MessageStore:
             token_estimates = [0] * len(messages)
 
         ids = []
-        with self._write_lock, self._conn:
+        with self._write_lock, owned_write(self._conn):
             for msg, est in zip(messages, token_estimates):
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
@@ -570,22 +597,20 @@ class MessageStore:
         """Move all persisted messages from one session_id to another."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return 0
-        with self._write_lock:
+        with self._write_lock, owned_write(self._conn):
             cur = self._conn.execute(
                 "UPDATE messages SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
-            self._conn.commit()
             return cur.rowcount if cur.rowcount is not None else 0
 
     def delete_session_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
-        with self._write_lock:
+        with self._write_lock, owned_write(self._conn):
             cur = self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?",
                 (session_id,),
             )
-            self._conn.commit()
             deleted = cur.rowcount if cur.rowcount is not None else 0
             return deleted
 
@@ -605,7 +630,7 @@ class MessageStore:
         later batch archive would slice the new (short) content at the old chunk
         offsets, returning a garbled fragment (F2).
         """
-        with self._write_lock:
+        with self._write_lock, owned_write(self._conn):
             row = self._conn.execute(
                 "SELECT role, pinned, content, tool_call_id FROM messages WHERE store_id = ?",
                 (store_id,),
@@ -628,24 +653,21 @@ class MessageStore:
             )
             if before_commit is not None:
                 before_commit(self._conn, store_id)
-            self._conn.commit()
             return True
 
     def pin(self, store_id: int) -> None:
 
         """Mark a message as pinned (protected from pruning)."""
-        with self._write_lock:
+        with self._write_lock, owned_write(self._conn):
             self._conn.execute(
                 "UPDATE messages SET pinned = 1 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     def unpin(self, store_id: int) -> None:
-        with self._write_lock:
+        with self._write_lock, owned_write(self._conn):
             self._conn.execute(
                 "UPDATE messages SET pinned = 0 WHERE store_id = ?", (store_id,)
             )
-            self._conn.commit()
 
     # -- Read operations ----------------------------------------------------
 
@@ -1040,7 +1062,7 @@ class MessageStore:
         """Normalize legacy NULL/blank source rows to the explicit unknown bucket."""
         stats_before = self.get_source_stats()
         blank_clause = _legacy_blank_source_clause("source")
-        with self._write_lock, self._conn:
+        with self._write_lock, owned_write(self._conn):
             cur = self._conn.execute(
                 f"UPDATE messages SET source = ? WHERE {blank_clause}",
                 (_UNKNOWN_SOURCE,),
@@ -1109,7 +1131,7 @@ class MessageStore:
         if conn is None:
             return False
         wrote = False
-        with self._write_lock:
+        with self._write_lock, owned_write(self._conn):
             for key in keys:
                 if skip_unchanged:
                     existing = conn.execute(
@@ -1126,8 +1148,6 @@ class MessageStore:
                     (key, serialized),
                 )
                 wrote = True
-            if wrote:
-                conn.commit()
         return wrote
 
     # -- Compaction telemetry ------------------------------------------------
@@ -1167,7 +1187,15 @@ class MessageStore:
             return None
 
         key = self._compaction_telemetry_key(conversation_id)
-        with self._write_lock:
+        deadline = time.monotonic() + 0.1
+
+        def begin():
+            # Retain the actual reservation: a probe followed by another BEGIN
+            # can lose the race to a peer and drop an otherwise valid increment.
+            if not _wait_for_write_lock(conn, deadline, retain=True):
+                raise sqlite3.OperationalError("database is locked")
+
+        with self._write_lock, _temporary_sqlite_busy_timeout([conn], 100), owned_write(conn, begin=begin):
             try:
                 # Separate MessageStore instances have separate Python locks.
                 # Acquire SQLite's write reservation before reading so this
@@ -1175,19 +1203,16 @@ class MessageStore:
                 # best-effort telemetry on the completed-compaction hot path, so
                 # permit only a tightly bounded overlap before skipping instead
                 # of inheriting the connection's 30s wait.
-                with _temporary_sqlite_busy_timeout([conn], 100):
-                    conn.execute("BEGIN IMMEDIATE")
-                    row = conn.execute(
-                        "SELECT value FROM metadata WHERE key = ?",
-                        (key,),
-                    ).fetchone()
-                    try:
-                        existing = json.loads(str(row[0])) if row and row[0] else {}
-                    except (ValueError, TypeError):
-                        existing = {}
-                    if not isinstance(existing, dict):
-                        existing = {}
-
+                row = conn.execute(
+                    "SELECT value FROM metadata WHERE key = ?",
+                    (key,),
+                ).fetchone()
+                try:
+                    existing = json.loads(str(row[0])) if row and row[0] else {}
+                except (ValueError, TypeError):
+                    existing = {}
+                if not isinstance(existing, dict):
+                    existing = {}
                 # Per-runtime high-water marks make a committed increment
                 # idempotent when its caller observes an ambiguous exception.
                 # Retain enough recent epochs for overlapping runtimes without
@@ -1270,11 +1295,8 @@ class MessageStore:
                     """,
                     (key, json.dumps(record, sort_keys=True)),
                 )
-                conn.commit()
                 return record
-            except Exception:
-                if conn.in_transaction:
-                    conn.rollback()
+            except BaseException:
                 raise
 
     def write_compaction_telemetry(self, conversation_id: str, record: Dict[str, Any]) -> None:

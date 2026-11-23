@@ -78,9 +78,9 @@ def _spawn_message_store_worker(db_path, start_barrier, repair_barrier, queue, w
         original_structural_check = worker_db_bootstrap._fts_needs_rebuild_structural
         synchronized = False
 
-        def synchronized_structural_check(conn, spec):
+        def synchronized_structural_check(conn, spec, **kwargs):
             nonlocal synchronized
-            result = original_structural_check(conn, spec)
+            result = original_structural_check(conn, spec, **kwargs)
             if result and not synchronized:
                 synchronized = True
                 repair_barrier.wait(timeout=30)
@@ -343,6 +343,7 @@ def test_existing_index_without_marker_runs_check_and_records_marker(tmp_path, m
     ensure_external_content_fts(conn, _spec())  # builds index (rebuild path)
     # Simulate an existing DB upgraded to the throttling version: no marker yet.
     conn.execute("DELETE FROM metadata WHERE key = ?", (MARKER_KEY,))
+    conn.commit()  # publish the fixture edit before an independent automatic scan
     integrity_calls.clear()
 
     ensure_external_content_fts(conn, _spec())
@@ -374,6 +375,7 @@ def test_expired_marker_reruns_integrity_check(tmp_path, monkeypatch, integrity_
         "UPDATE metadata SET value = ? WHERE key = ?",
         (str(time.time() - 100 * 3600), MARKER_KEY),
     )
+    conn.commit()  # the scan sees the aged marker in committed state
     integrity_calls.clear()
 
     ensure_external_content_fts(conn, _spec())
@@ -408,22 +410,26 @@ def test_negative_interval_never_checks_on_startup(tmp_path, monkeypatch, integr
     conn.close()
 
 
-def test_structural_mismatch_rebuilds_despite_fresh_marker(tmp_path, monkeypatch, integrity_calls):
+def test_row_count_drift_waits_for_deep_check_despite_fresh_marker(tmp_path, monkeypatch, integrity_calls):
     monkeypatch.setenv(INTERVAL_ENV, "24")
     conn = _make_conn(tmp_path)
     spec = _spec()
     ensure_external_content_fts(conn, spec)  # build + fresh marker, index has 2 docs
 
     # Insert a row without a trigger (spec has none): the FTS index now lags
-    # content. Marker is fresh, so the deep integrity-check is throttled, but
-    # the structural check must still detect the desync and rebuild.
+    # content. A fresh marker keeps automatic deep checks throttled; the cheap
+    # startup shape probe must not scan either corpus. Explicit repair still
+    # detects and rebuilds the drift.
     conn.execute("INSERT INTO messages(content) VALUES ('untracked row')")
     integrity_calls.clear()
 
     ensure_external_content_fts(conn, spec)
 
-    assert integrity_calls == []  # repaired via structural path, not deep check
-    assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is False
+    assert integrity_calls == []  # automatic check remains throttled
+    assert db_bootstrap._fts_needs_rebuild_structural(conn, spec) is True
+    repaired = db_bootstrap.repair_external_content_fts(conn, spec, throttle=False)
+    assert repaired["rebuilt"] is True
+    conn.rollback()
     conn.close()
 
 
@@ -639,8 +645,8 @@ def test_due_startup_repair_rebuilds_same_count_drift_with_one_missing_trigger(
         reopened.close()
 
 
-def test_repair_without_rebuild_still_clears_integrity_failed_flag(tmp_path, monkeypatch):
-    """Even a no-op repair (nothing to rebuild) clears a stale corruption flag."""
+def test_startup_preserves_failure_flag_until_verified_deep_check(tmp_path, monkeypatch):
+    """Only a successful deep check may clear a previous integrity failure."""
     monkeypatch.setenv(INTERVAL_ENV, "24")
     conn = _make_conn(tmp_path)
     spec = _spec()
@@ -650,9 +656,11 @@ def test_repair_without_rebuild_still_clears_integrity_failed_flag(tmp_path, mon
     conn.commit()
     assert db_bootstrap.load_integrity_failed(conn, spec) is not None
 
-    # Index is healthy: repair makes no rebuild but must still clear the flag.
+    # Cheap healthy shape is not evidence that a prior deep failure is resolved.
     repaired = db_bootstrap.repair_external_content_fts(conn, spec, throttle=True)
     assert repaired["rebuilt"] is False
+    assert db_bootstrap.load_integrity_failed(conn, spec) is not None
+    db_bootstrap.repair_external_content_fts(conn, spec, throttle=False)
     assert db_bootstrap.load_integrity_failed(conn, spec) is None
     conn.close()
 
@@ -800,7 +808,7 @@ def test_fts_repair_owned_transaction_rolls_back_and_restores_busy_timeout(
     conn.close()
 
 
-def test_fts_repair_preserves_caller_transaction_commit_behavior(tmp_path):
+def test_fts_repair_preserves_caller_transaction_until_explicit_commit(tmp_path):
     conn = _make_conn(tmp_path)
     db_bootstrap.ensure_metadata_table(conn)
     conn.commit()
@@ -809,7 +817,8 @@ def test_fts_repair_preserves_caller_transaction_commit_behavior(tmp_path):
 
     ensure_external_content_fts(conn, _spec())
 
-    assert conn.in_transaction is False
+    assert conn.in_transaction is True
+    conn.commit()
     verify = sqlite3.connect(_db_file(tmp_path))
     try:
         assert verify.execute(

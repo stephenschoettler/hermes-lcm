@@ -14,10 +14,12 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from typing import Iterable, Sequence
+from .sqlite_util import execute_statements, owned_write
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +162,10 @@ def _execute_wal_conversion_with_lock_retry(
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
                 raise
-        time.sleep(delay_seconds)
+        budget = getattr(conn, "_initialization_budget", None)
+        if budget is not None:
+            budget.check()
+        time.sleep(min(delay_seconds, max(0, budget.deadline - time.monotonic())) if budget else delay_seconds)
         delay_seconds = min(delay_seconds * 2, 0.25)
 
 
@@ -720,6 +725,18 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
 
 
 def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
+    marker_table = get_existing_table_names(conn, ("lcm_migration_state",))
+    migrated = marker_table and conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name='rollup_invalidation_order_v1'"
+    ).fetchone()
+    if migrated and not verify_temporal_rollup_schema(conn):
+        return
+    with owned_write(conn, immediate=True):
+        ensure_migration_state_table(conn)
+        _create_temporal_rollup_tables(conn)
+
+
+def _create_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     """Lazily create the opt-in temporal-rollup feature tables.
 
     These tables are NOT part of the core numeric ``schema_version`` migration:
@@ -733,7 +750,7 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
     invalidation; ``lease_expires_at`` bounds a ``building`` row so a crashed
     build can be reclaimed. See :mod:`hermes_lcm.rollup_store`.
     """
-    conn.executescript(
+    execute_statements(conn,
         """
         CREATE TABLE IF NOT EXISTS lcm_rollups (
             rollup_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -828,14 +845,18 @@ def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
         "next_day",
         "ALTER TABLE lcm_rollup_invalidations ADD COLUMN next_day TEXT",
     )
-    conn.execute(
-        """
-        UPDATE lcm_rollup_invalidations
-        SET covered_start = MIN(covered_start, covered_end),
-            covered_end = MAX(covered_start, covered_end)
-        WHERE covered_start > covered_end
-        """
-    )
+    # A data migration, not a per-open scan. Triggers normalize new events.
+    if conn.execute("SELECT 1 FROM lcm_migration_state WHERE step_name='rollup_invalidation_order_v1'").fetchone() is None:
+        conn.execute(
+            """
+            UPDATE lcm_rollup_invalidations
+            SET covered_start = MIN(covered_start, covered_end),
+                covered_end = MAX(covered_start, covered_end)
+            WHERE covered_start > covered_end
+            """
+        )
+        mark_migration_step_complete(conn, 'rollup_invalidation_order_v1')
+
 
     def ensure_index(name: str, create_sql: str) -> None:
         existing = conn.execute(
@@ -1317,7 +1338,7 @@ def ensure_embedding_tables(conn: sqlite3.Connection) -> None:
     per-identity counter bumped inside every vector write/delete transaction so
     the in-process NumPy matrix cache cannot serve cross-process-stale results.
     """
-    conn.executescript(
+    execute_statements(conn,
         """
         CREATE TABLE IF NOT EXISTS lcm_embedding_profile (
             identity_hash TEXT PRIMARY KEY,
@@ -1582,7 +1603,7 @@ def ensure_chunk_tables(conn: sqlite3.Connection) -> None:
     vectors, keyed on ``(chunk_id, identity_hash)`` where ``chunk_id`` is
     ``store_id:chunk_index``.
     """
-    conn.executescript(
+    execute_statements(conn,
         """
         CREATE TABLE IF NOT EXISTS lcm_chunk_meta (
             chunk_id TEXT,
@@ -1884,8 +1905,10 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
     # This guard is owned by the rebuildable assertion family. Recreate it so
     # databases opened after the optional source-time migration compare the
     # derived observation time, with the legacy write timestamp as fallback.
-    conn.execute("DROP TRIGGER IF EXISTS lcm_assertion_source_insert_guard")
-    conn.executescript(
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='lcm_assertion_source_insert_guard'").fetchone()
+    # Compare the source guard to this build's DDL, including observed_at. The
+    # other assertion contracts are verified by the caller before publication.
+    script = (
         """
         CREATE TABLE IF NOT EXISTS lcm_assertion_sources (
             source_store_id INTEGER NOT NULL,
@@ -2101,6 +2124,16 @@ def ensure_assertion_tables(conn: sqlite3.Connection) -> None:
         END;
         """
     )
+    match = re.search(r"CREATE TRIGGER IF NOT EXISTS lcm_assertion_source_insert_guard.*?END;", script, re.S)
+    def normalized(sql):
+        return re.sub(r"\s+", "", sql.lower().replace("IF NOT EXISTS", "").replace("if not exists", "")).rstrip(";")
+    replace_guard = row is not None and normalized(str(row[0])) != normalized(match.group())
+    if replace_guard:
+        with owned_write(conn):
+            conn.execute("DROP TRIGGER lcm_assertion_source_insert_guard")
+            execute_statements(conn, script)
+    else:
+        execute_statements(conn, script)
 
 
 @lru_cache(maxsize=1)
@@ -2289,6 +2322,8 @@ def verify_assertion_schema(conn: sqlite3.Connection) -> list[str]:
 
 def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> None:
     ensure_migration_state_table(conn)
+    if conn.execute("SELECT 1 FROM lcm_migration_state WHERE step_name=?", (step_name,)).fetchone():
+        return
     conn.execute(
         """
         INSERT INTO lcm_migration_state(step_name, completed_at)
@@ -2301,6 +2336,9 @@ def mark_migration_step_complete(conn: sqlite3.Connection, step_name: str) -> No
 
 def set_schema_version(conn: sqlite3.Connection, version: int = SCHEMA_VERSION) -> None:
     ensure_metadata_table(conn)
+    row = conn.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
+    if row is not None and row[0] == str(version):
+        return
     conn.execute(
         """
         INSERT INTO metadata(key, value)
@@ -2391,7 +2429,7 @@ def quote_sql_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> bool:
+def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, check_counts: bool = True) -> bool:
     shadow_tables = get_fts_shadow_table_names(spec.table_name)
     existing_tables = get_existing_table_names(conn, [spec.table_name, *shadow_tables])
     if spec.table_name not in existing_tables:
@@ -2416,6 +2454,8 @@ def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalConten
         if spec.indexed_column not in column_names:
             return True
 
+        if not check_counts:
+            return False
         content_count = conn.execute(
             f"SELECT COUNT(*) FROM {quote_sql_identifier(spec.content_table)}"
         ).fetchone()[0]
@@ -2434,7 +2474,7 @@ def _fts_needs_rebuild_structural(conn: sqlite3.Connection, spec: ExternalConten
         # A busy/locked snapshot is an availability problem, not FTS
         # corruption. Let the bounded caller transaction report it instead of
         # turning lock exhaustion into destructive repair.
-        if _is_sqlite_lock_error(exc):
+        if _is_sqlite_lock_error(exc) or getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
             raise
         return True
 
@@ -2579,6 +2619,8 @@ def _record_integrity_failed(
 
 def _clear_integrity_failed(conn: sqlite3.Connection, spec: ExternalContentFtsSpec) -> None:
     ensure_metadata_table(conn)
+    if conn.execute("SELECT 1 FROM metadata WHERE key=?", (_integrity_failed_key(spec),)).fetchone() is None:
+        return
     conn.execute("DELETE FROM metadata WHERE key = ?", (_integrity_failed_key(spec),))
 
 
@@ -2652,128 +2694,109 @@ def _clear_scan_started(
         )
 
 
-def _run_background_integrity_scan(
-    db_path: str, spec: ExternalContentFtsSpec, started_at: float
-) -> None:
-    """Daemon-thread body: deep-check ``spec`` on a private connection.
+# Automatic maintenance yields the only writer within a short VM budget and
+# never queues a retry. A durable per-database cooldown coordinates processes.
+AUTOMATIC_FTS_BUDGET_S = 0.05
+AUTOMATIC_FTS_RETRY_S = 60.0
 
-    Opens its own read/write connection for the scan (the FTS5 integrity-check is
-    issued as an INSERT command that rolls back inside a savepoint, so it never
-    mutates data, but it does require a writable handle) and a separate brief
-    connection to stamp the result. On corruption it flags rather than rebuilds.
-    """
+
+def _run_background_integrity_scan(db_path, spec, started_at, *, init_budget=None):
     key = (db_path, spec.table_name)
-    timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
+    conn = None
     try:
-        scan_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-        try:
-            scan_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            # Persist the scan-started stamp on this DB so a crash mid-scan is
-            # detectable cross-process via the staleness window above.
-            _record_scan_started(scan_conn, spec, now=started_at)
-            scan_conn.commit()
-            result = check_external_content_fts_integrity(scan_conn, spec)
-        finally:
-            scan_conn.close()
-
-        meta_conn = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-        try:
-            meta_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-            status = result.get("status")
-            if status == "pass":
-                _record_integrity_checked(meta_conn, spec, now=started_at)
-                _clear_integrity_failed(meta_conn, spec)
-            elif status == "fail":
-                _record_integrity_failed(
-                    meta_conn, spec, detail=result.get("detail", ""), now=started_at
-                )
-                logger.warning(
-                    "Background FTS integrity-check found corruption in '%s': %s. "
-                    "Run `/lcm doctor repair apply` to rebuild the index.",
-                    spec.table_name,
-                    result.get("detail", ""),
-                )
-            # 'unchecked' (e.g. a read-only DB): leave the throttle marker unset
-            # so the next bind retries; do not stamp or flag.
-            _clear_scan_started(meta_conn, spec, expected=started_at)
-            meta_conn.commit()
-        finally:
-            meta_conn.close()
-    except Exception:  # pragma: no cover - defensive
-        logger.exception(
-            "Background FTS integrity-check for '%s' failed", spec.table_name
-        )
-        try:
-            cleanup = sqlite3.connect(db_path, timeout=timeout, check_same_thread=False)
-            try:
-                _clear_scan_started(cleanup, spec, expected=started_at)
-                cleanup.commit()
-            finally:
-                cleanup.close()
-        except sqlite3.DatabaseError:
-            pass
+        if init_budget is not None and init_budget.expired():
+            return
+        conn = sqlite3.connect(db_path, timeout=0)
+        deadline = time.monotonic() + AUTOMATIC_FTS_BUDGET_S
+        if init_budget is not None:
+            deadline = min(deadline, init_budget.deadline)
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline or (init_budget is not None and init_budget.expired())), 1000)
+        conn.execute("BEGIN IMMEDIATE")
+        result = check_external_content_fts_integrity(conn, spec)
+        # Release the writer before recording status, even after VM cancellation.
+        conn.set_progress_handler(None, 0)
+        conn.rollback()
+        if time.monotonic() >= deadline or (init_budget is not None and init_budget.expired()):
+            return  # unchecked/pending; do not publish anything after expiration
+        with conn:
+            if result['status'] == 'pass':
+                _record_integrity_checked(conn, spec, now=started_at)
+                _clear_integrity_failed(conn, spec)
+            elif result['status'] == 'fail':
+                _record_integrity_failed(conn, spec, detail=result['detail'], now=started_at)
+                logger.warning("Background FTS integrity-check found corruption in '%s': %s. Run `/lcm doctor repair apply`.", spec.table_name, result['detail'])
+            _clear_scan_started(conn, spec, expected=started_at)
+    except sqlite3.Error as exc:
+        # BUSY/interrupt is pending, never evidence of corruption or success.
+        logger.debug("LCM stage=fts_scan pid=%s pending code=%s", os.getpid(), getattr(exc, 'sqlite_errorname', None))
     finally:
+        if conn is not None:
+            conn.close()
         with _integrity_scan_lock:
             if _integrity_scan_threads.get(key) is threading.current_thread():
                 _integrity_scan_threads.pop(key, None)
 
 
-def _dispatch_background_integrity_scan(
-    conn: sqlite3.Connection, spec: ExternalContentFtsSpec, *, now: float | None = None
-) -> bool:
-    """Try to run the deep FTS integrity-check on a daemon thread.
-
-    Returns ``True`` when the caller should NOT run the check synchronously —
-    either a scan was dispatched here or one is already in flight (in-process, or
-    in another process per a fresh ``fts_integrity_scan_started_at`` stamp).
-    Returns ``False`` to fall back to the synchronous check (e.g. an in-memory or
-    anonymous DB that cannot be reopened from another thread).
-    """
+def _dispatch_background_integrity_scan(conn, spec, *, now=None):
+    """No-wait, rechecked cross-process claim. Contention means pending."""
     db_path = _database_path_for_connection(conn)
-    if not db_path or db_path == ":memory:":
+    if not db_path or db_path == ':memory:':
         return False
     current = time.time() if now is None else now
     key = (db_path, spec.table_name)
-    with _integrity_scan_lock:
-        existing = _integrity_scan_threads.get(key)
-        if existing is not None and existing.is_alive():
-            return True
-        started = _load_scan_started_at(conn, spec)
-        if started is not None and (current - started) < INTEGRITY_SCAN_STALE_SECONDS:
-            # A recent scan (this or another process) owns this table; let it
-            # stamp the marker. The bind returns fast without a duplicate scan.
-            return True
-        # Durably claim the scan cross-process BEFORE starting the thread. The
-        # spawned thread stamps ``scan_started_at`` on its own connection, but
-        # ``thread.start()`` returns before that stamp is committed — a second
-        # process racing ``ensure_external_content_fts`` in that window would read
-        # no stamp and dispatch a duplicate deep scan (F6). Writing the stamp here
-        # under BEGIN IMMEDIATE closes that window; best-effort (a transient lock
-        # just falls back to the thread's own stamp).
-        claim_timeout = SQLITE_BUSY_TIMEOUT_MS / 1000.0
-        try:
-            claim_conn = sqlite3.connect(
-                db_path, timeout=claim_timeout, check_same_thread=False
-            )
-            try:
-                claim_conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-                claim_conn.execute("BEGIN IMMEDIATE")
-                _record_scan_started(claim_conn, spec, now=current)
-                claim_conn.commit()
-            finally:
-                claim_conn.close()
-        except sqlite3.DatabaseError:
-            pass
-
-        thread = threading.Thread(
-            target=_run_background_integrity_scan,
-            args=(db_path, spec, current),
-            name=f"lcm-fts-integrity-{spec.table_name}",
-            daemon=True,
-        )
-        _integrity_scan_threads[key] = thread
-        thread.start()
+    budget = getattr(conn, "_initialization_budget", None)
+    if budget is not None:
+        budget.check()
+    if not _integrity_scan_lock.acquire(blocking=False):
         return True
+    try:
+        if budget is not None:
+            budget.check()
+        if any(path == db_path and thread.is_alive()
+               for (path, _), thread in _integrity_scan_threads.items()):
+            return True
+        claim = None
+        try:
+            claim = sqlite3.connect(db_path, timeout=0)
+            if budget is not None:
+                claim.set_progress_handler(lambda: int(budget.expired()), 1000)
+            claim.execute('BEGIN IMMEDIATE')
+            started = _load_scan_started_at(claim, spec)
+            if started is not None and current - started < min(INTEGRITY_SCAN_STALE_SECONDS, AUTOMATIC_FTS_RETRY_S):
+                return True
+            row = claim.execute("SELECT value FROM metadata WHERE key='fts_integrity_next_attempt_at'").fetchone()
+            try:
+                next_attempt = float(row[0]) if row else 0
+            except (TypeError, ValueError):
+                next_attempt = 0
+            if current < next_attempt:
+                return True
+            if budget is not None:
+                budget.check()
+            _record_scan_started(claim, spec, now=current)
+            claim.execute("INSERT INTO metadata(key,value) VALUES('fts_integrity_next_attempt_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(current + AUTOMATIC_FTS_RETRY_S),))
+            if budget is not None:
+                budget.check()
+            claim.commit()
+        except sqlite3.DatabaseError as exc:
+            logger.debug("LCM stage=fts_claim pid=%s pending code=%s", os.getpid(), getattr(exc, 'sqlite_errorname', None))
+            return True  # never fall through to a foreground full scan
+        finally:
+            if claim is not None:
+                claim.close()
+        thread = threading.Thread(target=_run_background_integrity_scan,
+                                  args=(db_path, spec, current),
+                                  kwargs={"init_budget": budget} if budget is not None else {},
+                                  name=f'lcm-fts-integrity-{spec.table_name}', daemon=True)
+        _integrity_scan_threads[key] = thread
+        try:
+            thread.start()
+        except BaseException:
+            _integrity_scan_threads.pop(key, None)
+            raise
+        return True
+    finally:
+        _integrity_scan_lock.release()
 
 
 def join_background_integrity_scans(timeout: float | None = None) -> None:
@@ -2794,7 +2817,7 @@ def _fts_needs_rebuild(
     now: float | None = None,
     throttle: bool = False,
 ) -> bool:
-    if _fts_needs_rebuild_structural(conn, spec):
+    if _fts_needs_rebuild_structural(conn, spec, check_counts=not throttle):
         return True
     # Structurally sound: the FTS5 integrity-check is O(index size) and was the
     # dominant startup cost on large databases (issue #235). On the startup path
@@ -2811,10 +2834,69 @@ def _fts_needs_rebuild(
     if throttle and _background_integrity_enabled():
         if _dispatch_background_integrity_scan(conn, spec, now=now):
             return False
-    result = check_external_content_fts_integrity(conn, spec)
+    # The legacy synchronous switch remains supported, but automatic work still
+    # has a VM budget. On runtime-owned initialization connections the installed
+    # handler composes the scan deadline with the shared initialization budget.
+    # Standalone callers should use explicit repair for an unthrottled check.
+    if throttle:
+        result = _bounded_synchronous_integrity(conn, spec)
+    else:
+        result = check_external_content_fts_integrity(conn, spec)
     if result["status"] == "pass":
-        _record_integrity_checked(conn, spec, now=now)
+        timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            if throttle:
+                conn.execute("PRAGMA busy_timeout=0")
+            with owned_write(conn):
+                _record_integrity_checked(conn, spec, now=now)
+                _clear_integrity_failed(conn, spec)
+        except sqlite3.OperationalError as exc:
+            if not throttle or not _is_sqlite_lock_error(exc):
+                raise
+            # The successful scan could not publish its marker: still pending.
+        finally:
+            conn.execute(f"PRAGMA busy_timeout={timeout_ms}")
     return result["status"] == "fail"
+
+
+def _bounded_synchronous_integrity(conn, spec):
+    from .sqlite_util import _InitializingConnection
+
+    # SQLITE_INTERRUPT during the FTS write can roll back an entire transaction,
+    # even through a savepoint. Automatic work must not risk caller-owned writes
+    # on any connection, including a managed handle retained after initialization.
+    if conn.in_transaction:
+        return {"status": "unchecked", "detail": "caller transaction; automatic check pending"}
+    if not isinstance(conn, _InitializingConnection):
+        # stdlib sqlite cannot retrieve an arbitrary caller's progress handler.
+        # Use a private handle rather than overwrite it.
+        path = _database_path_for_connection(conn)
+        if not path:
+            return {"status": "unchecked", "detail": "anonymous database; automatic check pending"}
+        private = sqlite3.connect(path, timeout=0, factory=_InitializingConnection)
+        try:
+            return _bounded_synchronous_integrity(private, spec)
+        finally:
+            private.close()
+    deadline = time.monotonic() + AUTOMATIC_FTS_BUDGET_S
+    budget = getattr(conn, "_initialization_budget", None)
+    previous_handler = conn._progress_handler
+    previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    conn.execute("PRAGMA busy_timeout=0")
+    conn.set_progress_handler(lambda: int(time.monotonic() >= deadline or (budget is not None and budget.expired())), 1000)
+    try:
+        try:
+            result = check_external_content_fts_integrity(conn, spec)
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, 'sqlite_errorcode', None) != sqlite3.SQLITE_INTERRUPT:
+                raise
+            result = {"status": "unchecked", "detail": "automatic scan interrupted"}
+        if time.monotonic() >= deadline:
+            return {"status": "unchecked", "detail": "automatic scan budget exhausted"}
+        return result
+    finally:
+        conn.set_progress_handler(*previous_handler)
+        conn.execute(f"PRAGMA busy_timeout={previous_timeout}")
 
 
 # SQLite/FTS5 error substrings that denote genuine corruption or index drift
@@ -2848,22 +2930,30 @@ def check_external_content_fts_integrity(
     behind on the shared connection.
     """
 
-    if _fts_needs_rebuild_structural(conn, spec):
+    # The FTS5 rank=1 command below checks content/index consistency itself.
+    # Avoid a separate COUNT opcode over the corpus while holding the writer;
+    # its internal page walk does not offer per-row VM progress checkpoints.
+    if _fts_needs_rebuild_structural(conn, spec, check_counts=False):
         return {"status": "fail", "detail": "structural repair needed"}
 
     savepoint = f"lcm_fts_integrity_{spec.table_name}"
     savepoint_sql = quote_sql_identifier(savepoint)
+    started = False
     try:
         conn.execute(f"SAVEPOINT {savepoint_sql}")
+        started = True
         conn.execute(
             f"INSERT INTO {quote_sql_identifier(spec.table_name)}({quote_sql_identifier(spec.table_name)}, rank) VALUES('integrity-check', 1)"
         )
-    except sqlite3.DatabaseError as exc:
+    except BaseException as exc:
         try:
-            conn.execute(f"ROLLBACK TO {savepoint_sql}")
-            conn.execute(f"RELEASE {savepoint_sql}")
-        except sqlite3.DatabaseError:
+            if started:
+                conn.execute(f"ROLLBACK TO {savepoint_sql}")
+                conn.execute(f"RELEASE {savepoint_sql}")
+        except BaseException:
             pass
+        if not isinstance(exc, sqlite3.DatabaseError):
+            raise
         detail = str(exc)
         lowered = detail.lower()
         if "readonly" in lowered or "read-only" in lowered:
@@ -2880,7 +2970,7 @@ def check_external_content_fts_integrity(
         conn.execute(f"ROLLBACK TO {savepoint_sql}")
         conn.execute(f"RELEASE {savepoint_sql}")
     except sqlite3.DatabaseError as exc:
-        return {"status": "fail", "detail": str(exc)}
+        return {"status": "unchecked", "detail": str(exc)}
 
     return {"status": "pass", "detail": "ok"}
 
@@ -2945,49 +3035,20 @@ def external_content_fts_needs_repair(conn: sqlite3.Connection, spec: ExternalCo
 
 @contextmanager
 def _fts_repair_ownership(conn: sqlite3.Connection):
-    """Own the short FTS structural-repair transaction.
-
-    Fresh startup connections are normally outside a transaction, so
-    ``BEGIN IMMEDIATE`` serializes the structural recheck and all FTS DDL
-    across independent processes. A caller that already owns a transaction
-    gets a savepoint instead; committing that caller-owned transaction remains
-    the historical behavior of the repair helper.
-    """
-    if conn.in_transaction:
-        savepoint = quote_sql_identifier("lcm_fts_repair_ownership")
-        conn.execute(f"SAVEPOINT {savepoint}")
-        try:
-            yield False
-        except BaseException:
-            try:
-                conn.execute(f"ROLLBACK TO {savepoint}")
-            finally:
-                conn.execute(f"RELEASE {savepoint}")
-            raise
-        else:
-            conn.execute(f"RELEASE {savepoint}")
-        return
-
-    previous_timeout = conn.execute("PRAGMA busy_timeout").fetchone()
-    previous_timeout_ms = int(previous_timeout[0]) if previous_timeout else 0
+    """Serialize genuine repair; leave caller-owned transactions uncommitted."""
+    owns_transaction = not conn.in_transaction
+    previous_timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     try:
-        # A loser waits for the winner, then takes a current write snapshot and
-        # rechecks the complete FTS state before deciding whether to repair.
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield True
-        except BaseException:
-            conn.rollback()
-            raise
-        else:
-            try:
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                raise
+        with owned_write(conn, immediate=True):
+            yield owns_transaction
     finally:
-        conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+        causal_failure = sys.exc_info()[0] is not None
+        try:
+            conn.execute(f"PRAGMA busy_timeout={previous_timeout_ms}")
+        except BaseException:
+            if not causal_failure:
+                raise
 
 
 def repair_external_content_fts(
@@ -2999,7 +3060,7 @@ def repair_external_content_fts(
 ) -> dict[str, bool]:
     rebuilt = False
     degraded = False
-    fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec)
+    fts_structure_needs_rebuild = _fts_needs_rebuild_structural(conn, spec, check_counts=not throttle)
     deep_repair_needed = False
     if not fts_structure_needs_rebuild or not throttle:
         # Preserve the cheap startup path and its background integrity-scan
@@ -3012,15 +3073,13 @@ def repair_external_content_fts(
             # Return on the healthy fast path only while it is still complete;
             # any observed trigger repair must pass through write ownership below.
             if not _fts_missing_triggers(conn, spec):
-                _clear_integrity_failed(conn, spec)
-                conn.commit()
                 return {
                     "rebuilt": False,
                     "degraded": False,
                     "triggers_recreated": False,
                 }
 
-    with _fts_repair_ownership(conn) as owns_transaction:
+    with _fts_repair_ownership(conn):
         # This is the decisive cross-process recheck. If another process won
         # while we waited, accept its complete table/shadow/trigger state and do
         # not drop or recreate it.
@@ -3028,6 +3087,11 @@ def repair_external_content_fts(
         owner_rebuild_needed = (
             _fts_needs_rebuild_structural(conn, spec) if winner_state_needs_repair else False
         )
+        if winner_state_needs_repair and not owner_rebuild_needed:
+            # A missing trigger can have allowed same-count token drift. This
+            # is genuine repair under writer ownership, bounded by the bind's
+            # initialization budget, even when routine maintenance is not due.
+            owner_rebuild_needed = _fts_needs_rebuild(conn, spec, now=now, throttle=False)
         if not owner_rebuild_needed and deep_repair_needed:
             # Explicit repair (and synchronous startup when background scans are
             # disabled) must revalidate same-row-count token drift while owning
@@ -3081,11 +3145,6 @@ def repair_external_content_fts(
         # clear it in the SAME transaction that commits the rebuild.
         _clear_integrity_failed(conn, spec)
 
-    if not owns_transaction:
-        # Preserve the helper's historical behavior for callers that supplied an
-        # already-active transaction while keeping the startup path's ownership
-        # boundary isolated and rollback-safe.
-        conn.commit()
     return {"rebuilt": rebuilt, "degraded": degraded, "triggers_recreated": triggers_were_missing}
 
 
@@ -3105,26 +3164,14 @@ def run_versioned_migrations(conn: sqlite3.Connection) -> None:
 
     refuse_schema_version_too_new(conn)
     current_version = get_schema_version(conn)
-    if current_version < 2:
-        mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
-        current_version = 2
-
-    if current_version < 3:
-        ensure_lifecycle_state_table(conn)
-        mark_migration_step_complete(conn, "v3_lifecycle_state")
-        current_version = 3
-    else:
-        ensure_lifecycle_state_table(conn)
-
+    mark_migration_step_complete(conn, "v2_external_content_fts_triggers")
+    ensure_lifecycle_state_table(conn)
     ensure_lifecycle_state_columns(conn)
-    if current_version < 4:
-        mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
-        current_version = 4
-
+    mark_migration_step_complete(conn, "v3_lifecycle_state")
+    mark_migration_step_complete(conn, "v4_lifecycle_debt_columns")
     ensure_message_origin_columns(conn)
-    if current_version < 5:
-        mark_migration_step_complete(conn, "v5_message_conversation_id")
-        current_version = 5
+    mark_migration_step_complete(conn, "v5_message_conversation_id")
+    current_version = SCHEMA_VERSION
 
     # NOTE: the opt-in temporal-rollup tables are deliberately NOT created here.
     # Creating them would advance the core schema for every install (even with

@@ -361,6 +361,62 @@ def _make_command_handler(handle_lcm_command, engine, resolve_active_lcm_engine)
 
 
 def register(ctx):
+    from .sqlite_util import InitializationBudget
+
+    budget = InitializationBudget(
+        deadline=getattr(ctx, "_load_deadline", None),
+        cancelled=lambda: bool(getattr(ctx, "_load_abandoned", False)),
+    )
+    registrations = []
+
+    def own_registration(result):
+        if callable(getattr(result, "dispose", None)):
+            registrations.append(result)
+        elif isinstance(result, (list, tuple)):
+            for handle in result:
+                own_registration(handle)
+
+    def dispose_registrations():
+        # Public handles are idempotent and generation-aware in the host. The
+        # host may already have disposed an earlier cleanup snapshot.
+        while registrations:
+            handle = registrations.pop()
+            try:
+                handle.dispose()
+            except BaseException:
+                logger.debug("LCM registration cleanup failed", exc_info=True)
+
+    class BudgetedContext:
+        def __getattr__(self, name):
+            value = getattr(ctx, name)
+            if callable(value) and (name.startswith("register_") or name == "on_unload"):
+                def guarded(*args, **kwargs):
+                    budget.check()
+                    result = value(*args, **kwargs)
+                    own_registration(result)
+                    try:
+                        budget.check()
+                    except BaseException:
+                        # A registrar can finish after timeout cleanup swept
+                        # the host ledger. Dispose its returned handle now.
+                        dispose_registrations()
+                        raise
+                    return result
+                return guarded
+            return value
+
+    try:
+        _register(BudgetedContext(), budget)
+        budget.check()
+    except BaseException:
+        dispose_registrations()
+        engine = getattr(budget, "engine", None)
+        if engine is not None:
+            engine._close_storage()
+        raise
+
+
+def _register(ctx, budget):
     """Plugin entry point — register the LCM context engine and tools."""
     from .config import LCMConfig
     from .engine import LCMEngine, resolve_active_lcm_engine
@@ -393,7 +449,10 @@ def register(ctx):
         import os
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
-    engine = LCMEngine(config=config, hermes_home=hermes_home)
+    budget.check()
+    engine = LCMEngine(config=config, hermes_home=hermes_home, init_budget=budget)
+    budget.engine = engine
+    budget.check()
 
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)
@@ -556,9 +615,6 @@ def register(ctx):
     # existing _ingest_messages cursor prevents duplicates if compress() runs
     # later the same turn.
     try:
-        from hermes_cli.plugins import get_plugin_manager as _get_pm
-        _mgr = _get_pm()
-
         def _on_post_llm_call(**kwargs):
             history = kwargs.get("conversation_history")
             if not history:
@@ -600,7 +656,9 @@ def register(ctx):
             except Exception as exc:
                 logger.debug("LCM post_llm_call ingest error: %s", exc)
 
-        _mgr._hooks.setdefault("post_llm_call", []).append(_on_post_llm_call)
+        register_hook = getattr(ctx, "register_hook", None)
+        if callable(register_hook):
+            register_hook("post_llm_call", _on_post_llm_call)
         logger.debug("LCM registered post_llm_call hook for per-turn ingest")
     except Exception as exc:
         logger.debug("LCM could not register post_llm_call hook: %s", exc)

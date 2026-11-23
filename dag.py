@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from .sqlite_util import connect_initializing, storage_initialization, owned_write, execute_statements
+
 from .db_bootstrap import (
     ExternalContentFtsSpec,
     add_column_if_missing,
@@ -161,6 +163,7 @@ class SummaryDAG:
 
     DELETE_SESSION_SCOPE_TABLE = _DELETE_SESSION_SCOPE_TABLE
 
+    @storage_initialization
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
@@ -180,10 +183,10 @@ class SummaryDAG:
         return self._conn
 
     def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
+        self._conn = connect_initializing(self, str(self.db_path), timeout=5.0, check_same_thread=False)
         refuse_schema_version_too_new(self._conn)
         configure_connection(self._conn)
-        self._conn.executescript("""
+        execute_statements(self._conn,"""
             CREATE TABLE IF NOT EXISTS summary_nodes (
                 node_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -246,7 +249,7 @@ class SummaryDAG:
 
     def add_node(self, node: SummaryNode) -> int:
         """Insert a summary node and return its node_id."""
-        with self._db_lock:
+        with self._db_lock, owned_write(self._conn):
             cur = self._conn.execute(
                 """INSERT INTO summary_nodes
                    (session_id, depth, summary, token_count, source_token_count,
@@ -266,9 +269,8 @@ class SummaryDAG:
                     node.expand_hint,
                 ),
             )
-            self._conn.commit()
-            node.node_id = cur.lastrowid
-            return node.node_id
+        node.node_id = cur.lastrowid
+        return node.node_id
 
     @staticmethod
     def stage_delete_session_scope(
@@ -340,17 +342,12 @@ class SummaryDAG:
         deleted = 0
         while True:
             with self._db_lock:
-                try:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                with owned_write(self._conn, immediate=True):
                     node_ids = self.delete_node_batch(
                         self._conn,
                         (session_id,),
                         min_depth=min_depth,
                     )
-                    self._conn.commit()
-                except Exception:
-                    self._conn.rollback()
-                    raise
             if not node_ids:
                 return deleted
             deleted += len(node_ids)
@@ -394,13 +391,12 @@ class SummaryDAG:
         Used for /new carry-over where retained summaries should become part of
         the fresh session while preserving node IDs and node-to-node links.
         """
-        with self._db_lock:
+        with self._db_lock, owned_write(self._conn):
             cur = self._conn.execute(
                 "UPDATE summary_nodes SET session_id = ? WHERE session_id = ?",
                 (new_session_id, old_session_id),
             )
             moved = cur.rowcount
-            self._conn.commit()
         return moved
 
     # -- Read ---------------------------------------------------------------

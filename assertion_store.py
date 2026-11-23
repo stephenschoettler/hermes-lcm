@@ -9,6 +9,8 @@ late source-hash compare-and-swap, and query only source-valid assertions.
 
 from __future__ import annotations
 
+from .sqlite_util import connect_initializing, storage_initialization, owned_write
+
 from dataclasses import dataclass
 import hashlib
 import json
@@ -215,6 +217,7 @@ def _bounded_probability(value: float | None, field: str) -> float | None:
 class AssertionStore:
     """SQLite assertion store bound to the same physical DB as ``MessageStore``."""
 
+    @storage_initialization
     def __init__(self, db_path: str | Path, *, read_only: bool = False):
         self.db_path = Path(db_path)
         self.read_only = bool(read_only)
@@ -222,15 +225,13 @@ class AssertionStore:
         self._conn = self._open_connection()
         try:
             self._init_db()
-        except Exception:
-            self._conn.close()
-            self._conn = None  # type: ignore[assignment]
+        except BaseException:
             raise
 
     def _open_connection(self) -> sqlite3.Connection:
         if self.read_only:
             uri = f"file:{quote(str(self.db_path), safe='/')}?mode=ro"
-            conn = sqlite3.connect(
+            conn = connect_initializing(self,
                 uri,
                 uri=True,
                 timeout=5.0,
@@ -241,7 +242,7 @@ class AssertionStore:
             conn.execute("PRAGMA busy_timeout=30000")
         else:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(
+            conn = connect_initializing(self,
                 str(self.db_path),
                 timeout=5.0,
                 check_same_thread=False,
@@ -566,8 +567,7 @@ class AssertionStore:
         assertion_ids = tuple(str(row["assertion_id"]) for row in assertion_rows)
         relation_ids = tuple(str(row["relation_id"]) for row in relation_rows)
 
-        with self._write_lock:
-            self._begin_write()
+        with self._write_lock, owned_write(self._conn, begin=self._begin_write):
             try:
                 current_row = self._source_row(snapshot.store_id)
                 if current_row is None:
@@ -595,7 +595,6 @@ class AssertionStore:
                         and int(existing["assertion_count"]) == len(assertion_rows)
                         and int(existing["relation_count"]) == len(relation_rows)
                     ):
-                        self._conn.execute("COMMIT")
                         return PublishResult(
                             source_store_id=snapshot.store_id,
                             extraction_version=version,
@@ -649,7 +648,6 @@ class AssertionStore:
                             snapshot.content_sha256,
                         ),
                     )
-                    self._conn.execute("COMMIT")
                     return PublishResult(
                         source_store_id=snapshot.store_id,
                         extraction_version=version,
@@ -739,9 +737,7 @@ class AssertionStore:
                         """,
                         {**row, "created_at": time.time()},
                     )
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
+            except BaseException:
                 raise
 
         return PublishResult(
@@ -1047,8 +1043,7 @@ class AssertionStore:
         timestamp = _finite_number(invalidated_at, "invalidated_at")
         if timestamp is None:
             timestamp = time.time()
-        with self._write_lock:
-            self._begin_write()
+        with self._write_lock, owned_write(self._conn, begin=self._begin_write):
             try:
                 cursor = self._conn.execute(
                     """
@@ -1059,18 +1054,15 @@ class AssertionStore:
                     (timestamp, normalized_reason, int(store_id)),
                 )
                 changed = int(cursor.rowcount or 0)
-                self._conn.execute("COMMIT")
                 return changed
-            except Exception:
-                self._conn.execute("ROLLBACK")
+            except BaseException:
                 raise
 
     def remove_version(self, extraction_version: str) -> dict[str, int]:
         """Remove one rebuildable derived generation; raw messages are untouched."""
         self._require_writable()
         version = _validated_version(extraction_version)
-        with self._write_lock:
-            self._begin_write()
+        with self._write_lock, owned_write(self._conn, begin=self._begin_write):
             try:
                 counts = {
                     "sources": int(self._conn.execute(
@@ -1091,8 +1083,6 @@ class AssertionStore:
                     "DELETE FROM lcm_assertion_sources WHERE extraction_version = ?",
                     (version,),
                 )
-                self._conn.execute("COMMIT")
                 return counts
-            except Exception:
-                self._conn.execute("ROLLBACK")
+            except BaseException:
                 raise
