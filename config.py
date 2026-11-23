@@ -323,6 +323,9 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
+    _EnvFieldSpec(
+        "maintenance_min_pressure_ratio", "LCM_MAINTENANCE_MIN_PRESSURE_RATIO", float
+    ),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
@@ -484,6 +487,20 @@ class LCMConfig:
     critical_budget_pressure_ratio: float = 0.0
     # Opt into one bounded synchronous sweep after threshold pressure is reached.
     threshold_full_sweep_enabled: bool = False
+    # Minimum fraction of ``threshold_tokens`` a session must reach before an
+    # OPPORTUNISTIC maintenance compaction (the "compactable backlog outside the
+    # fresh tail" / "ignored-message backlog" arms) may be requested on the
+    # divergent-replay path.
+    #
+    # That path is entered whenever ingest rewrote the replay view -- most often
+    # because a payload was externalized (inline media, base64, a large tool
+    # result). Today the leaf-candidate check there runs with no token gate,
+    # while the identical check on the non-divergent path below sits behind
+    # ``rough >= threshold_tokens``. The result is that a media-heavy session
+    # requests maintenance compaction at ANY size.
+    #
+    # 0.0 (default) keeps the historical behavior exactly.
+    maintenance_min_pressure_ratio: float = 0.0
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
 
