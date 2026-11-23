@@ -167,6 +167,104 @@ _SENSITIVE_PATTERN_CATALOG: dict[str, re.Pattern[str]] = {
     ),
 }
 
+# --- Value-shape gate for the keyword patterns -----------------------------
+#
+# The three keyword patterns above anchor on a credential-ish name plus a
+# separator, then accept whatever follows. Without a shape test on the captured
+# value they match the code that proves a secret was NOT hardcoded (environment
+# lookups, config templating, plain identifier references) far more often than
+# they match a secret. Because redaction runs on the ingest write path, each
+# such match destroys non-secret text irreversibly.
+#
+# `_looks_like_credential` (below) gates every keyword-pattern match on these.
+# `private_key` is PEM-anchored, self-validating and produces no false
+# positives, so it is deliberately exempt.
+
+# Environment-variable indirection: os.environ[...] / os.getenv(...) /
+# process.env.X / $VAR / ${VAR} / %VAR% and friends. Anchored at the start of
+# the captured value.
+_ENV_INDIRECTION_RE = re.compile(
+    r"""^(?:
+          os\.environ\b
+        | os\.getenv\b
+        | environ\.get\b
+        | getenv\b
+        | process\.env\b
+        | import\.meta\.env\b
+        | Deno\.env\b
+        | ENV\[
+        | System\.getenv\b
+        | Environment\.GetEnvironmentVariable\b
+        | \$\{?[A-Za-z_][A-Za-z0-9_]*\}?
+        | %[A-Za-z_][A-Za-z0-9_]*%
+    )""",
+    re.VERBOSE,
+)
+
+# Config/CI templating and documentation placeholders that stand in for a
+# secret: ${{ secrets.X }}, {{ vault_x }}, <your-key-here>, !secret x,
+# $(command substitution), and the YOUR_*/REPLACE_ME/CHANGEME family.
+_TEMPLATE_REFERENCE_RE = re.compile(
+    r"""(?:
+          \$\{\{ | \{\{ | \}\} | \$\{ | \$\(
+        | ^< [^>]* >$
+        | ^! secret\b
+        | ^(?:YOUR|MY|SOME|EXAMPLE|SAMPLE|DUMMY|FAKE|TEST|PLACEHOLDER)[_-]
+        | ^(?:REPLACE[_-]?ME|CHANGE[_-]?ME|TODO|TBD|XXX+|FIXME|INSERT[_-])
+        | ^(?:xxx+|\*{3,}|\.{3,}|_{3,})$
+    )""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+# A *structured* code reference rather than a literal value: dotted attribute
+# paths, snake_case names, subscripts, calls, camelCase. `settings.openai_api_key`,
+# `user_password`, `response.json()[`, `apiKeyFromContext`. The structure signal
+# matters: an unbroken single-case run (`OLDSECRET`) is a literal, whereas Python
+# and JS references conventionally carry a `.`, a `_` or a camelCase hump.
+_STRUCTURED_REFERENCE_RE = re.compile(
+    r"""^[A-Za-z_$][A-Za-z0-9_$]*
+         (?:\.[A-Za-z_$][A-Za-z0-9_$]*)*
+         (?:\(\)|\[|\.)?$""",
+    re.VERBOSE,
+)
+_IDENTIFIER_STRUCTURE_RE = re.compile(
+    r"""(?: [._$\[(]          # dotted path, snake_case, subscript or call
+          | [a-z][A-Z]        # camelCase hump
+    )""",
+    re.VERBOSE,
+)
+
+# An unbroken single-case alphabetic run is a literal, not a reference: Python
+# constants are SCREAMING_SNAKE and locals are snake_case, so neither produces
+# one. Treated as a credential when it clears the length floor.
+_UNBROKEN_UPPER_RUN_RE = re.compile(r"^[A-Z]+$")
+
+# Punctuation that appears in generated credentials but not in identifiers or
+# attribute paths, used as an alternative entropy signal for all-alpha values.
+# `-` is included: it cannot appear in an identifier, so a hyphenated literal
+# after `password=` is a value rather than a variable reference. `.` and `_`
+# are deliberately excluded because dotted paths and snake_case names are the
+# dominant false-positive shape.
+_CREDENTIAL_PUNCTUATION_RE = re.compile(r"[!#$%&*+\-/:;<>?@\\^`|~=]")
+
+# Length floors for the captured value, per pattern. Below these a match is
+# noise: real issued credentials are longer, and short values are dominated by
+# words, flags and fixture strings.
+_SENSITIVE_MIN_SECRET_CHARS = {
+    "api_key": 12,
+    "bearer_token": 16,
+    "password_assignment": 8,
+}
+
+# An all-letters value this long with internal whitespace or credential
+# punctuation is treated as a passphrase and kept redacted.
+_SENSITIVE_PASSPHRASE_MIN_CHARS = 12
+
+# Keyword patterns whose captured value must pass `_looks_like_credential`.
+_VALUE_SHAPE_GATED_SENSITIVE_PATTERNS = frozenset(
+    {"api_key", "bearer_token", "password_assignment"}
+)
+
 # Sensitive redaction runs synchronously in the ingest path. The private_key
 # pattern (lazy `.*?` under DOTALL) rescans to end-of-string for every unmatched
 # BEGIN header, so a multi-MB payload with many headers and no END is O(n^2) and
@@ -717,6 +815,86 @@ def _active_sensitive_pattern_names(config) -> list[str]:
     return active
 
 
+def _has_mixed_alnum(value: str) -> bool:
+    """True when ``value`` mixes letters and digits.
+
+    The primary entropy signal for a real credential. Identifiers, dotted
+    attribute paths and English words overwhelmingly fail it; issued API keys,
+    tokens and generated passwords overwhelmingly pass it.
+    """
+    return any(ch.isalpha() for ch in value) and any(ch.isdigit() for ch in value)
+
+
+def _looks_like_credential(
+    value: str,
+    pattern_name: str,
+    *,
+    key_context: bool = False,
+) -> bool:
+    """Return True when ``value`` has the shape of a real embedded credential.
+
+    The keyword patterns (``api_key``, ``bearer_token``, ``password_assignment``)
+    anchor on an assignment and then accept whatever follows. That makes them
+    fire on the code which proves a credential was *not* hardcoded --
+    ``api_key=os.environ.get("OPENAI_API_KEY")``, ``password=user_password``,
+    ``api_key: ${{ secrets.OPENAI_API_KEY }}`` -- and, because redaction runs on
+    the ingest write path, the non-secret text is what gets destroyed.
+
+    This gate keeps the patterns' recall while requiring the captured value to
+    look like a secret rather than merely follow a separator. ``private_key`` is
+    PEM-anchored and self-validating, so it never reaches this gate.
+
+    ``key_context`` is set when the *key* already named the field a credential
+    (a ``{"api_key": ...}`` mapping rather than free text). There the value is
+    far more likely to be the real secret, so only the indirection and
+    plain-reference rejections apply; the entropy floor is not enforced.
+    """
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not candidate:
+        return False
+
+    # 1. Environment-variable indirection and config templating. These are
+    #    references to a secret held elsewhere, never the secret itself.
+    if _ENV_INDIRECTION_RE.match(candidate) or _TEMPLATE_REFERENCE_RE.search(candidate):
+        return False
+
+    # 2. Plain code references: bare identifiers (``user_password``), dotted
+    #    attribute paths (``settings.openai_api_key``), subscripts and calls
+    #    (``response.json()[``). A reference that carries no digits is a name,
+    #    not a value. An unbroken single-case run (``OLDSECRET``) is excluded:
+    #    neither snake_case nor SCREAMING_SNAKE produces one, so it reads as an
+    #    inline literal rather than a variable.
+    if (
+        _STRUCTURED_REFERENCE_RE.match(candidate)
+        and _IDENTIFIER_STRUCTURE_RE.search(candidate)
+        and not _has_mixed_alnum(candidate)
+    ):
+        return False
+
+    if key_context:
+        return True
+
+    minimum = _SENSITIVE_MIN_SECRET_CHARS.get(pattern_name, 8)
+    if len(candidate) < minimum:
+        return False
+
+    # 3. Entropy floor. Any one of these is enough to look like a credential:
+    #    mixed letters and digits; an unbroken single-case literal; a
+    #    multi-word passphrase; or a value using credential punctuation that no
+    #    identifier or attribute path can carry.
+    if _has_mixed_alnum(candidate):
+        return True
+    if _UNBROKEN_UPPER_RUN_RE.match(candidate):
+        return True
+    if len(candidate) >= _SENSITIVE_PASSPHRASE_MIN_CHARS and any(ch.isspace() for ch in candidate):
+        return True
+    if len(candidate) >= _SENSITIVE_PASSPHRASE_MIN_CHARS and _CREDENTIAL_PUNCTUATION_RE.search(candidate):
+        return True
+    return False
+
+
 def _sensitive_placeholder(pattern_name: str, secret: str) -> str:
     parts = [
         f"{_SENSITIVE_PLACEHOLDER_PREFIX} "
@@ -739,6 +917,12 @@ def _redact_match(pattern_name: str, match: re.Match[str]) -> str:
     if secret_group is None:
         return _sensitive_placeholder(pattern_name, match.group(0))
     secret = match.group(secret_group)
+    # Keyword patterns match on name + separator only; require the captured
+    # value to look like a credential before destroying it on the write path.
+    if pattern_name in _VALUE_SHAPE_GATED_SENSITIVE_PATTERNS and not _looks_like_credential(
+        secret, pattern_name
+    ):
+        return match.group(0)
     relative_start = match.start(secret_group) - match.start(0)
     relative_end = match.end(secret_group) - match.start(0)
     full = match.group(0)
@@ -783,6 +967,13 @@ def redact_sensitive_text(text: str, config) -> str:
 
 def _redact_entire_sensitive_string(text: str, pattern_name: str) -> str:
     if not text or _SENSITIVE_PLACEHOLDER_PREFIX in text:
+        return text
+    # The key already named this field a credential, so the value is very
+    # likely the secret itself. Still refuse to destroy an environment lookup
+    # or template reference: those name a secret held elsewhere.
+    if pattern_name in _VALUE_SHAPE_GATED_SENSITIVE_PATTERNS and not _looks_like_credential(
+        text, pattern_name, key_context=True
+    ):
         return text
     return _sensitive_placeholder(pattern_name, text)
 
