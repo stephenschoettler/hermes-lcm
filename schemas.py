@@ -1181,3 +1181,12 @@ LCM_EXPAND_QUERY = {
         "required": ["prompt"],
     },
 }
+
+
+def is_tool_enabled(name: str, config) -> bool:
+    """Expose tools only when their backing feature is enabled in resolved config."""
+    if name == "lcm_retrieve":
+        return bool(config.adaptive_retrieval_enabled)
+    if name == "lcm_query_state":
+        return bool(config.assertions_enabled)
+    return True

@@ -86,7 +86,11 @@ def _schema_by_tool_name() -> dict[str, dict]:
 
 
 def _engine_tool_schemas(tmp_path) -> list[dict]:
-    config = LCMConfig(database_path=str(tmp_path / "contract.db"))
+    config = LCMConfig(
+        database_path=str(tmp_path / "contract.db"),
+        assertions_enabled=True,
+        adaptive_retrieval_enabled=True,
+    )
     engine = LCMEngine(config=config)
     try:
         return engine.get_tool_schemas()

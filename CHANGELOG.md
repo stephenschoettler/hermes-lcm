@@ -6,6 +6,7 @@ This repo also publishes GitHub Releases. This file is the repo-root release sur
 
 ### Fixed
 
+- Hide `lcm_retrieve` and `lcm_query_state` from both tool exposure paths when adaptive retrieval or assertions, respectively, are disabled.
 - Build the synthetic PEM redaction fixture at runtime so Hermes plugin security scanning no longer reports an embedded private key.
 - Declare the three registered hooks in plugin.yaml while retaining the 15 public context-engine tool schemas in the manifest.
 

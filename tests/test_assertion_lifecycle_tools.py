@@ -432,7 +432,7 @@ def test_lcm_query_state_is_production_bounded_and_exact_source_cited(tmp_path):
         assertions_enabled=True,
     ))
     try:
-        assert "lcm_query_state" in {
+        assert "lcm_query_state" not in {
             schema["name"] for schema in disabled.get_tool_schemas()
         }
         disabled_result = json.loads(disabled.handle_tool_call(
