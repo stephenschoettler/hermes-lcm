@@ -22,6 +22,7 @@ import time
 from typing import Any, Callable, Iterable, Protocol, Sequence
 from urllib.parse import quote, unquote
 
+from .sqlite_util import guard_connection
 from .db_bootstrap import (
     configure_connection,
     get_fts_shadow_table_names,
@@ -624,7 +625,7 @@ class TrajectoryStore:
             configure_connection(conn)
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
-        return conn
+        return guard_connection(conn)
 
     def _validate_existing_schema_version(self) -> None:
         try:

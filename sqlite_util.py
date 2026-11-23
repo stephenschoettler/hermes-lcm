@@ -9,10 +9,12 @@ example the session-end timeout budget).
 from __future__ import annotations
 
 import errno
+import functools
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import threading
 import uuid
 from contextlib import contextmanager
 from typing import Iterator, List
@@ -237,3 +239,115 @@ def _temporary_sqlite_busy_timeout(
     finally:
         for conn, original in reversed(originals):
             conn.execute(f"PRAGMA busy_timeout={original}")
+
+
+class StoreClosed(sqlite3.Error):
+    """The connection was closed; the call never touched SQLite.
+
+    Subclasses ``sqlite3.Error`` so existing fail-open ``except sqlite3.Error`` callers keep working.
+    """
+
+
+class GuardedConnection:
+    """A ``check_same_thread=False`` connection whose every use and whose ``close()`` share one lock.
+
+    Closing a sqlite3 connection while another thread is inside ``execute``/``fetch`` on it is a
+    use-after-free in ``_sqlite3`` that can crash the interpreter. Every long-lived LCM connection
+    is wrapped at ``sqlite3.connect`` so the rule holds for store methods and for raw
+    ``store.connection`` users alike: a call waits for an in-flight one, and once ``close()`` ran
+    every call raises :class:`StoreClosed`. The lock is a leaf: nothing acquires another lock
+    while holding it.
+    """
+
+    __slots__ = ("_raw", "_guard_lock", "_closed")
+
+    def __init__(self, raw: sqlite3.Connection) -> None:
+        object.__setattr__(self, "_raw", raw)
+        object.__setattr__(self, "_guard_lock", threading.RLock())
+        object.__setattr__(self, "_closed", False)
+
+    def _live(self) -> sqlite3.Connection:
+        if self._closed:
+            raise StoreClosed("LCM sqlite connection is closed")
+        return self._raw
+
+    def _call(self, name: str, *args, **kwargs):
+        with self._guard_lock:
+            result = getattr(self._live(), name)(*args, **kwargs)
+            return GuardedCursor(result, self) if isinstance(result, sqlite3.Cursor) else result
+
+    def __getattr__(self, name: str):
+        if name in GuardedConnection.__slots__:  # half-built instance: never recurse
+            raise AttributeError(name)
+        with self._guard_lock:
+            value = getattr(self._live(), name)
+        if callable(value):
+            return functools.partial(self._call, name)
+        return value
+
+    def __setattr__(self, name: str, value) -> None:
+        with self._guard_lock:
+            setattr(self._live(), name, value)
+
+    def __enter__(self):
+        with self._guard_lock:
+            self._live().__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        with self._guard_lock:
+            return self._live().__exit__(*exc)
+
+    def backup(self, target, *args, **kwargs):
+        if isinstance(target, GuardedConnection):
+            with target._guard_lock:
+                return self._call("backup", target._live(), *args, **kwargs)
+        return self._call("backup", target, *args, **kwargs)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        with self._guard_lock:
+            if self._closed:
+                return
+            object.__setattr__(self, "_closed", True)
+            self._raw.close()
+
+
+class GuardedCursor:
+    """A cursor from a :class:`GuardedConnection`; fetching runs under the connection's lock."""
+
+    __slots__ = ("_raw", "_conn")
+
+    def __init__(self, raw: sqlite3.Cursor, conn: GuardedConnection) -> None:
+        self._raw = raw
+        self._conn = conn
+
+    def _call(self, name: str, *args, **kwargs):
+        with self._conn._guard_lock:
+            self._conn._live()
+            result = getattr(self._raw, name)(*args, **kwargs)
+            return self if result is self._raw else result
+
+    def __getattr__(self, name: str):
+        with self._conn._guard_lock:
+            self._conn._live()
+            value = getattr(self._raw, name)
+        if callable(value):
+            return functools.partial(self._call, name)
+        return value
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._conn._guard_lock:
+            self._conn._live()
+            return next(self._raw)
+
+
+def guard_connection(raw: sqlite3.Connection) -> GuardedConnection:
+    """Wrap a long-lived shared connection; see :class:`GuardedConnection`."""
+    return GuardedConnection(raw)
