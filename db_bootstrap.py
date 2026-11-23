@@ -128,11 +128,19 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                               readers cache WAL pages in RAM.
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    _execute_wal_conversion_with_lock_retry(conn)
+    # PATCH 2026-10-12 : DELETE au lieu de WAL.
+    # Cause racine de la corruption récurrente (27/09, 03/10, 06/10, 12/10) :
+    #  - SQLite 3.45.1 est dans la plage du bug WAL-reset (vuln. 3.7.0-3.51.2).
+    #  - lcm.db est en WAL + mmap_size=256MiB, tenu ouvert par plusieurs
+    #    processus (gateway, dashboard, CLI). Quand le WAL est reset/supprimé
+    #    sous ces connexions, les mappings stale lisent des frames libérées
+    #    -> pages garbage -> b-tree corrompu (rowids ~2^41, "Rowid out of order").
+    # DELETE (rollback journal) n'a pas de fichier WAL à reset -> plus de
+    # bug WAL-reset, plus de garbage-mmap. Coût : moins de concurrence,
+    # négligeable pour lcm.db. On annule aussi le mmap (inutile en DELETE).
+    conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute("PRAGMA wal_autocheckpoint=500")
-    conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute("PRAGMA mmap_size=0")
 
 
 def _execute_wal_conversion_with_lock_retry(
