@@ -14,12 +14,16 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
+
+# Cached by _resolve_mmap_size(); None until the first connection.
+_mmap_size: int | None = None
 
 
 class SchemaVersionTooNewError(RuntimeError):
@@ -40,6 +44,14 @@ class SchemaVersionTooNewError(RuntimeError):
 # counter free for the temporal train so neither collides on a v6.
 SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 30_000
+# Default ceiling for memory-mapped reads. 256 MiB mirrors the historic value and
+# is only a cap: SQLite maps the first N bytes of the file and falls back to
+# xRead() beyond N.
+DEFAULT_MMAP_SIZE = 268_435_456
+# ``PRAGMA mmap_size`` is per-connection. 0 disables memory-mapped I/O entirely,
+# which is what Darwin/APFS multi-process deployments need (see
+# ``_resolve_mmap_size``). Overridable with ``LCM_MMAP_SIZE``.
+MMAP_SIZE_ENV = "LCM_MMAP_SIZE"
 _MIN_DISK_SPACE_BYTES = 50 * 1024 * 1024
 REQUIRED_CORE_TABLES = (
     "messages",
@@ -95,6 +107,56 @@ def _is_sqlite_lock_error(exc: BaseException) -> bool:
     return False
 
 
+def _resolve_mmap_size() -> int:
+    """Memory-map budget for reads, resolved once per process.
+
+    Resolution order is ``LCM_MMAP_SIZE``, then the platform default.
+
+    WHY DARWIN DIFFERS: memory-mapped reads are only safe when every process
+    touching the database shares one coherent page cache. SQLite's own
+    documentation names this as the hard requirement -- "The operating system
+    must have a unified buffer cache in order for the memory-mapped I/O
+    extension to work correctly, especially in situations where two processes
+    are accessing the same database file and one process is using
+    memory-mapped I/O while the other is not. ... In some operating systems
+    that claim to have a unified buffer cache, the implementation is buggy and
+    can lead to corrupt databases." (https://sqlite.org/mmap.html)
+
+    APFS is such a case for the hermes-lcm topology: `lcm.db` is held open by a
+    supervised gateway, a desktop backend and every CLI/sub-agent process, each
+    with its own connection and its own map. Upstream reports the resulting
+    `database disk image is malformed` under exactly this shape, and disables
+    the pragma on Darwin (upstream PR #589). Note this is independent of the
+    journal mode: `database.journal_mode=delete` removes the WAL sidecar
+    failure class but does not make memory-mapped reads coherent.
+
+    An explicit ``LCM_MMAP_SIZE`` always wins, so an operator can pin the value
+    (including ``0`` on another platform, or non-zero on Darwin to reproduce
+    the upstream failure) without editing this file.
+    """
+    global _mmap_size
+    if _mmap_size is not None:
+        return _mmap_size
+
+    raw = (os.environ.get(MMAP_SIZE_ENV) or "").strip()
+    if raw:
+        try:
+            resolved = max(0, int(raw))
+        except ValueError:
+            logger.warning(
+                "LCM: ignoring %s=%r, which is not an integer; falling back to "
+                "the platform default mmap_size.",
+                MMAP_SIZE_ENV,
+                raw,
+            )
+        else:
+            _mmap_size = resolved
+            return resolved
+
+    _mmap_size = 0 if sys.platform == "darwin" else DEFAULT_MMAP_SIZE
+    return _mmap_size
+
+
 def configure_connection(conn: sqlite3.Connection) -> None:
     """Configure SQLite connection for WAL durability and hygiene.
 
@@ -124,15 +186,19 @@ def configure_connection(conn: sqlite3.Connection) -> None:
                                              or cap growth while another
                                              connection holds an old WAL
                                              end mark.
-    - mmap_size=268435456 (256 MiB)        : memory-map reads so concurrent
-                                              readers cache WAL pages in RAM.
+    - mmap_size=<DEFAULT_MMAP_SIZE|0>      : memory-map reads so concurrent
+                                              readers share pages with the OS
+                                              page cache. Disabled on Darwin:
+                                              APFS is not coherent for a
+                                              mixed mmap/xRead() multi-process
+                                              workload (see `_resolve_mmap_size`).
     """
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     _execute_wal_conversion_with_lock_retry(conn)
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA wal_autocheckpoint=500")
     conn.execute("PRAGMA journal_size_limit=67108864")
-    conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute(f"PRAGMA mmap_size={_resolve_mmap_size()}")
 
 
 def _execute_wal_conversion_with_lock_retry(

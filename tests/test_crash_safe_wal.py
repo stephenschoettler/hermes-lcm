@@ -12,12 +12,16 @@ still depends on SQLite WAL recovery.
 from __future__ import annotations
 
 import sqlite3
+import sys
 import threading
 from pathlib import Path
 
 import pytest
 
+import hermes_lcm.db_bootstrap as db_bootstrap
 from hermes_lcm.db_bootstrap import (
+    DEFAULT_MMAP_SIZE,
+    MMAP_SIZE_ENV,
     configure_connection,
     ensure_message_origin_columns,
 )
@@ -77,12 +81,38 @@ class TestConfigureConnectionPragmas:
         conn.close()
         assert val == 67_108_864, f"expected journal_size_limit=67108864, got {val}"
 
-    def test_mmap_size(self, db_path: Path):
+    def test_mmap_size_disabled_on_darwin(self, db_path: Path, monkeypatch):
+        """Darwin/APFS must not memory-map: mixed mmap/xRead() multi-process
+        access is incoherent there (upstream #589)."""
+        monkeypatch.delenv(MMAP_SIZE_ENV, raising=False)
+        monkeypatch.setattr(db_bootstrap, "_mmap_size", None)
         conn = sqlite3.connect(str(db_path))
         configure_connection(conn)
         val = conn.execute("PRAGMA mmap_size").fetchone()[0]
         conn.close()
-        assert val == 268_435_456, f"expected mmap_size=268435456, got {val}"
+        expected = 0 if sys.platform == "darwin" else DEFAULT_MMAP_SIZE
+        assert val == expected, f"expected mmap_size={expected}, got {val}"
+
+    def test_mmap_size_env_override_wins(self, db_path: Path, monkeypatch):
+        """LCM_MMAP_SIZE pins the value on every platform, so an operator can
+        reproduce or work around the platform default without editing code."""
+        monkeypatch.setenv(MMAP_SIZE_ENV, "12345")
+        monkeypatch.setattr(db_bootstrap, "_mmap_size", None)
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        val = conn.execute("PRAGMA mmap_size").fetchone()[0]
+        conn.close()
+        assert val == 12345, f"expected mmap_size=12345, got {val}"
+
+    def test_mmap_size_invalid_env_falls_back_to_default(self, db_path: Path, monkeypatch):
+        monkeypatch.setenv(MMAP_SIZE_ENV, "not-a-number")
+        monkeypatch.setattr(db_bootstrap, "_mmap_size", None)
+        conn = sqlite3.connect(str(db_path))
+        configure_connection(conn)
+        val = conn.execute("PRAGMA mmap_size").fetchone()[0]
+        conn.close()
+        expected = 0 if sys.platform == "darwin" else DEFAULT_MMAP_SIZE
+        assert val == expected, f"expected mmap_size={expected}, got {val}"
 
 
 # --------------------------------------------------------------------------- #
