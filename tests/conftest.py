@@ -3,14 +3,24 @@
 Patches the plugin modules so they can be imported both as a package
 (relative imports during plugin loading) and directly during testing.
 """
+import os
 import sys
 import importlib
 from pathlib import Path
 
-# Make the repo root importable (for agent.context_engine etc.)
-repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
-if repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
+# The standalone CI bootstrap places its hermes-agent stub in this checkout.
+# A host integration run may explicitly point at a real hermes-agent checkout;
+# never discover one by searching unrelated parent directories.
+plugin_dir = Path(__file__).resolve().parent.parent
+repo_root = Path(os.environ.get("HERMES_AGENT_ROOT", plugin_dir)).resolve()
+if not (repo_root / "agent" / "context_engine.py").is_file():
+    if "HERMES_AGENT_ROOT" in os.environ:
+        raise RuntimeError(
+            "HERMES_AGENT_ROOT must contain agent/context_engine.py: "
+            f"{repo_root}"
+        )
+else:
+    sys.path.insert(0, str(repo_root))
 
 # Register the plugin directory as a proper package
 plugin_dir = Path(__file__).resolve().parent.parent
