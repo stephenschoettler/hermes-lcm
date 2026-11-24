@@ -686,8 +686,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         sharing one registered instance across agents can let one conversation
         rebind another conversation's raw-message ingest and lifecycle state.
 
-        The clone shares the same durable SQLite database path/configuration,
-        but gets independent session/cursor/lifecycle runtime state. Runtime
+        The clone shares the prototype's SQLite helpers through a
+        reference-counted storage bundle (so N agents hold one connection set,
+        not N), but gets independent session/cursor/lifecycle runtime state.
+        Each clone releases its reference once on close()/shutdown(). Runtime
         model and context-window metadata is copied so the clone is immediately
         budget-aware even before a compatible Hermes host calls update_model().
         """
@@ -742,10 +744,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         clone._lcm_current_start_allows_bypass_lineage = False
         return clone
 
-    def create_runtime(self) -> "LCMEngine":
-        """Create the isolated, agent-owned runtime required by Hermes core."""
-        return self.clone_for_agent()
-
     def __deepcopy__(self, memo: dict[int, object]) -> "LCMEngine":
         """Copy the plugin runtime without pickling SQLite-backed helpers.
 
@@ -753,8 +751,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         AIAgent instances. A default object deepcopy walks into MessageStore,
         SummaryDAG, and LifecycleStateStore sqlite3.Connection handles, which
         cannot be pickled. LCM already exposes clone_for_agent() as the safe
-        boundary: share durable configuration/database path, but allocate fresh
-        per-agent runtime/storage helper objects.
+        boundary: share the reference-counted SQLite helpers, but allocate fresh
+        per-agent runtime state.
         """
         clone = self.clone_for_agent()
         memo[id(self)] = clone

@@ -7810,7 +7810,7 @@ def test_storage_bundle_closes_all_helpers_after_first_failure(caplog):
     assert "storage helper 0 failed to close" in caplog.text
 
 
-def test_context_engine_runtime_contract_shares_storage_and_closes_bundle(tmp_path):
+def test_runtime_clones_share_storage_and_close_bundle_once(tmp_path):
     from hermes_lcm.engine import LCMEngine
 
     prototype = LCMEngine(
@@ -7823,8 +7823,8 @@ def test_context_engine_runtime_contract_shares_storage_and_closes_bundle(tmp_pa
         assert bundle is not None
         assert bundle._refs == 1
 
-        runtime = prototype.create_runtime()
-        sibling = prototype.create_runtime()
+        runtime = prototype.clone_for_agent()
+        sibling = prototype.clone_for_agent()
         assert runtime is not prototype
         assert runtime._store is prototype._store
         assert bundle._refs == 3
@@ -7881,7 +7881,7 @@ def test_runtime_constructor_failure_releases_acquired_storage_bundle(
 
         monkeypatch.setattr(engine_module, helper_name, fail_constructor)
         with pytest.raises(RuntimeError, match=failure):
-            prototype.create_runtime()
+            prototype.clone_for_agent()
 
         assert bundle._refs == refs_before
     finally:

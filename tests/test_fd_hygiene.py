@@ -14,11 +14,12 @@ from hermes_lcm.engine import LCMEngine
 
 def _db_fd_count(db_path: Path) -> int:
     """Count this process's descriptors for the database and its WAL files."""
-    if os.name != "posix":
-        pytest.skip("/proc/self/fd is POSIX-only")
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("descriptor paths need /proc/self/fd (Linux)")
     return sum(
         1
-        for fd in Path("/proc/self/fd").iterdir()
+        for fd in fd_dir.iterdir()
         if db_path.name in os.path.realpath(fd)
     )
 
