@@ -537,6 +537,7 @@ def _status_text(engine) -> str:
         f"context_threshold: {status.get('context_threshold', engine._config.context_threshold)}",
         f"context_threshold_source: {status.get('context_threshold_source', config_sources.get('context_threshold', 'manual_or_default'))}",
         f"context_threshold_autoraised: {status.get('context_threshold_autoraised') or '(none)'}",
+        f"context_threshold_model_override: {status.get('context_threshold_model_override') or '(none)'}",
         f"threshold_tokens: {engine.threshold_tokens if session_bound else '(uninitialized)'}",
         f"cache_metrics_available: {_fmt_bool(status.get('cache_metrics_available'))}",
         f"last_input_tokens: {status.get('last_input_tokens', 0)}",

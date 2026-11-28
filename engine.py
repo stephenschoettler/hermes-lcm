@@ -489,6 +489,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             else "manual_or_default"
         )
         self._context_threshold_autoraised: dict[str, float] | None = None
+        # Distinct from the Codex gpt-5.5 autoraise notice above: a per-model
+        # threshold override (lcm.model_thresholds / LCM_MODEL_THRESHOLDS) can
+        # raise *or lower* the effective threshold and is a different
+        # mechanism entirely, so it gets its own status field rather than
+        # reusing the "autoraised" label.
+        self._context_threshold_model_override: dict[str, float] | None = None
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -872,6 +878,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
+        # Per-model threshold overrides take priority over everything else.
+        # Longest substring match wins (so "glm-5.2-1M" beats "glm-5.2").
+        if self._config.model_thresholds and route_model:
+            best_key = ""
+            for key in self._config.model_thresholds:
+                needle = route_model.lower()
+                if key.lower() in needle and len(key) > len(best_key):
+                    best_key = key
+            if best_key:
+                override = float(self._config.model_thresholds[best_key])
+                return (
+                    override,
+                    f"model_thresholds:{best_key}",
+                    {"from": configured, "to": override},
+                )
         if (
             _is_codex_gpt55_route(route_model, route_provider)
             and self._config.codex_gpt55_autoraise_enabled
@@ -884,6 +905,41 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 {"from": configured, "to": _CODEX_GPT55_COMPACTION_THRESHOLD},
             )
         return configured, source, None
+
+    def _apply_runtime_context_threshold(
+        self,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> None:
+        """Recompute and store the live context_threshold plus its notice.
+
+        ``_runtime_context_threshold`` returns at most one "notice" dict
+        describing a threshold change away from the configured value. Two
+        unrelated mechanisms can produce that notice -- the Codex gpt-5.5
+        route-specific autoraise, and a per-model threshold override -- and
+        they must not share a label: autoraise is specifically Hermes
+        Agent's behavior of *raising* a Codex gpt-5.5 threshold, while a
+        per-model override is a distinct, user-configured mechanism that can
+        just as easily *lower* the effective threshold. Reporting a lowered
+        per-model override under the "autoraised" status field would be a
+        mislabel, so each mechanism is stored under its own attribute.
+        """
+        (
+            self.context_threshold,
+            self._context_threshold_source,
+            notice,
+        ) = self._runtime_context_threshold(model=model, provider=provider)
+        if self._context_threshold_source == "codex_gpt55_autoraise":
+            self._context_threshold_autoraised = notice
+            self._context_threshold_model_override = None
+        elif self._context_threshold_source.startswith("model_thresholds:"):
+            self._context_threshold_autoraised = None
+            self._context_threshold_model_override = notice
+        else:
+            self._context_threshold_autoraised = None
+            self._context_threshold_model_override = None
+        self.threshold_percent = self.context_threshold
 
     def _effective_context_length(
         self,
@@ -944,10 +1000,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self.effective_context_length_reason = ""
             self._context_length_source = source
             self.threshold_tokens = 0
-            self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-                self._runtime_context_threshold(model=model, provider=provider)
-            )
-            self.threshold_percent = self.context_threshold
+            self._apply_runtime_context_threshold(model=model, provider=provider)
             return True
         self.raw_context_length = parsed_context_length
         effective_context_length, cap, reason = self._effective_context_length(
@@ -959,10 +1012,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.effective_context_length_cap = cap
         self.effective_context_length_reason = reason
         self._context_length_source = source
-        self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-            self._runtime_context_threshold(model=model, provider=provider)
-        )
-        self.threshold_percent = self.context_threshold
+        self._apply_runtime_context_threshold(model=model, provider=provider)
         context_threshold_tokens = int(
             effective_context_length * self.context_threshold
         )
@@ -3899,6 +3949,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_threshold": self.context_threshold,
             "context_threshold_source": self._context_threshold_source,
             "context_threshold_autoraised": self._context_threshold_autoraised,
+            "context_threshold_model_override": self._context_threshold_model_override,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),

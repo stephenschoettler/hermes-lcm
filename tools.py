@@ -6467,6 +6467,7 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "context_threshold": full_status.get("context_threshold", engine._config.context_threshold),
         "context_threshold_source": full_status.get("context_threshold_source", ""),
         "context_threshold_autoraised": full_status.get("context_threshold_autoraised"),
+        "context_threshold_model_override": full_status.get("context_threshold_model_override"),
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
         "last_input_tokens": engine.last_input_tokens,
